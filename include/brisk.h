@@ -19,10 +19,15 @@
 #define BRISK_SSL_VERSION_PATCH  0
 #define BRISK_SSL_VERSION_STRING "0.1.0-dev"
 
-#if defined(__GNUC__) && __GNUC__ >= 4
-#    define BRISK_API __attribute__((visibility("default")))
-#else
-#    define BRISK_API
+/* Symbol export: only a shared-library build (BRISK_SHARED_BUILD) exports the API. In a static
+ * build it stays empty so a .so that embeds libbrisk.a keeps its own visibility policy.
+ * Define BRISK_API yourself to override. */
+#ifndef BRISK_API
+#    if defined(BRISK_SHARED_BUILD) && defined(__GNUC__) && __GNUC__ >= 4
+#        define BRISK_API __attribute__((visibility("default")))
+#    else
+#        define BRISK_API
+#    endif
 #endif
 
 #ifdef __cplusplus

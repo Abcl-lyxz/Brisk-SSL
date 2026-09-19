@@ -1,72 +1,72 @@
 {
  "aarch64": {
-  "TOTAL flash": 4792,
+  "TOTAL flash": 4784,
   "TOTAL ram": 8,
   "hkdf": 1271,
-  "sha2": 3352,
+  "sha2": 3344,
   "util": 169
  },
  "armv5": {
-  "TOTAL flash": 5664,
+  "TOTAL flash": 5644,
   "TOTAL ram": 4,
   "hkdf": 1095,
-  "sha2": 4368,
+  "sha2": 4348,
   "util": 201
  },
  "armv7hf": {
-  "TOTAL flash": 4174,
+  "TOTAL flash": 4162,
   "TOTAL ram": 4,
   "hkdf": 729,
-  "sha2": 3318,
+  "sha2": 3306,
   "util": 127
  },
  "i686": {
-  "TOTAL flash": 5932,
+  "TOTAL flash": 5915,
   "TOTAL ram": 4,
   "hkdf": 1212,
-  "sha2": 4537,
+  "sha2": 4520,
   "util": 183
  },
  "mips": {
-  "TOTAL flash": 7696,
+  "TOTAL flash": 7660,
   "TOTAL ram": 4,
   "hkdf": 1736,
-  "sha2": 5748,
+  "sha2": 5712,
   "util": 212
  },
  "mips64": {
-  "TOTAL flash": 6636,
+  "TOTAL flash": 6620,
   "TOTAL ram": 8,
   "hkdf": 1684,
-  "sha2": 4736,
+  "sha2": 4720,
   "util": 216
  },
  "mipsel": {
-  "TOTAL flash": 7704,
+  "TOTAL flash": 7668,
   "TOTAL ram": 4,
   "hkdf": 1740,
-  "sha2": 5752,
+  "sha2": 5716,
   "util": 212
  },
  "ppc": {
-  "TOTAL flash": 6032,
+  "TOTAL flash": 6008,
   "TOTAL ram": 4,
   "hkdf": 1243,
-  "sha2": 4484,
+  "sha2": 4460,
   "util": 305
  },
  "riscv64": {
-  "TOTAL flash": 4576,
+  "TOTAL flash": 4558,
   "TOTAL ram": 8,
   "hkdf": 1041,
-  "sha2": 3394,
+  "sha2": 3376,
   "util": 141
  },
  "x86_64": {
-  "TOTAL flash": 4529,
+  "TOTAL flash": 4506,
   "TOTAL ram": 8,
   "hkdf": 1098,
-  "sha2": 3295,
+  "sha2": 3272,
   "util": 136
  }
 }

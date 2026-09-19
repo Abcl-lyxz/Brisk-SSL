@@ -1,11 +1,13 @@
 cmake_minimum_required(VERSION 3.20...4.4)
 project(brisk_ssl VERSION 0.1.0 LANGUAGES C)
 
-set(BRISK_PROFILE "DEFAULT" CACHE STRING "Feature profile: TINY, DEFAULT or FULL (see include/brisk_config.h)")
-set_property(CACHE BRISK_PROFILE PROPERTY STRINGS TINY DEFAULT FULL)
+# Empty = let include/brisk_config.h decide (DEFAULT, or whatever a BRISK_USER_CONFIG header sets).
+set(BRISK_PROFILE "" CACHE STRING "Feature profile: TINY, DEFAULT or FULL; empty = header default")
+set_property(CACHE BRISK_PROFILE PROPERTY STRINGS "" TINY DEFAULT FULL)
 option(BRISK_BUILD_TESTS "Build the test suite" ${PROJECT_IS_TOP_LEVEL})
 
-add_library(brisk
+# ponytail: static only until M8 (shared builds need BRISK_SHARED_BUILD + tests on internal symbols)
+add_library(brisk STATIC
     src/util.c
     src/crypto/sha2.c
     src/crypto/hkdf.c
@@ -14,7 +16,9 @@ set_target_properties(brisk PROPERTIES C_STANDARD 99 C_STANDARD_REQUIRED ON C_EX
                                        C_VISIBILITY_PRESET hidden)
 target_include_directories(brisk PUBLIC include PRIVATE src)
 # PUBLIC: consumers see exactly the configuration the library was built with.
-target_compile_definitions(brisk PUBLIC BRISK_PROFILE=BRISK_PROFILE_${BRISK_PROFILE})
+if(BRISK_PROFILE)
+    target_compile_definitions(brisk PUBLIC BRISK_PROFILE=BRISK_PROFILE_${BRISK_PROFILE})
+endif()
 
 if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
     target_compile_options(brisk PRIVATE

@@ -56,6 +56,24 @@ struct label_kat {
 
 static uint8_t A[BUF + 16], B[BUF + 16], C[BUF + 16], D[BUF + 16];
 
+/* Canary after every output: catches writes past the requested length that memcmp over the
+ * first n bytes (and ASan, inside these big buffers) would miss. */
+#define CANARY 32
+static void canary_set(uint8_t *out, size_t len)
+{
+    memset(out + len, 0xA5, CANARY);
+}
+static int canary_ok(const uint8_t *out, size_t len)
+{
+    size_t i;
+    for (i = 0; i < CANARY; i++) {
+        if (out[len + i] != 0xA5) {
+            return 0;
+        }
+    }
+    return 1;
+}
+
 static brisk_hash_alg alg_of(int bits)
 {
     return bits == 256 ? BRISK_HASH_SHA256 : bits == 384 ? BRISK_HASH_SHA384 : BRISK_HASH_SHA512;
@@ -104,8 +122,12 @@ static void sha2_kat(void)
         uint8_t *m = A + (off = i % 8), *out = B + (7 - off); /* every alignment, in and out */
         n = t_unhex(v->msg, m, BUF);
         hl = t_unhex(v->md, C, BUF);
+        canary_set(out, hl);
         hash_oneshot(v->bits, m, n, out);
-        CHECKI(memcmp(out, C, hl) == 0, i);
+        CHECKI(memcmp(out, C, hl) == 0 && canary_ok(out, hl), i);
+        hash_split(v->bits, m, n, n / 2,
+                   out); /* generic dispatch path must also write exactly hl */
+        CHECKI(memcmp(out, C, hl) == 0 && canary_ok(out, hl), i);
         if (n <= 300) {
             for (k = 0; k <= n; k++) {
                 hash_split(v->bits, m, n, k, out);
@@ -181,17 +203,21 @@ static void hmac_kat(void)
         brisk_hash_alg a = alg_of(v->bits);
         uint8_t *key = A + (off = i % 8), *msg = B + (7 - off), *out = D + off;
         brisk_hmac_ctx c;
+        size_t hl = brisk_hash_len(a);
         kl = t_unhex(v->key, key, BUF);
         ml = t_unhex(v->msg, msg, BUF);
         tl = t_unhex(v->tag, C, BUF);
-        CHECKI(brisk_hmac(a, key, kl, msg, ml, out) == BRISK_OK, i);
-        CHECKI((memcmp(out, C, tl) == 0) == v->valid, i);
+        canary_set(out, hl);
+        CHECKI(brisk_hmac(a, key, kl, msg, ml, out) == BRISK_OK && canary_ok(out, hl), i);
+        /* compare the way TLS will: with the constant-time comparator (exercises its "differ"
+         * path on every Wycheproof ModifiedTag vector) */
+        CHECKI(brisk__ct_memeq(out, C, tl) == v->valid, i);
         /* streamed in two parts */
         CHECKI(brisk_hmac_init(&c, a, key, kl) == BRISK_OK, i);
         brisk_hmac_update(&c, msg, ml / 3);
         brisk_hmac_update(&c, msg + ml / 3, ml - ml / 3);
         brisk_hmac_final(&c, out);
-        CHECKI((memcmp(out, C, tl) == 0) == v->valid, i);
+        CHECKI(brisk__ct_memeq(out, C, tl) == v->valid && canary_ok(out, hl), i);
     }
 }
 
@@ -213,27 +239,33 @@ static void hkdf_kat(void)
             pl = t_unhex(v->prk, want_prk, sizeof want_prk);
             CHECKI(pl == hl && memcmp(prk, want_prk, hl) == 0, i);
         }
-        rc = brisk__hkdf_expand(a, prk, hl, C + 1, nl, A + 3, v->size);
         if (v->valid) {
+            canary_set(A + 3, v->size);
+            rc = brisk__hkdf_expand(a, prk, hl, C + 1, nl, A + 3, v->size);
             CHECKI(rc == BRISK_OK && ol == v->size && memcmp(A + 3, D + 8, ol) == 0, i);
-        } else {
-            CHECKI(rc != BRISK_OK || memcmp(A + 3, D + 8, ol) != 0, i);
+            CHECKI(canary_ok(A + 3, v->size), i);
+        } else { /* invalid = length too large: must fail and write nothing at all */
+            canary_set(A + 3, 0);
+            rc = brisk__hkdf_expand(a, prk, hl, C + 1, nl, A + 3, v->size);
+            CHECKI(rc == BRISK_E_ARG && canary_ok(A + 3, 0), i);
         }
     }
 }
 
 static void extract_kat(void)
 {
-    size_t i, sl, il;
-    uint8_t prk[BRISK_HASH_MAX_LEN], want[BRISK_HASH_MAX_LEN];
+    size_t i, sl, il, hl;
+    uint8_t want[BRISK_HASH_MAX_LEN];
     for (i = 0; i < N(EXTRACT_KAT); i++) {
         const struct extract_kat *v = &EXTRACT_KAT[i];
         brisk_hash_alg a = alg_of(v->bits);
+        uint8_t *prk = D + i % 8;
         sl = t_unhex(v->salt, A, BUF);
         il = t_unhex(v->ikm, B, BUF);
-        t_unhex(v->prk, want, sizeof want);
+        hl = t_unhex(v->prk, want, sizeof want);
+        canary_set(prk, hl);
         CHECKI(brisk__hkdf_extract(a, sl ? A : NULL, sl, B, il, prk) == BRISK_OK, i);
-        CHECKI(memcmp(prk, want, brisk_hash_len(a)) == 0, i);
+        CHECKI(hl == brisk_hash_len(a) && memcmp(prk, want, hl) == 0 && canary_ok(prk, hl), i);
     }
 }
 
@@ -246,9 +278,34 @@ static void label_kat(void)
         sl = t_unhex(v->secret, A, BUF);
         cl = t_unhex(v->ctx, B + 3, BUF);
         ol = t_unhex(v->out, C, BUF);
+        canary_set(D + 5, ol);
         CHECKI(brisk__hkdf_expand_label(a, A, sl, v->label, B + 3, cl, D + 5, ol) == BRISK_OK, i);
-        CHECKI(memcmp(D + 5, C, ol) == 0, i);
+        CHECKI(memcmp(D + 5, C, ol) == 0 && canary_ok(D + 5, ol), i);
     }
+}
+
+/* brisk__ct_memeq decides every tag / Finished / binder check in TLS: a regression fails open. */
+static void ct_memeq_cases(void)
+{
+    uint8_t *x = A + 1, *y = B + 3; /* unaligned */
+    size_t pos, bit;
+    for (pos = 0; pos < 64; pos++) {
+        x[pos] = y[pos] = (uint8_t)(pos * 37 + 11);
+    }
+    CHECK(brisk__ct_memeq(x, y, 0) == 1);
+    CHECK(brisk__ct_memeq(x, y, 64) == 1);
+    for (pos = 0; pos < 64; pos++) { /* every single-bit difference, incl. 0x01 and 0x80 */
+        for (bit = 0; bit < 8; bit++) {
+            y[pos] ^= (uint8_t)(1u << bit);
+            CHECKI(brisk__ct_memeq(x, y, 64) == 0, pos * 8 + bit);
+            CHECKI(brisk__ct_memeq(x, y, pos) == 1, pos * 8 + bit); /* prefix before it is equal */
+            y[pos] ^= (uint8_t)(1u << bit);
+        }
+    }
+    y[63] ^= 0xFF; /* all bits differ in the last byte only */
+    CHECK(brisk__ct_memeq(x, y, 64) == 0);
+    y[63] ^= 0xFF;
+    CHECK(brisk__ct_memeq(x, y, 64) == 1);
 }
 
 static int all_zero(const void *p, size_t n)
@@ -338,5 +395,6 @@ void test_hash(void)
     hkdf_kat();
     extract_kat();
     label_kat();
+    ct_memeq_cases();
     edge_cases();
 }

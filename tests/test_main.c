@@ -79,5 +79,9 @@ int main(int argc, char **argv)
         }
     }
     printf("%ld checks, %ld failures\n", t_checks, t_fails);
+    if (t_checks == 0) { /* misspelt suite name in add_test() must not "pass" */
+        fprintf(stderr, "no checks ran: unknown suite name?\n");
+        return 2;
+    }
     return t_fails ? 1 : 0;
 }

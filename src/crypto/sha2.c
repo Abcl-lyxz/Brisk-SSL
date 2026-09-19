@@ -229,11 +229,10 @@ void brisk_sha384_update(brisk_sha384_ctx *c, const void *data, size_t len)
     brisk_sha512_update(c, data, len);
 }
 
-/* pad, process, write out_len bytes of state, wipe */
+/* pad, process, write out_len (48 or 64) bytes of state straight into out, wipe */
 static void sha512_finish(brisk_sha512_ctx *c, uint8_t *out, size_t out_len)
 {
     size_t used = (size_t)(c->len & 127), i;
-    uint8_t word[8];
     c->buf[used++] = 0x80;
     if (used > 112) {
         memset(c->buf + used, 0, 128 - used);
@@ -244,9 +243,9 @@ static void sha512_finish(brisk_sha512_ctx *c, uint8_t *out, size_t out_len)
     brisk__store_be64(c->buf + 112, c->len >> 61); /* 128-bit bit length: high part */
     brisk__store_be64(c->buf + 120, c->len << 3);
     sha512_block(c->h, c->buf);
-    for (i = 0; i < out_len; i += 8) {
-        brisk__store_be64(word, c->h[i / 8]);
-        memcpy(out + i, word, out_len - i < 8 ? out_len - i : 8);
+    /* no intermediate word buffer: it would leave digest (= key material in HKDF) on the stack */
+    for (i = 0; i < out_len / 8; i++) {
+        brisk__store_be64(out + 8 * i, c->h[i]);
     }
     brisk__secure_zero(c, sizeof *c);
 }

@@ -26,9 +26,9 @@ Flash = code + read-only data + data of the library objects actually linked (lib
 | module | x86_64 | i686 | aarch64 | armv7hf | armv5 | mips | mipsel | mips64 | riscv64 | ppc |
 |---|---|---|---|---|---|---|---|---|---|---|
 | hkdf (HMAC+HKDF+Expand-Label) | 1098 | 1212 | 1271 | 729 | 1095 | 1736 | 1740 | 1684 | 1041 | 1243 |
-| sha2 (SHA-256/384/512) | 3295 | 4537 | 3352 | 3318 | 4368 | 5748 | 5752 | 4736 | 3394 | 4484 |
+| sha2 (SHA-256/384/512) | 3272 | 4520 | 3344 | 3306 | 4348 | 5712 | 5716 | 4720 | 3376 | 4460 |
 | util | 136 | 183 | 169 | 127 | 201 | 212 | 212 | 216 | 141 | 305 |
-| **total flash** | 4529 | 5932 | 4792 | 4174 | 5664 | 7696 | 7704 | 6636 | 4576 | 6032 |
+| **total flash** | 4506 | 5915 | 4784 | 4162 | 5644 | 7660 | 7668 | 6620 | 4558 | 6008 |
 
 RAM: no static RAM beyond a few bytes; contexts are caller-owned
 (`brisk_sha256_ctx` 104 B, `brisk_sha512_ctx` 200 B, `brisk_hmac_ctx` 408 B on 64-bit).

@@ -33,9 +33,26 @@ void brisk__secure_zero(void *p, size_t n)
 #    define BRISK__PROFILE_NAME "FULL"
 #endif
 
-/* "@(#)" makes `strings`/`what` find the configuration in a shipped firmware image. */
-static const char brisk__build_info[] =
+/* "@(#)" makes `strings`/`what` find the configuration in a shipped firmware image. The consumer
+ * links with --gc-sections, which would drop the string unless brisk_build_info() is called, so:
+ * `retain` (GCC >= 11, Clang >= 13, binutils >= 2.36) keeps it in .rodata, and on older ELF
+ * toolchains a copy goes into .comment, which gc-sections never discards. */
+#if defined(__has_attribute)
+#    if __has_attribute(retain)
+#        define BRISK__RETAIN __attribute__((used, retain))
+#    endif
+#endif
+#ifndef BRISK__RETAIN
+#    define BRISK__RETAIN
+#    if defined(__ELF__)
+__asm__(".pushsection .comment\n\t.asciz \"@(#)BRISKCFG " BRISK_SSL_VERSION_STRING
+        " profile=" BRISK__PROFILE_NAME "\"\n\t.popsection");
+#    endif
+#endif
+
+BRISK__RETAIN static const char brisk__build_info[] =
     "@(#)BRISKCFG " BRISK_SSL_VERSION_STRING " profile=" BRISK__PROFILE_NAME;
+#undef BRISK__RETAIN
 
 const char *brisk_version(void)
 {
