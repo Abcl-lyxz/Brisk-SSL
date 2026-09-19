@@ -1,79 +1,89 @@
 {
  "aarch64": {
-  "TOTAL flash": 5621,
+  "TOTAL flash": 8097,
   "TOTAL ram": 12,
+  "chacha20_poly1305": 2476,
   "hkdf": 1271,
   "linux_rand": 837,
   "sha2": 3344,
   "util": 169
  },
  "armv5": {
-  "TOTAL flash": 6473,
+  "TOTAL flash": 9253,
   "TOTAL ram": 8,
+  "chacha20_poly1305": 2780,
   "hkdf": 1095,
   "linux_rand": 829,
   "sha2": 4348,
   "util": 201
  },
  "armv7hf": {
-  "TOTAL flash": 4697,
+  "TOTAL flash": 6705,
   "TOTAL ram": 8,
+  "chacha20_poly1305": 2008,
   "hkdf": 729,
   "linux_rand": 535,
   "sha2": 3306,
   "util": 127
  },
  "i686": {
-  "TOTAL flash": 6687,
+  "TOTAL flash": 9679,
   "TOTAL ram": 8,
+  "chacha20_poly1305": 2992,
   "hkdf": 1212,
   "linux_rand": 772,
   "sha2": 4520,
   "util": 183
  },
  "mips": {
-  "TOTAL flash": 8976,
+  "TOTAL flash": 12388,
   "TOTAL ram": 8,
+  "chacha20_poly1305": 3412,
   "hkdf": 1736,
   "linux_rand": 1316,
   "sha2": 5712,
   "util": 212
  },
  "mips64": {
-  "TOTAL flash": 7896,
+  "TOTAL flash": 11612,
   "TOTAL ram": 12,
+  "chacha20_poly1305": 3716,
   "hkdf": 1684,
   "linux_rand": 1276,
   "sha2": 4720,
   "util": 216
  },
  "mipsel": {
-  "TOTAL flash": 8984,
+  "TOTAL flash": 12372,
   "TOTAL ram": 8,
+  "chacha20_poly1305": 3388,
   "hkdf": 1740,
   "linux_rand": 1316,
   "sha2": 5716,
   "util": 212
  },
  "ppc": {
-  "TOTAL flash": 6977,
+  "TOTAL flash": 9929,
   "TOTAL ram": 8,
+  "chacha20_poly1305": 2952,
   "hkdf": 1243,
   "linux_rand": 969,
   "sha2": 4460,
   "util": 305
  },
  "riscv64": {
-  "TOTAL flash": 5213,
+  "TOTAL flash": 8037,
   "TOTAL ram": 12,
+  "chacha20_poly1305": 2824,
   "hkdf": 1041,
   "linux_rand": 655,
   "sha2": 3376,
   "util": 141
  },
  "x86_64": {
-  "TOTAL flash": 5203,
+  "TOTAL flash": 7900,
   "TOTAL ram": 12,
+  "chacha20_poly1305": 2697,
   "hkdf": 1098,
   "linux_rand": 697,
   "sha2": 3272,

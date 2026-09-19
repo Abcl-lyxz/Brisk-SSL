@@ -36,6 +36,19 @@ static inline void brisk__store_be64(uint8_t *p, uint64_t v)
     brisk__store_be32(p + 4, (uint32_t)v);
 }
 
+static inline uint32_t brisk__load_le32(const uint8_t *p)
+{
+    return (uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
+}
+
+static inline void brisk__store_le32(uint8_t *p, uint32_t v)
+{
+    p[0] = (uint8_t)v;
+    p[1] = (uint8_t)(v >> 8);
+    p[2] = (uint8_t)(v >> 16);
+    p[3] = (uint8_t)(v >> 24);
+}
+
 /* ---- util.c ---- */
 /* 1 if the n bytes at a and b are equal, else 0. Time depends only on n. */
 int brisk__ct_memeq(const void *a, const void *b, size_t n);
@@ -60,6 +73,38 @@ int brisk__hkdf_expand(brisk_hash_alg alg, const uint8_t *prk, size_t prk_len, c
 int brisk__hkdf_expand_label(brisk_hash_alg alg, const uint8_t *secret, size_t secret_len,
                              const char *label, const uint8_t *context, size_t context_len,
                              uint8_t *out, size_t out_len);
+
+/* ---- crypto/chacha20_poly1305.c: ChaCha20, Poly1305, AEAD_CHACHA20_POLY1305 (RFC 8439) ----
+ * Fixed sizes only (RFC 8439 2.8: K_LEN 32, nonce 12, tag 16). The per-record/per-packet nonce
+ * (iv XOR left-padded sequence or packet number, RFC 9846 5.3 / RFC 9001 5.3) is built by the
+ * caller; this module just takes the 12 bytes. */
+#define BRISK__CHACHA20_KEY_LEN   32
+#define BRISK__CHACHA20_NONCE_LEN 12
+#define BRISK__POLY1305_TAG_LEN   16
+
+/* out = in XOR ChaCha20 keystream(key, counter, nonce) (RFC 8439 2.4). in == out allowed; no
+ * partial overlap. The caller guarantees counter + ceil(len/64) <= 2^32: the 32-bit block counter
+ * is NOT checked for wrap, and a wrap would reuse keystream. Also QUIC header protection
+ * (RFC 9001 5.4.4): brisk__chacha20(hp, brisk__load_le32(sample), sample + 4, zero5, mask, 5). */
+void brisk__chacha20(const uint8_t key[32], uint32_t counter, const uint8_t nonce[12],
+                     const uint8_t *in, uint8_t *out, size_t len);
+
+/* One-shot Poly1305 (RFC 8439 2.5); key is a one-time key (r || s). */
+void brisk__poly1305(const uint8_t key[32], const uint8_t *msg, size_t len, uint8_t tag[16]);
+
+/* AEAD_CHACHA20_POLY1305 seal (RFC 8439 2.8): out gets len bytes of ciphertext, tag the 16-byte
+ * tag, so the TLS layer can place the tag right after the ciphertext (RFC 9846 5.2). in == out
+ * allowed. BRISK_OK, or BRISK_E_ARG if len > 274877906880 (P_MAX, before any access). */
+int brisk__chacha20_poly1305_seal(const uint8_t key[32], const uint8_t nonce[12],
+                                  const uint8_t *aad, size_t aad_len, const uint8_t *in, size_t len,
+                                  uint8_t *out, uint8_t tag[16]);
+
+/* Open: verifies the tag over (aad, in) with brisk__ct_memeq BEFORE decrypting anything.
+ * BRISK_OK with len bytes of plaintext in out; BRISK_E_AUTH with out[0..len) zeroed (with
+ * in == out that destroys the ciphertext, by design); or BRISK_E_ARG as for seal. */
+int brisk__chacha20_poly1305_open(const uint8_t key[32], const uint8_t nonce[12],
+                                  const uint8_t *aad, size_t aad_len, const uint8_t *in, size_t len,
+                                  uint8_t *out, const uint8_t tag[16]);
 
 /* ---- os/linux_rand.c (Linux builds only): the only randomness source, no userspace DRBG ---- */
 /* len bytes from the kernel CSPRNG: getrandom(2), which blocks until the pool is initialised.

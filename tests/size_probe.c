@@ -13,6 +13,9 @@ int main(int argc, char **argv)
     brisk_hmac(alg, out, 32, out, 32, out);
     brisk__hkdf_extract(alg, out, 32, out, 32, out);
     brisk__hkdf_expand_label(alg, out, 32, "derived", out, 32, out, 32);
+    brisk__chacha20(out, 1, out + 32, out, out, 5);
+    brisk__chacha20_poly1305_seal(out, out + 32, out, 5, out, 16, out, out + 48);
+    brisk__chacha20_poly1305_open(out, out + 32, out, 5, out, 16, out, out + 48);
 #ifdef __linux__
     brisk__os_random(out, 32);
 #endif

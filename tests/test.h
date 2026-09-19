@@ -16,6 +16,7 @@ size_t t_unhex(const char *hex, uint8_t *out, size_t cap);
 
 /* suites */
 void test_hash(void);
+void test_aead(void);
 void test_rand(void); /* Linux only */
 
 #endif

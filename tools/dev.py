@@ -31,7 +31,7 @@ TRIPLET = {"x86_64": "", "i686": "i686-linux-gnu", "aarch64": "aarch64-linux-gnu
            "riscv64": "riscv64-linux-gnu", "ppc": "powerpc-linux-gnu"}
 # 64-bit division pulls in slow, non-constant-time libgcc helpers on 32-bit CPUs; floats have no
 # business in a TLS library. Any of these in our objects is a bug.
-FORBIDDEN = re.compile(r"^(__u?(div|mod)di3|__aeabi_[lu]?l?divmod|__aeabi_[dfi]|__(add|sub|mul|div)[sd]f3"
+FORBIDDEN = re.compile(r"^(__u?(div|mod)di3|__muldi3|__ashldi3|__ashrdi3|__lshrdi3|__aeabi_l(mul|lsl|lsr|asr)|__aeabi_[lu]?l?divmod|__aeabi_[dfi]|__(add|sub|mul|div)[sd]f3"
                        r"|__float\w+|__fix\w+|__extend\w+|__trunc\w+)$")
 BASELINE = ROOT / "size" / "baseline.json"
 

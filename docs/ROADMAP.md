@@ -18,7 +18,7 @@ Tick a box only when the work is green on **every** arch (`python tools/dev.py t
 - [x] HMAC, HKDF extract/expand, TLS 1.3 HKDF-Expand-Label (RFC 8448 + RFC 9001 A.1 vectors)
 ### M1b RNG + AEAD
 - [x] `src/os/linux_rand.c`: getrandom syscall (per-arch numbers) -> poll /dev/random -> /dev/urandom, fail closed
-- [ ] ChaCha20 + Poly1305 + AEAD (RFC 8439, Wycheproof)
+- [x] ChaCha20 + Poly1305 + AEAD (RFC 8439, Wycheproof)
 - [ ] AES-128/256 constant-time (bitsliced; ct on 32-bit, ct64 on 64-bit), encrypt-only
 - [ ] GHASH (ctmul / ctmul64) + GCM (SP 800-38D, Wycheproof); decrypt RFC 9001 A.2 Initial packet
 - [ ] CT tooling: `CT_SECRET` macros + valgrind ctgrind job; `/ct-check` skill

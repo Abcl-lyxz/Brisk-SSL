@@ -11,6 +11,7 @@ add_library(brisk STATIC
     src/util.c
     src/crypto/sha2.c
     src/crypto/hkdf.c
+    src/crypto/chacha20_poly1305.c
 )
 if(CMAKE_SYSTEM_NAME STREQUAL "Linux") # src/os/ is Linux-only; the mingw host skips it
     target_sources(brisk PRIVATE src/os/linux_rand.c)
@@ -35,7 +36,7 @@ endif()
 
 if(BRISK_BUILD_TESTS)
     enable_testing()
-    add_executable(brisk_tests tests/test_main.c tests/test_hash.c)
+    add_executable(brisk_tests tests/test_main.c tests/test_hash.c tests/test_aead.c)
     set_target_properties(brisk_tests PROPERTIES C_STANDARD 99 C_EXTENSIONS OFF)
     target_link_libraries(brisk_tests PRIVATE brisk)
     target_include_directories(brisk_tests PRIVATE src tests)
@@ -45,6 +46,8 @@ if(BRISK_BUILD_TESTS)
     endif()
     add_test(NAME hash COMMAND brisk_tests hash)
     set_tests_properties(hash PROPERTIES TIMEOUT 900) # qemu-emulated 32-bit targets are slow
+    add_test(NAME aead COMMAND brisk_tests aead)
+    set_tests_properties(aead PROPERTIES TIMEOUT 900)
     if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
         target_sources(brisk_tests PRIVATE tests/test_rand.c)
         # fault injection for src/os/linux_rand.c (getrandom, /dev/random wait, kernel version)

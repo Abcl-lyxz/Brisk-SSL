@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Fetch official known-answer vectors and emit tests/kat/*.inc (stdlib only).
 
-Every vector is re-computed with Python's hashlib/hmac before it is written, so a parsing slip fails
+Every vector is re-computed with Python's hashlib/hmac (or a pure-Python RFC 8439 reference) before it is written, so a parsing slip fails
 here instead of silently weakening the C tests. Downloads are cached in .cache/kat/.
 
     python tools/kat.py            # regenerate tests/kat/*.inc + tests/kat/SOURCES.md
@@ -30,6 +30,8 @@ SRC = {
     "rfc5869": "https://www.rfc-editor.org/rfc/rfc5869.txt",
     "rfc8448": "https://www.rfc-editor.org/rfc/rfc8448.txt",
     "rfc9001": "https://www.rfc-editor.org/rfc/rfc9001.txt",
+    "rfc8439": "https://www.rfc-editor.org/rfc/rfc8439.txt",
+    "wp_chacha20_poly1305": f"{WP}chacha20_poly1305_test.json",
     **{f"wp_hmac_sha{b}": f"{WP}hmac_sha{b}_test.json" for b in (256, 384, 512)},
     **{f"wp_hkdf_sha{b}": f"{WP}hkdf_sha{b}_test.json" for b in (256, 384, 512)},
 }
@@ -75,6 +77,50 @@ def py_expand_label(bits, secret, label, ctx, n):
     full = b"tls13 " + label
     info = n.to_bytes(2, "big") + bytes([len(full)]) + full + bytes([len(ctx)]) + ctx
     return py_hkdf_expand(bits, secret, info, n)
+
+
+# ChaCha20 / Poly1305 / AEAD_CHACHA20_POLY1305 (RFC 8439), written straight from the RFC text.
+def py_chacha20_block(key, counter, nonce):
+    m32 = 0xFFFFFFFF
+    st = [0x61707865, 0x3320646E, 0x79622D32, 0x6B206574]
+    st += [int.from_bytes(key[i:i + 4], "little") for i in range(0, 32, 4)]
+    st += [counter] + [int.from_bytes(nonce[i:i + 4], "little") for i in range(0, 12, 4)]
+    x = st[:]
+
+    def qr(a, b, c, d):
+        for (p, q, r, n) in ((a, b, d, 16), (c, d, b, 12), (a, b, d, 8), (c, d, b, 7)):
+            x[p] = (x[p] + x[q]) & m32
+            x[r] ^= x[p]
+            x[r] = ((x[r] << n) | (x[r] >> (32 - n))) & m32
+
+    for _ in range(10):
+        qr(0, 4, 8, 12), qr(1, 5, 9, 13), qr(2, 6, 10, 14), qr(3, 7, 11, 15)
+        qr(0, 5, 10, 15), qr(1, 6, 11, 12), qr(2, 7, 8, 13), qr(3, 4, 9, 14)
+    return b"".join(((x[i] + st[i]) & m32).to_bytes(4, "little") for i in range(16))
+
+
+def py_chacha20(key, counter, nonce, data):
+    out = bytearray()
+    for j in range(0, len(data), 64):
+        ks = py_chacha20_block(key, counter + j // 64, nonce)
+        out += bytes(a ^ b for a, b in zip(data[j:j + 64], ks))
+    return bytes(out)
+
+
+def py_poly1305(key, msg):
+    r = int.from_bytes(key[:16], "little") & 0x0FFFFFFC0FFFFFFC0FFFFFFC0FFFFFFF
+    s, p, acc = int.from_bytes(key[16:], "little"), (1 << 130) - 5, 0
+    for j in range(0, len(msg), 16):
+        acc = (acc + int.from_bytes(msg[j:j + 16] + b"\x01", "little")) * r % p
+    return ((acc + s) & ((1 << 128) - 1)).to_bytes(16, "little")
+
+
+def py_aead_seal(key, nonce, aad, pt):
+    otk = py_chacha20_block(key, 0, nonce)[:32]
+    ct = py_chacha20(key, 1, nonce, pt)
+    pad = lambda b: b"\0" * (-len(b) % 16)
+    mac = aad + pad(aad) + ct + pad(ct) + len(aad).to_bytes(8, "little") + len(ct).to_bytes(8, "little")
+    return ct, py_poly1305(otk, mac)
 
 
 # ---------------------------------------------------------------- RFC text helpers
@@ -304,6 +350,176 @@ def rfc9001():
     return extracts, labels
 
 
+# ---------------------------------------------------------------- ChaCha20-Poly1305: RFC 8439 + Wycheproof + RFC 9001 A.5
+def rfc8439_fields(lines):
+    """Ordered (label, bytes) pairs of one RFC 8439 section: a label line followed by hex dumps in
+    any of the RFC's three styles ("000  4c 61 ...  ascii", "FF FF ...", "22:4f:51:...")."""
+    out = []
+    for ln in lines:
+        m = re.match(r"^\s*\d{3}  ((?:[0-9a-f]{2} ){0,15}[0-9a-f]{2})(?:\s|$)", ln)
+        m = m or re.match(r"^\s+((?:[0-9A-Fa-f]{2} )+[0-9A-Fa-f]{2})$", ln)
+        m = m or re.match(r"^\s+([0-9a-f]{2}(?::[0-9a-f]{2})+:?)$", ln)
+        if m and out:
+            out[-1][1].extend(hexbytes(m.group(1)))
+        elif ln.strip():
+            out.append((ln.strip().rstrip(":").strip(), bytearray()))
+    return {k: bytes(v) for k, v in out}  # a repeated label keeps its last dump
+
+
+def rfc8439():
+    lines = rfc_lines(fetch("rfc8439"))
+    start = {}
+    for i, ln in enumerate(lines):
+        m = re.match(r"^(\d(?:\.\d){0,2}|A\.\d)\.\s+\S", ln)
+        if m:
+            start[m.group(1)] = i  # the last hit wins: skips the table of contents
+
+    def sect(a, b):
+        return lines[start[a] : start[b]]
+
+    def vectors(a, b):  # "Test Vector #n" blocks of an appendix section -> [(fields, raw text)]
+        vs = []
+        for ln in sect(a, b):
+            if re.match(r"^\s*Test Vector #\d+", ln):
+                vs.append([])
+            if vs:
+                vs[-1].append(ln)
+        return [(rfc8439_fields(v), "\n".join(v)) for v in vs]
+
+    def inline(sec, name):  # "Key = 00:01:...:1f." or "Nonce = (00:...:00)." spread over lines
+        return hexbytes(re.search(name + r"\s*=\s*\(?([0-9a-f][0-9a-f:\s]*[0-9a-f])", sec).group(1))
+
+    chacha, poly, aead = [], [], []
+    # 2.3.2 block function, 2.4.2 encryption
+    s, f = "\n".join(sect("2.3.2", "2.4")), rfc8439_fields(sect("2.3.2", "2.4"))
+    chacha.append((inline(s, "Key"), int(re.search(r"Block Count = (\d+)", s).group(1)),
+                   inline(s, "Nonce"), bytes(64), f["Serialized Block"]))
+    s, f = "\n".join(sect("2.4.2", "2.5")), rfc8439_fields(sect("2.4.2", "2.5"))
+    chacha.append((inline(s, "Key"), int(re.search(r"Initial Counter = (\d+)", s).group(1)),
+                   inline(s, "Nonce"), f["Plaintext Sunscreen"], f["Ciphertext Sunscreen"]))
+    # 2.5.2 Poly1305 (key and tag are inline; one key byte is split across two lines)
+    s = "\n".join(sect("2.5.2", "2.6"))
+    key = hexbytes(re.search(r"Key Material:(.*?)\n\s*o ", s, re.S).group(1))
+    tag = hexbytes(re.search(r"Tag:\s*([0-9a-f:]+)", s).group(1))
+    poly.append((key, rfc8439_fields(sect("2.5.2", "2.6"))["Message to be Authenticated"], tag))
+    # 2.6.2 one-time key generation = first 32 bytes of the counter-0 block
+    f = rfc8439_fields(sect("2.6.2", "2.7"))
+    chacha.append((f["Key"], 0, f["Nonce"], bytes(32), f["Output bytes"]))
+    # 2.8.2 AEAD; nonce = 32-bit fixed-common part || IV
+    f = rfc8439_fields(sect("2.8.2", "3"))
+    nonce = f["32-bit fixed-common part"] + f["IV"]
+    aead.append((f["Key"], nonce, f["AAD"], f["Plaintext"], f["Ciphertext"], f["Tag"], 1))
+    if py_chacha20_block(f["Key"], 0, nonce)[:32] != f["Poly1305 Key"]:
+        die("RFC 8439 2.8.2 Poly1305 key mismatch")
+    # A.1 block function, A.2 encryption
+    for v, raw in vectors("A.1", "A.2"):
+        ctr = int(re.search(r"Block Counter = (\d+)", raw).group(1))
+        chacha.append((v["Key"], ctr, v["Nonce"], bytes(64), v["Keystream"]))
+    for v, raw in vectors("A.2", "A.3"):
+        ctr = int(re.search(r"Initial Block Counter = (\d+)", raw).group(1))
+        chacha.append((v["Key"], ctr, v["Nonce"], v["Plaintext"], v["Ciphertext"]))
+    # A.3 Poly1305: #1-#4 give a one-time key, #5-#11 give R / S / data / tag
+    for v, _ in vectors("A.3", "A.4"):
+        if "One-time Poly1305 Key" in v:
+            poly.append((v["One-time Poly1305 Key"], v["Text to MAC"], v["Tag"]))
+        else:
+            poly.append((v["R"] + v["S"], v["data"], v["tag"]))
+    # A.4 key generation (counter 0)
+    for v, _ in vectors("A.4", "A.5"):
+        chacha.append((v["The ChaCha20 Key"], 0, v["The nonce"], bytes(32), v["Poly1305 one-time key"]))
+    # A.5 AEAD decryption
+    f = rfc8439_fields(lines[start["A.5"] :])
+    if f["Calculated Tag"] != f["Received Tag"]:
+        die("RFC 8439 A.5 tag lines differ")
+    aead.append((f["The ChaCha20 Key"], f["The nonce"], f["The AAD"], f["Plaintext"], f["Ciphertext"],
+                 f["Received Tag"], 1))
+    for i, (k, c, n, pt, ct) in enumerate(chacha):
+        if len(k) != 32 or len(n) != 12 or not pt or py_chacha20(k, c, n, pt) != ct:
+            die(f"RFC 8439 ChaCha20 vector {i} mismatch")
+    for i, (k, m, t) in enumerate(poly):
+        if len(k) != 32 or py_poly1305(k, m) != t:
+            die(f"RFC 8439 Poly1305 vector {i} mismatch")
+    for i, (k, n, a, pt, ct, t, _) in enumerate(aead):
+        if not pt or py_aead_seal(k, n, a, pt) != (ct, t):
+            die(f"RFC 8439 AEAD vector {i} mismatch")
+    if (len(chacha), len(poly), len(aead)) != (2 + 1 + 5 + 3 + 3, 1 + 11, 2):
+        die(f"RFC 8439: parsed {len(chacha)} chacha, {len(poly)} poly1305, {len(aead)} aead vectors")
+    return chacha, poly, aead
+
+
+def wycheproof_chacha20_poly1305():
+    doc = json.loads(fetch("wp_chacha20_poly1305"))
+    out, skipped = [], 0
+    for g in doc["testGroups"]:
+        for t in g["tests"]:
+            if g["ivSize"] != 96:  # the API takes a fixed 12-byte nonce, so these cannot be expressed
+                if t["result"] != "invalid" or "InvalidNonceSize" not in t["flags"]:
+                    die(f"Wycheproof ChaCha20-Poly1305 tcId {t['tcId']}: non-96-bit iv that is not InvalidNonceSize")
+                skipped += 1
+                continue
+            if g["keySize"] != 256 or g["tagSize"] != 128:
+                die(f"Wycheproof ChaCha20-Poly1305 tcId {t['tcId']}: unexpected sizes")
+            k, n, a, m, ct, tag = (bytes.fromhex(t[x]) for x in ("key", "iv", "aad", "msg", "ct", "tag"))
+            valid = t["result"] == "valid"
+            if (py_aead_seal(k, n, a, m) == (ct, tag)) != valid:
+                die(f"Wycheproof ChaCha20-Poly1305 tcId {t['tcId']} inconsistent")
+            out.append((k, n, a, m, ct, tag, int(valid)))
+    if len(out) != 316 or skipped != 9 or sum(1 for r in out if not r[6]) != 60:
+        die(f"Wycheproof ChaCha20-Poly1305: {len(out)} emitted, {skipped} skipped")
+    return out
+
+
+def rfc9001_chacha():
+    """RFC 9001 A.5: ChaCha20-Poly1305 short header packet (key schedule, AEAD, header protection)."""
+    text = "\n".join(rfc_lines(fetch("rfc9001")))
+    a5 = text[text.rindex("\nA.5.  ChaCha20-Poly1305 Short Header Packet") : text.index("\nAppendix B.")]
+    v = {}
+    for n, h in re.findall(r"^\s+(secret|key|iv|hp)\b[^\n]*\n\s+=\s+([0-9a-f]+(?:\n\s+[0-9a-f]+)*)", a5, re.M):
+        v[n] = hexbytes(h)
+    for n, h in re.findall(r"^\s+(nonce|unprotected header|payload plaintext|payload ciphertext|sample|mask|header|packet)"
+                           r"\s+=\s+([0-9a-f]+)$", a5, re.M):
+        v[n] = bytes.fromhex(h)
+    pn = int(re.search(r"^\s+pn\s+=\s+(\d+)", a5, re.M).group(1))
+    for lab, n in (("key", 32), ("iv", 12), ("hp", 32)):
+        if py_expand_label(256, v["secret"], b"quic " + lab.encode(), b"", n) != v[lab]:
+            die(f"RFC 9001 A.5 {lab} mismatch")
+    nonce = bytes(a ^ b for a, b in zip(v["iv"], pn.to_bytes(12, "big")))  # RFC 9001 5.3
+    hdr = v["unprotected header"]
+    ct, tag = py_aead_seal(v["key"], nonce, hdr, v["payload plaintext"])
+    pn_len = (hdr[0] & 3) + 1
+    sample = (ct + tag)[4 - pn_len : 20 - pn_len]  # RFC 9001 5.4.2: sample starts at pn_offset + 4
+    mask = py_chacha20(v["hp"], int.from_bytes(sample[:4], "little"), sample[4:], bytes(5))  # 5.4.4
+    prot = bytes([hdr[0] ^ (mask[0] & 0x1F)]) + hdr[1 : len(hdr) - pn_len] + \
+        bytes(a ^ b for a, b in zip(hdr[len(hdr) - pn_len :], mask[1:]))
+    if (nonce != v["nonce"] or ct + tag != v["payload ciphertext"] or sample != v["sample"]
+            or mask != v["mask"] or prot != v["header"] or prot + ct + tag != v["packet"]):
+        die("RFC 9001 A.5 packet protection mismatch")
+    return [(v["secret"], pn, hdr, v["payload plaintext"], ct + tag, sample, mask, v["packet"])]
+
+
+def differential_chacha():
+    rnd = random.Random(20260920)
+    rb = lambda n: bytes(rnd.getrandbits(8) for _ in range(n))
+    edges = (0, 1, 15, 16, 17, 63, 64, 65, 127, 128, 129, 300)
+    aead = [(rb(32), rb(12), rb(a), rb(p)) for a in edges for p in edges]
+    while len(aead) < 200:
+        aead.append((rb(32), rb(12), rb(rnd.randrange(0, 81)), rb(rnd.randrange(0, 301))))
+    aead = [(k, n, a, p, *py_aead_seal(k, n, a, p), 1) for k, n, a, p in aead]
+    chacha = []
+    for i in range(60):
+        n = rnd.randrange(1, 301)
+        ctr = rnd.getrandbits(32) if i % 3 else 0xFFFFFFFF
+        if ctr + (n + 63) // 64 > 1 << 32:  # caller contract: no counter wrap inside one call
+            n = min(n, 64)
+        k, nn, m = rb(32), rb(12), rb(n)
+        chacha.append((k, ctr, nn, m, py_chacha20(k, ctr, nn, m)))
+    poly = []
+    for n in list(range(0, 50)) + [rnd.randrange(50, 400) for _ in range(30)]:
+        k, m = rb(32), rb(n)
+        poly.append((k, m, py_poly1305(k, m)))
+    return chacha, poly, aead
+
+
 # ---------------------------------------------------------------- differential (hashlib) vectors
 def differential():
     rnd = random.Random(20260919)
@@ -355,6 +571,10 @@ def main():
     x8448, l8448 = rfc8448()
     x9001, l9001 = rfc9001()
     dhash, dmac, dkdf, million = differential()
+    c8439, p8439, a8439 = rfc8439()
+    awp = wycheproof_chacha20_poly1305()
+    q9001 = rfc9001_chacha()
+    dchacha, dpoly, daead = differential_chacha()
 
     emit("sha2.inc", "struct hash_kat SHA2_KAT", cavp + dhash, lambda r: f"{r[0]}, {cstr(r[1])}, {cstr(r[2])}")
     emit("sha2_monte.inc", "struct monte_kat SHA2_MONTE", monte,
@@ -369,11 +589,21 @@ def main():
     emit("expand_label.inc", "struct label_kat LABEL_KAT", l8448 + l9001,
          lambda r: f'{r[0]}, {cstr(r[1])}, "{r[2]}", {cstr(r[3])}, {cstr(r[4])}')
 
+    hx = lambda b: cstr(b.hex())
+    emit("chacha20.inc", "struct chacha_kat CHACHA_KAT", c8439 + dchacha,
+         lambda r: f"{hx(r[0])}, 0x{r[1]:08x}u, {hx(r[2])}, {hx(r[3])}, {hx(r[4])}")
+    emit("poly1305.inc", "struct poly_kat POLY_KAT", p8439 + dpoly, lambda r: ", ".join(hx(x) for x in r))
+    emit("chacha20_poly1305.inc", "struct aead_kat AEAD_KAT", a8439 + awp + daead,
+         lambda r: ", ".join(hx(x) for x in r[:6]) + f", {r[6]}")
+    emit("quic_chacha.inc", "struct quic_chacha_kat QUIC_CHACHA_KAT", q9001,
+         lambda r: f"{hx(r[0])}, {r[1]}u, " + ", ".join(hx(x) for x in r[2:]))
+
     rows = "\n".join(f"| {k} | {u} | `{h}` |" for k, (u, h) in sorted(fetched.items()))
     (OUT / "SOURCES.md").write_text(
         "# Known-answer vector sources\n\n"
         f"Generated by `python tools/kat.py` on {datetime.date.today()}. Each vector was re-checked\n"
-        "against Python hashlib/hmac before emission. Differential vectors come from a fixed seed.\n\n"
+        "against Python hashlib/hmac or the pure-Python ChaCha20/Poly1305\n"
+        "reference before emission. Differential vectors come from a fixed seed.\n\n"
         "| name | url | sha256 of download |\n|---|---|---|\n" + rows + "\n", newline="\n")
     print("ok")
 
