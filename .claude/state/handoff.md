@@ -7,6 +7,12 @@
   4.2 KB (armv7 Thumb-2) .. 7.7 KB (MIPS32).
 - Claude Code setup: hooks, statusline, skills, agents, rules, workflows, `rfc` MCP, CLAUDE.md.
 
+- Adversarial review (3 lenses + refutation) of M1a: 10 confirmed findings fixed in b2b51e4
+  (SHA-384/512 stack leak, ct_memeq tests, output canaries, BRISKCFG retain, static lib).
+  Refuted-but-worth-revisiting later: HMAC ctx used after failed init/final fails open (make
+  update/final check alg when TLS code lands); tools/kat.py per-source minimum-count guards.
+- CI green on GitHub Actions (~2.5 min with cache).
+
 ## Next up
 - M1b: `src/os/linux_rand.c` (getrandom per-arch syscall numbers -> /dev/random poll ->
   /dev/urandom, fail closed), then ChaCha20-Poly1305 (RFC 8439 + Wycheproof) via `/implement-module`.
