@@ -1,0 +1,9 @@
+{
+  "mcpServers": {
+    "rfc": {
+      "type": "stdio",
+      "command": "python",
+      "args": ["${CLAUDE_PROJECT_DIR:-.}/tools/mcp/rfc_server.py"]
+    }
+  }
+}
