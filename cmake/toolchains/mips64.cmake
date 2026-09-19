@@ -1,0 +1,6 @@
+# mips64: mips64-linux-gnuabi64, tests run under qemu-mips64 (sysroot from Debian's libc6-dev-*-cross)
+set(CMAKE_SYSTEM_NAME Linux)
+set(CMAKE_SYSTEM_PROCESSOR mips64)
+set(CMAKE_C_COMPILER mips64-linux-gnuabi64-gcc)
+set(CMAKE_CROSSCOMPILING_EMULATOR qemu-mips64 -L /usr/mips64-linux-gnuabi64)
+set(CMAKE_FIND_ROOT_PATH_MODE_PROGRAM NEVER)

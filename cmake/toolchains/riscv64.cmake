@@ -1,0 +1,6 @@
+# riscv64: riscv64-linux-gnu, tests run under qemu-riscv64 (sysroot from Debian's libc6-dev-*-cross)
+set(CMAKE_SYSTEM_NAME Linux)
+set(CMAKE_SYSTEM_PROCESSOR riscv64)
+set(CMAKE_C_COMPILER riscv64-linux-gnu-gcc)
+set(CMAKE_CROSSCOMPILING_EMULATOR qemu-riscv64 -L /usr/riscv64-linux-gnu)
+set(CMAKE_FIND_ROOT_PATH_MODE_PROGRAM NEVER)

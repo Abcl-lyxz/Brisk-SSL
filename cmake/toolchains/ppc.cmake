@@ -1,0 +1,6 @@
+# ppc: powerpc-linux-gnu, tests run under qemu-ppc (sysroot from Debian's libc6-dev-*-cross)
+set(CMAKE_SYSTEM_NAME Linux)
+set(CMAKE_SYSTEM_PROCESSOR powerpc)
+set(CMAKE_C_COMPILER powerpc-linux-gnu-gcc)
+set(CMAKE_CROSSCOMPILING_EMULATOR qemu-ppc -L /usr/powerpc-linux-gnu)
+set(CMAKE_FIND_ROOT_PATH_MODE_PROGRAM NEVER)

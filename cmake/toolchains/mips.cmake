@@ -1,0 +1,6 @@
+# mips: mips-linux-gnu, tests run under qemu-mips (sysroot from Debian's libc6-dev-*-cross)
+set(CMAKE_SYSTEM_NAME Linux)
+set(CMAKE_SYSTEM_PROCESSOR mips)
+set(CMAKE_C_COMPILER mips-linux-gnu-gcc)
+set(CMAKE_CROSSCOMPILING_EMULATOR qemu-mips -L /usr/mips-linux-gnu)
+set(CMAKE_FIND_ROOT_PATH_MODE_PROGRAM NEVER)

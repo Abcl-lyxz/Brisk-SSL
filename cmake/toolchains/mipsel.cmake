@@ -1,0 +1,6 @@
+# mipsel: mipsel-linux-gnu, tests run under qemu-mipsel (sysroot from Debian's libc6-dev-*-cross)
+set(CMAKE_SYSTEM_NAME Linux)
+set(CMAKE_SYSTEM_PROCESSOR mipsel)
+set(CMAKE_C_COMPILER mipsel-linux-gnu-gcc)
+set(CMAKE_CROSSCOMPILING_EMULATOR qemu-mipsel -L /usr/mipsel-linux-gnu)
+set(CMAKE_FIND_ROOT_PATH_MODE_PROGRAM NEVER)

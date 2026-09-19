@@ -1,0 +1,6 @@
+# i686: i686-linux-gnu, tests run under qemu-i386 (sysroot from Debian's libc6-dev-*-cross)
+set(CMAKE_SYSTEM_NAME Linux)
+set(CMAKE_SYSTEM_PROCESSOR i686)
+set(CMAKE_C_COMPILER i686-linux-gnu-gcc)
+set(CMAKE_CROSSCOMPILING_EMULATOR qemu-i386 -L /usr/i686-linux-gnu)
+set(CMAKE_FIND_ROOT_PATH_MODE_PROGRAM NEVER)

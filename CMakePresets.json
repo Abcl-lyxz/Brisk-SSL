@@ -1,0 +1,502 @@
+{
+  "version": 6,
+  "configurePresets": [
+    {
+      "name": "base",
+      "hidden": true,
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build/${presetName}",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Debug"
+      }
+    },
+    {
+      "name": "dev",
+      "inherits": "base",
+      "displayName": "Host: native gcc, debug + UBSan (trap)",
+      "cacheVariables": {
+        "CMAKE_C_COMPILER": "gcc",
+        "CMAKE_C_FLAGS": "-fsanitize=undefined -fsanitize-undefined-trap-on-error"
+      }
+    },
+    {
+      "name": "dev32",
+      "inherits": "base",
+      "displayName": "Host: gcc -m32 (32-bit code paths)",
+      "cacheVariables": {
+        "CMAKE_C_COMPILER": "gcc",
+        "CMAKE_C_FLAGS": "-m32 -fsanitize=undefined -fsanitize-undefined-trap-on-error",
+        "CMAKE_EXE_LINKER_FLAGS": "-m32"
+      }
+    },
+    {
+      "name": "x86_64",
+      "inherits": "base",
+      "displayName": "Docker: x86_64 gcc, debug + UBSan (trap)",
+      "cacheVariables": {
+        "CMAKE_C_COMPILER": "gcc",
+        "CMAKE_C_FLAGS": "-fsanitize=undefined -fsanitize-undefined-trap-on-error"
+      }
+    },
+    {
+      "name": "asan",
+      "inherits": "base",
+      "displayName": "Docker: clang ASan + UBSan",
+      "cacheVariables": {
+        "CMAKE_C_COMPILER": "clang",
+        "CMAKE_C_FLAGS": "-fsanitize=address,undefined -fno-sanitize-recover=all -fno-omit-frame-pointer"
+      }
+    },
+    {
+      "name": "i686",
+      "inherits": "base",
+      "displayName": "Docker: i686 cross + qemu-user",
+      "toolchainFile": "${sourceDir}/cmake/toolchains/i686.cmake",
+      "cacheVariables": {
+        "CMAKE_C_FLAGS": "-fsanitize=undefined -fsanitize-undefined-trap-on-error"
+      }
+    },
+    {
+      "name": "aarch64",
+      "inherits": "base",
+      "displayName": "Docker: aarch64 cross + qemu-user",
+      "toolchainFile": "${sourceDir}/cmake/toolchains/aarch64.cmake",
+      "cacheVariables": {
+        "CMAKE_C_FLAGS": "-fsanitize=undefined -fsanitize-undefined-trap-on-error"
+      }
+    },
+    {
+      "name": "armv7hf",
+      "inherits": "base",
+      "displayName": "Docker: armv7hf cross + qemu-user",
+      "toolchainFile": "${sourceDir}/cmake/toolchains/armv7hf.cmake",
+      "cacheVariables": {
+        "CMAKE_C_FLAGS": "-fsanitize=undefined -fsanitize-undefined-trap-on-error"
+      }
+    },
+    {
+      "name": "armv5",
+      "inherits": "base",
+      "displayName": "Docker: armv5 cross + qemu-user",
+      "toolchainFile": "${sourceDir}/cmake/toolchains/armv5.cmake",
+      "cacheVariables": {
+        "CMAKE_C_FLAGS": "-fsanitize=undefined -fsanitize-undefined-trap-on-error"
+      }
+    },
+    {
+      "name": "mips",
+      "inherits": "base",
+      "displayName": "Docker: mips cross + qemu-user",
+      "toolchainFile": "${sourceDir}/cmake/toolchains/mips.cmake",
+      "cacheVariables": {
+        "CMAKE_C_FLAGS": "-fsanitize=undefined -fsanitize-undefined-trap-on-error"
+      }
+    },
+    {
+      "name": "mipsel",
+      "inherits": "base",
+      "displayName": "Docker: mipsel cross + qemu-user",
+      "toolchainFile": "${sourceDir}/cmake/toolchains/mipsel.cmake",
+      "cacheVariables": {
+        "CMAKE_C_FLAGS": "-fsanitize=undefined -fsanitize-undefined-trap-on-error"
+      }
+    },
+    {
+      "name": "mips64",
+      "inherits": "base",
+      "displayName": "Docker: mips64 cross + qemu-user",
+      "toolchainFile": "${sourceDir}/cmake/toolchains/mips64.cmake",
+      "cacheVariables": {
+        "CMAKE_C_FLAGS": "-fsanitize=undefined -fsanitize-undefined-trap-on-error"
+      }
+    },
+    {
+      "name": "riscv64",
+      "inherits": "base",
+      "displayName": "Docker: riscv64 cross + qemu-user",
+      "toolchainFile": "${sourceDir}/cmake/toolchains/riscv64.cmake",
+      "cacheVariables": {
+        "CMAKE_C_FLAGS": "-fsanitize=undefined -fsanitize-undefined-trap-on-error"
+      }
+    },
+    {
+      "name": "ppc",
+      "inherits": "base",
+      "displayName": "Docker: ppc cross + qemu-user",
+      "toolchainFile": "${sourceDir}/cmake/toolchains/ppc.cmake",
+      "cacheVariables": {
+        "CMAKE_C_FLAGS": "-fsanitize=undefined -fsanitize-undefined-trap-on-error"
+      }
+    }
+  ],
+  "buildPresets": [
+    {
+      "name": "dev",
+      "configurePreset": "dev"
+    },
+    {
+      "name": "dev32",
+      "configurePreset": "dev32"
+    },
+    {
+      "name": "x86_64",
+      "configurePreset": "x86_64"
+    },
+    {
+      "name": "asan",
+      "configurePreset": "asan"
+    },
+    {
+      "name": "i686",
+      "configurePreset": "i686"
+    },
+    {
+      "name": "aarch64",
+      "configurePreset": "aarch64"
+    },
+    {
+      "name": "armv7hf",
+      "configurePreset": "armv7hf"
+    },
+    {
+      "name": "armv5",
+      "configurePreset": "armv5"
+    },
+    {
+      "name": "mips",
+      "configurePreset": "mips"
+    },
+    {
+      "name": "mipsel",
+      "configurePreset": "mipsel"
+    },
+    {
+      "name": "mips64",
+      "configurePreset": "mips64"
+    },
+    {
+      "name": "riscv64",
+      "configurePreset": "riscv64"
+    },
+    {
+      "name": "ppc",
+      "configurePreset": "ppc"
+    }
+  ],
+  "testPresets": [
+    {
+      "name": "dev",
+      "configurePreset": "dev",
+      "output": {
+        "outputOnFailure": true
+      }
+    },
+    {
+      "name": "dev32",
+      "configurePreset": "dev32",
+      "output": {
+        "outputOnFailure": true
+      }
+    },
+    {
+      "name": "x86_64",
+      "configurePreset": "x86_64",
+      "output": {
+        "outputOnFailure": true
+      }
+    },
+    {
+      "name": "asan",
+      "configurePreset": "asan",
+      "output": {
+        "outputOnFailure": true
+      }
+    },
+    {
+      "name": "i686",
+      "configurePreset": "i686",
+      "output": {
+        "outputOnFailure": true
+      }
+    },
+    {
+      "name": "aarch64",
+      "configurePreset": "aarch64",
+      "output": {
+        "outputOnFailure": true
+      }
+    },
+    {
+      "name": "armv7hf",
+      "configurePreset": "armv7hf",
+      "output": {
+        "outputOnFailure": true
+      }
+    },
+    {
+      "name": "armv5",
+      "configurePreset": "armv5",
+      "output": {
+        "outputOnFailure": true
+      }
+    },
+    {
+      "name": "mips",
+      "configurePreset": "mips",
+      "output": {
+        "outputOnFailure": true
+      }
+    },
+    {
+      "name": "mipsel",
+      "configurePreset": "mipsel",
+      "output": {
+        "outputOnFailure": true
+      }
+    },
+    {
+      "name": "mips64",
+      "configurePreset": "mips64",
+      "output": {
+        "outputOnFailure": true
+      }
+    },
+    {
+      "name": "riscv64",
+      "configurePreset": "riscv64",
+      "output": {
+        "outputOnFailure": true
+      }
+    },
+    {
+      "name": "ppc",
+      "configurePreset": "ppc",
+      "output": {
+        "outputOnFailure": true
+      }
+    }
+  ],
+  "workflowPresets": [
+    {
+      "name": "dev",
+      "steps": [
+        {
+          "type": "configure",
+          "name": "dev"
+        },
+        {
+          "type": "build",
+          "name": "dev"
+        },
+        {
+          "type": "test",
+          "name": "dev"
+        }
+      ]
+    },
+    {
+      "name": "dev32",
+      "steps": [
+        {
+          "type": "configure",
+          "name": "dev32"
+        },
+        {
+          "type": "build",
+          "name": "dev32"
+        },
+        {
+          "type": "test",
+          "name": "dev32"
+        }
+      ]
+    },
+    {
+      "name": "x86_64",
+      "steps": [
+        {
+          "type": "configure",
+          "name": "x86_64"
+        },
+        {
+          "type": "build",
+          "name": "x86_64"
+        },
+        {
+          "type": "test",
+          "name": "x86_64"
+        }
+      ]
+    },
+    {
+      "name": "asan",
+      "steps": [
+        {
+          "type": "configure",
+          "name": "asan"
+        },
+        {
+          "type": "build",
+          "name": "asan"
+        },
+        {
+          "type": "test",
+          "name": "asan"
+        }
+      ]
+    },
+    {
+      "name": "i686",
+      "steps": [
+        {
+          "type": "configure",
+          "name": "i686"
+        },
+        {
+          "type": "build",
+          "name": "i686"
+        },
+        {
+          "type": "test",
+          "name": "i686"
+        }
+      ]
+    },
+    {
+      "name": "aarch64",
+      "steps": [
+        {
+          "type": "configure",
+          "name": "aarch64"
+        },
+        {
+          "type": "build",
+          "name": "aarch64"
+        },
+        {
+          "type": "test",
+          "name": "aarch64"
+        }
+      ]
+    },
+    {
+      "name": "armv7hf",
+      "steps": [
+        {
+          "type": "configure",
+          "name": "armv7hf"
+        },
+        {
+          "type": "build",
+          "name": "armv7hf"
+        },
+        {
+          "type": "test",
+          "name": "armv7hf"
+        }
+      ]
+    },
+    {
+      "name": "armv5",
+      "steps": [
+        {
+          "type": "configure",
+          "name": "armv5"
+        },
+        {
+          "type": "build",
+          "name": "armv5"
+        },
+        {
+          "type": "test",
+          "name": "armv5"
+        }
+      ]
+    },
+    {
+      "name": "mips",
+      "steps": [
+        {
+          "type": "configure",
+          "name": "mips"
+        },
+        {
+          "type": "build",
+          "name": "mips"
+        },
+        {
+          "type": "test",
+          "name": "mips"
+        }
+      ]
+    },
+    {
+      "name": "mipsel",
+      "steps": [
+        {
+          "type": "configure",
+          "name": "mipsel"
+        },
+        {
+          "type": "build",
+          "name": "mipsel"
+        },
+        {
+          "type": "test",
+          "name": "mipsel"
+        }
+      ]
+    },
+    {
+      "name": "mips64",
+      "steps": [
+        {
+          "type": "configure",
+          "name": "mips64"
+        },
+        {
+          "type": "build",
+          "name": "mips64"
+        },
+        {
+          "type": "test",
+          "name": "mips64"
+        }
+      ]
+    },
+    {
+      "name": "riscv64",
+      "steps": [
+        {
+          "type": "configure",
+          "name": "riscv64"
+        },
+        {
+          "type": "build",
+          "name": "riscv64"
+        },
+        {
+          "type": "test",
+          "name": "riscv64"
+        }
+      ]
+    },
+    {
+      "name": "ppc",
+      "steps": [
+        {
+          "type": "configure",
+          "name": "ppc"
+        },
+        {
+          "type": "build",
+          "name": "ppc"
+        },
+        {
+          "type": "test",
+          "name": "ppc"
+        }
+      ]
+    }
+  ]
+}
