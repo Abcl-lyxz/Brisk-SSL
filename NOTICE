@@ -32,8 +32,14 @@ Third-party code included in this distribution (each keeps its own notice):
     CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
     SOFTWARE.
 
-- fiat-crypto (MIT OR Apache-2.0 OR BSD-1-Clause) will be vendored under vendor/fiat/ in
-  milestone M1c; its notice and pinned commit will be recorded here and in vendor/VENDORED.md.
+- fiat-crypto (MIT OR Apache-2.0 OR BSD-1-Clause): vendor/fiat/{curve25519,p256}_{32,64}.c are
+  copied unmodified from https://github.com/mit-plv/fiat-crypto at v0.1.6, commit
+  9d0682462646bf645cba7409fa45794dee0418aa (see vendor/VENDORED.md).
+
+    Copyright (c) 2015-2026 the fiat-crypto authors (see vendor/fiat/AUTHORS)
+
+  Used here under the Apache License, Version 2.0. The full text of all three offered licenses
+  is kept alongside the code in vendor/fiat/LICENSE-{MIT,APACHE,BSD-1} and vendor/fiat/COPYRIGHT.
 
 Test vectors under tests/kat/ are derived from NIST CAVP (public domain), IETF RFCs, and
 C2SP Wycheproof (Apache-2.0); see tests/kat/SOURCES.md.

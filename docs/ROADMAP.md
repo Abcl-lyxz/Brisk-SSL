@@ -23,7 +23,7 @@ Tick a box only when the work is green on **every** arch (`python tools/dev.py t
 - [x] GHASH (ctmul / ctmul64) + GCM (SP 800-38D, Wycheproof); decrypt RFC 9001 A.2 Initial packet
 - [x] CT tooling: `CT_SECRET` macros + valgrind ctgrind job; `/ct-check` skill
 ### M1c Elliptic curves (fiat-crypto)
-- [ ] Vendor fiat curve25519_{32,64}, p256_{32,64} + vendor/VENDORED.md (commit, license) + NOTICE
+- [x] Vendor fiat curve25519_{32,64}, p256_{32,64} + vendor/VENDORED.md (commit, license) + NOTICE
 - [ ] X25519 (RFC 7748 incl. 1,000-iteration test; reject all-zero)
 - [ ] P-256 ECDHE + ECDSA verify (trimmed fiat on 32-bit: square=mul, Fermat inversion)
 - [ ] ECDSA P-256 sign, hedged RFC 6979 (mTLS) + sign-callback hook
