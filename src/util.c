@@ -9,10 +9,17 @@ int brisk__ct_memeq(const void *a, const void *b, size_t n)
     const volatile uint8_t *x = a, *y = b;
     uint8_t acc = 0;
     size_t i;
+    int r;
     for (i = 0; i < n; i++) {
         acc |= (uint8_t)(x[i] ^ y[i]);
     }
-    return (int)(1 & ((uint32_t)(acc - 1) >> 8)); /* acc == 0 -> 1, else 0, without a branch */
+    /* acc == 0 -> 1, else 0, without a branch */
+    r = (int)(1 & ((uint32_t)(acc - 1) >> 8));
+    /* The one legitimate declassification: callers branch on "did the tag match", and that answer
+     * is public (it is what the peer learns from the alert). Without it every tag check would show
+     * up as a secret-dependent branch under `dev.py ct`. */
+    BRISK__CT_PUBLIC(&r, sizeof r);
+    return r;
 }
 
 /* Calling memset through a volatile pointer keeps the compiler from proving the store dead. */

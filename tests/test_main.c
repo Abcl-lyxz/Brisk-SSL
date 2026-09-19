@@ -63,6 +63,7 @@ static const struct {
     {"hash", test_hash},
     {"aead", test_aead},
     {"aes", test_aes},
+    {"ct", test_ct},
 #ifdef __linux__
     {"rand", test_rand},
 #endif

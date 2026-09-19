@@ -49,6 +49,22 @@ static inline void brisk__store_le32(uint8_t *p, uint32_t v)
     p[3] = (uint8_t)(v >> 24);
 }
 
+/* ---- constant-time checking (`python tools/dev.py ct`) ----
+ * With -DBRISK_CT_CHECK the test suite hands valgrind's memcheck the secrets marked as
+ * "undefined", so every branch, memory index or division whose result depends on one is reported
+ * (the ctgrind trick). Both macros compile to nothing in a normal build, so the library and the
+ * tests are unchanged. BRISK__CT_PUBLIC declassifies a value that is public by design - a tag
+ * comparison result, a decision the protocol reveals anyway - and is the only way to silence a
+ * report: never "fix" one by declassifying a secret. */
+#ifdef BRISK_CT_CHECK
+#    include <valgrind/memcheck.h>
+#    define BRISK__CT_SECRET(p, n) VALGRIND_MAKE_MEM_UNDEFINED(p, n)
+#    define BRISK__CT_PUBLIC(p, n) VALGRIND_MAKE_MEM_DEFINED(p, n)
+#else
+#    define BRISK__CT_SECRET(p, n) ((void)0)
+#    define BRISK__CT_PUBLIC(p, n) ((void)0)
+#endif
+
 /* ---- util.c ---- */
 /* 1 if the n bytes at a and b are equal, else 0. Time depends only on n. */
 int brisk__ct_memeq(const void *a, const void *b, size_t n);
@@ -112,10 +128,12 @@ int brisk__chacha20_poly1305_open(const uint8_t key[32], const uint8_t nonce[12]
  * One variant is compiled per target: ct64 (4 blocks per pass in uint64_t q[8]) where pointers are
  * 64-bit, ct (2 blocks per pass in uint32_t q[8]) elsewhere, including ILP32 ABIs (x32, n32).
  * Stack: about 0.6 KB (ct) / 1.1 KB (ct64) per call for the expanded schedule and state. */
-#if UINTPTR_MAX > 0xFFFFFFFFu
-#    define BRISK__AES_CT64 1
-#else
-#    define BRISK__AES_CT64 0
+#ifndef BRISK__AES_CT64 /* -DBRISK__AES_CT64=0 builds the 32-bit variant anywhere (dev.py ct) */
+#    if UINTPTR_MAX > 0xFFFFFFFFu
+#        define BRISK__AES_CT64 1
+#    else
+#        define BRISK__AES_CT64 0
+#    endif
 #endif
 
 typedef struct {

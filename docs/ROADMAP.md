@@ -21,7 +21,7 @@ Tick a box only when the work is green on **every** arch (`python tools/dev.py t
 - [x] ChaCha20 + Poly1305 + AEAD (RFC 8439, Wycheproof)
 - [x] AES-128/256 constant-time (bitsliced; ct on 32-bit, ct64 on 64-bit), encrypt-only
 - [x] GHASH (ctmul / ctmul64) + GCM (SP 800-38D, Wycheproof); decrypt RFC 9001 A.2 Initial packet
-- [ ] CT tooling: `CT_SECRET` macros + valgrind ctgrind job; `/ct-check` skill
+- [x] CT tooling: `CT_SECRET` macros + valgrind ctgrind job; `/ct-check` skill
 ### M1c Elliptic curves (fiat-crypto)
 - [ ] Vendor fiat curve25519_{32,64}, p256_{32,64} + vendor/VENDORED.md (commit, license) + NOTICE
 - [ ] X25519 (RFC 7748 incl. 1,000-iteration test; reject all-zero)

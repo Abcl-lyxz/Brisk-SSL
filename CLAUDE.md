@@ -40,13 +40,14 @@ docs/ROADMAP.md  docs/ARCHITECTURE.md  docs/CONFIG.md        size/baseline.json 
 |---|---|
 | host tests (fast, x64 + x86) | `python tools/dev.py test` |
 | every arch under qemu | `python tools/dev.py test --arch all` (or `--arch mips ppc`) |
+| constant-time check (valgrind) | `python tools/dev.py ct` |
 | size table / save baseline | `python tools/dev.py size --arch all --md` / `... --save` |
 | regenerate vectors | `python tools/kat.py` |
 | rebuild Docker image | `python tools/dev.py image` |
 | one preset directly | `cmake --workflow --preset dev` |
 
 ## Claude Code setup in this repo
-- Skills: `/next` `/handoff` `/test` `/size` `/kat` `/new-module`
+- Skills: `/next` `/handoff` `/test` `/size` `/kat` `/ct-check` `/new-module`
 - Workflows: `/implement-module <task>` (spec → vectors → tests → code → 3 reviewers → fix loop),
   `/audit [path]` (read-only multi-lens security audit)
 - Agents: `crypto-reviewer`, `portability-reviewer`, `rfc-auditor`

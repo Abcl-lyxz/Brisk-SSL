@@ -6,6 +6,7 @@
   python tools/dev.py test --arch mips ppc       selected Docker presets
   python tools/dev.py size [--arch all|mipsel..] [--md] [--save] [--check]
                                                  per-module flash/RAM from the linker map (-Os, static)
+  python tools/dev.py ct                         constant-time check: the ct suite under valgrind
   python tools/dev.py image                      (re)build the brisk-dev Docker image
 
 Docker builds live in the named volume `brisk-build` (fast, and never collide with host builds).
@@ -71,6 +72,35 @@ def cmd_test(archs, jobs):
                 print("\n".join(out.splitlines()[-40:]))
     bad = [p for p, rc in results.items() if rc]
     print("docker:", "ALL PASSED" if not bad else "FAILED: " + " ".join(bad))
+    return 1 if bad else 0
+
+
+# --------------------------------------------------------------------------------------------- ct
+# ctgrind: build the tests with -DBRISK_CT_CHECK so tests/test_ct.c marks secrets "undefined", then
+# let valgrind report any branch/index/division that depends on one. Native x86_64 only - valgrind
+# does not run under qemu-user - so both AES/GHASH variants are built here instead: the 32-bit code
+# is the same C either way, and what differs per arch (multiplier timing, cache) is beyond valgrind.
+CT_VARIANTS = [("ct64", ""), ("ct32", " -DBRISK__AES_CT64=0")]
+
+
+def cmd_ct():
+    bad = []
+    for name, extra in CT_VARIANTS:
+        bdir = f"build/ct-{name}"
+        cfg = ["cmake", "-S", ".", "-B", bdir, "-G", "Ninja", "-DCMAKE_BUILD_TYPE=Debug",
+               "-DCMAKE_C_FLAGS=-O1 -g -DBRISK_CT_CHECK" + extra]
+        rc, out = run(docker_cmd(cfg), True)
+        if not rc:
+            rc, out = run(docker_cmd(["cmake", "--build", bdir, "--target", "brisk_tests"]), True)
+        if not rc:
+            # --error-exitcode: memcheck findings must fail the run, not just print.
+            rc, out = run(docker_cmd(["valgrind", "-q", "--error-exitcode=9", "--track-origins=yes",
+                                      f"./{bdir}/brisk_tests", "ct"]), True)
+        print(f"{name:<6} {'ok' if rc == 0 else 'FAILED'}", flush=True)
+        if rc:
+            bad.append(name)
+            print("\n".join(out.splitlines()[-60:]))
+    print("ct:", "ALL PASSED" if not bad else "FAILED: " + " ".join(bad))
     return 1 if bad else 0
 
 
@@ -189,6 +219,7 @@ def main():
     s.add_argument("--save", action="store_true", help="write size/baseline.json")
     s.add_argument("--check", action="store_true", help="exit 1 if a total grew > max(1%%, 256 B)")
     s.add_argument("-j", "--jobs", type=int, default=max(1, (os.cpu_count() or 2) // 2))
+    sub.add_parser("ct")
     sub.add_parser("image")
     m = sub.add_parser("_measure")
     m.add_argument("arch")
@@ -197,6 +228,8 @@ def main():
         return cmd_test(a.arch, a.jobs)
     if a.cmd == "size":
         return cmd_size(a.arch, a.md, a.save, a.check, a.jobs)
+    if a.cmd == "ct":
+        return cmd_ct()
     if a.cmd == "image":
         return run(["docker", "build", "-t", IMAGE, "docker/"], False)[0]
     if a.cmd == "_measure":

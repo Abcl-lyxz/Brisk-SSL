@@ -103,6 +103,11 @@ brisk_feed(c, in, n); brisk_pull(c, out, cap);           /* sans-I/O for your ow
 - Everything verified with NIST CAVP / RFC / Wycheproof vectors re-checked in Python.
 
 ## Build, test, size
+- Constant time is checked, not just reviewed: `dev.py ct` builds the tests with -DBRISK_CT_CHECK,
+  which marks every key and secret input "undefined" for valgrind, and runs the `ct` suite under
+  memcheck (both the 64-bit and the 32-bit AES/GHASH variant). Any branch, memory index or
+  division that depends on a secret is reported. Hardware timing (the multiplier caveat above,
+  caches) is out of its reach.
 - CMake presets: host `dev`/`dev32` (TDM-GCC); Docker `x86_64`, `asan`, and i686, aarch64,
   armv7hf, armv5 (ARM926), mips (BE), mipsel, mips64, riscv64, ppc (BE) under qemu-user.
 - `tools/dev.py size` links a static probe at -Os and attributes kept sections per module from
