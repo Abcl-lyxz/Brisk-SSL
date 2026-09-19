@@ -33,7 +33,10 @@ SRC = {
     "rfc8439": "https://www.rfc-editor.org/rfc/rfc8439.txt",
     **{f"cavp_aes_{k}": "https://csrc.nist.gov/CSRC/media/Projects/Cryptographic-Algorithm-Validation-Program/"
        f"documents/aes/{f}" for k, f in (("kat", "KAT_AES.zip"), ("mmt", "aesmmt.zip"), ("mct", "aesmct.zip"))},
+    "cavp_gcm": "https://csrc.nist.gov/CSRC/media/Projects/Cryptographic-Algorithm-Validation-Program/"
+    "documents/mac/gcmtestvectors.zip",
     "wp_chacha20_poly1305": f"{WP}chacha20_poly1305_test.json",
+    "wp_aes_gcm": f"{WP}aes_gcm_test.json",
     **{f"wp_hmac_sha{b}": f"{WP}hmac_sha{b}_test.json" for b in (256, 384, 512)},
     **{f"wp_hkdf_sha{b}": f"{WP}hkdf_sha{b}_test.json" for b in (256, 384, 512)},
 }
@@ -714,6 +717,144 @@ def aes_vectors():
     return ecb, mct, ctr, hp
 
 
+# ---------------------------------------------------------------- AES-GCM: CAVP, Wycheproof, RFC 9001 A.2/A.3
+def py_gf_mul(x, y):
+    """SP 800-38D 6.3 Algorithm 1, bit by bit: blocks as big-endian ints, x^0 is the leftmost bit."""
+    z, v = 0, y
+    for i in range(128):
+        if (x >> (127 - i)) & 1:
+            z ^= v
+        v = (v >> 1) ^ (0xE1 << 120) if v & 1 else v >> 1
+    return z
+
+
+def py_ghash(y, h, data):
+    """y continued over data (SP 800-38D 6.4); a short last block is zero-padded on the right."""
+    yi, hi = int.from_bytes(y, "big"), int.from_bytes(h, "big")
+    for j in range(0, len(data), 16):
+        blk = data[j : j + 16]
+        yi = py_gf_mul(yi ^ int.from_bytes(blk + bytes(16 - len(blk)), "big"), hi)
+    return yi.to_bytes(16, "big")
+
+
+def py_gcm_seal(key, iv, aad, pt):
+    """SP 800-38D 7.1 with a 96-bit IV: J0 = IV || 0^31 || 1, payload from inc32(J0)."""
+    h = py_aes_encrypt(key, bytes(16))
+    ct = py_aes_ctr32(key, iv + b"\0\0\0\2", pt)
+    pad = lambda b: b + bytes(-len(b) % 16)
+    s = py_ghash(bytes(16), h, pad(aad) + pad(ct) + (8 * len(aad)).to_bytes(8, "big") + (8 * len(ct)).to_bytes(8, "big"))
+    return ct, bytes(a ^ b for a, b in zip(py_aes_encrypt(key, iv + b"\0\0\0\1"), s))
+
+
+def cavp_gcm():
+    """gcm{EncryptExtIV,Decrypt}{128,256}.rsp, IVlen 96 / Taglen 128 only; FAIL rows are invalid tags."""
+    z = zipfile.ZipFile(io.BytesIO(fetch("cavp_gcm")))
+    names = {Path(n).name: n for n in z.namelist()}
+    out, seen = [], 0
+    for fname in ("gcmEncryptExtIV128.rsp", "gcmEncryptExtIV256.rsp", "gcmDecrypt128.rsp", "gcmDecrypt256.rsp"):
+        txt = z.read(names[fname]).decode().replace("\r", "")
+        for sec in re.split(r"\n(?=\[Keylen)", txt)[1:]:
+            p = dict(re.findall(r"\[(\w+) = (\d+)\]", sec))
+            if p["IVlen"] != "96" or p["Taglen"] != "128":
+                continue
+            for blk in re.split(r"\n(?=Count = )", sec)[1:]:
+                f = dict(re.findall(r"^(\w+) = ?([0-9a-f]*)$", blk, re.M))
+                k, iv, a, c, t = (bytes.fromhex(f[x]) for x in ("Key", "IV", "AAD", "CT", "Tag"))
+                valid = "FAIL" not in blk
+                pt = bytes.fromhex(f["PT"]) if valid else b""
+                if len(a) * 8 != int(p["AADlen"]) or len(c) * 8 != int(p["PTlen"]):
+                    die(f"CAVP {fname} Count {f['Count']}: length header mismatch")
+                if valid and py_gcm_seal(k, iv, a, pt) != (c, t):
+                    die(f"CAVP {fname} Count {f['Count']} mismatch")
+                if not valid and py_gcm_seal(k, iv, a, py_aes_ctr32(k, iv + b"\0\0\0\2", c))[1] == t:
+                    die(f"CAVP {fname} Count {f['Count']}: FAIL row has a correct tag")
+                seen += 1
+                # ponytail: every row is verified above; only counts 0-2 of each section plus every
+                # FAIL row are emitted, to keep the .inc small
+                if int(f["Count"]) < 3 or not valid:
+                    out.append((k, iv, a, pt if valid else b"", c, t, int(valid)))
+    if seen != 4 * 25 * 15 or sum(1 for r in out if not r[6]) < 200:
+        die(f"CAVP GCM: {seen} rows seen, {len(out)} emitted")
+    return out
+
+
+def wycheproof_aes_gcm():
+    doc = json.loads(fetch("wp_aes_gcm"))
+    out, skipped = [], 0
+    for g in doc["testGroups"]:
+        for t in g["tests"]:
+            if g["ivSize"] != 96 or g["keySize"] not in (128, 256) or g["tagSize"] != 128:
+                skipped += 1  # only 96-bit IVs, AES-128/256 and 16-byte tags exist in the API
+                continue
+            k, n, a, m, ct, tag = (bytes.fromhex(t[x]) for x in ("key", "iv", "aad", "msg", "ct", "tag"))
+            valid = t["result"] == "valid"
+            if (py_gcm_seal(k, n, a, m) == (ct, tag)) != valid:
+                die(f"Wycheproof AES-GCM tcId {t['tcId']} inconsistent")
+            out.append((k, n, a, m, ct, tag, int(valid)))
+    if len(out) != 133 or skipped != 183 or sum(1 for r in out if not r[6]) != 54:
+        die(f"Wycheproof AES-GCM: {len(out)} emitted, {skipped} skipped")
+    return out
+
+
+def rfc9001_gcm():
+    """RFC 9001 A.2 client / A.3 server Initial (AES-128-GCM): full protected packets."""
+    text = "\n".join(rfc_lines(fetch("rfc9001")))
+    salt = bytes.fromhex("38762cf7f55934b34d179ae6a4c80cadccbb7f0a")  # RFC 9001 5.2 (checked in rfc9001())
+    init = py_hkdf_extract(256, salt, bytes.fromhex("8394c8f03e515708"))
+    blocks = (("\nA.2.  Client Initial\n", "\nA.3.  Server Initial\n", b"client in", r"1162-byte payload:",
+               r"The unprotected header", r"protected packet is:"),
+              ("\nA.3.  Server Initial\n", "\nA.4.  Retry\n", b"server in", r"no PADDING frames:",
+               r"The header from the server", r"protected packet is then:"))
+    out = []
+    for start, end, label, p0, p1, k0 in blocks:
+        sec = text[text.rindex(start) : text.rindex(end)]
+        pt = hexbytes(sec[sec.index(p0) + len(p0) : sec.index(p1)])
+        if label == b"client in":
+            pt += bytes(1162 - len(pt))  # PADDING frames (RFC 9000 19.1) up to the stated payload size
+        hdr = bytes.fromhex(re.search(r"\n\s+(c[0-9a-f]{30,})\n", sec[sec.index(p1) :]).group(1))
+        pkt = hexbytes(sec[sec.index(k0) + len(k0) :])
+        secret = py_expand_label(256, init, label, b"", 32)
+        key, iv, hp = (py_expand_label(256, secret, b"quic " + x, b"", n) for x, n in ((b"key", 16), (b"iv", 12), (b"hp", 16)))
+        pn_len = (hdr[0] & 3) + 1
+        pn = int.from_bytes(hdr[-pn_len:], "big")
+        nonce = bytes(a ^ b for a, b in zip(iv, pn.to_bytes(12, "big")))  # RFC 9001 5.3
+        ct, tag = py_gcm_seal(key, nonce, hdr, pt)
+        mask = py_aes_encrypt(hp, (ct + tag)[4 - pn_len : 20 - pn_len])  # 5.4.2 / 5.4.3
+        prot = bytes([hdr[0] ^ (mask[0] & 0x0F)]) + hdr[1:-pn_len] + bytes(a ^ b for a, b in zip(hdr[-pn_len:], mask[1:]))
+        if prot + ct + tag != pkt:
+            die(f"RFC 9001 {start.strip()} AES-GCM packet mismatch")
+        out.append((secret, pn, hdr, pt, pkt))
+    if [len(r[3]) for r in out][0] != 1162 or len(out) != 2:
+        die("RFC 9001 A.2/A.3: bad parse")
+    return out
+
+
+def differential_gcm():
+    rnd = random.Random(20260922)
+    rb = lambda n: bytes(rnd.getrandbits(8) for _ in range(n))
+    rows = []
+    for L in list(range(0, 81)) + [255, 256, 257, 1024, 4097]:
+        for a, p in ((L, L), (0, L), (L, 0), (rnd.randrange(0, 40), L)) if L <= 80 else ((L, 17), (13, L)):
+            k, iv = rb(16 if len(rows) % 2 else 32), rb(12)
+            aad, pt = rb(a), rb(p)
+            rows.append((k, iv, aad, pt, *py_gcm_seal(k, iv, aad, pt), 1))
+    # length-block swap check: (aad='', pt=X) and (aad=X, pt='') under one key/iv
+    k, iv, x = rb(16), rb(12), rb(16)
+    for aad, pt in ((b"", x), (x, b""), (b"", x + b"\x01"), (x + b"\x01", b"")):
+        rows.append((k, iv, aad, pt, *py_gcm_seal(k, iv, aad, pt), 1))
+    if len({r[5] for r in rows[-4:]}) != 4:
+        die("differential GCM: swapped length blocks collide")
+    # GHASH on its own (y, h, data -> y'), incl. H = 0, H = 1 (0x80 00..), all-ones H / X / y
+    ones, one = b"\xff" * 16, b"\x80" + bytes(15)
+    gh = [(bytes(16), bytes(16), ones * 2), (bytes(16), one, rb(40)), (ones, ones, ones * 3), (rb(16), ones, rb(33)),
+          (ones, rb(16), ones + b"\xff"), (bytes(16), one, b""), (rb(16), rb(16), b"")]
+    for n in list(range(0, 50)) + [64, 100, 255]:
+        gh.append((rb(16), rb(16), rb(n)))
+    if py_ghash(bytes(16), one, one) != one or py_ghash(one, bytes(16), b"") != one:
+        die("GHASH reference: identity element broken")
+    return rows, [(y, h, d, py_ghash(y, h, d)) for y, h, d in gh]
+
+
 # ---------------------------------------------------------------- C emitters
 def cstr(hx, width=96):
     if not hx:
@@ -743,6 +884,8 @@ def main():
     q9001 = rfc9001_chacha()
     dchacha, dpoly, daead = differential_chacha()
     aes_ecb, aes_mct, aes_ctr, aes_hp = aes_vectors()
+    gcm_cavp, gcm_wp, gcm_quic = cavp_gcm(), wycheproof_aes_gcm(), rfc9001_gcm()
+    gcm_diff, ghash = differential_gcm()
 
     emit("sha2.inc", "struct hash_kat SHA2_KAT", cavp + dhash, lambda r: f"{r[0]}, {cstr(r[1])}, {cstr(r[2])}")
     emit("sha2_monte.inc", "struct monte_kat SHA2_MONTE", monte,
@@ -771,6 +914,11 @@ def main():
          lambda r: f"{r[0]}, " + ", ".join(hx(x) for x in r[1:]))
     emit("aes_ctr.inc", "struct aes_ctr_kat AES_CTR_KAT", aes_ctr, lambda r: ", ".join(hx(x) for x in r))
     emit("aes_quic_hp.inc", "struct aes_hp_kat AES_HP_KAT", aes_hp, lambda r: ", ".join(hx(x) for x in r))
+    emit("aes_gcm.inc", "struct gcm_kat GCM_KAT", gcm_wp + gcm_cavp + gcm_diff,
+         lambda r: ", ".join(hx(x) for x in r[:6]) + f", {r[6]}")
+    emit("ghash.inc", "struct ghash_kat GHASH_KAT", ghash, lambda r: ", ".join(hx(x) for x in r))
+    emit("quic_gcm.inc", "struct quic_gcm_kat QUIC_GCM_KAT", gcm_quic,
+         lambda r: f"{hx(r[0])}, {r[1]}u, " + ", ".join(hx(x) for x in r[2:]))
 
     rows = "\n".join(f"| {k} | {u} | `{h}` |" for k, (u, h) in sorted(fetched.items()))
     (OUT / "SOURCES.md").write_text(

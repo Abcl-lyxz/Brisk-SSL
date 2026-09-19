@@ -9,12 +9,14 @@ reference before emission. Differential vectors come from a fixed seed.
 | cavp_aes_kat | https://csrc.nist.gov/CSRC/media/Projects/Cryptographic-Algorithm-Validation-Program/documents/aes/KAT_AES.zip | `a203b16c9246b2ebae31dee5de21a606be80cf78ceabaca37150236fa098eb60` |
 | cavp_aes_mct | https://csrc.nist.gov/CSRC/media/Projects/Cryptographic-Algorithm-Validation-Program/documents/aes/aesmct.zip | `6a2a72c00b1daacb9a7d20ab92617d322fa1c5dee493968660990e3f4571426b` |
 | cavp_aes_mmt | https://csrc.nist.gov/CSRC/media/Projects/Cryptographic-Algorithm-Validation-Program/documents/aes/aesmmt.zip | `12d1616f7a713e807714055973f04efc402f46a14e3d81869717c7ace4ecbaf0` |
+| cavp_gcm | https://csrc.nist.gov/CSRC/media/Projects/Cryptographic-Algorithm-Validation-Program/documents/mac/gcmtestvectors.zip | `f9fc479e134cde2980b3bb7cddbcb567b2cd96fd753835243ed067699f26a023` |
 | cavp_sha | https://csrc.nist.gov/CSRC/media/Projects/Cryptographic-Algorithm-Validation-Program/documents/shs/shabytetestvectors.zip | `929ef80b7b3418aca026643f6f248815913b60e01741a44bba9e118067f4c9b8` |
 | rfc4231 | https://www.rfc-editor.org/rfc/rfc4231.txt | `72178527ce93500e730bc8eb182b857e583096d652b64ece0879c52ba1df973b` |
 | rfc5869 | https://www.rfc-editor.org/rfc/rfc5869.txt | `7a40eb3835b35fc947eb12a2ed614db079d43b26e50dbc537c31fba16397089c` |
 | rfc8439 | https://www.rfc-editor.org/rfc/rfc8439.txt | `25bef70fbf7a07ff45c2fe4cb7c6ce954eac687413d8610603268b4e4415324c` |
 | rfc8448 | https://www.rfc-editor.org/rfc/rfc8448.txt | `6564d1376d1ec744fc7a9993da15ebc1b9be361908b166091f47ef605c537fba` |
 | rfc9001 | https://www.rfc-editor.org/rfc/rfc9001.txt | `3bbaecdf5afd278052a2c48348ce118c4ff8d0cf6b9915549858171b3f98a591` |
+| wp_aes_gcm | https://raw.githubusercontent.com/C2SP/wycheproof/main/testvectors_v1/aes_gcm_test.json | `985e5ecc172e181eaf49e89508b9470dcf478002eb7e8559c707eb42dc97dfe7` |
 | wp_chacha20_poly1305 | https://raw.githubusercontent.com/C2SP/wycheproof/main/testvectors_v1/chacha20_poly1305_test.json | `fe61d25f90e1bde4461d00eafe61049e5f29bd999f36b766df9cda90906ad53d` |
 | wp_hkdf_sha256 | https://raw.githubusercontent.com/C2SP/wycheproof/main/testvectors_v1/hkdf_sha256_test.json | `bb2b462a38b251cb52a2aede706d6d4b62b26864f4e80c95497507ddb07c5f1e` |
 | wp_hkdf_sha384 | https://raw.githubusercontent.com/C2SP/wycheproof/main/testvectors_v1/hkdf_sha384_test.json | `69ff6ea3657bb9c1b8cdffbbb4e7832353d08fd15c0d9997b03f7a6b180e3678` |

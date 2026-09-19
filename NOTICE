@@ -7,6 +7,8 @@ Third-party code included in this distribution (each keeps its own notice):
 - BearSSL (MIT): src/crypto/aes_ct.c and src/crypto/aes_ct64.c are adapted from BearSSL
   src/symcipher/aes_ct.c, aes_ct_enc.c, aes_ct_ctr.c, aes_ct64.c, aes_ct64_enc.c and
   aes_ct64_ctr.c at commit 7bea48e5e850ab4cafbe68d3765cdaba13a86d6f (https://bearssl.org/).
+  The GHASH in src/crypto/gcm.c is adapted from BearSSL src/hash/ghash_ctmul32.c and
+  ghash_ctmul64.c at the same commit.
 
     Copyright (c) 2016 Thomas Pornin <pornin@bolet.org>
 

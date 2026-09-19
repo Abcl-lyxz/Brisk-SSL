@@ -90,7 +90,13 @@ brisk_feed(c, in, n); brisk_pull(c, out, cap);           /* sans-I/O for your ow
 ## Crypto choices
 - Hash layer (done): loop-rolled SHA-2, HMAC, HKDF, Expand-Label. 4.2 KB (Thumb-2) .. 7.7 KB (MIPS32).
 - AES: bitsliced constant-time (32-bit and 64-bit variants), encrypt direction only (TLS/QUIC
-  never decrypt with AES). GHASH constant-time multiply.
+  never decrypt with AES). GHASH without tables (BearSSL ctmul64 on 64-bit, ctmul32 on 32-bit:
+  32x32->32 multiplies only, so no widening multiply or libgcc helper). AES-GCM takes 96-bit
+  IVs and 16-byte tags only; the key context caches H = E(K, 0) (264 B). Known limit: ARM7/ARM9
+  (armv5) and some MIPS32 4K cores have early-terminating multipliers, so GHASH timing there
+  may depend on H. Listing ChaCha20-Poly1305 first does not remove this - the server picks the
+  suite, and AES-128-GCM is mandatory in TLS 1.3 - so when M3 lands, those targets get either a
+  multiply-free GHASH or AES-GCM dropped from the default ClientHello.
 - X25519 and P-256 field arithmetic from fiat-crypto (formally verified). On 32-bit targets the
   fiat P-256 code is trimmed (square = mul, Fermat inversion) - ~8 KB instead of ~24 KB on MIPS.
 - P-384 and RSA are verify-only (public data) on one generic i31 Montgomery bignum.

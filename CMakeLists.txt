@@ -14,6 +14,7 @@ add_library(brisk STATIC
     src/crypto/chacha20_poly1305.c
     src/crypto/aes_ct.c   # 32-bit targets (the file compiles to nothing on 64-bit)
     src/crypto/aes_ct64.c # 64-bit targets
+    src/crypto/gcm.c      # GHASH ctmul32 / ctmul64 (same split) + AES-GCM
 )
 if(CMAKE_SYSTEM_NAME STREQUAL "Linux") # src/os/ is Linux-only; the mingw host skips it
     target_sources(brisk PRIVATE src/os/linux_rand.c)

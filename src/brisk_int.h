@@ -144,6 +144,39 @@ void brisk__aes_encrypt(const brisk__aes_key *k, const uint8_t in[16], uint8_t o
 void brisk__aes_ctr32(const brisk__aes_key *k, const uint8_t cb[16], const uint8_t *in, size_t len,
                       uint8_t *out);
 
+/* ---- crypto/gcm.c: GHASH (SP 800-38D 6.4) and AES-GCM (SP 800-38D 7.1/7.2, RFC 5116 5.1/5.3)
+ * 96-bit IV and 128-bit tag only. The per-record/packet nonce is built by the caller (RFC 9846
+ * 5.3, RFC 9001 5.3); a nonce must never repeat under one key (RFC 5116 5.1.1) and this module is
+ * stateless, so the TLS/QUIC counters own that. Sender limits (2^24.5 full records per key, RFC
+ * 9846 5.5; 2^23 packets, RFC 9001 6.6) are enforced by the TLS/QUIC layers. */
+#define BRISK__GCM_IV_LEN  12
+#define BRISK__GCM_TAG_LEN 16
+
+/* y = GHASH_H continued over data: for each 16-byte block X (a short last block is zero-padded),
+ * y = (y ^ X) * H in GF(2^128). Constant time (ctmul32 on 32-bit, ctmul64 on 64-bit targets,
+ * from BearSSL). len may be 0 (data may then be NULL). */
+void brisk__ghash(uint8_t y[16], const uint8_t h[16], const uint8_t *data, size_t len);
+
+typedef struct {
+    brisk__aes_key aes; /* 248 B on every arch */
+    uint8_t h[16];      /* H = E(K, 0^128) */
+} brisk__gcm_key;       /* 264 B; the caller wipes it with brisk__secure_zero(k, sizeof *k) */
+
+/* key_len 16 or 32; otherwise BRISK_E_ARG and nothing is written. */
+int brisk__gcm_init(brisk__gcm_key *k, const uint8_t *key, size_t key_len);
+
+/* Same shape as brisk__chacha20_poly1305_seal/open. in == out allowed (no partial overlap); NULL
+ * allowed where the matching length is 0. BRISK_E_ARG, before any access, if len > 2^36 - 32
+ * (SP 800-38D 5.2.1.1: beyond it inc32 would wrap into J0) or aad_len > 2^61 - 1 (64-bit size_t
+ * only). */
+int brisk__gcm_seal(const brisk__gcm_key *k, const uint8_t iv[12], const uint8_t *aad,
+                    size_t aad_len, const uint8_t *in, size_t len, uint8_t *out, uint8_t tag[16]);
+/* Tag over (aad, in) checked with brisk__ct_memeq BEFORE decrypting. On BRISK_E_AUTH, out[0..len)
+ * is zeroed (in place, that destroys the ciphertext). */
+int brisk__gcm_open(const brisk__gcm_key *k, const uint8_t iv[12], const uint8_t *aad,
+                    size_t aad_len, const uint8_t *in, size_t len, uint8_t *out,
+                    const uint8_t tag[16]);
+
 /* ---- os/linux_rand.c (Linux builds only): the only randomness source, no userspace DRBG ---- */
 /* len bytes from the kernel CSPRNG: getrandom(2), which blocks until the pool is initialised.
  * Only on kernels older than 4.8 that lack it (ENOSYS) or filter it (EPERM): wait once for

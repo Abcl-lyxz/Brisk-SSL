@@ -22,6 +22,12 @@ int main(int argc, char **argv)
         brisk__aes_encrypt(&k, out, out);
         brisk__aes_ctr32(&k, out + 16, out, 33, out);
     }
+    {
+        brisk__gcm_key g;
+        brisk__gcm_init(&g, out, (size_t)argc * 16);
+        brisk__gcm_seal(&g, out, out, 5, out, 16, out, out + 48);
+        brisk__gcm_open(&g, out, out, 5, out, 16, out, out + 48);
+    }
 #ifdef __linux__
     brisk__os_random(out, 32);
 #endif
