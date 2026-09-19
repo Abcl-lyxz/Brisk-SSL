@@ -106,6 +106,44 @@ int brisk__chacha20_poly1305_open(const uint8_t key[32], const uint8_t nonce[12]
                                   const uint8_t *aad, size_t aad_len, const uint8_t *in, size_t len,
                                   uint8_t *out, const uint8_t tag[16]);
 
+/* ---- crypto/aes_ct.c | aes_ct64.c: AES-128/256 forward cipher (FIPS 197), bitsliced, constant
+ * time Only the forward cipher: GCM (SP 800-38D) and QUIC header protection (RFC 9001 5.4.3) never
+ * decrypt with AES. AES-192 is not supported (no TLS 1.3 / TLS 1.2 AEAD / QUIC suite uses it).
+ * One variant is compiled per target: ct64 (4 blocks per pass in uint64_t q[8]) where pointers are
+ * 64-bit, ct (2 blocks per pass in uint32_t q[8]) elsewhere, including ILP32 ABIs (x32, n32).
+ * Stack: about 0.6 KB (ct) / 1.1 KB (ct64) per call for the expanded schedule and state. */
+#if UINTPTR_MAX > 0xFFFFFFFFu
+#    define BRISK__AES_CT64 1
+#else
+#    define BRISK__AES_CT64 0
+#endif
+
+typedef struct {
+    /* compressed bitsliced schedule, only ever accessed through the compiled variant's member */
+    union {
+        uint32_t w32[60];
+        uint64_t w64[30];
+    } sk;
+    unsigned nr;  /* 10 or 14 */
+    unsigned pad; /* sizeof is 248 on every arch (i386 aligns uint64_t to 4 only) */
+} brisk__aes_key;
+
+/* key_len 16 or 32, else BRISK_E_ARG before anything is written. The caller wipes k with
+ * brisk__secure_zero(k, sizeof *k). */
+int brisk__aes_init(brisk__aes_key *k, const uint8_t *key, size_t key_len);
+
+/* One block, FIPS 197 5.1 Cipher(). in == out allowed; no alignment needed. QUIC HP mask
+ * (RFC 9001 5.4.3), GCM H = E(K, 0^128) and E(K, J0). */
+void brisk__aes_encrypt(const brisk__aes_key *k, const uint8_t in[16], uint8_t out[16]);
+
+/* GCTR with inc32 (SP 800-38D 6.2/6.5): out = in XOR E(K, cb) || E(K, inc32(cb)) || ...
+ * Only bytes 12..15 of cb (big-endian) count up, mod 2^32; cb itself is not modified. in == out
+ * allowed (no partial overlap); any len including 0; a short last block uses the leading keystream
+ * bytes. Stateless: a caller splitting a message advances cb itself. The 2^32 - 2 block limit is
+ * the caller's (GCM's) job. */
+void brisk__aes_ctr32(const brisk__aes_key *k, const uint8_t cb[16], const uint8_t *in, size_t len,
+                      uint8_t *out);
+
 /* ---- os/linux_rand.c (Linux builds only): the only randomness source, no userspace DRBG ---- */
 /* len bytes from the kernel CSPRNG: getrandom(2), which blocks until the pool is initialised.
  * Only on kernels older than 4.8 that lack it (ENOSYS) or filter it (EPERM): wait once for

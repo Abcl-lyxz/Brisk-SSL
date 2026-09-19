@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Fetch official known-answer vectors and emit tests/kat/*.inc (stdlib only).
 
-Every vector is re-computed with Python's hashlib/hmac (or a pure-Python RFC 8439 reference) before it is written, so a parsing slip fails
+Every vector is re-computed with Python's hashlib/hmac (or a pure-Python RFC 8439 / FIPS 197 reference) before it is written, so a parsing slip fails
 here instead of silently weakening the C tests. Downloads are cached in .cache/kat/.
 
     python tools/kat.py            # regenerate tests/kat/*.inc + tests/kat/SOURCES.md
@@ -31,6 +31,8 @@ SRC = {
     "rfc8448": "https://www.rfc-editor.org/rfc/rfc8448.txt",
     "rfc9001": "https://www.rfc-editor.org/rfc/rfc9001.txt",
     "rfc8439": "https://www.rfc-editor.org/rfc/rfc8439.txt",
+    **{f"cavp_aes_{k}": "https://csrc.nist.gov/CSRC/media/Projects/Cryptographic-Algorithm-Validation-Program/"
+       f"documents/aes/{f}" for k, f in (("kat", "KAT_AES.zip"), ("mmt", "aesmmt.zip"), ("mct", "aesmct.zip"))},
     "wp_chacha20_poly1305": f"{WP}chacha20_poly1305_test.json",
     **{f"wp_hmac_sha{b}": f"{WP}hmac_sha{b}_test.json" for b in (256, 384, 512)},
     **{f"wp_hkdf_sha{b}": f"{WP}hkdf_sha{b}_test.json" for b in (256, 384, 512)},
@@ -121,6 +123,71 @@ def py_aead_seal(key, nonce, aad, pt):
     pad = lambda b: b"\0" * (-len(b) % 16)
     mac = aad + pad(aad) + ct + pad(ct) + len(aad).to_bytes(8, "little") + len(ct).to_bytes(8, "little")
     return ct, py_poly1305(otk, mac)
+
+
+# AES forward cipher (FIPS 197 5.1/5.2), table-based: fine for a generator, never for the library.
+def _gmul2(a):
+    return ((a << 1) ^ 0x11B) & 0xFF if a & 0x80 else a << 1
+
+
+def _aes_sbox():
+    """FIPS 197 5.1.1: inverse in GF(2^8) mod x^8+x^4+x^3+x+1, then the affine map (computed, not typed)."""
+    def mul(a, b):
+        r = 0
+        while b:
+            if b & 1:
+                r ^= a
+            a, b = _gmul2(a), b >> 1
+        return r
+    inv = [0] + [next(b for b in range(1, 256) if mul(a, b) == 1) for a in range(1, 256)]
+    rot = lambda b, n: ((b << n) | (b >> (8 - n))) & 0xFF
+    return [b ^ rot(b, 1) ^ rot(b, 2) ^ rot(b, 3) ^ rot(b, 4) ^ 0x63 for b in inv]
+
+
+AES_SBOX = _aes_sbox()
+
+
+def py_aes_expand(key):
+    nk = len(key) // 4
+    nr = nk + 6
+    w, rcon = [list(key[4 * i : 4 * i + 4]) for i in range(nk)], 1
+    for i in range(nk, 4 * (nr + 1)):
+        t = w[i - 1][:]
+        if i % nk == 0:
+            t = [AES_SBOX[b] for b in t[1:] + t[:1]]
+            t[0] ^= rcon
+            rcon = _gmul2(rcon)
+        elif nk > 6 and i % nk == 4:
+            t = [AES_SBOX[b] for b in t]
+        w.append([a ^ b for a, b in zip(w[i - nk], t)])
+    return [sum(w[4 * r : 4 * r + 4], []) for r in range(nr + 1)]
+
+
+def py_aes_encrypt(key, blk, rk=None):
+    rk = rk or py_aes_expand(key)
+    s = [a ^ b for a, b in zip(blk, rk[0])]
+    for r in range(1, len(rk)):
+        s = [AES_SBOX[b] for b in s]
+        s = [s[(i + 4 * (i % 4)) % 16] for i in range(16)]  # ShiftRows, column-major state
+        if r != len(rk) - 1:  # no MixColumns in the final round
+            t = []
+            for c in range(4):
+                a = s[4 * c : 4 * c + 4]
+                x = a[0] ^ a[1] ^ a[2] ^ a[3]
+                t += [a[j] ^ x ^ _gmul2(a[j] ^ a[(j + 1) % 4]) for j in range(4)]
+            s = t
+        s = [a ^ b for a, b in zip(s, rk[r])]
+    return bytes(s)
+
+
+def py_aes_ctr32(key, cb, data):
+    """SP 800-38D 6.2 inc32 / 6.5 GCTR: only the low 32 bits count, mod 2^32; a short tail uses the
+    leading keystream bytes."""
+    rk, low, out = py_aes_expand(key), int.from_bytes(cb[12:], "big"), bytearray()
+    for j in range(0, len(data), 16):
+        ks = py_aes_encrypt(key, cb[:12] + ((low + j // 16) & 0xFFFFFFFF).to_bytes(4, "big"), rk)
+        out += bytes(a ^ b for a, b in zip(data[j : j + 16], ks))
+    return bytes(out)
 
 
 # ---------------------------------------------------------------- RFC text helpers
@@ -547,6 +614,106 @@ def differential():
     return hashes + fips, macs, kdfs, million
 
 
+# ---------------------------------------------------------------- AES: FIPS 197, CAVP, SP 800-38A, RFC 9001
+def rsp_encrypt(z, fname):
+    """[ENCRYPT] rows of one CAVP AESAVS .rsp file as (count, key, pt, ct) byte strings."""
+    names = {Path(n).name: n for n in z.namelist()}
+    txt = z.read(names[fname]).decode()
+    enc = txt[txt.index("[ENCRYPT]") : txt.index("[DECRYPT]")]
+    rows = re.findall(r"COUNT = (\d+)\s+KEY = ([0-9a-f]+)\s+PLAINTEXT = ([0-9a-f]+)\s+CIPHERTEXT = ([0-9a-f]+)", enc)
+    if not rows:
+        die(f"CAVP {fname}: no ENCRYPT rows")
+    return [(int(c), bytes.fromhex(k), bytes.fromhex(p), bytes.fromhex(x)) for c, k, p, x in rows]
+
+
+def py_aes_ecb(key, pt):
+    rk = py_aes_expand(key)
+    return b"".join(py_aes_encrypt(key, pt[j : j + 16], rk) for j in range(0, len(pt), 16))
+
+
+def aes_vectors():
+    # FIPS 197 Appendix C.1 / C.3 (the PDF is not machine-friendly; checked against the reference,
+    # which is itself checked against every CAVP row below).
+    fips = [(bytes(range(16)), bytes.fromhex("00112233445566778899aabbccddeeff"),
+             bytes.fromhex("69c4e0d86a7b0430d8cdb78070b4c55a")),
+            (bytes(range(32)), bytes.fromhex("00112233445566778899aabbccddeeff"),
+             bytes.fromhex("8ea2b7ca516745bfeafc49904b496089"))]
+    ecb = list(fips)
+    z = zipfile.ZipFile(io.BytesIO(fetch("cavp_aes_kat")))
+    for bits in (128, 256):  # AES-192 deliberately absent (no TLS 1.3 / TLS 1.2 AEAD / QUIC suite uses it)
+        for kind in ("GFSbox", "KeySbox", "VarKey", "VarTxt"):
+            ecb += [(k, p, c) for _, k, p, c in rsp_encrypt(z, f"ECB{kind}{bits}.rsp")]
+    z = zipfile.ZipFile(io.BytesIO(fetch("cavp_aes_mmt")))
+    for bits in (128, 256):
+        ecb += [(k, p, c) for _, k, p, c in rsp_encrypt(z, f"ECBMMT{bits}.rsp")]
+    for i, (k, p, c) in enumerate(ecb):
+        if len(k) not in (16, 32) or len(p) % 16 or len(p) != len(c) or py_aes_ecb(k, p) != c:
+            die(f"AES ECB vector {i} mismatch")
+    if len(ecb) != 2 + 7 + 21 + 128 + 128 + 5 + 16 + 256 + 128 + 20:
+        die(f"CAVP AES ECB: {len(ecb)} rows")
+    # AESAVS 6.4 Monte Carlo (ECB): 1000 chained encryptions per row, then the key update
+    mct = []
+    z = zipfile.ZipFile(io.BytesIO(fetch("cavp_aes_mct")))
+    for bits in (128, 256):
+        rows = rsp_encrypt(z, f"ECBMCT{bits}.rsp")
+        key, pt = rows[0][1], rows[0][2]
+        for cnt, k, p, c in rows:
+            if (k, p) != (key, pt):
+                die(f"CAVP ECBMCT{bits} COUNT {cnt}: key/pt chain mismatch")
+            rk, prev, ct = py_aes_expand(key), None, pt
+            for _ in range(1000):
+                prev, ct = ct, py_aes_encrypt(key, ct, rk)
+            if ct != c:
+                die(f"CAVP ECBMCT{bits} COUNT {cnt} mismatch")
+            key = bytes(a ^ b for a, b in zip(key, ct if bits == 128 else prev + ct))
+            pt = ct
+            mct.append((cnt, k, p, c))
+        if len(rows) != 100:
+            die(f"CAVP ECBMCT{bits}: {len(rows)} rows")
+    # SP 800-38A F.5.1 / F.5.5 CTR-AES128/256.Encrypt (from the PDF; checked against the reference)
+    msg = bytes.fromhex("6bc1bee22e409f96e93d7e117393172aae2d8a571e03ac9c9eb76fac45af8e51"
+                        "30c81c46a35ce411e5fbc1191a0a52eff69f2445df4f9b17ad2b417be66c3710")
+    cb = bytes.fromhex("f0f1f2f3f4f5f6f7f8f9fafbfcfdfeff")
+    ctr = [(bytes.fromhex("2b7e151628aed2a6abf7158809cf4f3c"), cb, msg,
+            bytes.fromhex("874d6191b620e3261bef6864990db6ce9806f66b7970fdff8617187bb9fffdff"
+                          "5ae4df3edbd5d35e5b4f09020db03eab1e031dda2fbe03d1792170a0f3009cee")),
+           (bytes.fromhex("603deb1015ca71be2b73aef0857d77811f352c073b6108d72d9810a30914dff4"), cb, msg,
+            bytes.fromhex("601ec313775789a5b7a7f504bbf3d228f443e3ca4d62b59aca84e990cacaf5c5"
+                          "2b0930daa23de94ce87017ba2d84988ddfc9c58db67aada613c2dd08457941a6"))]
+    for i, (k, c0, m, c) in enumerate(ctr):
+        if py_aes_ctr32(k, c0, m) != c:
+            die(f"SP 800-38A F.5 vector {i} mismatch")
+    # RFC 9001 A.2 / A.3: header protection mask = AES-ECB(hp, sample)[0..4] with the A.1 hp keys
+    text = "\n".join(rfc_lines(fetch("rfc9001")))
+    a1 = text[text.index("\nA.1.  Keys\n") : text.index("\nA.2.  Client Initial\n")]
+    hps = [bytes.fromhex(h) for h in
+           re.findall(r"hp\s+= HKDF-Expand-Label\(\w+, \"quic hp\", \"\", 16\)\s+=\s+([0-9a-f]{32})", a1)]
+    a23 = text[text.index("\nA.2.  Client Initial\n") : text.index("\nA.4.  Retry\n")]
+    samples = [bytes.fromhex(h) for h in re.findall(r"sample = ([0-9a-f]{32})", a23)]
+    masks = [bytes.fromhex(h) for h in
+             re.findall(r"mask\s+=(?: AES-ECB\(hp, sample\)\[0\.\.4\]\s+=)?\s+([0-9a-f]{10})\n", a23)]
+    if not (len(hps) == len(samples) == len(masks) == 2):
+        die(f"RFC 9001 A.2/A.3: parsed {len(hps)} hp, {len(samples)} samples, {len(masks)} masks")
+    hp = list(zip(hps, samples, masks))
+    for i, (k, s_, m) in enumerate(hp):
+        if py_aes_encrypt(k, s_)[:5] != m:
+            die(f"RFC 9001 A.{i + 2} AES header protection mismatch")
+    # seeded differential CTR set: random keys, counters near the 32-bit wrap, lengths 0..300
+    rnd = random.Random(20260921)
+    rb = lambda n: bytes(rnd.getrandbits(8) for _ in range(n))
+    for i in range(120):
+        k = rb(16 if i % 2 else 32)
+        low = (0xFFFFFFFF - rnd.randrange(0, 8)) if i % 3 == 0 else rnd.getrandbits(32)
+        c0 = rb(12) + low.to_bytes(4, "big")
+        m = rb(i if i < 40 else rnd.randrange(0, 301))
+        ctr.append((k, c0, m, py_aes_ctr32(k, c0, m)))
+    for low in (0xFFFFFFFE, 0xFFFFFFFF):  # wraps to 00000000; byte 11 = ff must not take a carry
+        k, c0 = rb(16), rb(11) + b"\xff" + low.to_bytes(4, "big")
+        m = rb(16 * 5 + 7)
+        ctr.append((k, c0, m, py_aes_ctr32(k, c0, m)))
+    return ecb, mct, ctr, hp
+
+
 # ---------------------------------------------------------------- C emitters
 def cstr(hx, width=96):
     if not hx:
@@ -575,6 +742,7 @@ def main():
     awp = wycheproof_chacha20_poly1305()
     q9001 = rfc9001_chacha()
     dchacha, dpoly, daead = differential_chacha()
+    aes_ecb, aes_mct, aes_ctr, aes_hp = aes_vectors()
 
     emit("sha2.inc", "struct hash_kat SHA2_KAT", cavp + dhash, lambda r: f"{r[0]}, {cstr(r[1])}, {cstr(r[2])}")
     emit("sha2_monte.inc", "struct monte_kat SHA2_MONTE", monte,
@@ -598,11 +766,17 @@ def main():
     emit("quic_chacha.inc", "struct quic_chacha_kat QUIC_CHACHA_KAT", q9001,
          lambda r: f"{hx(r[0])}, {r[1]}u, " + ", ".join(hx(x) for x in r[2:]))
 
+    emit("aes_ecb.inc", "struct aes_ecb_kat AES_ECB_KAT", aes_ecb, lambda r: ", ".join(hx(x) for x in r))
+    emit("aes_mct.inc", "struct aes_mct_kat AES_MCT_KAT", aes_mct,
+         lambda r: f"{r[0]}, " + ", ".join(hx(x) for x in r[1:]))
+    emit("aes_ctr.inc", "struct aes_ctr_kat AES_CTR_KAT", aes_ctr, lambda r: ", ".join(hx(x) for x in r))
+    emit("aes_quic_hp.inc", "struct aes_hp_kat AES_HP_KAT", aes_hp, lambda r: ", ".join(hx(x) for x in r))
+
     rows = "\n".join(f"| {k} | {u} | `{h}` |" for k, (u, h) in sorted(fetched.items()))
     (OUT / "SOURCES.md").write_text(
         "# Known-answer vector sources\n\n"
         f"Generated by `python tools/kat.py` on {datetime.date.today()}. Each vector was re-checked\n"
-        "against Python hashlib/hmac or the pure-Python ChaCha20/Poly1305\n"
+        "against Python hashlib/hmac or the pure-Python ChaCha20/Poly1305/AES\n"
         "reference before emission. Differential vectors come from a fixed seed.\n\n"
         "| name | url | sha256 of download |\n|---|---|---|\n" + rows + "\n", newline="\n")
     print("ok")

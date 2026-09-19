@@ -4,8 +4,34 @@ Copyright 2026 The Brisk-SSL authors
 This product is licensed under the Apache License, Version 2.0 (see LICENSE).
 
 Third-party code included in this distribution (each keeps its own notice):
-- (none yet) fiat-crypto (MIT OR Apache-2.0 OR BSD-1-Clause) will be vendored under vendor/fiat/
-  in milestone M1c; its notice and pinned commit will be recorded here and in vendor/VENDORED.md.
+- BearSSL (MIT): src/crypto/aes_ct.c and src/crypto/aes_ct64.c are adapted from BearSSL
+  src/symcipher/aes_ct.c, aes_ct_enc.c, aes_ct_ctr.c, aes_ct64.c, aes_ct64_enc.c and
+  aes_ct64_ctr.c at commit 7bea48e5e850ab4cafbe68d3765cdaba13a86d6f (https://bearssl.org/).
+
+    Copyright (c) 2016 Thomas Pornin <pornin@bolet.org>
+
+    Permission is hereby granted, free of charge, to any person obtaining
+    a copy of this software and associated documentation files (the
+    "Software"), to deal in the Software without restriction, including
+    without limitation the rights to use, copy, modify, merge, publish,
+    distribute, sublicense, and/or sell copies of the Software, and to
+    permit persons to whom the Software is furnished to do so, subject to
+    the following conditions:
+
+    The above copyright notice and this permission notice shall be
+    included in all copies or substantial portions of the Software.
+
+    THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
+    EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
+    MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND
+    NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS
+    BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN
+    ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN
+    CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+    SOFTWARE.
+
+- fiat-crypto (MIT OR Apache-2.0 OR BSD-1-Clause) will be vendored under vendor/fiat/ in
+  milestone M1c; its notice and pinned commit will be recorded here and in vendor/VENDORED.md.
 
 Test vectors under tests/kat/ are derived from NIST CAVP (public domain), IETF RFCs, and
 C2SP Wycheproof (Apache-2.0); see tests/kat/SOURCES.md.
