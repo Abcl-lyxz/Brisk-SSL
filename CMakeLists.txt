@@ -12,6 +12,9 @@ add_library(brisk STATIC
     src/crypto/sha2.c
     src/crypto/hkdf.c
 )
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux") # src/os/ is Linux-only; the mingw host skips it
+    target_sources(brisk PRIVATE src/os/linux_rand.c)
+endif()
 set_target_properties(brisk PROPERTIES C_STANDARD 99 C_STANDARD_REQUIRED ON C_EXTENSIONS OFF
                                        C_VISIBILITY_PRESET hidden)
 target_include_directories(brisk PUBLIC include PRIVATE src)
@@ -42,6 +45,13 @@ if(BRISK_BUILD_TESTS)
     endif()
     add_test(NAME hash COMMAND brisk_tests hash)
     set_tests_properties(hash PROPERTIES TIMEOUT 900) # qemu-emulated 32-bit targets are slow
+    if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+        target_sources(brisk_tests PRIVATE tests/test_rand.c)
+        # fault injection for src/os/linux_rand.c (getrandom, /dev/random wait, kernel version)
+        target_link_options(brisk_tests PRIVATE -Wl,--wrap=syscall,--wrap=poll,--wrap=uname,--wrap=personality)
+        add_test(NAME rand COMMAND brisk_tests rand)
+        set_tests_properties(rand PROPERTIES TIMEOUT 300) # a fill loop that never ends must fail
+    endif()
 endif()
 
 # size probe: statically links every entry point so `tools/dev.py size` can read per-module

@@ -61,4 +61,16 @@ int brisk__hkdf_expand_label(brisk_hash_alg alg, const uint8_t *secret, size_t s
                              const char *label, const uint8_t *context, size_t context_len,
                              uint8_t *out, size_t out_len);
 
+/* ---- os/linux_rand.c (Linux builds only): the only randomness source, no userspace DRBG ---- */
+/* len bytes from the kernel CSPRNG: getrandom(2), which blocks until the pool is initialised.
+ * Only on kernels older than 4.8 that lack it (ENOSYS) or filter it (EPERM): wait once for
+ * /dev/random to be readable, then read /dev/urandom. BRISK_E_RNG otherwise: abort, never use
+ * the buffer. */
+int brisk__os_random(uint8_t *out, size_t len);
+/* The two sources on their own, for tests. brisk__os_getrandom returns BRISK__RAND_FALLBACK on
+ * ENOSYS/EPERM; brisk__os_urandom (the waited-for /dev/urandom) never checks the kernel version. */
+#define BRISK__RAND_FALLBACK 1
+int brisk__os_getrandom(uint8_t *out, size_t len);
+int brisk__os_urandom(uint8_t *out, size_t len);
+
 #endif /* BRISK_INT_H */

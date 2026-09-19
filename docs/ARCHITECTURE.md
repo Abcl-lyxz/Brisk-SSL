@@ -82,8 +82,10 @@ brisk_feed(c, in, n); brisk_pull(c, out, cap);           /* sans-I/O for your ow
   INSECURE_NO_TIME exist. Dates are int64, never `time_t` (Y2038, 9999 notAfter).
 - SPKI pins are additive (never replace chain validation); pin roots, not leaves/intermediates
   (Let's Encrypt rotates intermediates; certificate lifetimes drop to 47 days by 2029).
-- RNG: getrandom -> /dev/urandom fallback after /dev/random is readable; fail closed; no
-  userspace DRBG, so fork-safe by construction.
+- RNG: getrandom (own per-arch syscall table, checked against the headers). Only on kernels
+  < 4.8 without it (ENOSYS, or EPERM from seccomp): /dev/urandom once /dev/random has been
+  readable, waited for once per process (on >= 4.8 readable no longer means seeded, so a filter
+  that blocks getrandom there fails). Fail closed otherwise; no userspace DRBG, so fork-safe.
 
 ## Crypto choices
 - Hash layer (done): loop-rolled SHA-2, HMAC, HKDF, Expand-Label. 4.2 KB (Thumb-2) .. 7.7 KB (MIPS32).

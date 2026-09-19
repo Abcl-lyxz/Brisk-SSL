@@ -13,6 +13,9 @@ int main(int argc, char **argv)
     brisk_hmac(alg, out, 32, out, 32, out);
     brisk__hkdf_extract(alg, out, 32, out, 32, out);
     brisk__hkdf_expand_label(alg, out, 32, "derived", out, 32, out, 32);
+#ifdef __linux__
+    brisk__os_random(out, 32);
+#endif
     return out[0] + (brisk_build_info()[0] == brisk_version()[0]) +
            brisk__ct_memeq(out, out + 1, 8);
 }

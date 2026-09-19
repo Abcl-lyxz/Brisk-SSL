@@ -39,7 +39,8 @@ extern "C" {
  */
 enum {
     BRISK_OK = 0,
-    BRISK_E_ARG = -1 /* invalid argument: unknown algorithm, length out of range, ... */
+    BRISK_E_ARG = -1, /* invalid argument: unknown algorithm, length out of range, ... */
+    BRISK_E_RNG = -2  /* kernel randomness unavailable; seccomp filters must allow getrandom */
 };
 
 /* Library version, e.g. "0.1.0-dev". */

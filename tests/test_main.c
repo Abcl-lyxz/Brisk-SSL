@@ -61,6 +61,9 @@ static const struct {
     void (*run)(void);
 } SUITES[] = {
     {"hash", test_hash},
+#ifdef __linux__
+    {"rand", test_rand},
+#endif
 };
 
 int main(int argc, char **argv)
