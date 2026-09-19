@@ -1,26 +1,32 @@
-# Handoff - 2026-09-19 (session 1)
+# Handoff - 2026-09-19 (session 2)
 
 ## Done
-- M0 infra: CMake presets (host dev/dev32, Docker x86_64/asan + 9 cross archs under qemu),
-  Docker image `brisk-dev`, tools/dev.py (test/size/image), tools/kat.py, CI, size baseline.
-- M1a hash layer: SHA-256/384/512, HMAC, HKDF, Expand-Label - green on all 13 presets.
-  4.2 KB (armv7 Thumb-2) .. 7.7 KB (MIPS32).
-- Claude Code setup: hooks, statusline, skills, agents, rules, workflows, `rfc` MCP, CLAUDE.md.
+- 89768a7 os: kernel RNG `src/os/linux_rand.c` - getrandom via own per-arch syscall table
+  (#error-checked vs SYS_getrandom), pre-4.8-only /dev/random-wait -> /dev/urandom fallback,
+  write-once `seeded` latch, UNAME26 refused, fail closed (BRISK_E_RNG). Fault-injection tests via
+  -Wl,--wrap=syscall,poll,uname,personality; 14 mutations caught. 3 review rounds.
+- a29e4c9 crypto: ChaCha20 / Poly1305 / AEAD (RFC 8439) `src/crypto/chacha20_poly1305.c` +
+  tests/test_aead.c; RFC 8439, Wycheproof, differential, RFC 9001 A.5. New BRISK_E_AUTH.
+  dev.py FORBIDDEN also covers __muldi3 and 64-bit shift helpers. Size baseline saved.
+- All green on 13 presets.
 
-- Adversarial review (3 lenses + refutation) of M1a: 10 confirmed findings fixed in b2b51e4
-  (SHA-384/512 stack leak, ct_memeq tests, output canaries, BRISKCFG retain, static lib).
-  Refuted-but-worth-revisiting later: HMAC ctx used after failed init/final fails open (make
-  update/final check alg when TLS code lands); tools/kat.py per-source minimum-count guards.
-- CI green on GitHub Actions (~2.5 min with cache).
+## In progress
+- Nothing.
 
 ## Next up
-- M1b: `src/os/linux_rand.c` (getrandom per-arch syscall numbers -> /dev/random poll ->
-  /dev/urandom, fail closed), then ChaCha20-Poly1305 (RFC 8439 + Wycheproof) via `/implement-module`.
+- M1b: AES-128/256 constant-time bitsliced (ct on 32-bit, ct64 on 64-bit), encrypt-only
+  (BearSSL-style aes_ct/aes_ct64: keep MIT notice in file header + NOTICE). Then GHASH + GCM.
+  Use `/implement-module`.
 
 ## Decisions / gotchas
-- Python's CA bundle rejects csrc.nist.gov; kat.py reuses `.cache/kat/*` (download with curl if
-  needed). Every vector is re-verified with hashlib, so the source host doesn't matter.
-- RFC 4231 TC3 has a typo ("Key" without "="); RFC 9001 TOC contains "A.1.  Keys" - both handled.
-- ASan cannot link `-static`: the size probe is behind `-DBRISK_SIZE_PROBE=ON` (dev.py sets it).
-- Hooks are exec-form `node` scripts; `python` (not `python3`) on the Windows host.
-- The user's personal `.claude/settings.local.json` sets `ECC_GATEGUARD=off` (not committed).
+- RNG: fallback only when kernel < 4.8 (OpenSSL's cut-off): from 4.8 a readable /dev/random
+  does not mean urandom is seeded, so seccomp-blocked getrandom there -> BRISK_E_RNG.
+  personality(0xffffffff) returns -1 under qemu-user on 32-bit targets: treated as "unknown".
+- The rand test's `fallback_gate()` must run first in the process (latch can't be reset).
+- ChaCha20 rounds stay unrolled: rolling saved only 210-430 B and costs speed on MIPS/ARM.
+- Poly1305 poly_finish's last h0->h1 carry is unreachable by vectors (~2^-100); keep it.
+- Reviewer agents sometimes return empty findings or get blocked by the API cyber safeguard:
+  verify with a mutation run instead of trusting "0 findings".
+- Earlier deferred items still open: HMAC ctx use after failed init/final; kat.py per-source
+  minimum-count guards.
+- Session cost ran ~$80; the implement-module workflow is ~380k subagent tokens per module.
