@@ -50,9 +50,9 @@ BRISK_API const char *brisk_build_info(void);
  * Streaming: *_init, then *_update any number of times with any lengths, then *_final, which
  * writes the digest and wipes the context. One-shot helpers do all three.
  */
-#define BRISK_SHA256_LEN 32
-#define BRISK_SHA384_LEN 48
-#define BRISK_SHA512_LEN 64
+#define BRISK_SHA256_LEN   32
+#define BRISK_SHA384_LEN   48
+#define BRISK_SHA512_LEN   64
 #define BRISK_HASH_MAX_LEN 64
 
 typedef struct {
@@ -104,7 +104,8 @@ typedef struct {
 } brisk_hmac_ctx;
 
 /* Returns BRISK_OK, or BRISK_E_ARG for an unknown algorithm. The key may be any length. */
-BRISK_API int brisk_hmac_init(brisk_hmac_ctx *c, brisk_hash_alg alg, const void *key, size_t key_len);
+BRISK_API int brisk_hmac_init(brisk_hmac_ctx *c, brisk_hash_alg alg, const void *key,
+                              size_t key_len);
 BRISK_API void brisk_hmac_update(brisk_hmac_ctx *c, const void *data, size_t len);
 /* Writes brisk_hash_len(alg) bytes and wipes the context. */
 BRISK_API void brisk_hmac_final(brisk_hmac_ctx *c, uint8_t *out);

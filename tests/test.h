@@ -8,8 +8,8 @@
 extern long t_checks, t_fails;
 
 void t_check(int ok, const char *file, int line, const char *what, long idx);
-#define CHECK(c)        t_check(!!(c), __FILE__, __LINE__, #c, -1)
-#define CHECKI(c, idx)  t_check(!!(c), __FILE__, __LINE__, #c, (long)(idx)) /* with vector index */
+#define CHECK(c)       t_check(!!(c), __FILE__, __LINE__, #c, -1)
+#define CHECKI(c, idx) t_check(!!(c), __FILE__, __LINE__, #c, (long)(idx)) /* with vector index */
 
 /* Decode a hex string into out (cap bytes). Aborts the run on odd length / bad digit / overflow. */
 size_t t_unhex(const char *hex, uint8_t *out, size_t cap);

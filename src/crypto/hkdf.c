@@ -66,8 +66,8 @@ int brisk_hmac(brisk_hash_alg alg, const void *key, size_t key_len, const void *
     return BRISK_OK;
 }
 
-int brisk__hkdf_extract(brisk_hash_alg alg, const uint8_t *salt, size_t salt_len, const uint8_t *ikm,
-                        size_t ikm_len, uint8_t *prk)
+int brisk__hkdf_extract(brisk_hash_alg alg, const uint8_t *salt, size_t salt_len,
+                        const uint8_t *ikm, size_t ikm_len, uint8_t *prk)
 {
     /* An empty salt as an HMAC key is zero-padded to a block, identical to HashLen zero bytes. */
     return brisk_hmac(alg, salt, salt_len, ikm, ikm_len, prk);

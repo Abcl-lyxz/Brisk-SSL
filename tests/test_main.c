@@ -1,4 +1,5 @@
-/* test_main.c - runs every suite, or only those named on the command line: brisk_tests [suite...] */
+/* test_main.c - runs every suite, or only those named on the command line: brisk_tests [suite...]
+ */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -40,7 +41,8 @@ size_t t_unhex(const char *hex, uint8_t *out, size_t cap)
 {
     size_t n = strlen(hex), i;
     if (n % 2 || n / 2 > cap) {
-        fprintf(stderr, "t_unhex: bad length %lu (cap %lu)\n", (unsigned long)n, (unsigned long)cap);
+        fprintf(stderr, "t_unhex: bad length %lu (cap %lu)\n", (unsigned long)n,
+                (unsigned long)cap);
         exit(2);
     }
     for (i = 0; i < n / 2; i++) {

@@ -1,6 +1,7 @@
-/* test_hash.c - SHA-2, HMAC, HKDF, HKDF-Expand-Label against official vectors (tests/kat/SOURCES.md).
- * Every vector also runs with unaligned input/output buffers and split/streamed updates, which is
- * where byte-order, alignment and buffering bugs show up on MIPS/ARM/PPC under qemu. */
+/* test_hash.c - SHA-2, HMAC, HKDF, HKDF-Expand-Label against official vectors
+ * (tests/kat/SOURCES.md). Every vector also runs with unaligned input/output buffers and
+ * split/streamed updates, which is where byte-order, alignment and buffering bugs show up on
+ * MIPS/ARM/PPC under qemu. */
 #include <stdio.h>
 #include <string.h>
 
@@ -123,7 +124,8 @@ static void sha2_kat(void)
     }
 }
 
-/* NIST SHAVS 6.4 Monte Carlo: MD_i = H(MD_{i-3} || MD_{i-2} || MD_{i-1}), 1000 steps per checkpoint */
+/* NIST SHAVS 6.4 Monte Carlo: MD_i = H(MD_{i-3} || MD_{i-2} || MD_{i-1}), 1000 steps per checkpoint
+ */
 static void sha2_monte(void)
 {
     size_t i, j, it, hl;
@@ -262,7 +264,8 @@ static int all_zero(const void *p, size_t n)
 
 static void edge_cases(void)
 {
-    static const char empty256[] = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+    static const char empty256[] =
+        "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
     uint8_t out[BRISK_HASH_MAX_LEN], want[BRISK_HASH_MAX_LEN], prk[32];
     char label[256];
     brisk_sha256_ctx s;
@@ -290,19 +293,23 @@ static void edge_cases(void)
 
     /* expand in place: out aliases prk */
     memcpy(B, prk, 32);
-    CHECK(brisk__hkdf_expand(BRISK_HASH_SHA256, prk, 32, (const uint8_t *)"x", 1, C, 32) == BRISK_OK);
+    CHECK(brisk__hkdf_expand(BRISK_HASH_SHA256, prk, 32, (const uint8_t *)"x", 1, C, 32) ==
+          BRISK_OK);
     CHECK(brisk__hkdf_expand(BRISK_HASH_SHA256, B, 32, (const uint8_t *)"x", 1, B, 32) == BRISK_OK);
     CHECK(memcmp(B, C, 32) == 0);
 
     /* HkdfLabel field limits (RFC 9846 7.1): "tls13 " + label <= 255, context <= 255 */
     memset(label, 'a', sizeof label);
     label[249] = '\0';
-    CHECK(brisk__hkdf_expand_label(BRISK_HASH_SHA256, prk, 32, label, NULL, 0, out, 32) == BRISK_OK);
+    CHECK(brisk__hkdf_expand_label(BRISK_HASH_SHA256, prk, 32, label, NULL, 0, out, 32) ==
+          BRISK_OK);
     label[249] = 'a';
     label[250] = '\0';
-    CHECK(brisk__hkdf_expand_label(BRISK_HASH_SHA256, prk, 32, label, NULL, 0, out, 32) == BRISK_E_ARG);
+    CHECK(brisk__hkdf_expand_label(BRISK_HASH_SHA256, prk, 32, label, NULL, 0, out, 32) ==
+          BRISK_E_ARG);
     CHECK(brisk__hkdf_expand_label(BRISK_HASH_SHA256, prk, 32, "key", A, 255, out, 16) == BRISK_OK);
-    CHECK(brisk__hkdf_expand_label(BRISK_HASH_SHA256, prk, 32, "key", A, 256, out, 16) == BRISK_E_ARG);
+    CHECK(brisk__hkdf_expand_label(BRISK_HASH_SHA256, prk, 32, "key", A, 256, out, 16) ==
+          BRISK_E_ARG);
 
     /* final() wipes the context (it held message-derived state) */
     brisk_sha256_init(&s);

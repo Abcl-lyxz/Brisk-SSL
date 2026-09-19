@@ -10,7 +10,8 @@
 
 #include "brisk.h"
 
-/* ---- byte order: explicit, alignment-free loads/stores (safe on MIPS/ARMv5, any endianness) ---- */
+/* ---- byte order: explicit, alignment-free loads/stores (safe on MIPS/ARMv5, any endianness) ----
+ */
 static inline uint32_t brisk__load_be32(const uint8_t *p)
 {
     return ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) | ((uint32_t)p[2] << 8) | p[3];
@@ -49,8 +50,8 @@ void brisk__hash_final(brisk_hash_ctx *c, brisk_hash_alg alg, uint8_t *out);
 
 /* ---- crypto/hkdf.c: HKDF (RFC 5869) and TLS 1.3 HKDF-Expand-Label (RFC 9846 7.1) ---- */
 /* prk receives brisk_hash_len(alg) bytes. An empty salt means HashLen zero bytes (RFC 5869 2.2). */
-int brisk__hkdf_extract(brisk_hash_alg alg, const uint8_t *salt, size_t salt_len, const uint8_t *ikm,
-                        size_t ikm_len, uint8_t *prk);
+int brisk__hkdf_extract(brisk_hash_alg alg, const uint8_t *salt, size_t salt_len,
+                        const uint8_t *ikm, size_t ikm_len, uint8_t *prk);
 /* BRISK_E_ARG if out_len > 255 * HashLen. `out` may alias `prk`, but must not overlap `info`. */
 int brisk__hkdf_expand(brisk_hash_alg alg, const uint8_t *prk, size_t prk_len, const uint8_t *info,
                        size_t info_len, uint8_t *out, size_t out_len);
