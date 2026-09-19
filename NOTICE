@@ -1,0 +1,11 @@
+Brisk-SSL
+Copyright 2026 The Brisk-SSL authors
+
+This product is licensed under the Apache License, Version 2.0 (see LICENSE).
+
+Third-party code included in this distribution (each keeps its own notice):
+- (none yet) fiat-crypto (MIT OR Apache-2.0 OR BSD-1-Clause) will be vendored under vendor/fiat/
+  in milestone M1c; its notice and pinned commit will be recorded here and in vendor/VENDORED.md.
+
+Test vectors under tests/kat/ are derived from NIST CAVP (public domain), IETF RFCs, and
+C2SP Wycheproof (Apache-2.0); see tests/kat/SOURCES.md.
