@@ -1,37 +1,41 @@
-# Handoff - 2026-09-19 (session 3)
+# Handoff - 2026-09-20 (session 4)
 
 ## Done
-- d2bbdd6 crypto: AES-128/256 bitsliced constant-time, encrypt-only. `src/crypto/aes_ct.c` (32-bit)
-  and `aes_ct64.c` (64-bit), both are always in CMake and `#if BRISK__AES_CT64` selects one. Same
-  `brisk__aes_init/encrypt/ctr32` API. Adapted from BearSSL 7bea48e5, MIT notice in the file
-  headers and NOTICE. Vectors: FIPS 197, CAVP (incl. MCT), SP 800-38A CTR, RFC 9001 A.2/A.3 HP,
-  counter-wrap differential. All 13 presets green. 19/19 non-equivalent mutations caught.
-  Size baseline saved.
+- 5a439ff crypto: GHASH + AES-GCM. One file `src/crypto/gcm.c`: ctmul64 / ctmul32 GHASH picked
+  by `#if BRISK__AES_CT64` (same split as aes_ct), AEAD_AES_128/256_GCM, 96-bit IV and 16-byte
+  tag only, ct tag compare, output wiped on BRISK_E_AUTH. BearSSL 7bea48e5, MIT notice in the
+  header and NOTICE. Vectors: CAVP GCMVS, Wycheproof (96-bit IV, AES-128/256), GHASH edge H
+  values, differential set, RFC 9001 A.2/A.3 Initial packets; all re-checked against a Python
+  SP 800-38D reference in tools/kat.py. 27/27 mutations caught. Flash +1.5 KB (armv7hf) ..
+  +2.7 KB (MIPS32), RAM unchanged, baseline saved.
+- 7007119 build: CT tooling. `BRISK__CT_SECRET` / `BRISK__CT_PUBLIC` in brisk_int.h (valgrind
+  client requests, no-ops without -DBRISK_CT_CHECK), new `ct` suite in tests/test_ct.c,
+  `python tools/dev.py ct`, skill `/ct-check`.
 
 ## In progress
-- Nothing. The GHASH+GCM workflow was started and then stopped during the spec phase, so the
-  tree is clean.
+- Nothing. Tree clean, all 13 presets green, `dev.py ct` green.
 
 ## Next up
-- M1b: GHASH (ctmul 32-bit / ctmul64 64-bit, BearSSL-style, MIT notice) + AES-GCM AEAD
-  (SP 800-38D), 96-bit IV only, 16-byte tag. Mirror the ChaCha20-Poly1305 AEAD API: ct tag
-  compare, wipe the output on BRISK_E_AUTH. Build on brisk__aes_ctr32. Vectors: GCM spec
-  cases, Wycheproof aes_gcm (skip non-96-bit IV and AES-192), differential, and decrypt the
-  RFC 9001 A.2 client Initial packet. Use `/implement-module` (the task text last time was the
-  line above).
+- M1c: vendor fiat-crypto `curve25519_{32,64}` and `p256_{32,64}` into `vendor/fiat/` untouched
+  (a hook blocks edits there) + `vendor/VENDORED.md` with the upstream commit and license +
+  NOTICE. Then X25519 (RFC 7748, incl. the 1,000-iteration test, reject all-zero output).
+  Use `/implement-module` with the ROADMAP line as the task text.
 
 ## Decisions / gotchas
-- brisk__aes_key is fixed at 248 B. It has an explicit `unsigned pad` because i386 aligns
-  uint64_t to 4, which would otherwise make it 244 B. A static assert in test_aes.c checks this.
-- Only one AES variant links per arch (ct64 on x86_64, aarch64, mips64, riscv64). The host x86
-  preset runs ct and host x64 runs ct64.
-- AES stack per call: ~0.6 KB (ct), ~1.1 KB (ct64).
-- brisk__aes_* does not check k->nr. That review finding was refuted: it is an internal API and
-  an uninitialised key is the caller's bug.
-- Still open: hand-check the -Os disassembly of aes_ct on mips/armv5 for constant time (or
-  wait for the M1b CT tooling / ctgrind task).
-- Reviewer agents again returned empty findings (2 of 3). The mutation run at
-  scratchpad mut_aes.py was the real check, so repeat that for GCM.
+- `dev.py ct` is x86_64-only (valgrind cannot run under qemu-user), so it builds twice: native
+  and `-DBRISK__AES_CT64=0` to cover the 32-bit AES/GHASH C. brisk_int.h now only defines
+  BRISK__AES_CT64 `#ifndef`, which is what makes that override possible.
+- Add every new primitive to tests/test_ct.c or it is simply not checked. If a run looks
+  suspiciously clean, inject `if (secret16[0] == 0x5A) { t_checks++; }` into test_ct() and
+  confirm both variants FAIL (that is how this one was verified).
+- Only one BRISK__CT_PUBLIC exists: the brisk__ct_memeq result (a failed tag check is public).
+  A second one needs a written reason.
+- Still open, now with a documented plan in ARCHITECTURE.md: armv5 / MIPS32 4K early-terminating
+  multipliers leak H through GHASH timing. Valgrind cannot see it. When M3 lands, those targets
+  get a multiply-free GHASH or no AES-GCM in the default ClientHello.
+- Reviewer round found 3, 2 confirmed (static `too_long` name clash with chacha20_poly1305.c for
+  the future amalgamation; the ARCHITECTURE wording above). The workflow hit the session limit in
+  its fix phase - the fixes, tests, size and commit were finished by hand.
 - Earlier deferred items still open: HMAC ctx use after failed init/final; kat.py per-source
-  minimum-count guards.
-- Cost: the implement-module workflow used ~480k subagent tokens for AES.
+  minimum-count guards; hand-check of the -Os aes_ct disassembly on mips/armv5.
+- Cost: the implement-module workflow used ~665k subagent tokens for GCM.
