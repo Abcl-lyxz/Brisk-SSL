@@ -1,45 +1,46 @@
-# Handoff - 2026-09-20 (session 5)
+# Handoff - 2026-09-20 (session 6)
 
 ## Done
-- 2e907ba crypto: vendored fiat-crypto v0.1.6 (`9d0682462646bf645cba7409fa45794dee0418aa`) into
-  `vendor/fiat/`: `{curve25519,p256}_{32,64}.c` byte-for-byte + COPYRIGHT/AUTHORS/all 3 licenses.
-  `vendor/VENDORED.md` has the pinned commit, per-file sha256 and the exact re-vendor command;
-  NOTICE updated, `.gitattributes` marks `vendor/**` vendored. No build wiring, no size delta.
-- 6dc658c crypto: X25519 (`src/crypto/x25519.c`, RFC 7748) - decodeScalar25519 on a private copy,
-  Montgomery ladder with mask/XOR cswap, 254-sq/11-mul Fermat inversion, all-zero reject
-  (RFC 7748 6.1/7, RFC 9846 7.4.2 -> `BRISK_E_ARG`, out wiped). 672 KAT rows + 3 iterated
-  (RFC 7748 5.2/6.1, RFC 8448, all 518 Wycheproof XdhComp, differential). 11 archs green,
-  `dev.py ct` green, baseline saved.
+- fba9ccb crypto: P-256 ECDHE + ECDSA verify (`src/crypto/p256.c`, ROADMAP M1c line ticked).
+  RCB-2015 complete addition, 256-step double-and-add-always ladder, Fermat inversion, in-house
+  8x32 CIOS Montgomery mod n. 462 ECDH / 299 verify / 74 keygen / 748 scalar rows; 11 archs green,
+  `dev.py ct` green on both field variants, baseline saved.
 
 ## In progress
-- Nothing. Tree clean. **Both commits are local - `git push` has not run yet.**
+- Nothing. Tree clean. **fba9ccb is not pushed yet** (the earlier two commits are).
 
 ## Next up
-- M1c: `P-256 ECDHE + ECDSA verify` on `vendor/fiat/p256_{32,64}.c` (trimmed fiat on 32-bit:
-  square=mul, Fermat inversion). Then `ECDSA P-256 sign, hedged RFC 6979 + sign-callback hook`.
-  Use `/implement-module` with the ROADMAP line as the task text - it worked well this session.
+- M1c: `ECDSA P-256 sign, hedged RFC 6979 (mTLS) + sign-callback hook`. `/implement-module` with
+  the ROADMAP line as task text. The mod-n core (`brisk__p256_scalar_{valid,reduce,add,mul,inv}`)
+  is already there and is what sign needs; `brisk__p256_scalar_inv` exponentiates the *public*
+  constant n-2, so it is safe on a secret k despite the `if (bit)`.
 
 ## Decisions / gotchas
-- fiat `_32` and `_64` export **identical function names and signatures**; only the field-element
-  typedef differs (5xu64 vs 10xu32). So the curve layer is written once and the variant is one
-  `#include`. Same trick will work for P-256.
-- `BRISK__FIAT_64` (brisk_int.h) needs `UINTPTR_MAX > 0xFFFFFFFF` **and** `__SIZEOF_INT128__`, so
-  x32/n32 take the 32-bit file. `-DBRISK__FIAT_64=0` forces it anywhere; `dev.py ct` uses that to
-  get valgrind over the 32-bit field code (same pattern as `BRISK__AES_CT64`).
-- fiat generates with `--static --inline`: the files are `#include`d into one of our TUs, **never**
-  added to `add_library`. Needs `-Ivendor` - added to CMake and to `.claude/hooks/post_edit.js`.
-  The including TU owns the `-Wunused-function` pragma push/pop around the include.
-- `vendor/` is edit-blocked by `pre_guard.js`. To change it: re-vendor per VENDORED.md.
-- A **second** `BRISK__CT_PUBLIC` now exists (the x25519 all-zero verdict); reason is written at
-  `src/crypto/x25519.c:217`. Still the rule: a new one needs a written reason.
-- Wipe limit, stated in the x25519 header: our locals are zeroed, but fiat keeps the same limbs in
-  its own frame and is edit-blocked, so a stack scan can still find field residue. Closing it means
-  scrubbing the stack window - a separate decision, not silently claimed.
-- **Size is the thing to watch.** 32-bit fiat is ~2x the 64-bit one (fully unrolled 10-limb carry
-  chains): x25519 flash = 3.9 KB riscv64/aarch64 but 9.2 KB i686, 8.9 KB mips/mipsel. TOTAL on
-  mipsel is now 27.6 KB. P-256 will be worse. Raise TINY-profile knobs before M8 if this matters.
-- The RFC 7748 1,000,000-iteration vector is in `tests/kat/x25519_iter.inc` but only runs with
-  `BRISK_TEST_SLOW=1`; 1,000 runs by default (hours under qemu-armv5 otherwise).
-- Still open from earlier sessions: armv5/MIPS32 GHASH timing leak (plan in ARCHITECTURE.md, fix at
-  M3); HMAC ctx use after failed init/final; `kat.py` per-source minimum-count guards; hand-check of
-  the `-Os` aes_ct disassembly on mips/armv5.
+- **`sc_mont_mul` requires a < n and b < n** (`p256.c:~555`, written there). Sign adds new call
+  sites: reduce every operand first. Without it `t[SC_LIMBS]` can reach 2, where one conditional
+  subtraction cannot reduce at all - two reviewers proposed a uniform-mask "fix" for
+  `sc_cond_sub_n`; it was refuted, it only swaps one wrong answer for another. The precondition is
+  the whole protection.
+- **Error-code split in verify, decided this session**: r or s outside [1, n-1] -> `BRISK_E_AUTH`
+  (FIPS 186-5 6.4.2 step 1 says INVALID, and RFC 9846 4.5.2 wants decrypt_error). A public key
+  that is not a point -> `BRISK_E_ARG` (bad_certificate). M3 must map them that way.
+- **`tools/kat.py fetch()` now enforces the sha256 column of `tests/kat/SOURCES.md`** and dies on
+  mismatch, cache hits included. Before, the table was rewritten from whatever was downloaded, so
+  it pinned nothing. If upstream republishes a file, update its SOURCES.md row in the same commit
+  as the regenerated vectors, deliberately. "Deliberately not used" lives in the kat.py template,
+  not in the .md - hand edits to SOURCES.md are overwritten.
+- **Stack figures are per optimisation level** (`p256.c` header has the table). 1504 B keygen/ECDH
+  and 1856 B verify at -Os; -O3 reaches 2160 B, -O0 (what the CMake presets use) about 4 KB. Do
+  not quote "2 KB" without the level.
+- **Size.** p256 is 6230 B (riscv64) to 17195 B (i686); `fiat_p256_mul` alone is over half the
+  32-bit figure. The in-house mod-n core is ~2 KB against the ~8-10 KB a re-vendored fiat
+  p256_scalar would have cost - that is why it is in-house. TOTAL on i686 is now 41.6 KB. TINY
+  profile knobs need raising before M8.
+- **Two hardening items deferred on purpose, not forgotten:**
+  1. `fe_cmov` (`p256.c`) and `fe_cswap` (`x25519.c`) have no compiler value barrier, while the
+     fiat code beside them was generated with one. Fix is one `brisk__ct_value_barrier_u32/u64` in
+     `src/util.c` and 4 call sites - do it for both files at once, with its own ct re-run.
+  2. Typedefs `fe` / `pt` / `sc_ctx` in p256.c are unprefixed. No collision today (an amalgamation
+     was compiled to check), but `p384.c` in M1d would want the same names. Rename at M8.
+- `tests/test_p256.c` does **not** pin `P256_P`; `check_p256_source_constants()` in kat.py does,
+  at generation time only. The header comment says so now - do not re-add the old claim.
