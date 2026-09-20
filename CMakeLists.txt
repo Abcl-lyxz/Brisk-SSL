@@ -32,7 +32,13 @@ endif()
 if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
     target_compile_options(brisk PRIVATE
         -Wall -Wextra -Wpedantic -Wshadow -Wcast-align -Wstrict-prototypes -Wundef -Wvla
-        -ffunction-sections -fdata-sections)
+        -ffunction-sections -fdata-sections
+        # Pinned, and PRIVATE so only our own TUs get it. Every stack figure in the sources
+        # (p256.c's header table) and every number in size/baseline.json is an -Os figure; -O3
+        # inlines the P-256 ladder until ECDSA verify passes the 2 KB budget. Comes after
+        # CMAKE_C_FLAGS/CMAKE_C_FLAGS_<CONFIG>, and the last -O wins, so it overrides the build
+        # type on purpose. A consumer who wants -O3 for *their* code still gets it.
+        -Os)
     if(NOT WIN32)
         # dead-code elimination needs the linker flag in the *final* link, so export it
         target_link_options(brisk INTERFACE -Wl,--gc-sections)

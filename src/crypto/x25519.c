@@ -48,6 +48,7 @@ static void fe_cswap(fe_tight a, fe_tight b, uint32_t swap)
 {
     fe_limb mask = (fe_limb)0 - (fe_limb)swap;
     size_t i;
+    BRISK__CT_BARRIER(mask);
     for (i = 0; i < FE_LIMBS; i++) {
         fe_limb t = mask & (a[i] ^ b[i]);
         a[i] ^= t;

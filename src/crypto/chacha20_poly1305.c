@@ -215,6 +215,7 @@ static void poly_finish(poly_state *st, uint8_t tag[16])
     g3 &= 0x3ffffff;
     g4 = h4 + c - (1u << 26);
     mask = (g4 >> 31) - 1; /* all ones if g4 >= 0 (take g), else zero (keep h) */
+    BRISK__CT_BARRIER(mask);
     h0 = (h0 & ~mask) | (g0 & mask);
     h1 = (h1 & ~mask) | (g1 & mask);
     h2 = (h2 & ~mask) | (g2 & mask);

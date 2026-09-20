@@ -65,6 +65,21 @@ static inline void brisk__store_le32(uint8_t *p, uint32_t v)
 #    define BRISK__CT_PUBLIC(p, n) ((void)0)
 #endif
 
+/* Value barrier: launders an integer lvalue through a register so the optimizer forgets what it
+ * knows about it. Use on a 0/all-ones select mask right after computing it - otherwise a compiler
+ * that can prove `flag` is 0 or 1 may turn the mask/XOR select back into a branch or a cmov on a
+ * target where cmov is not constant time. The vendored fiat code is generated with the same
+ * barrier, so this keeps our hand-written selects at its level. Takes an lvalue, modifies it in
+ * place, works for any integer width (the "+r" constraint picks the register class).
+ *
+ * ponytail: no-op on a non-GNU compiler, which leaves that build exactly as it was before this
+ * macro existed. Nothing in the support matrix (gcc, clang, mingw-gcc) lands there today. */
+#if defined(__GNUC__) || defined(__clang__)
+#    define BRISK__CT_BARRIER(x) __asm__ __volatile__("" : "+r"(x))
+#else
+#    define BRISK__CT_BARRIER(x) ((void)0)
+#endif
+
 /* ---- util.c ---- */
 /* 1 if the n bytes at a and b are equal, else 0. Time depends only on n. */
 int brisk__ct_memeq(const void *a, const void *b, size_t n);

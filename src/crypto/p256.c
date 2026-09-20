@@ -200,6 +200,7 @@ static void fe_cmov(fe out, const fe a, uint32_t flag)
 {
     p256_limb mask = (p256_limb)0 - (p256_limb)flag;
     size_t i;
+    BRISK__CT_BARRIER(mask);
     for (i = 0; i < FE_LIMBS; i++) {
         out[i] ^= mask & (out[i] ^ a[i]);
     }
@@ -498,6 +499,7 @@ static void sc_cond_sub_n(uint32_t r[SC_LIMBS], const uint32_t t[SC_LIMBS], uint
     /* Subtract when the extra limb was set (the value is certainly at least n) or when the
      * subtraction did not borrow out (t >= n). */
     mask = (uint32_t)0 - (hi | (borrow ^ 1));
+    BRISK__CT_BARRIER(mask);
     for (i = 0; i < SC_LIMBS; i++) {
         r[i] = (t[i] & ~mask) | (d[i] & mask);
     }
