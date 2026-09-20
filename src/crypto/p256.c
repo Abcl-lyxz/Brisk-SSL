@@ -1,8 +1,12 @@
-/* p256.c - P-256 (secp256r1) ECDHE and ECDSA verify on vendored fiat-crypto field arithmetic.
+/* p256.c - P-256 (secp256r1) ECDHE, ECDSA verify and ECDSA sign on vendored fiat-crypto field
+ * arithmetic.
  *
  * RFC 9846 4.3.8.2 (KeyShareEntry encoding and the MUST to validate the peer point), 7.4.2 (the
- * ECDHE shared secret), 4.3.3 (ecdsa_secp256r1_sha256); FIPS 186-5 6.4.2 (verify); domain
- * parameters from RFC 5903 3.1 = SP 800-186 3.2.1.3 = SEC 2 2.4.2.
+ * ECDHE shared secret), 4.3.3 (ecdsa_secp256r1_sha256); FIPS 186-5 6.4.2 (verify) and 6.4.1
+ * (sign) with the deterministic-plus-hedged nonce of RFC 6979 3.2/3.6; domain parameters from
+ * RFC 5903 3.1 = SP 800-186 3.2.1.3 = SEC 2 2.4.2. Signing sits behind BRISK_ENABLE_MTLS: this
+ * file is linked into every build for ECDHE, which is mandatory-to-implement, so a TINY image
+ * would otherwise carry a signer it never runs.
  *
  * The field layer is vendor/fiat/p256_{64,32}.c, generated and proved by fiat-crypto. Every
  * function there is `static`, so the file is #included here rather than compiled on its own
@@ -31,9 +35,10 @@
  * fixed 256 steps with a mask/XOR select, the field inversion walks a fixed exponent chain (never
  * a binary GCD; fiat's divstep would also have done, it is just bigger), and the mod-n inversion
  * walks the bits of the public constant
- * n-2. Four values are declassified, each with its reason written at the point of use: the
- * private-key range verdict in keygen/ECDH, the peer point and its validity verdict, the "the
- * result is the point at infinity" bit in pt_encode, and every input to ECDSA verify. A caveat
+ * n-2. Five values are declassified, each with its reason written at the point of use: the
+ * private-key range verdict in keygen/ECDH/sign, the peer point and its validity verdict, the
+ * "the result is the point at infinity" bit in pt_encode, every input to ECDSA verify, and the
+ * one-bit "this RFC 6979 candidate was rejected" verdict in the signing retry loop. A caveat
  * valgrind cannot see: on armv5 and MIPS32 the 32x32->64
  * multiply is variable latency, in both fiat p256_32 and the scalar core below - the same caveat
  * already logged for GHASH in docs/ARCHITECTURE.md.
@@ -42,15 +47,29 @@
  * and the ladder keeps an accumulator, an addend and the base alive. Measured with -fstack-usage
  * on gcc 10.3 and summed along the deepest call chain, at the optimisation level named - because
  * the figure is NOT optimisation-independent, and saying so would be the easy lie here:
- *   -Os, x86_64 / 64-bit field: ecdh 448 + pt_mul 320 + pt_add 416 + fiat_p256_mul 320 = 1504 B,
- *                               verify 800 + 320 + 416 + 320 = 1856 B
- *   -O2, i686 / 32-bit field:   1224 B and 1576 B
- *   -O3, x86_64:                1808 B and 2160 B   <- over the budget below
- *   -O0, x86_64:                3680 B and 4016 B   <- what the Debug presets run under qemu
- * Budget 2 KB, which holds at -Os and -O2 and is what a release build should use; -O3 inlines
- * fe_inv/fe_pow2k into their callers and pt_add's frame grows 416 -> 560. That is above
- * brisk__aes_key's 1.1 KB, and nothing here uses a VLA or malloc to hide it, so these are whole
- * frames and what you measure is what you get - but measure the level you ship.
+ *                               ecdh / verify / sign, deepest chain, in bytes
+ *   -Os, x86_64 / 64-bit field: 1504 (448 + pt_mul 320 + pt_add 416 + fiat_p256_mul 320)
+ *                               1856 (verify 800 + 320 + 416 + 320)
+ *                               2688 (sign 832 + verify 800 + 320 + 416 + 320)
+ *   -O2, x86_64:                1792 / 2144 / 3200   <- verify and sign both over budget
+ *   -O3, x86_64:                1552 / 1904 / 3328   <- sign over budget
+ *   -O2, i686 / 32-bit field:   1224 / 1576 / 2296
+ * Budget 3 KB with BRISK_ENABLE_MTLS, 2 KB without. Only -Os meets both on the 64-bit field, and
+ * that is why -Os is pinned PRIVATE in CMakeLists.txt (so the build type's -O0/-O2 never reaches
+ * library code, and there is no -O0 row to quote). Do not raise the level without re-measuring.
+ * The sign figure is the fault-check verify nested inside the signing frame:
+ * gcc gives brisk__p256_ecdsa_sign 832 B (the inlined rfc6979_ctx, the inlined
+ * ecdsa_sign_with_k with its two pt and one 65-byte encoding, and the self-verify's pub[65]) and
+ * then brisk__p256_ecdsa_verify's own 800 B sits on top of it. Keeping the DRBG scoped and the
+ * verify in a sibling block is what stops it being worse; it cannot be made to disappear, and
+ * dropping the countermeasure to save the kilobyte is the one simplification not on offer here.
+ * The RFC 6979 branch is shallower, but not by as much as it looks: rfc6979_reseed ends in a real
+ * call to rfc6979_v, not a sibling call (&h escapes to brisk__secure_zero), so both frames stack:
+ * sign 832 + rfc6979_reseed 496 + rfc6979_v 480 + brisk_hmac_init 368 + brisk__hash_update 8 +
+ * brisk_sha512_update 80 + sha512_block 320 = 2584 B at -Os. -O3 inlines fe_inv/fe_pow2k into
+ * their callers and pt_add's frame grows 416 -> 560. All of this is above brisk__aes_key's 1.1 KB,
+ * and nothing here uses a VLA or malloc to hide it, so these are whole frames and what you measure
+ * is what you get - but measure the level you ship.
  *
  * Wipe scope, stated as honestly as the x25519 header states its own: our named locals holding a
  * secret or an intermediate are zeroed before return. What we do not reach is the frame of
@@ -559,7 +578,8 @@ static void sc_init(sc_ctx *c)
  * final t[SC_LIMBS] is 0 or 1, which is the only range sc_cond_sub_n can correct. Feed it an
  * unreduced operand and t[SC_LIMBS] can reach 2, where one conditional subtraction cannot reduce
  * at all and the result is silently wrong - no mask trick rescues that, only the precondition.
- * ECDSA signing is the next roadmap line and will add call sites: reduce there too. */
+ * The sign path honours it too: ecdsa_sign_with_k only ever goes through
+ * brisk__p256_scalar_{reduce,add,mul,inv}, which reduce before they get here. */
 static void sc_mont_mul(uint32_t r[SC_LIMBS], const uint32_t a[SC_LIMBS],
                         const uint32_t b[SC_LIMBS], const uint32_t n[SC_LIMBS], uint32_t n0)
 {
@@ -815,6 +835,211 @@ int brisk__p256_ecdsa_verify(const uint8_t pub[65], const uint8_t *hash, size_t 
     brisk__p256_scalar_reduce(v, enc + 1);
     return brisk__ct_memeq(v, sig, 32) ? BRISK_OK : BRISK_E_AUTH;
 }
+
+#if BRISK_ENABLE_MTLS
+/* ------------------------------------------------------- ECDSA sign: RFC 6979 nonce + 6.4.1 */
+/* The per-signature HMAC_DRBG of RFC 6979 3.2. It is nonce derivation, not a randomness source -
+ * seeded only from (d, h1, k'), never persisted, never reseeded from anywhere - so the "no
+ * userspace DRBG" rule in .claude/rules/crypto.md is not in play here. Written out so a reviewer
+ * does not have to re-derive that.
+ *
+ * K and V are hlen bytes, where hlen is the digest length of the SAME hash that produced the
+ * message digest (3.2 b). Everything in it is secret. */
+typedef struct {
+    uint8_t k[BRISK_HASH_MAX_LEN]; /* DRBG K */
+    uint8_t v[BRISK_HASH_MAX_LEN]; /* DRBG V */
+    brisk_hash_alg alg;
+    uint8_t hlen;
+    uint8_t started; /* 0 until the first candidate; a public loop flag, not data */
+} rfc6979_ctx;
+
+/* V = HMAC_K(V). */
+static void rfc6979_v(rfc6979_ctx *c)
+{
+    brisk_hmac_ctx h;
+    brisk_hmac_init(&h, c->alg, c->k, c->hlen);
+    brisk_hmac_update(&h, c->v, c->hlen);
+    brisk_hmac_final(&h, c->v); /* wipes h's keyed states */
+    brisk__secure_zero(&h, sizeof h);
+}
+
+/* K = HMAC_K(V || tag || int2octets(x) || bits2octets(h1) || k'), then V = HMAC_K(V): steps d+e
+ * (tag 0x00), f+g (tag 0x01) and the h.3 reject path (tag 0x00 with priv == NULL, so the suffix
+ * is absent).
+ *
+ * int2octets(x) (RFC 6979 2.3.3) is `priv` unchanged, because rlen = 256 = qlen for P-256; there
+ * is no re-encoding step. bits2octets(h1) (2.3.4) is `z`, computed once by the caller.
+ * k' is appended AFTER bits2octets(h1) - RFC 6979 3.6, bullet 2. Check that order against the
+ * RFC text, not against this code: it is the one thing the hedged mode can get wrong, and no
+ * official vector covers it (3.6: a variant "ceases to be verifiable against the test vectors
+ * published in this document"). What guards it instead is that extra_len == 0 must still
+ * reproduce A.2.5 byte-for-byte. */
+static void rfc6979_reseed(rfc6979_ctx *c, uint8_t tag, const uint8_t *priv, const uint8_t *z,
+                           const uint8_t *extra, size_t extra_len)
+{
+    brisk_hmac_ctx h;
+    brisk_hmac_init(&h, c->alg, c->k, c->hlen);
+    brisk_hmac_update(&h, c->v, c->hlen);
+    brisk_hmac_update(&h, &tag, 1);
+    if (priv != NULL) {
+        brisk_hmac_update(&h, priv, BRISK__P256_SCALAR_LEN);
+        brisk_hmac_update(&h, z, BRISK__P256_SCALAR_LEN);
+        if (extra_len != 0) {
+            brisk_hmac_update(&h, extra, extra_len);
+        }
+    }
+    brisk_hmac_final(&h, c->k);
+    brisk__secure_zero(&h, sizeof h);
+    rfc6979_v(c);
+}
+
+/* RFC 6979 3.2 steps a-g. */
+static void rfc6979_init(rfc6979_ctx *c, brisk_hash_alg alg, const uint8_t priv[32],
+                         const uint8_t z[32], const uint8_t *extra, size_t extra_len)
+{
+    c->alg = alg;
+    c->hlen = (uint8_t)brisk_hash_len(alg);
+    c->started = 0;
+    memset(c->v, 0x01, c->hlen);                        /* a: V = 0x01 repeated hlen times */
+    memset(c->k, 0x00, c->hlen);                        /* b: K = 0x00 repeated hlen times */
+    rfc6979_reseed(c, 0x00, priv, z, extra, extra_len); /* c+d+e */
+    rfc6979_reseed(c, 0x01, priv, z, extra, extra_len); /* f+g */
+}
+
+/* Step h: the next candidate k. The first call generates from the state step g left; every later
+ * call first runs the h.3 reject path (K = HMAC_K(V || 0x00), V = HMAC_K(V)), because a later
+ * call happens only when the previous candidate was rejected - either out of range here, or
+ * r == 0 / s == 0 in the caller (RFC 6979 3.4 reuses the same mechanism).
+ *
+ * bits2int of T (2.3.2) is the leftmost 32 bytes: qlen = 256 and every accepted hash is at least
+ * 256 bits, so one pass of step h.2 always yields enough and there is no shifting path. The
+ * candidate is COMPARED against q, never reduced mod q - reducing would bias k.
+ * Returns 1 when 1 <= k <= n-1. */
+static int rfc6979_next(rfc6979_ctx *c, uint8_t k_out[32])
+{
+    if (c->started) {
+        rfc6979_reseed(c, 0x00, NULL, NULL, NULL, 0);
+    }
+    c->started = 1;
+    rfc6979_v(c); /* h.2: T = V, one pass */
+    memcpy(k_out, c->v, BRISK__P256_SCALAR_LEN);
+    return brisk__p256_scalar_valid(k_out);
+}
+
+/* FIPS 186-5 6.4.1 steps 4-7 with k already chosen: (x1, y1) = k*G, r = x1 mod n,
+ * s = k^-1 (e + r*d) mod n, written as r || s. `e` is the reduced digest, which for P-256 is the
+ * same value as bits2octets(h1). Returns 1 iff r and s are both non-zero - the caller retries
+ * with the next k otherwise (RFC 6979 3.4).
+ *
+ * No scalar blinding: k^-1 goes through brisk__p256_scalar_inv, which is Fermat over a fixed
+ * public exponent, and every multiplication is the constant-time sc_mont_mul, so no intermediate
+ * is compared or branched on. Blinding would cost another 32 bytes of entropy and a multiply;
+ * that is a decision to take deliberately, not by omission. */
+static uint32_t ecdsa_sign_with_k(uint8_t sig[64], const uint8_t k[32], const uint8_t priv[32],
+                                  const uint8_t e[32])
+{
+    pt g, r;
+    fe bm, r2;
+    uint8_t enc[65], kinv[32], t[32];
+    uint32_t ok;
+
+    p256_consts(bm, r2);
+    p256_gen(&g, r2);
+    pt_mul(&r, k, &g, bm);
+    ok = pt_encode(enc, &r); /* k in [1, n-1] against a prime-order G: never infinity */
+    brisk__p256_scalar_reduce(sig, enc + 1);   /* r = x1 mod n */
+    brisk__p256_scalar_inv(kinv, k);           /* k^-1 mod n */
+    brisk__p256_scalar_mul(t, sig, priv);      /* r * d */
+    brisk__p256_scalar_add(t, t, e);           /* e + r*d */
+    brisk__p256_scalar_mul(sig + 32, kinv, t); /* s */
+    /* Both are already reduced mod n, so "valid" here is exactly "non-zero". */
+    ok &= (uint32_t)brisk__p256_scalar_valid(sig) & (uint32_t)brisk__p256_scalar_valid(sig + 32);
+
+    brisk__secure_zero(&r, sizeof r);
+    brisk__secure_zero(enc, sizeof enc);
+    brisk__secure_zero(kinv, sizeof kinv);
+    brisk__secure_zero(t, sizeof t);
+    return ok;
+}
+
+int brisk__p256_ecdsa_sign(uint8_t sig[64], const uint8_t priv[32], const uint8_t *hash,
+                           size_t hash_len, const uint8_t *extra, size_t extra_len)
+{
+    brisk_hash_alg alg;
+    rfc6979_ctx drbg;
+    uint8_t z[32], k[32], out[64];
+    int ok, rc = BRISK_E_AUTH;
+    unsigned tries;
+
+    /* hash_len picks the RFC 6979 hash as well as bounding the digest, so it is not a ">= 32"
+     * check: it must be exactly the width of the H that produced `hash` (RFC 6979 3.2 b). */
+    if (hash_len == BRISK_SHA256_LEN) {
+        alg = BRISK_HASH_SHA256;
+    } else if (hash_len == BRISK_SHA384_LEN) {
+        alg = BRISK_HASH_SHA384;
+    } else if (hash_len == BRISK_SHA512_LEN) {
+        alg = BRISK_HASH_SHA512;
+    } else {
+        return BRISK_E_ARG; /* a caller bug; sig is left untouched */
+    }
+
+    ok = brisk__p256_scalar_valid(priv);
+    /* BRISK__CT_PUBLIC: the one-bit range verdict for d, not d itself - the same declassification
+     * brisk__p256_keygen makes, for the same reason (FIPS 186-5 A.2.2 tests candidates, so the
+     * caller loops visibly). */
+    BRISK__CT_PUBLIC(&ok, sizeof ok);
+    if (!ok) {
+        return BRISK_E_ARG; /* sig untouched, so the caller can retry into it */
+    }
+
+    /* bits2octets(h1) (RFC 6979 2.3.4) = bits2int(h1) mod n. bits2int is the leftmost
+     * min(qlen, bitlen H) bits = the first 32 bytes, so this is exactly a scalar_reduce over
+     * them - and the same value is e of FIPS 186-5 6.4.1, so it is computed once. */
+    brisk__p256_scalar_reduce(z, hash);
+    rfc6979_init(&drbg, alg, priv, z, extra, extra_len);
+    /* Bounded: an unbounded secret-dependent loop is not acceptable on an IoT watchdog budget.
+     * A candidate is rejected with p ~ 2^-32 (out of range) or p ~ 2^-128 (r or s zero), so
+     * reaching 64 is a 2^-2048-class event - a bug or a fault, and it fails closed. */
+    for (tries = 0; tries < 64; tries++) {
+        int got = rfc6979_next(&drbg, k);
+        BRISK__CT_PUBLIC(&got, sizeof got); /* the accept/reject bit, never k */
+        if (!got) {
+            continue;
+        }
+        got = (int)ecdsa_sign_with_k(out, k, priv, z);
+        BRISK__CT_PUBLIC(&got, sizeof got);
+        if (got) {
+            rc = BRISK_OK;
+            break;
+        }
+    }
+    brisk__secure_zero(&drbg, sizeof drbg);
+    brisk__secure_zero(k, sizeof k);
+    brisk__secure_zero(z, sizeof z);
+
+    if (rc == BRISK_OK) {
+        /* Fault countermeasure, deliberately not in the RFC: verify what we just produced. A
+         * single glitched ECDSA signature leaks the long-term device key, and on hardware that
+         * sits in a cabinet for ten years that is the risk worth one keygen plus one verify. Kept
+         * in a sibling scope so its frame does not stack on the signing block's. */
+        uint8_t pub[65];
+        if (brisk__p256_keygen(pub, priv) != BRISK_OK ||
+            brisk__p256_ecdsa_verify(pub, hash, hash_len, out) != BRISK_OK) {
+            rc = BRISK_E_AUTH;
+        }
+        brisk__secure_zero(pub, sizeof pub);
+    }
+    /* sig may alias hash and/or extra, so it is written only now that both are consumed. On any
+     * failure past the argument checks it is zeroed, never left half-written. */
+    if (rc == BRISK_OK) {
+        memcpy(sig, out, sizeof out);
+    } else {
+        memset(sig, 0, BRISK__P256_SIG_LEN);
+    }
+    brisk__secure_zero(out, sizeof out);
+    return rc;
+}
+#endif /* BRISK_ENABLE_MTLS */
 
 #undef FE_LIMBS
 #undef FE_LIMB_BITS

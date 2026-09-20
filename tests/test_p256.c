@@ -1,7 +1,14 @@
-/* test_p256.c - P-256 (secp256r1) ECDHE and ECDSA verify against RFC 5903 3.1/8.1, NIST CAVP
- * (KAS ECC CDH, 186-3 ECDSAVS KeyPair/PKV/SigVer at SHA-256, SHA-384 and SHA-512), the full
- * Wycheproof ecdh_secp256r1_ecpoint and ecdsa_secp256r1_sha256_p1363 suites, RFC 6979 A.2.5 and a
- * seeded differential set (tests/kat/SOURCES.md).
+/* test_p256.c - P-256 (secp256r1) ECDHE, ECDSA verify and ECDSA sign against RFC 5903 3.1/8.1,
+ * NIST CAVP (KAS ECC CDH, 186-3 ECDSAVS KeyPair/PKV/SigVer/SigGen at SHA-256, SHA-384 and
+ * SHA-512), the full Wycheproof ecdh_secp256r1_ecpoint and ecdsa_secp256r1_sha256_p1363 suites,
+ * RFC 6979 A.2.5 and a seeded differential set (tests/kat/SOURCES.md).
+ *
+ * Signing (BRISK_ENABLE_MTLS): the 6 usable RFC 6979 A.2.5 rows are the only official pin on the
+ * deterministic-k derivation, and tools/kat.py checks the published k as well as r and s before
+ * emitting them. The hedged rows (RFC 6979 3.6) can only be generated - the RFC itself says a
+ * variant stops matching its published vectors - so what anchors them is that the same code path
+ * with k' absent reproduces A.2.5 byte-for-byte. The k-out-of-range and r/s == 0 retries ship
+ * with no vector coverage at all; that gap is recorded in tests/kat/SOURCES.md.
  *
  * Wycheproof flag coverage worth naming, counted as EMITTED - tools/kat.py drops every row whose
  * point is not 65 bytes or whose signature is not 64, so the upstream per-flag totals are larger:
@@ -35,10 +42,12 @@
  * satisfy with no vectors at all (inv(a)*a == 1, inv(0) == 0, add(a, n-a) == 0).
  *
  * The `deep` flag on a row also runs it at buffer offsets 1..3 with 0xA5 canaries. Running all
- * 462 ECDH and 299 verify rows four times over would blow the 900 s qemu-armv5 budget, so `deep`
- * marks the interesting ones: the RFC, CAVP and generated rows, plus every Wycheproof row whose
- * expected result is not "valid" (tools/kat.py sets deep = result != "valid" there, so the 204
- * EdgeCaseDoubling rows and the other valid edge cases run at offset 0 only).
+ * 462 ECDH and 344 verify rows four times over would blow the 900 s qemu-armv5 budget, so `deep`
+ * marks the interesting ones: the RFC, CAVP SigVer and generated rows, plus every Wycheproof row
+ * whose expected result is not "valid" (tools/kat.py sets deep = result != "valid" there, so the
+ * 204 EdgeCaseDoubling rows and the other valid edge cases run at offset 0 only). The 45 CAVP
+ * SigGen rows are deep = 0 for the same budget reason - they are there to pin keygen(d) and the
+ * published (R, S), not to repeat the mutation pass.
  *
  * Every entry point here is one-shot over fixed-size buffers - there is no streaming API - so the
  * c-code rule's "split input" case does not apply; nothing is missing.
@@ -72,12 +81,19 @@ struct p256_scalar_kat {
     int op; /* 0 = reduce(a), 1 = add(a,b), 2 = mul(a,b), 3 = inv(a) */
     const char *a, *b, *r;
 };
+struct p256_sign_kat {
+    const char *priv, *hash, *extra, *sig;
+    int ok; /* 1 = BRISK_OK and sig is exact; 0 = BRISK_E_ARG with sig untouched */
+};
 
 #include "kat/p256_ecdh.inc"
 #include "kat/p256_keygen.inc"
 #include "kat/p256_params.inc"
 #include "kat/p256_scalar.inc"
 #include "kat/p256_verify.inc"
+#if BRISK_ENABLE_MTLS
+#    include "kat/p256_sign.inc"
+#endif
 
 #define N(a) (sizeof(a) / sizeof((a)[0]))
 
@@ -85,7 +101,10 @@ struct p256_scalar_kat {
  * leave that prose (and the qemu-armv5 budget argument built on it) quietly stale. Same idiom as
  * test_aes.c:53. Update both places together. */
 typedef char p256_ecdh_row_count[N(P256_ECDH_KAT) == 462 ? 1 : -1];
-typedef char p256_verify_row_count[N(P256_VERIFY_KAT) == 299 ? 1 : -1];
+typedef char p256_verify_row_count[N(P256_VERIFY_KAT) == 344 ? 1 : -1];
+#if BRISK_ENABLE_MTLS
+typedef char p256_sign_row_count[N(P256_SIGN_KAT) == 57 ? 1 : -1];
+#endif
 
 #define SL     BRISK__P256_SCALAR_LEN /* 32 */
 #define PL     BRISK__P256_POINT_LEN  /* 65 */
@@ -451,10 +470,197 @@ static void test_verify(void)
     }
 }
 
+#if BRISK_ENABLE_MTLS
+/* ------------------------------------------------------------------------------ ECDSA sign */
+/* One sign at chosen offsets, with canaries around the output. */
+static void sign_one(const uint8_t *priv, const uint8_t *h, size_t hlen, const uint8_t *ex,
+                     size_t exlen, const uint8_t *want, size_t os, size_t op, size_t oh, size_t oe,
+                     long idx)
+{
+    uint8_t ss[GL + 8 + CANARY], ps[SL + 8], hs[96 + 8], es[64 + 8];
+    memcpy(ps + op, priv, SL);
+    memcpy(hs + oh, h, hlen);
+    if (exlen) {
+        memcpy(es + oe, ex, exlen);
+    }
+    memset(ss + os, 0, GL);
+    memset(ss + os + GL, 0xA5, CANARY);
+    CHECKI(brisk__p256_ecdsa_sign(ss + os, ps + op, hs + oh, hlen, exlen ? es + oe : NULL, exlen) ==
+               BRISK_OK,
+           idx);
+    CHECKI(memcmp(ss + os, want, GL) == 0, idx);
+    CHECKI(canary_ok(ss + os + GL, CANARY), idx);
+    CHECKI(memcmp(ps + op, priv, SL) == 0, idx); /* inputs are never modified */
+    CHECKI(memcmp(hs + oh, h, hlen) == 0, idx);
+}
+
+static void test_sign(void)
+{
+    uint8_t priv[SL], h[96], ex[64], want[GL], sig[GL], pub[PL], buf[128];
+    size_t i, hlen, exlen;
+
+    for (i = 0; i < N(P256_SIGN_KAT); i++) {
+        const struct p256_sign_kat *v = &P256_SIGN_KAT[i];
+        CHECKI(t_unhex(v->priv, priv, SL) == SL, i);
+        hlen = t_unhex(v->hash, h, sizeof h);
+        exlen = t_unhex(v->extra, ex, sizeof ex);
+        memset(sig, 0xA5, GL);
+        if (!v->ok) {
+            /* Bad d, or a hash_len that is not 32/48/64: BRISK_E_ARG before any DRBG or point
+             * work, with sig left untouched so the caller can retry into the same buffer. */
+            CHECKI(brisk__p256_ecdsa_sign(sig, priv, h, hlen, exlen ? ex : NULL, exlen) ==
+                       BRISK_E_ARG,
+                   i);
+            CHECKI(canary_ok(sig, GL), i);
+            continue;
+        }
+        CHECKI(t_unhex(v->sig, want, GL) == GL, i);
+        CHECKI(brisk__p256_ecdsa_sign(sig, priv, h, hlen, exlen ? ex : NULL, exlen) == BRISK_OK, i);
+        CHECKI(memcmp(sig, want, GL) == 0, i);
+        /* The signature must verify under the matching public key. (The module already
+         * self-verifies internally; this pins that the key it used is keygen(priv).) */
+        CHECKI(brisk__p256_keygen(pub, priv) == BRISK_OK, i);
+        CHECKI(brisk__p256_ecdsa_verify(pub, h, hlen, sig) == BRISK_OK, i);
+    }
+
+    /* Everything below runs on one vector: each extra sign costs four scalar multiplications
+     * (the sign itself, plus the keygen and two inside the fault-check verify), and the p256
+     * suite has a 900 s qemu-armv5 budget. */
+    CHECK(t_unhex(P256_SIGN_KAT[0].priv, priv, SL) == SL);
+    hlen = t_unhex(P256_SIGN_KAT[0].hash, h, sizeof h);
+    CHECK(t_unhex(P256_SIGN_KAT[0].sig, want, GL) == GL);
+    CHECK(brisk__p256_keygen(pub, priv) == BRISK_OK);
+
+    /* Unaligned: every buffer at every offset 0..7, rotated so each one sees each offset. The
+     * full 8^4 cross product would be 4096 signatures and buys nothing - an alignment fault
+     * depends on one pointer's low bits, not on a combination. */
+    for (i = 0; i < 8; i++) {
+        sign_one(priv, h, hlen, NULL, 0, want, i, (i + 1) % 8, (i + 3) % 8, (i + 5) % 8, (long)i);
+    }
+
+    /* Aliasing: sig is written only after hash and extra are consumed. */
+    memcpy(buf, h, hlen);
+    CHECK(brisk__p256_ecdsa_sign(buf, priv, buf, hlen, NULL, 0) == BRISK_OK);
+    CHECK(memcmp(buf, want, GL) == 0);
+    memcpy(buf, h, hlen); /* sig overlapping extra, and extra == hash */
+    CHECK(brisk__p256_ecdsa_sign(buf + 4, priv, buf, hlen, buf, hlen) == BRISK_OK);
+    {
+        uint8_t ref[GL];
+        CHECK(brisk__p256_ecdsa_sign(ref, priv, h, hlen, h, hlen) == BRISK_OK);
+        CHECK(memcmp(buf + 4, ref, GL) == 0);
+    }
+
+    /* Hedging: k' = NULL reproduces the RFC 6979 A.2.5 row exactly - the proof that the hedged
+     * code path and the deterministic one are the same path - while two different k' give two
+     * different signatures, both valid. */
+    {
+        uint8_t e1[32], e2[32], s1[GL], s2[GL];
+        memset(e1, 0x01, sizeof e1);
+        memset(e2, 0x02, sizeof e2);
+        CHECK(brisk__p256_ecdsa_sign(s1, priv, h, hlen, e1, sizeof e1) == BRISK_OK);
+        CHECK(brisk__p256_ecdsa_sign(s2, priv, h, hlen, e2, sizeof e2) == BRISK_OK);
+        CHECK(memcmp(s1, s2, GL) != 0);
+        CHECK(memcmp(s1, want, GL) != 0);
+        CHECK(brisk__p256_ecdsa_verify(pub, h, hlen, s1) == BRISK_OK);
+        CHECK(brisk__p256_ecdsa_verify(pub, h, hlen, s2) == BRISK_OK);
+        /* Same k' twice is the same signature: the variant is still deterministic. */
+        CHECK(brisk__p256_ecdsa_sign(s2, priv, h, hlen, e1, sizeof e1) == BRISK_OK);
+        CHECK(memcmp(s1, s2, GL) == 0);
+        /* extra_len 0 with a non-NULL pointer is the same as NULL. */
+        CHECK(brisk__p256_ecdsa_sign(s2, priv, h, hlen, e1, 0) == BRISK_OK);
+        CHECK(memcmp(s2, want, GL) == 0);
+    }
+
+    /* Negative: one flipped bit anywhere must stop it verifying, and a signature made with d
+     * does not verify under a different key. */
+    {
+        uint8_t t[GL], h2[96], pub2[PL], priv2[SL];
+        size_t k;
+        for (k = 0; k < 8; k++) {
+            size_t bit = (k * 53) % (GL * 8);
+            memcpy(t, want, GL);
+            t[bit / 8] = (uint8_t)(t[bit / 8] ^ (1u << (bit % 8)));
+            CHECKI(brisk__p256_ecdsa_verify(pub, h, hlen, t) != BRISK_OK, (long)k);
+            bit = (k * 37) % (32 * 8); /* only the leftmost 32 bytes feed e */
+            memcpy(h2, h, hlen);
+            h2[bit / 8] = (uint8_t)(h2[bit / 8] ^ (1u << (bit % 8)));
+            CHECKI(brisk__p256_ecdsa_verify(pub, h2, hlen, want) != BRISK_OK, (long)k);
+        }
+        memcpy(priv2, priv, SL);
+        priv2[SL - 1] = (uint8_t)(priv2[SL - 1] ^ 0x01);
+        CHECK(brisk__p256_keygen(pub2, priv2) == BRISK_OK);
+        CHECK(brisk__p256_ecdsa_verify(pub2, h, hlen, want) == BRISK_E_AUTH);
+    }
+
+    /* hash_len is checked before anything reads `hash`, so a poisoned pointer must survive. The
+     * generated rows cover 31/33/47/49/63/65; these are the ones no vector can express. */
+    {
+        static const size_t bad[] = {0, 1, 2, 16, 96, (size_t)-1};
+        for (i = 0; i < N(bad); i++) {
+            memset(sig, 0xA5, GL);
+            CHECKI(brisk__p256_ecdsa_sign(sig, priv, NULL, bad[i], NULL, 0) == BRISK_E_ARG, i);
+            CHECKI(canary_ok(sig, GL), i);
+        }
+    }
+}
+/* The brisk_sign_fn hook (include/brisk.h). It has no caller until the M3 handshake, so what can
+ * be tested today is the contract itself, and that is worth pinning before an integrator builds
+ * against it: `tbs` is the raw to-be-signed bytes and NOT a digest, the output is the RAW r || s
+ * and not DER, a scheme other than ecdsa_secp256r1_sha256 is BRISK_E_ARG, and a buffer smaller
+ * than the signature is a refusal rather than a truncation. The callback below is exactly what a
+ * software signer looks like; a secure-element one passes its PKCS#11 output straight through. */
+#    define SCHEME_ECDSA_P256_SHA256 0x0403
+
+static int demo_sign(void *ctx, uint16_t scheme, const uint8_t *tbs, size_t tbs_len, uint8_t *sig,
+                     size_t sig_cap, size_t *sig_len)
+{
+    uint8_t digest[BRISK_SHA256_LEN];
+    int rc;
+    if (scheme != SCHEME_ECDSA_P256_SHA256 || sig_cap < BRISK_SIG_ECDSA_P256_LEN) {
+        return BRISK_E_ARG; /* never truncate: a short buffer is a caller bug */
+    }
+    brisk_sha256(tbs, tbs_len, digest);
+    rc = brisk__p256_ecdsa_sign(sig, (const uint8_t *)ctx, digest, sizeof digest, NULL, 0);
+    if (rc == BRISK_OK) {
+        *sig_len = BRISK_SIG_ECDSA_P256_LEN;
+    }
+    brisk__secure_zero(digest, sizeof digest);
+    return rc;
+}
+
+static void test_sign_hook(void)
+{
+    brisk_sign_fn fn = demo_sign;
+    uint8_t priv[SL], pub[PL], sig[GL + 1], digest[BRISK_SHA256_LEN];
+    static const uint8_t tbs[] = "TLS 1.3, server CertificateVerify";
+    size_t sig_len = 0;
+
+    CHECK(t_unhex(P256_SIGN_KAT[0].priv, priv, SL) == SL);
+    CHECK(brisk__p256_keygen(pub, priv) == BRISK_OK);
+    memset(sig, 0xA5, sizeof sig);
+    CHECK(fn(priv, SCHEME_ECDSA_P256_SHA256, tbs, sizeof tbs - 1, sig, GL, &sig_len) == BRISK_OK);
+    CHECK(sig_len == BRISK_SIG_ECDSA_P256_LEN);
+    CHECK(sig[GL] == 0xA5); /* wrote exactly sig_len bytes */
+    /* Raw r || s, over the digest of the RAW tbs bytes - not DER, and tbs is not pre-hashed. */
+    brisk_sha256(tbs, sizeof tbs - 1, digest);
+    CHECK(brisk__p256_ecdsa_verify(pub, digest, sizeof digest, sig) == BRISK_OK);
+
+    memset(sig, 0xA5, sizeof sig);
+    CHECK(fn(priv, 0x0804, tbs, sizeof tbs - 1, sig, GL, &sig_len) == BRISK_E_ARG); /* rsa_pss */
+    CHECK(fn(priv, SCHEME_ECDSA_P256_SHA256, tbs, sizeof tbs - 1, sig, GL - 1, &sig_len) ==
+          BRISK_E_ARG);
+    CHECK(canary_ok(sig, GL)); /* refused, not truncated */
+}
+#endif /* BRISK_ENABLE_MTLS */
+
 void test_p256(void)
 {
     test_scalar();
     test_keygen();
     test_ecdh();
     test_verify();
+#if BRISK_ENABLE_MTLS
+    test_sign();
+    test_sign_hook();
+#endif
 }

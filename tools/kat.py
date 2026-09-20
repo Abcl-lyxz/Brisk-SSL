@@ -1495,6 +1495,202 @@ def rfc6979_verify():
     return rows
 
 
+# ---------------------------------------------------------------- P-256 ECDSA signing
+# sign row = (priv, hash, extra, sig64, ok). ok = 0 means BRISK_E_ARG with `sig` untouched: d
+# outside [1, n-1], or a hash_len the module does not accept. `extra` is the RFC 6979 3.6 hedging
+# input k'; empty means plain RFC 6979, which is what keeps the A.2.5 rows usable as a self-test
+# of the hedged code path.
+def py_ecdsa_sign_with_k(d, e, k):
+    """FIPS 186-5 6.4.1 steps 4-7 with k given. None when r == 0 or s == 0, i.e. retry."""
+    n = P256["n"]
+    R = py_p256_mul(k, P256_G)
+    if R is None:
+        return None
+    r = R[0] % n
+    if r == 0:
+        return None
+    s = pow(k, -1, n) * (e + r * d) % n
+    if s == 0:
+        return None
+    return r, s
+
+
+def py_rfc6979_ks(bits, x, z, extra):
+    """RFC 6979 3.2 a-h, hedged per 3.6, as a stream of candidate k. Second implementation.
+
+    int2octets(x) (2.3.3) is the 32-byte big-endian key unchanged, since rlen = qlen = 256 for
+    P-256; z is bits2octets(h1) (2.3.4) computed by the caller. qlen = 256 and every accepted
+    hash is at least 256 bits, so step h's bits2int (2.3.2) is 'the leftmost 32 bytes' with no
+    shifting. k' goes AFTER bits2octets(h1), in both step d and step f (3.6, bullet 2) - the one
+    placement question the hedged mode has, and the reason extra = b"" must still reproduce
+    A.2.5 exactly."""
+    alg = HASH[bits]
+    hlen = alg().digest_size
+    xb = x.to_bytes(32, "big")
+    v, k, first = b"\x01" * hlen, b"\x00" * hlen, True
+    for tag in (b"\x00", b"\x01"):  # steps d-g
+        k = hmac.new(k, v + tag + xb + z + extra, alg).digest()
+        v = hmac.new(k, v, alg).digest()
+    while True:
+        if not first:  # h.3: the previous candidate was rejected - reseed, never reduce
+            k = hmac.new(k, v + b"\x00", alg).digest()
+            v = hmac.new(k, v, alg).digest()
+        first = False
+        v = hmac.new(k, v, alg).digest()  # h.2, one pass: tlen = hlen >= qlen
+        yield int.from_bytes(v[:32], "big")
+
+
+def py_p256_sign(d, h, bits, extra=b""):
+    """(r, s) for the deterministic (or hedged) nonce. Mirrors the C retry loop exactly."""
+    n = P256["n"]
+    z = int.from_bytes(h[:32], "big") % n  # bits2octets(h1) (2.3.4) == e of FIPS 186-5 6.4.1
+    for i, k in enumerate(py_rfc6979_ks(bits, d, z.to_bytes(32, "big"), extra)):
+        if i >= 64:
+            die("P-256 sign: no usable k in 64 tries")
+        if not 1 <= k < n:  # h.3: compared against q, never reduced mod q (that would bias k)
+            continue
+        rs = py_ecdsa_sign_with_k(d, z, k)
+        if rs is not None:
+            return rs
+    return None
+
+
+def sign_row(d, h, bits, extra=b"", ok=1):
+    if not ok:
+        return (f"{d:064x}", h.hex(), extra.hex(), "", 0)
+    r, s = py_p256_sign(d, h, bits, extra)
+    sig = r.to_bytes(32, "big") + s.to_bytes(32, "big")
+    if py_p256_verify(py_p256_keygen(d)[0], h, sig) != P256_OK:
+        die("P-256 sign: a generated signature does not verify")
+    return (f"{d:064x}", h.hex(), extra.hex(), sig.hex(), 1)
+
+
+def rfc6979_sign():
+    """RFC 6979 A.2.5 with extra = NULL: the only official pin on the deterministic-k derivation.
+
+    Both the k values and the resulting (r, s) are checked, so a wrong DRBG that happened to land
+    on a valid signature would still fail here. The SHA-384/512 rows are also what exercise
+    bits2int on a digest longer than qlen."""
+    text = "\n".join(rfc_lines(fetch("rfc6979")))
+    s = text[text.rindex("A.2.5.  ECDSA, 256 Bits") : text.rindex("A.2.6.")]
+    kv = dict(re.findall(r"\n\s+(x|Ux|Uy) = ([0-9A-F]{64})\n", s))
+    if {"x", "Ux", "Uy"} - kv.keys():
+        die(f"RFC 6979 A.2.5: key fields {sorted(kv)}")
+    x = int(kv["x"], 16)
+    if py_p256_keygen(x)[0] != p256_enc((int(kv["Ux"], 16), int(kv["Uy"], 16))):
+        die("RFC 6979 A.2.5: U is not x*G")
+    pat = (r"With SHA-(\d+), message = \"(sample|test)\":\n\s+k = ([0-9A-F]{64})\n"
+           r"\s+r = ([0-9A-F]{64})\n\s+s = ([0-9A-F]{64})\n")
+    hits = re.findall(pat, s)
+    if len(hits) != 10:
+        die(f"RFC 6979 A.2.5: parsed {len(hits)} of 10 (hash, message) pairs")
+    rows = []
+    for bits, msg, k, r, s_ in hits:
+        if int(bits) not in HASH:  # SHA-1 / SHA-224: neither is compiled, see SOURCES.md
+            continue
+        h = HASH[int(bits)](msg.encode()).digest()
+        z = (int.from_bytes(h[:32], "big") % P256["n"]).to_bytes(32, "big")
+        if next(py_rfc6979_ks(int(bits), x, z, b"")) != int(k, 16):
+            die(f"RFC 6979 A.2.5 SHA-{bits}/{msg}: derived k does not match the RFC")
+        row = sign_row(x, h, int(bits))
+        if row[3] != (r + s_).lower():
+            die(f"RFC 6979 A.2.5 SHA-{bits}/{msg}: r||s does not match the RFC")
+        rows.append(row)
+    if len(rows) != 6:
+        die(f"RFC 6979 A.2.5: {len(rows)} usable rows, expected 6")
+    return rows
+
+
+def cavp_siggen():
+    """186-3 ECDSAVS SigGen.txt (Msg, d, Qx, Qy, k, R, S) - the official floor under the
+    generated sign rows, without any new API surface:
+      1. brisk__p256_keygen(d) must reproduce the published (Qx, Qy)  -> p256_keygen.inc;
+      2. brisk__p256_ecdsa_verify must accept the published (R, S)    -> p256_verify.inc;
+      3. py_ecdsa_sign_with_k, the core every generated row below is built on, is validated
+         against NIST here in Python before it is used - so the generated vectors rest on an
+         official foundation rather than on the generator agreeing with itself.
+    The k-driven recomputation is deliberately not re-run in C: it would need a public
+    sign-with-given-k entry point that no caller wants."""
+    z = zipfile.ZipFile(io.BytesIO(fetch("cavp_ecdsa")))
+    sections = rsp_sections(z.read("SigGen.txt").decode("latin-1"))
+    pat = (r"Msg = ([0-9a-f]+)\nd = ([0-9a-f]+)\nQx = ([0-9a-f]+)\nQy = ([0-9a-f]+)\n"
+           r"k = ([0-9a-f]+)\nR = ([0-9a-f]+)\nS = ([0-9a-f]+)")
+    keys, verify = [], []
+    for bits in (256, 384, 512):
+        hits = re.findall(pat, sections[f"[P-256,SHA-{bits}]"])
+        if len(hits) != 15:
+            die(f"CAVP SigGen P-256/SHA-{bits}: parsed {len(hits)} of 15 rows")
+        for msg, d, qx, qy, k, r, s_ in hits:
+            d = int(d, 16)
+            pub, ok = py_p256_keygen(d)
+            if not ok or pub != p256_enc((int(qx, 16), int(qy, 16))):
+                die("CAVP SigGen: Q is not d*G")
+            h = HASH[bits](bytes.fromhex(msg)).digest()
+            e = int.from_bytes(h[:32], "big") % P256["n"]
+            if py_ecdsa_sign_with_k(d, e, int(k, 16)) != (int(r, 16), int(s_, 16)):
+                die(f"CAVP SigGen SHA-{bits}: (R, S) mismatch - the signing core is wrong")
+            sig = int(r, 16).to_bytes(32, "big") + int(s_, 16).to_bytes(32, "big")
+            # deep = 0: these 45 rows are a keygen/verify pin, not another offset-and-mutation
+            # study. Every one of them is valid, so deep would add ~1400 verifications - four
+            # times the whole existing valid-row mutation pass - for coverage the CAVP SigVer and
+            # RFC 6979 A.2.5 rows already provide, and the p256 suite has a 900 s armv5 budget.
+            row = verify_row(pub, h, sig, 0)
+            if row[3] != P256_OK:
+                die("CAVP SigGen: a published signature does not verify")
+            keys.append((f"{d:064x}", pub.hex(), 1))
+            verify.append(row)
+    if len(verify) != 45:
+        die(f"CAVP SigGen P-256: emitted {len(verify)} of 45 rows")
+    return keys, verify
+
+
+def differential_p256_sign():
+    """Generated deterministic and hedged rows, plus the invalid-input half.
+
+    Wycheproof publishes no ECDSA *signing* suite (signing has no attacker-controlled input) and
+    RFC 6979 3.6 says a variant "ceases to be verifiable against the test vectors published in
+    this document", so the hedged rows can only be generated - by the independent Python
+    implementation above. Row count is kept small on purpose: every ok row costs the C suite four
+    scalar multiplications (sign, then keygen + the two inside the self-verify), and the
+    qemu-armv5 budget is 900 s for the whole p256 suite."""
+    n = P256["n"]
+    rnd = random.Random(20260922)
+    rows = []
+
+    # Deterministic, extra = empty. d = 1 and d = n-1 are the scalar-ladder extremes.
+    for d in [1, n - 1, rnd.randrange(1, n), rnd.randrange(1, n), rnd.randrange(1, n)]:
+        for bits in (256, 384, 512):
+            rows.append(sign_row(d, HASH[bits](b"brisk-ssl mTLS").digest(), bits))
+
+    # Hedged (RFC 6979 3.6): a fixed k' keeps the row deterministic, which is the only way this
+    # can be a known-answer vector at all.
+    for j in range(3):
+        d = rnd.randrange(1, n)
+        extra = bytes((j * 17 + i) & 0xFF for i in range(32))
+        for bits in (256, 384, 512):
+            rows.append(sign_row(d, HASH[bits](b"hedged").digest(), bits, extra))
+    # Any k' length is legal; the bytes are simply appended.
+    d = rnd.randrange(1, n)
+    for ln in (0, 1, 16, 33, 64):
+        rows.append(sign_row(d, hashlib.sha256(b"k-prime length").digest(), 256, bytes(range(ln))))
+
+    # Digest edge cases: these drive the conditional subtraction inside bits2octets. A tail past
+    # the leftmost 32 bytes is ignored by the truncation rule but still selects the DRBG hash.
+    for lead in (bytes(32), b"\xff" * 32, n.to_bytes(32, "big"), (n - 1).to_bytes(32, "big")):
+        for ln, bits in ((32, 256), (48, 384), (64, 512)):
+            rows.append(sign_row(d, lead + bytes(ln - 32), bits))
+
+    # Invalid d (FIPS 186-5 A.2.2 range) -> BRISK_E_ARG, sig untouched.
+    h0 = hashlib.sha256(b"invalid").digest()
+    for bad in (0, n, n + 1, 2 ** 256 - 1):
+        rows.append(sign_row(bad, h0, 256, ok=0))
+    # Invalid hash_len: 32, 48 and 64 are the only accepted widths, because hash_len also selects
+    # the RFC 6979 HMAC hash (3.2 b) and must be the same H that produced the digest.
+    for ln in (31, 33, 47, 49, 63, 65):
+        rows.append(sign_row(d, bytes((i * 7 + 1) & 0xFF for i in range(ln)), 256, ok=0))
+    return rows
+
+
 def differential_p256():
     """Seeded agreement, small-k scalar multiplication and hand-built bad encodings."""
     p, n = P256["p"], P256["n"]
@@ -1653,10 +1849,12 @@ def main():
     k5903, e5903 = rfc5903_ecdh()
     kcavp, ecavp, vcavp = cavp_p256()
     kdiff, ediff, vdiff = differential_p256()
-    p256_keys = k5903 + kcavp + kdiff
+    ksgen, vsgen = cavp_siggen()
+    p256_keys = k5903 + kcavp + kdiff + ksgen
     p256_ecdh = e5903 + ecavp + wycheproof_p256_ecdh() + ediff
-    p256_verify = vcavp + wycheproof_p256_ecdsa() + rfc6979_verify() + vdiff
+    p256_verify = vcavp + wycheproof_p256_ecdsa() + rfc6979_verify() + vdiff + vsgen
     p256_scalar = p256_scalar_vectors()
+    p256_sign = rfc6979_sign() + differential_p256_sign()
 
     emit("sha2.inc", "struct hash_kat SHA2_KAT", cavp + dhash, lambda r: f"{r[0]}, {cstr(r[1])}, {cstr(r[2])}")
     emit("sha2_monte.inc", "struct monte_kat SHA2_MONTE", monte,
@@ -1706,6 +1904,8 @@ def main():
          lambda r: f"{cstr(r[0])}, {cstr(r[1])}, {cstr(r[2])}, {r[3]}, {r[4]}")
     emit("p256_scalar.inc", "struct p256_scalar_kat P256_SCALAR_KAT", p256_scalar,
          lambda r: f"{r[0]}, {cstr(r[1])}, {cstr(r[2])}, {cstr(r[3])}")
+    emit("p256_sign.inc", "struct p256_sign_kat P256_SIGN_KAT", p256_sign,
+         lambda r: f"{cstr(r[0])}, {cstr(r[1])}, {cstr(r[2])}, {cstr(r[3])}, {r[4]}")
 
     rows = "\n".join(f"| {k} | {u} | `{h}` |" for k, (u, h) in sorted(fetched.items()))
     (OUT / "SOURCES.md").write_text(
@@ -1741,7 +1941,26 @@ def main():
         "  `[P-256,SHA-384]` and `[P-256,SHA-512]` sections of the same file ARE used, 15 rows\n"
         "  each with 12 failing: they are what exercises the FIPS 186-5 6.4.2 leftmost-bits\n"
         "  rule with official negative vectors.\n"
-        "- CAVP `SigGen.rsp` and RFC 6979 `k` values: ECDSA signing is the next roadmap line.\n",
+        "- No Wycheproof ECDSA *signing* suite exists, for `brisk__p256_ecdsa_sign` or for\n"
+        "  anyone else: signing has no attacker-controlled input, so there is nothing for a\n"
+        "  test suite to attack. The invalid half of `p256_sign.inc` is therefore generated -\n"
+        "  d in {0, n, n+1, 2^256-1} and hash_len in {31, 33, 47, 49, 63, 65}. The verify half\n"
+        "  that the sign round trip leans on keeps `ecdsa_secp256r1_sha256_p1363_test.json` as\n"
+        "  its invalid-input authority, and that suite's rejected r/s classes are what\n"
+        "  guarantee our own signatures do not land in one.\n"
+        "- No official vectors exist for the HEDGED nonce (RFC 6979 3.6), by construction: the\n"
+        "  RFC says a variant \"ceases to be verifiable against the test vectors published in\n"
+        "  this document\". The hedged rows come from the second, independent RFC 6979\n"
+        "  implementation in tools/kat.py, and what anchors them is that the same code path\n"
+        "  with k' absent reproduces RFC 6979 A.2.5 byte-for-byte - k as well as r and s.\n"
+        "- CAVP `SigGenComponent.txt` is not in the 186-3 zip named above (it ships with the\n"
+        "  186-4 one). `SigGen.txt` from this zip is used instead and carries d and k, so the\n"
+        "  signing core is validated against NIST all the same.\n"
+        "- The r == 0 / s == 0 retry (p ~ 2^-128) and the k-out-of-range retry (p ~ 2^-32) in\n"
+        "  `brisk__p256_ecdsa_sign` ship with NO known-answer coverage. Neither can be reached\n"
+        "  by any official vector and neither can be searched for at P-256 sizes. What stands\n"
+        "  in for a vector is the bounded retry loop, the code review, and the fact that the\n"
+        "  Python generator implements the same rejection logic. A real, accepted coverage gap.\n",
         newline="\n")
     print("ok")
 

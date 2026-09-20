@@ -134,8 +134,8 @@ static void ct_p256(void)
     CHECK(brisk__p256_ecdh(shared, secret32, peer) == BRISK_OK);
     brisk__secure_zero(shared, sizeof shared);
 
-    /* The mod-n core with a secret operand: ECDSA signing (next roadmap line) will use it that
-     * way, so it is exercised here as a secret even though verify only feeds it public data. */
+    /* The mod-n core with a secret operand: ECDSA signing uses it that way, so it is exercised
+     * here as a secret even though verify only feeds it public data. */
     brisk__p256_scalar_inv(shared, secret32);
     brisk__p256_scalar_mul(shared, secret32, shared);
     brisk__p256_scalar_add(shared, secret32, shared);
@@ -153,6 +153,23 @@ static void ct_p256(void)
     memset(hash, 0x11, sizeof hash);
     memset(sig, 0x22, sizeof sig);
     CHECK(brisk__p256_ecdsa_verify(peer, hash, sizeof hash, sig) == BRISK_E_AUTH);
+
+#if BRISK_ENABLE_MTLS
+    /* ECDSA sign: the device key and the RFC 6979 3.6 hedging input k' are secret, and so is
+     * everything the DRBG derives from them (K, V, k, k^-1, s). The message digest is public -
+     * it is the transcript hash the peer computes too. The only value declassified inside the
+     * module is the one-bit "this candidate k was rejected" verdict, the same declassification
+     * brisk__p256_keygen makes for its range check; any other report from this call is a real
+     * leak and must not be silenced with BRISK__CT_PUBLIC. */
+    {
+        uint8_t kprime[32];
+        memset(kprime, 0x3C, sizeof kprime);
+        BRISK__CT_SECRET(kprime, sizeof kprime);
+        CHECK(brisk__p256_ecdsa_sign(sig, secret32, hash, sizeof hash, kprime, sizeof kprime) ==
+              BRISK_OK);
+        brisk__secure_zero(kprime, sizeof kprime);
+    }
+#endif
 }
 
 static void ct_memeq(void)

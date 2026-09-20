@@ -20,3 +20,5 @@ __pycache__/
 /CLAUDE.local.md
 .vscode/
 .idea/
+# scratch copies left by the clang-format / -fsyntax-only post-edit hook
+*.tmp[0-9]

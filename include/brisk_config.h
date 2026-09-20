@@ -45,4 +45,13 @@
  * SHA-256/384/512, HMAC and HKDF are always built: every TLS configuration needs them.
  */
 
+/* Client certificates (mTLS): ECDSA P-256 signing with a hedged RFC 6979 nonce, and the
+ * brisk_sign_fn hook for a key held in a secure element. Off in TINY - a gateway that only
+ * authenticates the server links neither. It is a knob rather than always-on because
+ * src/crypto/p256.c is linked into every build for ECDHE, which is mandatory-to-implement, so
+ * without this the smallest image would pay for signing it never performs. */
+#ifndef BRISK_ENABLE_MTLS
+#    define BRISK_ENABLE_MTLS (BRISK_PROFILE >= BRISK_PROFILE_DEFAULT)
+#endif
+
 #endif /* BRISK_CONFIG_H */

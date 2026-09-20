@@ -19,6 +19,7 @@ that says how to fix it. Knobs are added as their milestone lands.
 | Knob | Default | Needs | Size cost (bytes, -Os) |
 |---|---|---|---|
 | (always built) SHA-256/384/512, HMAC, HKDF | on | - | see table below |
+| `BRISK_ENABLE_MTLS` — client certificates: ECDSA P-256 signing (hedged RFC 6979) and the `brisk_sign_fn` hook | DEFAULT and FULL | SHA-2, HMAC, P-256 (all already built) | 818 (armv7hf) … 1776 (mips); 1309 on x86_64 |
 
 ## Measured size (M1a, `python tools/dev.py size --arch all`)
 Flash = code + read-only data + data of the library objects actually linked (libc excluded).

@@ -40,6 +40,9 @@ int main(int argc, char **argv)
         brisk__p256_scalar_add(out, out + 32, out);
         brisk__p256_scalar_mul(out, out + 32, out);
         brisk__p256_scalar_inv(out, out + 32);
+#if BRISK_ENABLE_MTLS
+        brisk__p256_ecdsa_sign(out, out + 32, pt, 32, pt + 32, 32);
+#endif
     }
 #ifdef __linux__
     brisk__os_random(out, 32);

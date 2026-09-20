@@ -243,7 +243,7 @@ int brisk__x25519(uint8_t out[32], const uint8_t scalar[32], const uint8_t u[32]
  * brisk__os_random - L1 crypto never calls the OS itself. */
 void brisk__x25519_base(uint8_t out[32], const uint8_t scalar[32]);
 
-/* ---- crypto/p256.c: P-256 (secp256r1) ECDHE and ECDSA verify ----
+/* ---- crypto/p256.c: P-256 (secp256r1) ECDHE, ECDSA verify and (BRISK_ENABLE_MTLS) ECDSA sign ---
  * RFC 9846 4.3.8.2 (key_share encoding + the MUST to validate the peer point), 7.4.2 (the ECDHE
  * shared secret), 4.3.3 (ecdsa_secp256r1_sha256); FIPS 186-5 6.4.2 (verify); parameters from
  * RFC 5903 3.1 = SP 800-186 3.2.1.3. Both halves are mandatory-to-implement for a TLS 1.3 client
@@ -251,10 +251,15 @@ void brisk__x25519_base(uint8_t out[32], const uint8_t scalar[32]);
  *
  * One TU: vendor/fiat/p256_{64,32}.c is #included (every fiat function is static), selected by
  * BRISK__FIAT_64 exactly as for x25519. Stateless, no key context; the caller owns all memory.
- * Stack: measured with -fstack-usage along the deepest call chain (gcc 10.3), 1504 B for a keygen
- * or an ECDH and 1856 B for a verify at -Os; budget 2 KB, which holds at -Os and -O2 only. The
- * figure is not optimisation-independent: -O3 reaches 2160 B and -O0 about 4 KB. Above
- * brisk__aes_key's 1.1 KB, and no VLA or malloc hides it - see src/crypto/p256.c for the
+ * Stack: measured with -fstack-usage along the deepest call chain (gcc 10.3), at -Os, 1504 B for
+ * a keygen or an ECDH, 1856 B for a verify and 2688 B for a SIGN. Budget 3 KB, raised from 2 KB
+ * when signing landed: the sign path runs its fault-check verify nested inside its own frame, so
+ * the two add up and no reordering removes that - the countermeasure is worth the kilobyte (see
+ * brisk__p256_ecdsa_sign). Verify and ECDH still fit the old 2 KB, so a TINY build without
+ * BRISK_ENABLE_MTLS keeps the smaller number. The figures are not optimisation-independent and
+ * only -Os holds on the 64-bit field: -O2 needs 2144 B for a verify and 3200 B for a sign, -O3
+ * 3328 B for a sign - all over budget, which is why -Os is pinned PRIVATE in CMakeLists.txt.
+ * Above brisk__aes_key's 1.1 KB, and no VLA or malloc hides it - see src/crypto/p256.c for the
  * per-frame numbers and the full table. */
 #define BRISK__P256_SCALAR_LEN 32
 #define BRISK__P256_POINT_LEN  65 /* 0x04 || X || Y (RFC 9846 4.3.8.2) */
@@ -292,6 +297,50 @@ int brisk__p256_ecdh(uint8_t out[32], const uint8_t priv[32], const uint8_t peer
 int brisk__p256_ecdsa_verify(const uint8_t pub[65], const uint8_t *hash, size_t hash_len,
                              const uint8_t sig[64]);
 
+#if BRISK_ENABLE_MTLS
+/* ECDSA signature generation (FIPS 186-5 6.4.1) with a deterministic nonce (RFC 6979 3.2), hedged
+ * with caller-supplied extra data (RFC 6979 3.6, bullet 2) when `extra` is non-NULL. The mTLS
+ * device-key half of RFC 9846 4.3.3; gated by BRISK_ENABLE_MTLS because p256.c is linked into
+ * every build for ECDHE and a TINY image never signs.
+ *
+ * `sig`   receives r || s, 64 bytes, fixed width. The DER ECDSA-Sig-Value of RFC 9846 4.3.3 is
+ *         wrapped by the caller, mirroring brisk__p256_ecdsa_verify's input contract.
+ * `priv`  the device key d, 32 bytes big-endian. BRISK_E_ARG with `sig` untouched if d == 0 or
+ *         d >= n, so the caller can retry into the same buffer (as brisk__p256_keygen).
+ * `hash`  the message digest. hash_len must be 32, 48 or 64: it is both the leftmost-bits input
+ *         (only the first 32 bytes are read) and the selector for the RFC 6979 HMAC hash, which
+ *         must be the same H that produced the digest (RFC 6979 3.2 b). Any other length is
+ *         BRISK_E_ARG - a caller bug, not a signature failure. RFC 9846 4.3.3 forbids SHA-224 and
+ *         leaves SHA-1 legacy-only, and brisk.h compiles no digest below SHA-256, so there is no
+ *         shorter case to support.
+ * `extra` k' (RFC 6979 3.6): 32 bytes from brisk__os_random in production, NULL/0 for pure
+ *         RFC 6979. L1 crypto never calls the OS, so the caller owns that draw - which is also
+ *         what makes the hedged path testable with a fixed k'. Any extra_len is legal; the bytes
+ *         are appended after bits2octets(h1) in steps d and f, and nothing else changes. With
+ *         `extra` absent the function is bit-exact RFC 6979, which is what lets the A.2.5 vectors
+ *         serve as a self-test of the hedged code path.
+ *
+ * The HMAC_DRBG inside is nonce derivation, not a randomness source: it is per-signature, seeded
+ * only from (d, h1, k'), never persisted and never reseeded, so it does not contradict the "no
+ * userspace DRBG" rule in .claude/rules/crypto.md.
+ *
+ * No low-s normalisation. TLS 1.3 does not ask for it, RFC 6979 A.2.5 publishes the
+ * non-normalised s, and normalising would break every official vector. Do not add it.
+ *
+ * Returns BRISK_OK, BRISK_E_ARG (bad d or bad hash_len), or BRISK_E_AUTH when the self-verify of
+ * the produced signature fails - a fault or a bug, and `sig` is then zeroed rather than emitted.
+ * That self-verify is deliberate and not in the RFC: a single glitched ECDSA signature leaks the
+ * long-term device key, and this is the one place in the library where that risk is unbounded.
+ * It costs one keygen plus one verify per signature. Do not simplify it away.
+ *
+ * Constant time in d, k and the DRBG state; the only value that reaches a branch is the one-bit
+ * "this candidate was rejected" verdict, declassified exactly as in brisk__p256_keygen. `hash` is
+ * public (the peer computes the same transcript hash).
+ * `sig` may alias `hash` and/or `extra`: it is written only after both have been consumed. */
+int brisk__p256_ecdsa_sign(uint8_t sig[64], const uint8_t priv[32], const uint8_t *hash,
+                           size_t hash_len, const uint8_t *extra, size_t extra_len);
+#endif
+
 /* Scalar arithmetic modulo n, the group order: in-house constant-time Montgomery over 8 limbs of
  * 32 bits on every target - deliberately one width, since a 4x64 variant would need
  * unsigned __int128 and a second code path to buy about 2% of a verify (the rationale is written
@@ -299,8 +348,8 @@ int brisk__p256_ecdsa_verify(const uint8_t pub[65], const uint8_t *hash, size_t 
  * the tests stay
  * byte-level. Operands are reduced mod n on the way in, so any 32 bytes are legal. n0' and
  * R^2 mod n are derived at run time, so no hand-typed Montgomery constant exists to be wrong.
- * ECDSA signing (the next roadmap line) reuses these unchanged; `add` is the one verify does not
- * need and is here so the generated vectors cover it too. r may alias a and/or b. */
+ * brisk__p256_ecdsa_sign reuses all five unchanged - `add` is the one verify does not need, and
+ * signing is what needs it (e + r*d). r may alias a and/or b. */
 int brisk__p256_scalar_valid(const uint8_t a[32]); /* 1 iff 1 <= a <= n-1, constant time */
 void brisk__p256_scalar_reduce(uint8_t r[32], const uint8_t a[32]);
 void brisk__p256_scalar_add(uint8_t r[32], const uint8_t a[32], const uint8_t b[32]);

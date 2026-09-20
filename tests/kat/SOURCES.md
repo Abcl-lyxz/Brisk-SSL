@@ -61,4 +61,23 @@ reference before emission. Differential vectors come from a fixed seed.
   `[P-256,SHA-384]` and `[P-256,SHA-512]` sections of the same file ARE used, 15 rows
   each with 12 failing: they are what exercises the FIPS 186-5 6.4.2 leftmost-bits
   rule with official negative vectors.
-- CAVP `SigGen.rsp` and RFC 6979 `k` values: ECDSA signing is the next roadmap line.
+- No Wycheproof ECDSA *signing* suite exists, for `brisk__p256_ecdsa_sign` or for
+  anyone else: signing has no attacker-controlled input, so there is nothing for a
+  test suite to attack. The invalid half of `p256_sign.inc` is therefore generated -
+  d in {0, n, n+1, 2^256-1} and hash_len in {31, 33, 47, 49, 63, 65}. The verify half
+  that the sign round trip leans on keeps `ecdsa_secp256r1_sha256_p1363_test.json` as
+  its invalid-input authority, and that suite's rejected r/s classes are what
+  guarantee our own signatures do not land in one.
+- No official vectors exist for the HEDGED nonce (RFC 6979 3.6), by construction: the
+  RFC says a variant "ceases to be verifiable against the test vectors published in
+  this document". The hedged rows come from the second, independent RFC 6979
+  implementation in tools/kat.py, and what anchors them is that the same code path
+  with k' absent reproduces RFC 6979 A.2.5 byte-for-byte - k as well as r and s.
+- CAVP `SigGenComponent.txt` is not in the 186-3 zip named above (it ships with the
+  186-4 one). `SigGen.txt` from this zip is used instead and carries d and k, so the
+  signing core is validated against NIST all the same.
+- The r == 0 / s == 0 retry (p ~ 2^-128) and the k-out-of-range retry (p ~ 2^-32) in
+  `brisk__p256_ecdsa_sign` ship with NO known-answer coverage. Neither can be reached
+  by any official vector and neither can be searched for at P-256 sizes. What stands
+  in for a vector is the bounded retry loop, the code review, and the fact that the
+  Python generator implements the same rejection logic. A real, accepted coverage gap.
