@@ -1,41 +1,45 @@
-# Handoff - 2026-09-20 (session 4)
+# Handoff - 2026-09-20 (session 5)
 
 ## Done
-- 5a439ff crypto: GHASH + AES-GCM. One file `src/crypto/gcm.c`: ctmul64 / ctmul32 GHASH picked
-  by `#if BRISK__AES_CT64` (same split as aes_ct), AEAD_AES_128/256_GCM, 96-bit IV and 16-byte
-  tag only, ct tag compare, output wiped on BRISK_E_AUTH. BearSSL 7bea48e5, MIT notice in the
-  header and NOTICE. Vectors: CAVP GCMVS, Wycheproof (96-bit IV, AES-128/256), GHASH edge H
-  values, differential set, RFC 9001 A.2/A.3 Initial packets; all re-checked against a Python
-  SP 800-38D reference in tools/kat.py. 27/27 mutations caught. Flash +1.5 KB (armv7hf) ..
-  +2.7 KB (MIPS32), RAM unchanged, baseline saved.
-- 7007119 build: CT tooling. `BRISK__CT_SECRET` / `BRISK__CT_PUBLIC` in brisk_int.h (valgrind
-  client requests, no-ops without -DBRISK_CT_CHECK), new `ct` suite in tests/test_ct.c,
-  `python tools/dev.py ct`, skill `/ct-check`.
+- 2e907ba crypto: vendored fiat-crypto v0.1.6 (`9d0682462646bf645cba7409fa45794dee0418aa`) into
+  `vendor/fiat/`: `{curve25519,p256}_{32,64}.c` byte-for-byte + COPYRIGHT/AUTHORS/all 3 licenses.
+  `vendor/VENDORED.md` has the pinned commit, per-file sha256 and the exact re-vendor command;
+  NOTICE updated, `.gitattributes` marks `vendor/**` vendored. No build wiring, no size delta.
+- 6dc658c crypto: X25519 (`src/crypto/x25519.c`, RFC 7748) - decodeScalar25519 on a private copy,
+  Montgomery ladder with mask/XOR cswap, 254-sq/11-mul Fermat inversion, all-zero reject
+  (RFC 7748 6.1/7, RFC 9846 7.4.2 -> `BRISK_E_ARG`, out wiped). 672 KAT rows + 3 iterated
+  (RFC 7748 5.2/6.1, RFC 8448, all 518 Wycheproof XdhComp, differential). 11 archs green,
+  `dev.py ct` green, baseline saved.
 
 ## In progress
-- Nothing. Tree clean, all 13 presets green, `dev.py ct` green.
+- Nothing. Tree clean. **Both commits are local - `git push` has not run yet.**
 
 ## Next up
-- M1c: vendor fiat-crypto `curve25519_{32,64}` and `p256_{32,64}` into `vendor/fiat/` untouched
-  (a hook blocks edits there) + `vendor/VENDORED.md` with the upstream commit and license +
-  NOTICE. Then X25519 (RFC 7748, incl. the 1,000-iteration test, reject all-zero output).
-  Use `/implement-module` with the ROADMAP line as the task text.
+- M1c: `P-256 ECDHE + ECDSA verify` on `vendor/fiat/p256_{32,64}.c` (trimmed fiat on 32-bit:
+  square=mul, Fermat inversion). Then `ECDSA P-256 sign, hedged RFC 6979 + sign-callback hook`.
+  Use `/implement-module` with the ROADMAP line as the task text - it worked well this session.
 
 ## Decisions / gotchas
-- `dev.py ct` is x86_64-only (valgrind cannot run under qemu-user), so it builds twice: native
-  and `-DBRISK__AES_CT64=0` to cover the 32-bit AES/GHASH C. brisk_int.h now only defines
-  BRISK__AES_CT64 `#ifndef`, which is what makes that override possible.
-- Add every new primitive to tests/test_ct.c or it is simply not checked. If a run looks
-  suspiciously clean, inject `if (secret16[0] == 0x5A) { t_checks++; }` into test_ct() and
-  confirm both variants FAIL (that is how this one was verified).
-- Only one BRISK__CT_PUBLIC exists: the brisk__ct_memeq result (a failed tag check is public).
-  A second one needs a written reason.
-- Still open, now with a documented plan in ARCHITECTURE.md: armv5 / MIPS32 4K early-terminating
-  multipliers leak H through GHASH timing. Valgrind cannot see it. When M3 lands, those targets
-  get a multiply-free GHASH or no AES-GCM in the default ClientHello.
-- Reviewer round found 3, 2 confirmed (static `too_long` name clash with chacha20_poly1305.c for
-  the future amalgamation; the ARCHITECTURE wording above). The workflow hit the session limit in
-  its fix phase - the fixes, tests, size and commit were finished by hand.
-- Earlier deferred items still open: HMAC ctx use after failed init/final; kat.py per-source
-  minimum-count guards; hand-check of the -Os aes_ct disassembly on mips/armv5.
-- Cost: the implement-module workflow used ~665k subagent tokens for GCM.
+- fiat `_32` and `_64` export **identical function names and signatures**; only the field-element
+  typedef differs (5xu64 vs 10xu32). So the curve layer is written once and the variant is one
+  `#include`. Same trick will work for P-256.
+- `BRISK__FIAT_64` (brisk_int.h) needs `UINTPTR_MAX > 0xFFFFFFFF` **and** `__SIZEOF_INT128__`, so
+  x32/n32 take the 32-bit file. `-DBRISK__FIAT_64=0` forces it anywhere; `dev.py ct` uses that to
+  get valgrind over the 32-bit field code (same pattern as `BRISK__AES_CT64`).
+- fiat generates with `--static --inline`: the files are `#include`d into one of our TUs, **never**
+  added to `add_library`. Needs `-Ivendor` - added to CMake and to `.claude/hooks/post_edit.js`.
+  The including TU owns the `-Wunused-function` pragma push/pop around the include.
+- `vendor/` is edit-blocked by `pre_guard.js`. To change it: re-vendor per VENDORED.md.
+- A **second** `BRISK__CT_PUBLIC` now exists (the x25519 all-zero verdict); reason is written at
+  `src/crypto/x25519.c:217`. Still the rule: a new one needs a written reason.
+- Wipe limit, stated in the x25519 header: our locals are zeroed, but fiat keeps the same limbs in
+  its own frame and is edit-blocked, so a stack scan can still find field residue. Closing it means
+  scrubbing the stack window - a separate decision, not silently claimed.
+- **Size is the thing to watch.** 32-bit fiat is ~2x the 64-bit one (fully unrolled 10-limb carry
+  chains): x25519 flash = 3.9 KB riscv64/aarch64 but 9.2 KB i686, 8.9 KB mips/mipsel. TOTAL on
+  mipsel is now 27.6 KB. P-256 will be worse. Raise TINY-profile knobs before M8 if this matters.
+- The RFC 7748 1,000,000-iteration vector is in `tests/kat/x25519_iter.inc` but only runs with
+  `BRISK_TEST_SLOW=1`; 1,000 runs by default (hours under qemu-armv5 otherwise).
+- Still open from earlier sessions: armv5/MIPS32 GHASH timing leak (plan in ARCHITECTURE.md, fix at
+  M3); HMAC ctx use after failed init/final; `kat.py` per-source minimum-count guards; hand-check of
+  the `-Os` aes_ct disassembly on mips/armv5.
