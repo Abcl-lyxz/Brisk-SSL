@@ -18,7 +18,7 @@ process.stdin.on('data', (d) => (raw += d)).on('end', () => {
   // src/os/ uses Linux headers that mingw lacks; the Stop hook / Docker presets cover it.
   if (rel.startsWith('src/os/')) return fmtNote && console.error(fmtNote);
   const args = ['-fsyntax-only', '-std=c99', '-Wall', '-Wextra', '-Wpedantic', '-Wshadow',
-    '-Wcast-align', '-Wstrict-prototypes', '-Wundef', '-Wvla', '-Iinclude', '-Isrc', '-Itests'];
+    '-Wcast-align', '-Wstrict-prototypes', '-Wundef', '-Wvla', '-Iinclude', '-Isrc', '-Itests', '-Ivendor'];
   if (rel.startsWith('tests/')) args.push('-Wno-overlength-strings');
   const cc = spawnSync('gcc', [...args, file], { cwd: root, encoding: 'utf8', timeout: 30000 });
   if (cc.error) return; // no gcc on PATH: nothing to check with

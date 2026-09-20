@@ -28,6 +28,8 @@ int main(int argc, char **argv)
         brisk__gcm_seal(&g, out, out, 5, out, 16, out, out + 48);
         brisk__gcm_open(&g, out, out, 5, out, 16, out, out + 48);
     }
+    brisk__x25519(out, out + 32, out);
+    brisk__x25519_base(out, out + 32);
 #ifdef __linux__
     brisk__os_random(out, 32);
 #endif

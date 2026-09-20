@@ -195,6 +195,39 @@ int brisk__gcm_open(const brisk__gcm_key *k, const uint8_t iv[12], const uint8_t
                     size_t aad_len, const uint8_t *in, size_t len, uint8_t *out,
                     const uint8_t tag[16]);
 
+/* ---- crypto/x25519.c: X25519 (RFC 7748) on vendored fiat-crypto field arithmetic ----
+ * One TU: vendor/fiat/curve25519_{64,32}.c is #included (every fiat function is static).
+ * Stateless, no key context: the scalar is 32 bytes and lives with the caller.
+ * The _64 file needs unsigned __int128, so it is picked on 64-bit pointers AND __int128 support;
+ * ILP32-on-64 ABIs (x32, mips n32) correctly take the 32-bit file, as they do for AES. */
+#ifndef BRISK__FIAT_64 /* -DBRISK__FIAT_64=0 builds the 32-bit fiat variant anywhere (dev.py ct)   \
+                        */
+#    if UINTPTR_MAX > 0xFFFFFFFFu && defined(__SIZEOF_INT128__)
+#        define BRISK__FIAT_64 1
+#    else
+#        define BRISK__FIAT_64 0
+#    endif
+#endif
+
+#define BRISK__X25519_LEN 32
+
+/* out = X25519(scalar, u) (RFC 7748 5). The scalar is clamped on a private copy
+ * (decodeScalar25519) and the caller's bytes are untouched; bit 255 of u is masked (RFC 7748 5,
+ * MUST) and non-canonical u (2^255-19 .. 2^255-1) is accepted and reduced (ditto). Every 32-byte
+ * u is a legal input - there is no point validation. out may alias scalar and/or u.
+ * Constant time in both inputs; the only value that ever reaches a branch is the all-zero test
+ * below, which the protocol reveals anyway (BRISK__CT_PUBLIC on that one byte).
+ * BRISK_OK, or BRISK_E_ARG with out wiped when the result is the all-zero value: the peer sent a
+ * small-order point (RFC 7748 6.1, 7; RFC 9846 7.4.2 says MUST abort). The TLS layer maps that to
+ * an illegal_parameter alert. */
+int brisk__x25519(uint8_t out[32], const uint8_t scalar[32], const uint8_t u[32]);
+
+/* Public key for a private key: X25519(scalar, 9), the KeyShareEntry.key_exchange bytes
+ * (RFC 7748 6.1, RFC 9846 7.4.2). No status: a clamped scalar is never 0 mod the group order, so
+ * the all-zero case cannot occur on the base point. The caller supplies the private key from
+ * brisk__os_random - L1 crypto never calls the OS itself. */
+void brisk__x25519_base(uint8_t out[32], const uint8_t scalar[32]);
+
 /* ---- os/linux_rand.c (Linux builds only): the only randomness source, no userspace DRBG ---- */
 /* len bytes from the kernel CSPRNG: getrandom(2), which blocks until the pool is initialised.
  * Only on kernels older than 4.8 that lack it (ENOSYS) or filter it (EPERM): wait once for

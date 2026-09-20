@@ -15,13 +15,14 @@ add_library(brisk STATIC
     src/crypto/aes_ct.c   # 32-bit targets (the file compiles to nothing on 64-bit)
     src/crypto/aes_ct64.c # 64-bit targets
     src/crypto/gcm.c      # GHASH ctmul32 / ctmul64 (same split) + AES-GCM
+    src/crypto/x25519.c   # #includes vendor/fiat/curve25519_{32,64}.c (all-static, see VENDORED.md)
 )
 if(CMAKE_SYSTEM_NAME STREQUAL "Linux") # src/os/ is Linux-only; the mingw host skips it
     target_sources(brisk PRIVATE src/os/linux_rand.c)
 endif()
 set_target_properties(brisk PROPERTIES C_STANDARD 99 C_STANDARD_REQUIRED ON C_EXTENSIONS OFF
                                        C_VISIBILITY_PRESET hidden)
-target_include_directories(brisk PUBLIC include PRIVATE src)
+target_include_directories(brisk PUBLIC include PRIVATE src vendor)
 # PUBLIC: consumers see exactly the configuration the library was built with.
 if(BRISK_PROFILE)
     target_compile_definitions(brisk PUBLIC BRISK_PROFILE=BRISK_PROFILE_${BRISK_PROFILE})
@@ -40,7 +41,7 @@ endif()
 if(BRISK_BUILD_TESTS)
     enable_testing()
     add_executable(brisk_tests tests/test_main.c tests/test_hash.c tests/test_aead.c tests/test_aes.c
-                               tests/test_ct.c)
+                               tests/test_x25519.c tests/test_ct.c)
     set_target_properties(brisk_tests PROPERTIES C_STANDARD 99 C_EXTENSIONS OFF)
     target_link_libraries(brisk_tests PRIVATE brisk)
     target_include_directories(brisk_tests PRIVATE src tests)
@@ -54,6 +55,8 @@ if(BRISK_BUILD_TESTS)
     set_tests_properties(aead PROPERTIES TIMEOUT 900)
     add_test(NAME aes COMMAND brisk_tests aes)
     set_tests_properties(aes PROPERTIES TIMEOUT 900)
+    add_test(NAME x25519 COMMAND brisk_tests x25519)
+    set_tests_properties(x25519 PROPERTIES TIMEOUT 900)
     add_test(NAME ct COMMAND brisk_tests ct) # under valgrind in `dev.py ct`; here just a smoke run
     set_tests_properties(ct PROPERTIES TIMEOUT 900)
     if(CMAKE_SYSTEM_NAME STREQUAL "Linux")

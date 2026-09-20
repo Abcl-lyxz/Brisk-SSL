@@ -31,6 +31,8 @@ SRC = {
     "rfc8448": "https://www.rfc-editor.org/rfc/rfc8448.txt",
     "rfc9001": "https://www.rfc-editor.org/rfc/rfc9001.txt",
     "rfc8439": "https://www.rfc-editor.org/rfc/rfc8439.txt",
+    "rfc7748": "https://www.rfc-editor.org/rfc/rfc7748.txt",
+    "wp_x25519": f"{WP}x25519_test.json",
     **{f"cavp_aes_{k}": "https://csrc.nist.gov/CSRC/media/Projects/Cryptographic-Algorithm-Validation-Program/"
        f"documents/aes/{f}" for k, f in (("kat", "KAT_AES.zip"), ("mmt", "aesmmt.zip"), ("mct", "aesmct.zip"))},
     "cavp_gcm": "https://csrc.nist.gov/CSRC/media/Projects/Cryptographic-Algorithm-Validation-Program/"
@@ -126,6 +128,45 @@ def py_aead_seal(key, nonce, aad, pt):
     pad = lambda b: b"\0" * (-len(b) % 16)
     mac = aad + pad(aad) + ct + pad(ct) + len(aad).to_bytes(8, "little") + len(ct).to_bytes(8, "little")
     return ct, py_poly1305(otk, mac)
+
+
+# X25519 (RFC 7748 5), written straight from the RFC's pseudocode: decodeScalar25519, the
+# Montgomery ladder with a conditional swap, x_2 * z_2^(p-2). Python ints, so no constant-time
+# claim - this is a generator, not the library.
+X25519_P = (1 << 255) - 19
+
+
+def py_x25519(k, u):
+    a = bytearray(k)
+    a[0] &= 248
+    a[31] &= 127
+    a[31] |= 64  # decodeScalar25519
+    kk = int.from_bytes(a, "little")
+    p = X25519_P
+    x1 = (int.from_bytes(u, "little") & ((1 << 255) - 1)) % p  # mask bit 255, reduce (RFC 7748 5)
+    x2, z2, x3, z3, swap = 1, 0, x1, 1, 0
+    for t in range(254, -1, -1):
+        kt = (kk >> t) & 1
+        if swap ^ kt:
+            x2, x3, z2, z3 = x3, x2, z3, z2
+        swap = kt
+        aa = (x2 + z2) % p
+        aa2 = aa * aa % p
+        bb = (x2 - z2) % p
+        bb2 = bb * bb % p
+        e = (aa2 - bb2) % p
+        c, d = (x3 + z3) % p, (x3 - z3) % p
+        da, cb = d * aa % p, c * bb % p
+        x3 = (da + cb) ** 2 % p
+        z3 = x1 * ((da - cb) ** 2 % p) % p
+        x2 = aa2 * bb2 % p
+        z2 = e * ((aa2 + 121665 * e) % p) % p
+    if swap:
+        x2, z2 = x3, z3
+    return (x2 * pow(z2, p - 2, p) % p).to_bytes(32, "little")
+
+
+X25519_BASE = bytes([9]) + bytes(31)
 
 
 # AES forward cipher (FIPS 197 5.1/5.2), table-based: fine for a generator, never for the library.
@@ -331,13 +372,13 @@ def wycheproof_hkdf():
 
 
 # ---------------------------------------------------------------- TLS 1.3 key schedule: RFC 8448 + RFC 9001
-def rfc8448():
-    """Every 'extract secret' and 'derive ...' block of the RFC 8448 traces (all SHA-256)."""
-    extracts, labels, blocks, cur, field = [], [], [], None, None
+def rfc8448_blocks():
+    """The RFC 8448 traces as ordered {_side, _h, _f} blocks ("{client}  <header>:" + hex fields)."""
+    blocks, cur, field = [], None, None
     for ln in rfc_lines(fetch("rfc8448")):
-        m = re.match(r"^\s*\{(?:client|server)\}\s+(.*)$", ln)
+        m = re.match(r"^\s*\{(client|server)\}\s+(.*)$", ln)
         if m:
-            cur = {"_h": m.group(1), "_f": {}}
+            cur = {"_side": m.group(1), "_h": m.group(2), "_f": {}}
             blocks.append(cur)
             field = None
             continue
@@ -358,8 +399,13 @@ def rfc8448():
             cur["_f"][field] += " " + m.group(1)
         else:
             field = None
-    seen = set()
-    for b in blocks:
+    return blocks
+
+
+def rfc8448():
+    """Every 'extract secret' and 'derive ...' block of the RFC 8448 traces (all SHA-256)."""
+    extracts, labels, seen = [], [], set()
+    for b in rfc8448_blocks():
         f = {k: hexbytes(v) for k, v in b["_f"].items()}
         if b["_h"].startswith("extract secret") and {"IKM", "secret"} <= f.keys():
             salt = f.get("salt", b"")
@@ -855,6 +901,137 @@ def differential_gcm():
     return rows, [(y, h, d, py_ghash(y, h, d)) for y, h, d in gh]
 
 
+# ---------------------------------------------------------------- X25519: RFC 7748 + RFC 8448 + Wycheproof
+# Row = (scalar, u, out, ok, deep). ok = 0 when the result is the all-zero value, which RFC 7748
+# 6.1 / RFC 9846 7.4.2 make an abort; deep = 1 asks test_x25519.c for the slow variants (offsets
+# 1..3, canaries): the RFC rows, every all-zero row and every non-canonical u. Running all 518
+# Wycheproof cases four times over would blow the 900 s qemu-armv5 budget.
+def x25519_row(k, u, deep=0):
+    out = py_x25519(k, u)
+    return (k.hex(), u.hex(), out.hex(), int(out != bytes(32)), deep)
+
+
+def rfc7748():
+    """RFC 7748 5.2 (two KATs + the iterated test) and 6.1 (Alice/Bob worked example)."""
+    text = "\n".join(rfc_lines(fetch("rfc7748")))
+    s52 = text[text.index("\n5.2.  Test Vectors") : text.index("\n6.  Diffie-Hellman")]
+    hexblk = r"((?:\s+[0-9a-f]+\n)+)"
+    rows = []
+    pat = (r"Input scalar:\n" + hexblk + r".*?Input u-coordinate:\n" + hexblk +
+           r".*?Output u-coordinate:\n" + hexblk)
+    for k, u, o in re.findall(pat, s52, re.S):
+        k, u, o = hexbytes(k), hexbytes(u), hexbytes(o)
+        if len(k) != 32:
+            continue  # the X448 pair in the same section
+        if py_x25519(k, u) != o:
+            die("RFC 7748 5.2 KAT mismatch")
+        rows.append(x25519_row(k, u, 1))
+    if len(rows) != 2:
+        die(f"RFC 7748 5.2: parsed {len(rows)} of 2 X25519 KATs")
+
+    # 6.1: X25519(a,9) = K_A, X25519(b,9) = K_B, X25519(a,K_B) = X25519(b,K_A) = K.
+    s61 = text[text.index("\n6.1.  Curve25519") : text.index("\n6.2.  Curve448")]
+    v = dict(re.findall(r"((?:Alice's|Bob's) (?:private|public) key|Their shared secret)"
+                        r"[^\n]*:\n\s+([0-9a-f]{64})\n", s61))
+    if len(v) != 5:
+        die(f"RFC 7748 6.1: parsed {len(v)} of 5 fields")
+    a, ka = hexbytes(v["Alice's private key"]), hexbytes(v["Alice's public key"])
+    b, kb = hexbytes(v["Bob's private key"]), hexbytes(v["Bob's public key"])
+    kk = hexbytes(v["Their shared secret"])
+    if (py_x25519(a, X25519_BASE), py_x25519(b, X25519_BASE)) != (ka, kb):
+        die("RFC 7748 6.1 public key mismatch")
+    if py_x25519(a, kb) != kk or py_x25519(b, ka) != kk:
+        die("RFC 7748 6.1 shared secret mismatch")
+    rows += [x25519_row(a, X25519_BASE, 1), x25519_row(b, X25519_BASE, 1),
+             x25519_row(a, kb, 1), x25519_row(b, ka, 1)]
+
+    # Iterated test. The 1,000,000-iteration value is taken from the RFC text and NOT recomputed
+    # here (hours in pure Python); test_x25519.c only runs it under BRISK_TEST_SLOW=1.
+    it = dict((n.replace(",", ""), hexbytes(h)) for n, h in
+              re.findall(r"After (one|1,000|1,000,000) iterations?:\n\s+([0-9a-f]{64})\n", s52))
+    if len(it) != 3:
+        die(f"RFC 7748 5.2: parsed {len(it)} of 3 iterated values")
+    k = u = X25519_BASE
+    iters, want = [], {1: it["one"], 1000: it["1000"], 1000000: it["1000000"]}
+    for i in range(1, 1001):
+        k, u = py_x25519(k, u), k
+        if i in want:
+            if k != want[i]:
+                die(f"RFC 7748 5.2 iterated mismatch at {i}")
+            iters.append((i, k.hex()))
+    iters.append((1000000, want[1000000].hex()))
+    return rows, iters
+
+
+def rfc8448_x25519():
+    """RFC 8448: each ephemeral x25519 key pair, and the handshake IKM = X25519(priv, peer pub)."""
+    rows, last = [], {}
+    for b in rfc8448_blocks():
+        f = {k: hexbytes(v) for k, v in b["_f"].items()}
+        if "x25519 key pair" in b["_h"] and {"private key", "public key"} <= f.keys():
+            priv, pub = f["private key"], f["public key"]
+            if py_x25519(priv, X25519_BASE) != pub:
+                die(f"RFC 8448 {b['_side']} x25519 public key mismatch")
+            last[b["_side"]] = (priv, pub)
+            rows.append(x25519_row(priv, X25519_BASE, 1))
+        if b["_h"].startswith('extract secret "handshake"') and "IKM" in f and len(last) == 2:
+            # Section 5 completes on P-256 after the HelloRetryRequest, so its IKM is not an
+            # X25519 output: the equality test below simply skips it.
+            cp, sp = last["client"], last["server"]
+            if py_x25519(cp[0], sp[1]) == f["IKM"] == py_x25519(sp[0], cp[1]):
+                rows.append(x25519_row(cp[0], sp[1], 1))
+    # 4 sections (3, 4, 6, 7) x (client pub, server pub, shared) + section 5's unused client pair
+    if len(rows) != 13:
+        die(f"RFC 8448 x25519: parsed {len(rows)} rows, expected 13")
+    return rows
+
+
+def wycheproof_x25519():
+    doc = json.loads(fetch("wp_x25519"))
+    out = []
+    for g in doc["testGroups"]:
+        if g["curve"] != "curve25519" or g["type"] != "XdhComp":
+            die(f"Wycheproof X25519: unexpected group {g['curve']}/{g['type']}")
+        for t in g["tests"]:
+            priv, pub, shared = (bytes.fromhex(t[x]) for x in ("private", "public", "shared"))
+            if len(pub) != 32 or py_x25519(priv, pub) != shared:
+                die(f"Wycheproof X25519 tcId {t['tcId']} inconsistent")
+            # "acceptable" here still pins the output bytes; only an all-zero shared secret is an
+            # error for us, so the expectation comes from the value, never from the flags.
+            noncanon = (int.from_bytes(pub, "little") & ((1 << 255) - 1)) >= X25519_P
+            out.append(x25519_row(priv, pub, int(shared == bytes(32) or noncanon)))
+    zero, deep = sum(1 for r in out if not r[3]), sum(r[4] for r in out)
+    if len(out) != 518 or zero != 31 or deep != 36:
+        die(f"Wycheproof X25519: {len(out)} vectors, {zero} all-zero, {deep} deep")
+    return out
+
+
+def differential_x25519():
+    """Small-order / edge u values plus a seeded random set, both directions of each pair."""
+    rows = []
+    # The classic small-order and boundary u-coordinates: every one must give the all-zero result.
+    small = [0, 1, 325606250916557431795983626356110631294008115727848805560023387167927233504,
+             39382357235489614581723060781553021112529911719440698176882885853963445705823,
+             X25519_P - 1, X25519_P, X25519_P + 1]
+    k0 = bytes(range(1, 33))
+    for n in small:
+        u = (n % (1 << 256)).to_bytes(32, "little")
+        r = x25519_row(k0, u, 1)
+        if r[3]:
+            die(f"X25519 small-order u {n:#x} did not produce the all-zero value")
+        rows.append(r)
+    rnd = random.Random(20260923)
+    rb = lambda n: bytes(rnd.getrandbits(8) for _ in range(n))
+    for _ in range(32):
+        a, b = rb(32), rb(32)
+        ka, kb = py_x25519(a, X25519_BASE), py_x25519(b, X25519_BASE)
+        if py_x25519(a, kb) != py_x25519(b, ka):
+            die("differential X25519: ECDH disagreement")
+        rows += [x25519_row(a, X25519_BASE), x25519_row(b, X25519_BASE),
+                 x25519_row(a, kb), x25519_row(b, ka)]
+    return rows
+
+
 # ---------------------------------------------------------------- C emitters
 def cstr(hx, width=96):
     if not hx:
@@ -886,6 +1063,8 @@ def main():
     aes_ecb, aes_mct, aes_ctr, aes_hp = aes_vectors()
     gcm_cavp, gcm_wp, gcm_quic = cavp_gcm(), wycheproof_aes_gcm(), rfc9001_gcm()
     gcm_diff, ghash = differential_gcm()
+    x7748, x_iter = rfc7748()
+    x25519 = x7748 + rfc8448_x25519() + wycheproof_x25519() + differential_x25519()
 
     emit("sha2.inc", "struct hash_kat SHA2_KAT", cavp + dhash, lambda r: f"{r[0]}, {cstr(r[1])}, {cstr(r[2])}")
     emit("sha2_monte.inc", "struct monte_kat SHA2_MONTE", monte,
@@ -919,6 +1098,11 @@ def main():
     emit("ghash.inc", "struct ghash_kat GHASH_KAT", ghash, lambda r: ", ".join(hx(x) for x in r))
     emit("quic_gcm.inc", "struct quic_gcm_kat QUIC_GCM_KAT", gcm_quic,
          lambda r: f"{hx(r[0])}, {r[1]}u, " + ", ".join(hx(x) for x in r[2:]))
+
+    emit("x25519.inc", "struct x25519_kat X25519_KAT", x25519,
+         lambda r: f"{cstr(r[0])}, {cstr(r[1])}, {cstr(r[2])}, {r[3]}, {r[4]}")
+    emit("x25519_iter.inc", "struct x25519_iter_kat X25519_ITER_KAT", x_iter,
+         lambda r: f"{r[0]}L, {cstr(r[1])}")
 
     rows = "\n".join(f"| {k} | {u} | `{h}` |" for k, (u, h) in sorted(fetched.items()))
     (OUT / "SOURCES.md").write_text(

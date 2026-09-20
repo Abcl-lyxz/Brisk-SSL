@@ -80,7 +80,7 @@ def cmd_test(archs, jobs):
 # let valgrind report any branch/index/division that depends on one. Native x86_64 only - valgrind
 # does not run under qemu-user - so both AES/GHASH variants are built here instead: the 32-bit code
 # is the same C either way, and what differs per arch (multiplier timing, cache) is beyond valgrind.
-CT_VARIANTS = [("ct64", ""), ("ct32", " -DBRISK__AES_CT64=0")]
+CT_VARIANTS = [("ct64", ""), ("ct32", " -DBRISK__AES_CT64=0 -DBRISK__FIAT_64=0")]
 
 
 def cmd_ct():

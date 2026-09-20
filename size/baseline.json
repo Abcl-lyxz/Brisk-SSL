@@ -1,6 +1,6 @@
 {
  "aarch64": {
-  "TOTAL flash": 12647,
+  "TOTAL flash": 16579,
   "TOTAL ram": 12,
   "aes_ct": 0,
   "aes_ct64": 2962,
@@ -9,10 +9,11 @@
   "hkdf": 1271,
   "linux_rand": 837,
   "sha2": 3344,
-  "util": 169
+  "util": 169,
+  "x25519": 3932
  },
  "armv5": {
-  "TOTAL flash": 14491,
+  "TOTAL flash": 21931,
   "TOTAL ram": 8,
   "aes_ct": 2930,
   "aes_ct64": 0,
@@ -21,10 +22,11 @@
   "hkdf": 1095,
   "linux_rand": 829,
   "sha2": 4348,
-  "util": 201
+  "util": 201,
+  "x25519": 7440
  },
  "armv7hf": {
-  "TOTAL flash": 10263,
+  "TOTAL flash": 15545,
   "TOTAL ram": 8,
   "aes_ct": 2056,
   "aes_ct64": 0,
@@ -33,10 +35,11 @@
   "hkdf": 729,
   "linux_rand": 535,
   "sha2": 3306,
-  "util": 127
+  "util": 127,
+  "x25519": 5282
  },
  "i686": {
-  "TOTAL flash": 15200,
+  "TOTAL flash": 24447,
   "TOTAL ram": 8,
   "aes_ct": 3037,
   "aes_ct64": 0,
@@ -45,10 +48,11 @@
   "hkdf": 1212,
   "linux_rand": 772,
   "sha2": 4520,
-  "util": 183
+  "util": 183,
+  "x25519": 9247
  },
  "mips": {
-  "TOTAL flash": 18660,
+  "TOTAL flash": 27536,
   "TOTAL ram": 8,
   "aes_ct": 3552,
   "aes_ct64": 0,
@@ -57,10 +61,11 @@
   "hkdf": 1736,
   "linux_rand": 1316,
   "sha2": 5712,
-  "util": 212
+  "util": 212,
+  "x25519": 8876
  },
  "mips64": {
-  "TOTAL flash": 18596,
+  "TOTAL flash": 24520,
   "TOTAL ram": 12,
   "aes_ct": 0,
   "aes_ct64": 4440,
@@ -69,10 +74,11 @@
   "hkdf": 1684,
   "linux_rand": 1276,
   "sha2": 4720,
-  "util": 216
+  "util": 216,
+  "x25519": 5924
  },
  "mipsel": {
-  "TOTAL flash": 18676,
+  "TOTAL flash": 27616,
   "TOTAL ram": 8,
   "aes_ct": 3560,
   "aes_ct64": 0,
@@ -81,10 +87,11 @@
   "hkdf": 1740,
   "linux_rand": 1316,
   "sha2": 5716,
-  "util": 212
+  "util": 212,
+  "x25519": 8940
  },
  "ppc": {
-  "TOTAL flash": 15067,
+  "TOTAL flash": 23439,
   "TOTAL ram": 8,
   "aes_ct": 2838,
   "aes_ct64": 0,
@@ -93,10 +100,11 @@
   "hkdf": 1243,
   "linux_rand": 969,
   "sha2": 4460,
-  "util": 305
+  "util": 305,
+  "x25519": 8372
  },
  "riscv64": {
-  "TOTAL flash": 13111,
+  "TOTAL flash": 16969,
   "TOTAL ram": 12,
   "aes_ct": 0,
   "aes_ct64": 3402,
@@ -105,10 +113,11 @@
   "hkdf": 1041,
   "linux_rand": 655,
   "sha2": 3376,
-  "util": 141
+  "util": 141,
+  "x25519": 3858
  },
  "x86_64": {
-  "TOTAL flash": 13758,
+  "TOTAL flash": 19387,
   "TOTAL ram": 12,
   "aes_ct": 0,
   "aes_ct64": 4000,
@@ -117,6 +126,7 @@
   "hkdf": 1098,
   "linux_rand": 697,
   "sha2": 3272,
-  "util": 136
+  "util": 136,
+  "x25519": 5629
  }
 }

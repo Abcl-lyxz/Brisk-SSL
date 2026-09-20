@@ -100,6 +100,19 @@ static void ct_aes_gcm(void)
     brisk__ghash(block, h, plain, sizeof plain);
 }
 
+/* X25519: the scalar is the private key, the peer's u-coordinate is public (it came over the
+ * wire). The only declassified value is the all-zero verdict, which RFC 9846 7.4.2 makes a
+ * visible abort - see BRISK__CT_PUBLIC in brisk__x25519. */
+static void ct_x25519(void)
+{
+    uint8_t pub[32], shared[32];
+    static const uint8_t peer[32] = {0xE6, 0xDB, 0x68, 0x67, 0x58, 0x30, 0x30, 0xDB};
+    brisk__x25519_base(pub, secret32);
+    BRISK__CT_PUBLIC(pub, sizeof pub); /* the public key goes into the KeyShareEntry */
+    CHECK(brisk__x25519(shared, secret32, peer) == BRISK_OK);
+    brisk__secure_zero(shared, sizeof shared);
+}
+
 static void ct_memeq(void)
 {
     uint8_t copy[16];
@@ -115,5 +128,6 @@ void test_ct(void)
     ct_hash_hkdf();
     ct_chacha20_poly1305();
     ct_aes_gcm();
+    ct_x25519();
     ct_memeq();
 }
