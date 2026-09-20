@@ -228,6 +228,70 @@ int brisk__x25519(uint8_t out[32], const uint8_t scalar[32], const uint8_t u[32]
  * brisk__os_random - L1 crypto never calls the OS itself. */
 void brisk__x25519_base(uint8_t out[32], const uint8_t scalar[32]);
 
+/* ---- crypto/p256.c: P-256 (secp256r1) ECDHE and ECDSA verify ----
+ * RFC 9846 4.3.8.2 (key_share encoding + the MUST to validate the peer point), 7.4.2 (the ECDHE
+ * shared secret), 4.3.3 (ecdsa_secp256r1_sha256); FIPS 186-5 6.4.2 (verify); parameters from
+ * RFC 5903 3.1 = SP 800-186 3.2.1.3. Both halves are mandatory-to-implement for a TLS 1.3 client
+ * (RFC 9846 9.1), so neither sits behind a config knob.
+ *
+ * One TU: vendor/fiat/p256_{64,32}.c is #included (every fiat function is static), selected by
+ * BRISK__FIAT_64 exactly as for x25519. Stateless, no key context; the caller owns all memory.
+ * Stack: measured with -fstack-usage along the deepest call chain (gcc 10.3), 1504 B for a keygen
+ * or an ECDH and 1856 B for a verify at -Os; budget 2 KB, which holds at -Os and -O2 only. The
+ * figure is not optimisation-independent: -O3 reaches 2160 B and -O0 about 4 KB. Above
+ * brisk__aes_key's 1.1 KB, and no VLA or malloc hides it - see src/crypto/p256.c for the
+ * per-frame numbers and the full table. */
+#define BRISK__P256_SCALAR_LEN 32
+#define BRISK__P256_POINT_LEN  65 /* 0x04 || X || Y (RFC 9846 4.3.8.2) */
+#define BRISK__P256_SIG_LEN    64 /* r || s; DER is the X.509 / handshake layer's job */
+
+/* Public key for a private key: pub = 0x04 || X(d*G) || Y(d*G), ready for KeyShareEntry.
+ * `priv` is 32 caller-supplied random bytes (brisk__os_random) read big-endian; BRISK_E_ARG with
+ * pub untouched if d == 0 or d >= n, so the caller draws again (FIPS 186-5 A.2.2, p ~ 2^-32).
+ * L1 crypto never calls the OS itself. Constant time in d. */
+int brisk__p256_keygen(uint8_t pub[65], const uint8_t priv[32]);
+
+/* out = X(d * Q): the 32-byte shared secret Z, leading zeros kept (RFC 9846 7.4.2).
+ * `peer` is the peer's 65-byte uncompressed point, validated first (RFC 9846 4.3.8.2: first byte
+ * 0x04, x and y both < p, y^2 == x^3 - 3x + b) - compressed and hybrid forms are rejected, never
+ * decompressed, and the point at infinity fails the curve equation. Validation runs before any
+ * field element is built, because fiat_p256_from_bytes does not reduce and every Montgomery
+ * operation is only proved for inputs < p. BRISK_E_ARG with out wiped on a bad point or a bad d;
+ * the TLS layer maps that to illegal_parameter. Constant time in d and in the shared secret; only
+ * the validity verdict reaches a branch. out may alias priv and/or peer. */
+int brisk__p256_ecdh(uint8_t out[32], const uint8_t priv[32], const uint8_t peer[65]);
+
+/* ECDSA verify (FIPS 186-5 6.4.2). `sig` is r || s, 64 bytes: the DER ECDSA-Sig-Value of
+ * RFC 9846 4.3.3 is unwrapped by the caller (the M2 DER parser). `hash` is the message digest;
+ * hash_len must be >= 32 and only the leftmost 32 bytes are used (FIPS 186-5's leftmost-bits
+ * rule), so a P-256 key certified with SHA-384/512 works.
+ *
+ * Three outcomes, and the split is what the TLS layer needs to pick an alert:
+ *   BRISK_OK     the signature verifies.
+ *   BRISK_E_AUTH it does not - including r or s outside [1, n-1], which FIPS 186-5 6.4.2 calls
+ *                INVALID rather than an error, and R turning out to be the point at infinity.
+ *                A CertificateVerify caller MUST turn this into decrypt_error (RFC 9846 4.5.2).
+ *   BRISK_E_ARG  `pub` is not a point on the curve (malformed key material -> bad_certificate,
+ *                not a failed signature), or hash_len < 32, which is a caller bug.
+ * Every input is public, so this path may branch on all of them. */
+int brisk__p256_ecdsa_verify(const uint8_t pub[65], const uint8_t *hash, size_t hash_len,
+                             const uint8_t sig[64]);
+
+/* Scalar arithmetic modulo n, the group order: in-house constant-time Montgomery over 8 limbs of
+ * 32 bits on every target - deliberately one width, since a 4x64 variant would need
+ * unsigned __int128 and a second code path to buy about 2% of a verify (the rationale is written
+ * out in src/crypto/p256.c). Big-endian 32-byte in and out, so the limb layout stays private and
+ * the tests stay
+ * byte-level. Operands are reduced mod n on the way in, so any 32 bytes are legal. n0' and
+ * R^2 mod n are derived at run time, so no hand-typed Montgomery constant exists to be wrong.
+ * ECDSA signing (the next roadmap line) reuses these unchanged; `add` is the one verify does not
+ * need and is here so the generated vectors cover it too. r may alias a and/or b. */
+int brisk__p256_scalar_valid(const uint8_t a[32]); /* 1 iff 1 <= a <= n-1, constant time */
+void brisk__p256_scalar_reduce(uint8_t r[32], const uint8_t a[32]);
+void brisk__p256_scalar_add(uint8_t r[32], const uint8_t a[32], const uint8_t b[32]);
+void brisk__p256_scalar_mul(uint8_t r[32], const uint8_t a[32], const uint8_t b[32]);
+void brisk__p256_scalar_inv(uint8_t r[32], const uint8_t a[32]); /* a^(n-2) mod n; 0 -> 0 */
+
 /* ---- os/linux_rand.c (Linux builds only): the only randomness source, no userspace DRBG ---- */
 /* len bytes from the kernel CSPRNG: getrandom(2), which blocks until the pool is initialised.
  * Only on kernels older than 4.8 that lack it (ENOSYS) or filter it (EPERM): wait once for

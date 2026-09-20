@@ -81,8 +81,8 @@ static void ct_aes_gcm(void)
     size_t klen;
     for (klen = 16; klen <= 32; klen += 16) { /* AES-128 and AES-256 */
         CHECK(brisk__aes_init(&ak, secret32, klen) == BRISK_OK);
-        brisk__aes_encrypt(&ak, ctr, block);         /* one block of a public counter */
-        brisk__aes_ctr32(&ak, ctr, plain, 48, ct);   /* keystream over a secret plaintext */
+        brisk__aes_encrypt(&ak, ctr, block);       /* one block of a public counter */
+        brisk__aes_ctr32(&ak, ctr, plain, 48, ct); /* keystream over a secret plaintext */
         CHECK(brisk__gcm_init(&gk, secret32, klen) == BRISK_OK);
         CHECK(brisk__gcm_seal(&gk, nonce, aad, sizeof aad, plain, sizeof plain, ct, tag) ==
               BRISK_OK);
@@ -113,6 +113,48 @@ static void ct_x25519(void)
     brisk__secure_zero(shared, sizeof shared);
 }
 
+/* P-256: the private scalar is secret, the peer point and our own public key are not. Three
+ * things are declassified inside the module, each with its reason written there: the private-key
+ * range verdict (FIPS 186-5 A.2.2 rejection sampling is observable by construction), the peer
+ * point and its validity verdict (the attacker wrote it, and a bad point is a visible alert), and
+ * every input to ECDSA verify, which is public by definition. */
+static void ct_p256(void)
+{
+    uint8_t pub[65], shared[32], sig[64], hash[32];
+    static const uint8_t peer[65] = {
+        0x04, 0x6B, 0x17, 0xD1, 0xF2, 0xE1, 0x2C, 0x42, 0x47, 0xF8, 0xBC, 0xE6, 0xE5, 0x63,
+        0xA4, 0x40, 0xF2, 0x77, 0x03, 0x7D, 0x81, 0x2D, 0xEB, 0x33, 0xA0, 0xF4, 0xA1, 0x39,
+        0x45, 0xD8, 0x98, 0xC2, 0x96, 0x4F, 0xE3, 0x42, 0xE2, 0xFE, 0x1A, 0x7F, 0x9B, 0x8E,
+        0xE7, 0xEB, 0x4A, 0x7C, 0x0F, 0x9E, 0x16, 0x2B, 0xCE, 0x33, 0x57, 0x6B, 0x31, 0x5E,
+        0xCE, 0xCB, 0xB6, 0x40, 0x68, 0x37, 0xBF, 0x51, 0xF5}; /* the generator, a valid point */
+
+    /* secret32 is 0xA5 repeated, which is below n, so the range verdict is "accept". */
+    CHECK(brisk__p256_keygen(pub, secret32) == BRISK_OK);
+    BRISK__CT_PUBLIC(pub, sizeof pub); /* our public key goes into the KeyShareEntry */
+    CHECK(brisk__p256_ecdh(shared, secret32, peer) == BRISK_OK);
+    brisk__secure_zero(shared, sizeof shared);
+
+    /* The mod-n core with a secret operand: ECDSA signing (next roadmap line) will use it that
+     * way, so it is exercised here as a secret even though verify only feeds it public data. */
+    brisk__p256_scalar_inv(shared, secret32);
+    brisk__p256_scalar_mul(shared, secret32, shared);
+    brisk__p256_scalar_add(shared, secret32, shared);
+    brisk__p256_scalar_reduce(shared, secret32);
+    {
+        /* The range verdict for a secret scalar, declassified exactly as brisk__p256_keygen
+         * declassifies it and for the same reason (FIPS 186-5 A.2.2 rejection is observable). */
+        int v = brisk__p256_scalar_valid(secret32);
+        BRISK__CT_PUBLIC(&v, sizeof v);
+        CHECK(v == 1);
+    }
+    brisk__secure_zero(shared, sizeof shared);
+
+    /* Verify: everything public, so nothing here should report either way. */
+    memset(hash, 0x11, sizeof hash);
+    memset(sig, 0x22, sizeof sig);
+    CHECK(brisk__p256_ecdsa_verify(peer, hash, sizeof hash, sig) == BRISK_E_AUTH);
+}
+
 static void ct_memeq(void)
 {
     uint8_t copy[16];
@@ -129,5 +171,6 @@ void test_ct(void)
     ct_chacha20_poly1305();
     ct_aes_gcm();
     ct_x25519();
+    ct_p256();
     ct_memeq();
 }

@@ -1,6 +1,6 @@
 {
  "aarch64": {
-  "TOTAL flash": 16579,
+  "TOTAL flash": 23967,
   "TOTAL ram": 12,
   "aes_ct": 0,
   "aes_ct64": 2962,
@@ -8,12 +8,13 @@
   "gcm": 1588,
   "hkdf": 1271,
   "linux_rand": 837,
+  "p256": 7388,
   "sha2": 3344,
   "util": 169,
   "x25519": 3932
  },
  "armv5": {
-  "TOTAL flash": 21931,
+  "TOTAL flash": 34155,
   "TOTAL ram": 8,
   "aes_ct": 2930,
   "aes_ct64": 0,
@@ -21,12 +22,13 @@
   "gcm": 2308,
   "hkdf": 1095,
   "linux_rand": 829,
+  "p256": 12224,
   "sha2": 4348,
   "util": 201,
   "x25519": 7440
  },
  "armv7hf": {
-  "TOTAL flash": 15545,
+  "TOTAL flash": 24143,
   "TOTAL ram": 8,
   "aes_ct": 2056,
   "aes_ct64": 0,
@@ -34,12 +36,13 @@
   "gcm": 1502,
   "hkdf": 729,
   "linux_rand": 535,
+  "p256": 8598,
   "sha2": 3306,
   "util": 127,
   "x25519": 5282
  },
  "i686": {
-  "TOTAL flash": 24447,
+  "TOTAL flash": 41653,
   "TOTAL ram": 8,
   "aes_ct": 3037,
   "aes_ct64": 0,
@@ -47,12 +50,13 @@
   "gcm": 2484,
   "hkdf": 1212,
   "linux_rand": 772,
+  "p256": 17206,
   "sha2": 4520,
   "util": 183,
   "x25519": 9247
  },
  "mips": {
-  "TOTAL flash": 27536,
+  "TOTAL flash": 43520,
   "TOTAL ram": 8,
   "aes_ct": 3552,
   "aes_ct64": 0,
@@ -60,12 +64,13 @@
   "gcm": 2720,
   "hkdf": 1736,
   "linux_rand": 1316,
+  "p256": 15984,
   "sha2": 5712,
   "util": 212,
   "x25519": 8876
  },
  "mips64": {
-  "TOTAL flash": 24520,
+  "TOTAL flash": 35172,
   "TOTAL ram": 12,
   "aes_ct": 0,
   "aes_ct64": 4440,
@@ -73,12 +78,13 @@
   "gcm": 2544,
   "hkdf": 1684,
   "linux_rand": 1276,
+  "p256": 10652,
   "sha2": 4720,
   "util": 216,
   "x25519": 5924
  },
  "mipsel": {
-  "TOTAL flash": 27616,
+  "TOTAL flash": 43428,
   "TOTAL ram": 8,
   "aes_ct": 3560,
   "aes_ct64": 0,
@@ -86,12 +92,13 @@
   "gcm": 2744,
   "hkdf": 1740,
   "linux_rand": 1316,
+  "p256": 15812,
   "sha2": 5716,
   "util": 212,
   "x25519": 8940
  },
  "ppc": {
-  "TOTAL flash": 23439,
+  "TOTAL flash": 35807,
   "TOTAL ram": 8,
   "aes_ct": 2838,
   "aes_ct64": 0,
@@ -99,25 +106,27 @@
   "gcm": 2300,
   "hkdf": 1243,
   "linux_rand": 969,
+  "p256": 12368,
   "sha2": 4460,
   "util": 305,
   "x25519": 8372
  },
  "riscv64": {
-  "TOTAL flash": 16969,
+  "TOTAL flash": 23207,
   "TOTAL ram": 12,
   "aes_ct": 0,
   "aes_ct64": 3402,
   "chacha20_poly1305": 2824,
   "gcm": 1672,
   "hkdf": 1041,
-  "linux_rand": 655,
-  "sha2": 3376,
+  "linux_rand": 659,
+  "p256": 6232,
+  "sha2": 3378,
   "util": 141,
   "x25519": 3858
  },
  "x86_64": {
-  "TOTAL flash": 19387,
+  "TOTAL flash": 28383,
   "TOTAL ram": 12,
   "aes_ct": 0,
   "aes_ct64": 4000,
@@ -125,6 +134,7 @@
   "gcm": 1858,
   "hkdf": 1098,
   "linux_rand": 697,
+  "p256": 8996,
   "sha2": 3272,
   "util": 136,
   "x25519": 5629

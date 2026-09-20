@@ -41,7 +41,10 @@ enum {
     BRISK_OK = 0,
     BRISK_E_ARG = -1, /* invalid argument: unknown algorithm, length out of range, ... */
     BRISK_E_RNG = -2, /* kernel randomness unavailable; seccomp filters must allow getrandom */
-    BRISK_E_AUTH = -3 /* AEAD authentication failed (TLS bad_record_mac); no plaintext released */
+    BRISK_E_AUTH =
+        -3 /* a cryptographic check failed on data the peer sent: AEAD authentication
+            * (TLS bad_record_mac; no plaintext released), or a signature that does not
+            * verify (TLS decrypt_error). Never a caller mistake - that is BRISK_E_ARG. */
 };
 
 /* Library version, e.g. "0.1.0-dev". */

@@ -30,6 +30,17 @@ int main(int argc, char **argv)
     }
     brisk__x25519(out, out + 32, out);
     brisk__x25519_base(out, out + 32);
+    {
+        uint8_t pt[65];
+        brisk__p256_keygen(pt, out);
+        brisk__p256_ecdh(out, out + 32, pt);
+        brisk__p256_ecdsa_verify(pt, out, 32, out);
+        brisk__p256_scalar_valid(out);
+        brisk__p256_scalar_reduce(out, out + 32);
+        brisk__p256_scalar_add(out, out + 32, out);
+        brisk__p256_scalar_mul(out, out + 32, out);
+        brisk__p256_scalar_inv(out, out + 32);
+    }
 #ifdef __linux__
     brisk__os_random(out, 32);
 #endif

@@ -19,7 +19,8 @@ void test_hash(void);
 void test_aead(void);
 void test_aes(void);
 void test_x25519(void);
-void test_ct(void); /* constant-time smoke run; the real check is `dev.py ct` */
+void test_p256(void);
+void test_ct(void);   /* constant-time smoke run; the real check is `dev.py ct` */
 void test_rand(void); /* Linux only */
 
 #endif

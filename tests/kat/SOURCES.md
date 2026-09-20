@@ -9,10 +9,14 @@ reference before emission. Differential vectors come from a fixed seed.
 | cavp_aes_kat | https://csrc.nist.gov/CSRC/media/Projects/Cryptographic-Algorithm-Validation-Program/documents/aes/KAT_AES.zip | `a203b16c9246b2ebae31dee5de21a606be80cf78ceabaca37150236fa098eb60` |
 | cavp_aes_mct | https://csrc.nist.gov/CSRC/media/Projects/Cryptographic-Algorithm-Validation-Program/documents/aes/aesmct.zip | `6a2a72c00b1daacb9a7d20ab92617d322fa1c5dee493968660990e3f4571426b` |
 | cavp_aes_mmt | https://csrc.nist.gov/CSRC/media/Projects/Cryptographic-Algorithm-Validation-Program/documents/aes/aesmmt.zip | `12d1616f7a713e807714055973f04efc402f46a14e3d81869717c7ace4ecbaf0` |
+| cavp_ecdh | https://csrc.nist.gov/CSRC/media/Projects/Cryptographic-Algorithm-Validation-Program/documents/components/ecccdhtestvectors.zip | `5fff092551f2d72e89a3d9362711878708f9a14b502f0dfae819649105b0ea39` |
+| cavp_ecdsa | https://csrc.nist.gov/CSRC/media/Projects/Cryptographic-Algorithm-Validation-Program/documents/dss/186-3ecdsatestvectors.zip | `e0d9bee3f760ca3fabb82bd43dd04c13ee64ca9e0b719c6ea64fd52c9f0dd929` |
 | cavp_gcm | https://csrc.nist.gov/CSRC/media/Projects/Cryptographic-Algorithm-Validation-Program/documents/mac/gcmtestvectors.zip | `f9fc479e134cde2980b3bb7cddbcb567b2cd96fd753835243ed067699f26a023` |
 | cavp_sha | https://csrc.nist.gov/CSRC/media/Projects/Cryptographic-Algorithm-Validation-Program/documents/shs/shabytetestvectors.zip | `929ef80b7b3418aca026643f6f248815913b60e01741a44bba9e118067f4c9b8` |
 | rfc4231 | https://www.rfc-editor.org/rfc/rfc4231.txt | `72178527ce93500e730bc8eb182b857e583096d652b64ece0879c52ba1df973b` |
 | rfc5869 | https://www.rfc-editor.org/rfc/rfc5869.txt | `7a40eb3835b35fc947eb12a2ed614db079d43b26e50dbc537c31fba16397089c` |
+| rfc5903 | https://www.rfc-editor.org/rfc/rfc5903.txt | `939fab548a6e6bb49a5b3c4dd24a3c5df54a46645447b2d6f4df4fd88ff2d69f` |
+| rfc6979 | https://www.rfc-editor.org/rfc/rfc6979.txt | `456e8f17558fdbd206f968b96fc6f1b4a71ea331ab30ad17f711ab3adaa7d701` |
 | rfc7748 | https://www.rfc-editor.org/rfc/rfc7748.txt | `279ca0ecc5e92e2962e27b846986aeb74729d9dd34bd4a04a362f80dcb596ad3` |
 | rfc8439 | https://www.rfc-editor.org/rfc/rfc8439.txt | `25bef70fbf7a07ff45c2fe4cb7c6ce954eac687413d8610603268b4e4415324c` |
 | rfc8448 | https://www.rfc-editor.org/rfc/rfc8448.txt | `6564d1376d1ec744fc7a9993da15ebc1b9be361908b166091f47ef605c537fba` |
@@ -25,4 +29,36 @@ reference before emission. Differential vectors come from a fixed seed.
 | wp_hmac_sha256 | https://raw.githubusercontent.com/C2SP/wycheproof/main/testvectors_v1/hmac_sha256_test.json | `2d201cfa61d1bf95e6f5d07d96634b4a348b31e8eaa277ad7c8d09677b7a743f` |
 | wp_hmac_sha384 | https://raw.githubusercontent.com/C2SP/wycheproof/main/testvectors_v1/hmac_sha384_test.json | `28b9776e979dd755d852ca471043ea6cedce8b15f7a28abdf6ea9efd982b43c0` |
 | wp_hmac_sha512 | https://raw.githubusercontent.com/C2SP/wycheproof/main/testvectors_v1/hmac_sha512_test.json | `b6c90477bdb4a6fc8ee3d1f7b2c0b69a8dfffab34718abaa6cabd71cc2ba1207` |
+| wp_p256_ecdh | https://raw.githubusercontent.com/C2SP/wycheproof/main/testvectors_v1/ecdh_secp256r1_ecpoint_test.json | `648f16d077caf2400d02331ca51f44744c72c799830c8d0595d0b18b6dd9f886` |
+| wp_p256_ecdsa | https://raw.githubusercontent.com/C2SP/wycheproof/main/testvectors_v1/ecdsa_secp256r1_sha256_p1363_test.json | `c60de693930e386c3a5472d08081623ef8504decc54b38ac01ec6b2a2575c986` |
 | wp_x25519 | https://raw.githubusercontent.com/C2SP/wycheproof/main/testvectors_v1/x25519_test.json | `35c3f5231cf25cc640b524d403461deee9e49441d5d915a3a25b2c8ff5adbe7d` |
+
+## Deliberately not used
+
+- `ecdsa_secp256r1_sha256_test.json` (the DER-encoded Wycheproof sibling of
+  `ecdsa_secp256r1_sha256_p1363_test.json`). `brisk__p256_ecdsa_verify` takes a fixed
+  64-byte r||s, so that suite's extra invalid cases are all ASN.1 encoding errors and
+  belong to the M2 DER parser, not here. Not forgotten - out of scope by design.
+- CAVP `PKV.rsp` [P-256]: 4 of the 12 rows are "Q_x or Q_y out of range" with a 33-byte
+  coordinate, which the 65-byte encoding of RFC 9846 4.3.8.2 cannot express. The in-range
+  half of that check is pinned by generated `x == p` / `y == p` / `coord == 2^256-1` rows.
+- `ecdh_secp256r1_ecpoint_test.json`: 9 of the 355 rows carry a 0- or 33-byte encoding
+  (one empty, eight compressed, including the single "acceptable" one). `brisk__p256_ecdh`
+  takes a fixed `uint8_t[65]`, so those cannot reach it - the length check belongs to the
+  TLS layer reading `KeyShareEntry.key_exchange`. The rule behind them, that a compressed
+  point is rejected and never decompressed, is pinned instead by generated
+  0x02/0x03/0x06/0x07 rows and by the all-256-first-bytes sweep in `tests/test_p256.c`.
+- `ecdsa_secp256r1_sha256_p1363_test.json`: 21 of the 262 rows carry a signature that is
+  not 64 bytes (2 to 82), all of them "invalid". `brisk__p256_ecdsa_verify` takes a fixed
+  `uint8_t[64]`, so the width is settled by the caller that unwraps the DER
+  ECDSA-Sig-Value. Their substance - r or s outside [1, n-1] - is pinned at the right
+  width by generated r/s edge rows (0, n, n+1, 2^256-1 on each side).
+- CAVP `SigVer.rsp` `[P-256,SHA-1]` and `[P-256,SHA-224]`, and the RFC 6979 A.2.5
+  SHA-1 / SHA-224 rows. These are skipped for a *behavioural* reason, not an
+  encoding one: `brisk__p256_ecdsa_verify` requires `hash_len >= 32` and returns
+  `BRISK_E_ARG` below that, because RFC 9846 4.3.3 forbids SHA-224 and leaves SHA-1
+  legacy-only, and `include/brisk.h` compiles no digest shorter than SHA-256. The
+  `[P-256,SHA-384]` and `[P-256,SHA-512]` sections of the same file ARE used, 15 rows
+  each with 12 failing: they are what exercises the FIPS 186-5 6.4.2 leftmost-bits
+  rule with official negative vectors.
+- CAVP `SigGen.rsp` and RFC 6979 `k` values: ECDSA signing is the next roadmap line.
