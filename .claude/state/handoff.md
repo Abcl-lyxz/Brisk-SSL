@@ -1,46 +1,46 @@
-# Handoff - 2026-09-21 (session 8)
+# Handoff - 2026-09-21 (session 9)
 
 ## Done
-- 1ffaa17 crypto: P-384 ECDSA verify on the i31 bignum. **M1 Crypto is closed.** bn.c untouched,
-  exactly as its header promised: p384.c adds constants, a projective point type and one
-  Straus-Shamir interleaved ladder (384 doublings + ~384 adds, no table). RCB-2015 Alg. 4 complete
-  addition as in p256.c; Fermat inversions through `brisk__bn_modpow_pub` with p-2 and n-2 derived
-  at run time. `BRISK_ENABLE_P384`, off in TINY. 630 generated rows (CAVP SigVer P-384/SHA-384+512,
-  CAVP PKV, Wycheproof sha384+sha512 p1363, RFC 6979 A.2.6). 11 archs + asan + ct32/ct64 green,
-  baseline re-saved (+2671 armv7hf .. +5092 mips, RAM unchanged).
+- 326340b **x509: strict DER reader + fuzz target. M2 line 1 closed.** `src/x509/der.c`: zero-copy
+  cursor, sticky error, X.690 clause 8/10/11 enforced; `brisk__der_walk` validates a whole value
+  with its own 16-deep end stack, so attacker nesting never reaches the C stack. 884 vectors -
+  337 real SPKIs from the cached Wycheproof suites, the 481 adversarial signature blobs of
+  `ecdsa_secp256r1_sha256_test.json` (the DER sibling the p1363 API could not use), and one
+  generated row per clause. `python tools/dev.py fuzz der` is new (clang+ASan/UBSan, corpus
+  unpacked from der.inc, nothing extra committed): 20.1M execs clean. 11 archs + asan, ct32/ct64,
+  baseline re-saved.
 
 ## In progress
-- Nothing. Tree clean, committed and pushed.
+- **`Certificate parse` (M2 line 2) is WRITTEN AND UNCOMMITTED.** New: `src/x509/cert.c`,
+  `tests/test_x509.c`, `tests/kat/x509_cert.inc` (102 certs), `tests/kat/x509_time.inc` (41).
+  Modified: `src/brisk_int.h` (the `x509/cert.c` block), `CMakeLists.txt`, `tests/test.h`,
+  `tests/test_main.c`, `tests/size_probe.c`, `tools/kat.py`.
+- Verified: host dev+dev32 10/10, TINY profile clean (9101 checks), Docker x86_64 + asan.
+  **NOT verified: the 9 cross archs, `ct`, `size`.** The sweep was killed twice - once by the
+  harness for host RAM pressure (9 parallel containers), once by the user.
+- To finish: `python tools/dev.py test --arch all` (use `-j 3` if RAM is tight) -> `ct` ->
+  `size --arch all --save` (cert is a NEW module: 3252 B armv7hf .. 6308 B mips, RAM unchanged)
+  -> tick the ROADMAP box -> commit `x509:`. Nothing else is left to write.
 
 ## Next up
-- **M2 X.509, first line: `DER parser (strict, depth-limited) + fuzz target`.** `/implement-module`
-  with that ROADMAP line as task text. Nothing from M1 blocks it.
+- Finish the above, then M2 line 3: `Chain building (unordered/extra certs, stop at first trust
+  anchor), signature checks`. cert.c already hands it `tbs`/`sig`/`sig_alg`/`sig_hash`/
+  `sig_salt_len`/`key_alg`/`key`, and issuer/subject as raw TLVs for a memcmp chain.
 
 ## Decisions / gotchas
-- **`/implement-module` died on the session limit for the SECOND run in a row**, again in `fix:r2`,
-  again after every edit was written and before anything was re-run. Assume this is the normal
-  failure mode, not bad luck. Recovery that worked: map `subagents/workflows/<run>/journal.jsonl`
-  by `key` (`type:started` carries the label, `type:result` the verdict), take every
-  `refuted:false`, check whether the fix agent already applied it, then run host tests, `--arch
-  all`, `ct` and `size` yourself. All four round-2 findings turned out to be already fixed.
-- **Do not trust the workflow's own summary object.** Its `build` came back null (the post-phases
-  threw on `build.files_changed`), and it reported a "round 3, found 3, confirmed 0" that has no
-  entries in the journal at all. The journal is the record; the summary is not.
-- **`p384.c:410` `(void)` on `p384_load_reduced` / `brisk__bn_encode` status: refuted by BOTH
-  skeptics and left as is on purpose.** The path needs `bn_be_bitlen(src) > m[0]`, but src is
-  fixed at 48 bytes and `m[0]` is pinned to 384 by `p384_ctx_init`; the same convention is used at
-  four other sites in the file. Do not re-raise it in the next audit.
-- **`BRISK_RSA_MAX_BITS` is now a stack lever for p384.c too**, not just rsa.c: `bn_mont_mul`
-  sizes its CIOS accumulator at `BRISK__BN_MAX_LIMBS` (640 B at 4096) whatever the operand width,
-  and it sits under every one of a verify's ~12,000 multiplications. p384 verify is 2648 B along
-  the deepest chain at -Os, inside the 3 KB budget. Recorded in docs/CONFIG.md, deliberately NOT
-  fixed in bn.c (a VLA is forbidden by -Wvla, alloca is not on offer).
-- **M2 must not call `brisk__p384_ecdsa_verify` with `hash_len` 32.** A P-384 key certified with
-  ecdsa-with-SHA256 exists in some private PKIs and this API cannot verify it by design (RFC 9846
-  4.3.3 pairs the curve with its own hash). The certificate layer rejects that pairing with
-  `unsupported_certificate`; the API returns BRISK_E_ARG for a short digest.
-- **Cost of a P-384 verify, measured:** 3.2 ms on the x86_64 host at -Os, 32 ms under qemu-armv5 -
-  cheap enough that the p384 suite runs in 42 s there against p256's 148 s. Upgrade paths, in
-  order and none taken: `bn_muladd_small` + CT divrem to kill `bn_to_mont`'s 403 doublings, then a
-  2-bit joint window (~12%), then a Solinas fast reduction (a locked-decision change).
-- Docker Desktop was already running this session; `--arch all` and `ct` worked with no npipe error.
+- **Both reviewers earn their keep on this module; two rounds found real fail-open bugs.** Run
+  `rfc-auditor` AND `portability-reviewer` on cert/chain code before every commit.
+- **RSASSA-PSS: never require the DEFAULT fields.** RFC 4055 3.1 makes omitting `trailerField` a
+  MUST for signers and accepting all four absent a MUST for validators. The first draft demanded
+  all four present, i.e. it rejected every PSS certificate in existence. Same trap one level down:
+  RFC 4055 5 says PKCS#1 v1.5 params MUST be accepted absent as well as NULL.
+- **`key_usage == 0` means "absent" only if the BIT STRING LENGTH is bounded to 9.** Checking the
+  octet count plus X.690 11.2.2 is not enough: a 2-octet string whose only set bit is >= 9
+  satisfies both, harvests nothing, and chain code reads the 0 as unrestricted.
+- **`brisk__der_walk` does not descend into an extnValue** - an OCTET STRING is a leaf. cert.c
+  walks each recognised extnValue separately; without it a SAN entry with a BER length reaches
+  the hostname matcher. Remember this when writing the names item.
+- **32-bit `/` and `%` are allowed** (c-code.md bans 64-bit only) and `days_from_civil` uses four.
+  A reviewer will flag `__aeabi_idivmod` on armv5/armv7hf; it is not a defect, do not "fix" it.
+- `check_x509_source_constants()` in tools/kat.py verifies all 22 OIDs in cert.c against their
+  dotted forms - add new OIDs to `X509_OIDS` there or the run dies.
