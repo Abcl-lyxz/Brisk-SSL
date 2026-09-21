@@ -95,6 +95,12 @@ int main(int argc, char **argv)
         brisk__der_fail(&c);
         brisk__der_end(&c);
     }
+    {
+        brisk__x509_cert xc;
+        int64_t when;
+        brisk__x509_parse(&xc, out, sizeof out);
+        brisk__x509_time(BRISK__DER_UTC_TIME, out, sizeof out, &when);
+    }
 #ifdef __linux__
     brisk__os_random(out, 32);
 #endif

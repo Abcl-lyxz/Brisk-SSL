@@ -62,7 +62,7 @@ static const struct {
 } SUITES[] = {
     {"hash", test_hash},     {"aead", test_aead}, {"aes", test_aes},
     {"x25519", test_x25519}, {"p256", test_p256}, {"p384", test_p384},
-    {"rsa", test_rsa},     {"der", test_der},
+    {"rsa", test_rsa},     {"der", test_der},   {"x509", test_x509},
     {"ct", test_ct},
 #ifdef __linux__
     {"rand", test_rand},

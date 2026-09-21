@@ -33,7 +33,7 @@ Tick a box only when the work is green on **every** arch (`python tools/dev.py t
 
 ## M2 X.509
 - [x] DER parser (strict, depth-limited) + fuzz target
-- [ ] Certificate parse: basicConstraints, keyUsage, EKU, SAN, validity, unknown-critical reject
+- [x] Certificate parse: basicConstraints, keyUsage, EKU, SAN, validity, unknown-critical reject
 - [ ] Chain building (unordered/extra certs, stop at first trust anchor), signature checks
 - [ ] RFC 9525 hostname / IP matching
 - [ ] Time policy STRICT / FLOOR (default) / INSECURE_NO_TIME; int64 dates

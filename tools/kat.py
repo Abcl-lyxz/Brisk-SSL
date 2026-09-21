@@ -6,6 +6,7 @@ here instead of silently weakening the C tests. Downloads are cached in .cache/k
 
     python tools/kat.py            # regenerate tests/kat/*.inc + tests/kat/SOURCES.md
 """
+import calendar
 import datetime
 import hashlib
 import hmac
@@ -2989,6 +2990,460 @@ def der_values():
     return rows
 
 
+# ------------------------------------------------------------------ X.509 certificates (M2)
+# No official "parse this certificate" suite exists at this layer either. x509-limbo is the real
+# one and it is its own ROADMAP item; what stands here until then is:
+#   1. certificates BUILT by the encoder below, one per rule src/x509/cert.c enforces, with the
+#      expected decode of every field computed in Python. A constructed certificate is the only
+#      way to get a keyUsage with a trailing zero bit or a pathLenConstraint without cA - no CA
+#      issues those, which is exactly why a parser has to be told about them explicitly.
+#   2. the same shell wrapped around REAL SubjectPublicKeyInfo blobs taken from the Wycheproof
+#      suites, so read_spki() meets key material produced by other people's tools rather than
+#      only by this file.
+# The signatures on all of them are nonsense bytes, deliberately: this item parses, it does not
+# verify, and a vector set that needed valid signatures could not cover a tenth of these cases.
+X509_MAX_CERTS = 30  # real SPKIs to wrap; the whole table would be 300 KB for nothing new
+
+
+def py_oid(dotted):
+    """DER contents octets of an OBJECT IDENTIFIER, X.690 8.19."""
+    parts = [int(x) for x in dotted.split(".")]
+    out = bytearray([40 * parts[0] + parts[1]])
+    for n in parts[2:]:
+        chunk = [n & 0x7f]
+        n >>= 7
+        while n:
+            chunk.append(0x80 | (n & 0x7f))
+            n >>= 7
+        out += bytes(reversed(chunk))
+    return bytes(out)
+
+
+X509_OIDS = {
+    "OID_RSA": "1.2.840.113549.1.1.1", "OID_RSA_PSS": "1.2.840.113549.1.1.10",
+    "OID_MGF1": "1.2.840.113549.1.1.8", "OID_RSA_SHA256": "1.2.840.113549.1.1.11",
+    "OID_RSA_SHA384": "1.2.840.113549.1.1.12", "OID_RSA_SHA512": "1.2.840.113549.1.1.13",
+    "OID_EC_KEY": "1.2.840.10045.2.1", "OID_P256": "1.2.840.10045.3.1.7",
+    "OID_ECDSA_SHA256": "1.2.840.10045.4.3.2", "OID_ECDSA_SHA384": "1.2.840.10045.4.3.3",
+    "OID_ECDSA_SHA512": "1.2.840.10045.4.3.4", "OID_P384": "1.3.132.0.34",
+    "OID_SHA256": "2.16.840.1.101.3.4.2.1", "OID_SHA384": "2.16.840.1.101.3.4.2.2",
+    "OID_SHA512": "2.16.840.1.101.3.4.2.3", "OID_KEY_USAGE": "2.5.29.15",
+    "OID_SAN": "2.5.29.17", "OID_BASIC_CONSTR": "2.5.29.19", "OID_EKU": "2.5.29.37",
+    "OID_EKU_ANY": "2.5.29.37.0", "OID_KP_SERVER": "1.3.6.1.5.5.7.3.1",
+    "OID_KP_CLIENT": "1.3.6.1.5.5.7.3.2",
+}
+
+
+def check_x509_source_constants():
+    """Every OID table entry in src/x509/cert.c must equal the encoding of its dotted form.
+
+    Same guard as check_p256_source_constants(): the bytes in the source are not allowed to be
+    something a human typed and nobody re-derived."""
+    src = (ROOT / "src" / "x509" / "cert.c").read_text()
+    for name, dotted in sorted(X509_OIDS.items()):
+        m = re.search(r"OID_" + name[4:] + r"\s*=\s*\{\s*(\d+)\s*,\s*\{([^}]*)\}", src)
+        if not m:
+            die(f"cert.c: no table entry for {name}")
+        got = bytes(int(x, 16) for x in re.findall(r"0x([0-9a-f]{2})", m.group(2)))
+        want = py_oid(dotted)
+        if int(m.group(1)) != len(want) or got != want:
+            die(f"cert.c {name} ({dotted}): source has {got.hex()}/{m.group(1)}, "
+                f"the OID encodes to {want.hex()}/{len(want)}")
+    print(f"  cert.c: {len(X509_OIDS)} OIDs match their dotted forms")
+
+
+# ---------------------------------------------------------------- a certificate encoder
+def x_seq(*p):
+    return der_tlv(0x30, b"".join(p))
+
+
+def x_oid(dotted):
+    return der_tlv(0x06, py_oid(dotted))
+
+
+def x_int(v):
+    if isinstance(v, bytes):
+        return der_tlv(0x02, v)
+    n = max(1, (v.bit_length() + 8) // 8)
+    return der_tlv(0x02, v.to_bytes(n, "big"))
+
+
+def x_ctx(num, content, constructed=True):
+    return der_tlv(0x80 | (0x20 if constructed else 0) | num, content)
+
+
+def x_bits(payload, unused=0):
+    return der_tlv(0x03, bytes([unused]) + payload)
+
+
+def x_named_bits(bits):
+    """A NamedBitList BIT STRING with the trailing zero bits removed, per X.690 11.2.2."""
+    if not bits:
+        return x_bits(b"", 0)
+    top = max(bits)
+    octets = bytearray(top // 8 + 1)
+    for b in bits:
+        octets[b // 8] |= 0x80 >> (b % 8)
+    return x_bits(bytes(octets), 7 - top % 8)
+
+
+def x_name(cn):
+    """RDNSequence with one commonName; b"" gives the empty name RFC 5280 4.2.1.6 allows."""
+    if cn is None:
+        return x_seq()
+    return x_seq(der_tlv(0x31, x_seq(x_oid("2.5.4.3"), der_tlv(0x0c, cn.encode()))))
+
+
+def x_ext(dotted, critical, value):
+    parts = [x_oid(dotted)]
+    if critical:
+        parts.append(der_tlv(0x01, b"\xff"))
+    parts.append(der_tlv(0x04, value))
+    return x_seq(*parts)
+
+
+def x_alg_rsa_pkcs1(h=256):
+    return x_seq(x_oid(f"1.2.840.113549.1.1.{ {256: 11, 384: 12, 512: 13}[h] }"), b"\x05\x00")
+
+
+def x_alg_ecdsa(h=256):
+    return x_seq(x_oid(f"1.2.840.10045.4.3.{ {256: 2, 384: 3, 512: 4}[h] }"))
+
+
+SHA_OID = {256: "2.16.840.1.101.3.4.2.1", 384: "2.16.840.1.101.3.4.2.2",
+           512: "2.16.840.1.101.3.4.2.3"}
+
+
+def x_alg_pss(h=256, salt=None, trailer=None, mgf_h=None, omit_hash=False, omit_mgf=False):
+    """RSASSA-PSS-params, RFC 4055 3.1, in the DER form a conforming CA actually emits: every
+    field has a DEFAULT, so trailerField is always omitted (3.1 makes that a MUST for signers)
+    and saltLength is omitted when it is the default 20. Pass trailer= or omit_* to build the
+    shapes a validator must accept or refuse."""
+    salt = {256: 32, 384: 48, 512: 64}[h] if salt is None else salt
+    parts = []
+    if not omit_hash:
+        parts.append(x_ctx(0, x_seq(x_oid(SHA_OID[h]))))
+    if not omit_mgf:
+        parts.append(x_ctx(1, x_seq(x_oid("1.2.840.113549.1.1.8"),
+                                    x_seq(x_oid(SHA_OID[mgf_h or h])))))
+    if salt != 20:
+        parts.append(x_ctx(2, x_int(salt)))
+    if trailer is not None:
+        parts.append(x_ctx(3, x_int(trailer)))
+    return x_seq(x_oid("1.2.840.113549.1.1.10"), x_seq(*parts))
+
+
+def x_spki_rsa(n_hex=None, e_hex="010001"):
+    n = bytes.fromhex(n_hex or RSA_KEYS[0][0])
+    key = x_seq(x_int(int.from_bytes(n, "big")), x_int(int.from_bytes(bytes.fromhex(e_hex), "big")))
+    return x_seq(x_seq(x_oid("1.2.840.113549.1.1.1"), b"\x05\x00"), x_bits(key))
+
+
+def x_spki_ec(curve="1.2.840.10045.3.1.7", point=None):
+    if point is None:
+        point = bytes.fromhex("04") + bytes(96 if curve.endswith("0.34") else 64)
+    return x_seq(x_seq(x_oid("1.2.840.10045.2.1"), x_oid(curve)), x_bits(point))
+
+
+def x_time(text):
+    return der_tlv(0x17 if len(text) <= 13 else 0x18, text.encode())
+
+
+def make_cert(version=3, serial=1, alg=None, outer_alg=None, issuer="Brisk Test CA",
+              subject="device.example.com", nbf="200101000000Z", naf="300101000000Z",
+              spki=None, exts=None, sig=None, sig_unused=0, uids=b"", extra_tbs=b""):
+    alg = x_alg_rsa_pkcs1() if alg is None else alg
+    spki = x_spki_rsa() if spki is None else spki
+    parts = []
+    if version != 1:
+        parts.append(x_ctx(0, x_int(version - 1)))
+    parts += [x_int(serial), alg, x_name(issuer), x_seq(x_time(nbf), x_time(naf)), x_name(subject),
+              spki]
+    tbs = x_seq(*parts, uids, extra_tbs, x_ctx(3, x_seq(*exts)) if exts is not None else b"")
+    return x_seq(tbs, outer_alg if outer_alg is not None else alg,
+                 x_bits(sig if sig is not None else bytes(64), sig_unused))
+
+
+# ---------------------------------------------------------------- expected decode
+def cert_row(der, note, reject=0, flags=0, version=3, key_alg=1, sig_alg=1, sig_hash=1, salt=0,
+             key_usage=0, eku=0, is_ca=0, path_len=-1, serial=b"\x01", san=b"",
+             nbf="200101000000Z", naf="300101000000Z"):
+    nb = na = 0
+    if not reject:
+        nb, na = py_asn1_time(nbf), py_asn1_time(naf)
+    return (der.hex(), reject, note, flags, version, key_alg, sig_alg, sig_hash, salt, key_usage, eku,
+            is_ca, path_len, serial.hex(), san.hex(), nb, na)
+
+
+def py_asn1_time(text):
+    """Seconds since the epoch for a UTCTime / GeneralizedTime string, via calendar.timegm."""
+    if len(text) == 13:
+        yy = int(text[:2])
+        y, rest = (2000 + yy if yy < 50 else 1900 + yy), text[2:12]
+    else:
+        y, rest = int(text[:4]), text[4:14]
+    mo, d, h, mi, s = (int(rest[i:i + 2]) for i in range(0, 10, 2))
+    return calendar.timegm((y, mo, d, h, mi, s, 0, 1, 0))
+
+
+def x509_time_vectors():
+    """(tag, text, reject, seconds) for brisk__x509_time."""
+    rows = []
+    good = ["500101000000Z", "700101000000Z", "991231235959Z", "000101000000Z",
+            "490101000000Z", "240229120000Z", "380119031407Z", "010203040506Z"]
+    for t in good:
+        rows.append((0x17, t, 0, py_asn1_time(t)))
+        rows.append((0x18, "20" + t if int(t[:2]) < 50 else "19" + t, 0,
+                     py_asn1_time(("20" if int(t[:2]) < 50 else "19") + t)))
+    for t in ["19500101000000Z", "20000229000000Z", "21000301000000Z", "99991231235959Z",
+              "20240101000000Z"]:
+        rows.append((0x18, t, 0, py_asn1_time(t)))
+    bad_utc = [
+        ("2001010000Z", "no seconds - RFC 5280 4.1.2.5.1 requires them"),
+        ("200101000000", "no Z terminator"),
+        ("200101000000+0100", "a time differential, not Zulu"),
+        ("200101000000z", "lowercase z"),
+        ("201301000000Z", "month 13"),
+        ("200001000000Z", "month 0"),
+        ("200132000000Z", "day 32"),
+        ("200100000000Z", "day 0"),
+        ("230229000000Z", "29 February in a common year"),
+        ("200101240000Z", "hour 24"),
+        ("200101006000Z", "minute 60"),
+        ("200101000060Z", "second 60 - a leap second, refused on purpose"),
+        ("2001010000x0Z", "a non-digit in the seconds"),
+        ("", "empty"),
+    ]
+    for t, why in bad_utc:
+        rows.append((0x17, t, 1, 0))
+    for t, why in [("2020010100000Z", "one digit short"), ("202001010000001Z", "one digit long"),
+                   ("20200101000000.5Z", "a fractional part - 4.1.2.5.2 forbids it"),
+                   ("19490101000000Z", "before 1950: a local floor, not an RFC 5280 rule"), ("100000101000000Z", "16 octets: longer than any GeneralizedTime this profile takes")]:
+        rows.append((0x18, t, 1, 0))
+    rows.append((0x13, "200101000000Z", 1, 0))  # PrintableString, not a Time
+    return rows
+
+
+KU_DIGITAL_SIGNATURE, KU_KEY_ENCIPHERMENT, KU_KEY_CERT_SIGN, KU_CRL_SIGN = 0x01, 0x04, 0x20, 0x40
+EKU_SERVER, EKU_CLIENT, EKU_ANY, EKU_OTHER = 0x01, 0x02, 0x04, 0x08
+SAN_DNS = der_tlv(0x82, b"device.example.com")
+SAN_TWO = SAN_DNS + der_tlv(0x87, bytes([192, 0, 2, 1]))
+
+
+def x509_real_spkis():
+    """SubjectPublicKeyInfo blobs from the cached Wycheproof suites, one per distinct key, kept
+    only where the algorithm is one this client supports."""
+    out, seen = [], set()
+    for name in list(SRC):
+        if not name.startswith(("wp_rsa_", "wp_p256_", "wp_p384_")):
+            continue
+        for g in json.loads(fetch(name))["testGroups"]:
+            hx = g.get("publicKeyDer")
+            if not isinstance(hx, str) or hx in seen:
+                continue
+            seen.add(hx)
+            blob = bytes.fromhex(hx)
+            for oid, alg, p384 in ((py_oid("1.2.840.113549.1.1.1"), 1, 0),
+                                   (py_oid("1.2.840.10045.3.1.7"), 2, 0),
+                                   (py_oid("1.3.132.0.34"), 3, 1)):
+                if oid in blob:
+                    out.append((blob, alg, p384, name))
+                    break
+    out.sort(key=lambda r: (r[1], len(r[0]), r[0]))
+    return out[:X509_MAX_CERTS] if len(out) <= X509_MAX_CERTS else \
+        out[::max(1, len(out) // X509_MAX_CERTS)][:X509_MAX_CERTS]
+
+
+def x509_cert_vectors():
+    rows = []
+    ku_leaf = x_ext("2.5.29.15", True, x_named_bits([0, 2]))
+    ku_ca = x_ext("2.5.29.15", True, x_named_bits([5, 6]))
+    bc_ca = x_ext("2.5.29.19", True, x_seq(der_tlv(0x01, b"\xff")))
+    bc_ca0 = x_ext("2.5.29.19", True, x_seq(der_tlv(0x01, b"\xff"), x_int(0)))
+    san = x_ext("2.5.29.17", False, x_seq(SAN_DNS))
+    eku = x_ext("2.5.29.37", False, x_seq(x_oid("1.3.6.1.5.5.7.3.1"),
+                                          x_oid("1.3.6.1.5.5.7.3.2")))
+
+    # ---------------------------------------------------------------- accepted
+    rows.append(cert_row(make_cert(exts=[san]), "v3 RSA leaf with a dNSName", san=SAN_DNS))
+    rows.append(cert_row(make_cert(version=1, exts=None), "v1 RSA, no extensions", version=1))
+    rows.append(cert_row(make_cert(version=2, exts=None), "v2 RSA, no extensions", version=2))
+    rows.append(cert_row(make_cert(spki=x_spki_ec(), alg=x_alg_ecdsa(256), exts=[san]),
+                         "P-256 leaf, ecdsa-with-SHA256", key_alg=2, sig_alg=3, sig_hash=1,
+                         san=SAN_DNS))
+    rows.append(cert_row(make_cert(spki=x_spki_ec("1.3.132.0.34"), alg=x_alg_ecdsa(384),
+                                   exts=[san]),
+                         "P-384 leaf, ecdsa-with-SHA384", key_alg=3, sig_alg=3, sig_hash=2,
+                         san=SAN_DNS, flags=1))
+    rows.append(cert_row(make_cert(alg=x_alg_pss(256), exts=[san]),
+                         "RSASSA-PSS sha256, salt 32", sig_alg=2, sig_hash=1, salt=32,
+                         san=SAN_DNS))
+    rows.append(cert_row(make_cert(alg=x_alg_pss(512, salt=0), exts=[san]),
+                         "RSASSA-PSS sha512, salt 0", sig_alg=2, sig_hash=3, salt=0, san=SAN_DNS))
+    rows.append(cert_row(make_cert(alg=x_alg_rsa_pkcs1(384), exts=[san]),
+                         "sha384WithRSAEncryption", sig_hash=2, san=SAN_DNS))
+    rows.append(cert_row(make_cert(alg=x_seq(x_oid("1.2.840.113549.1.1.11")), exts=[san]),
+                         "sha256WithRSAEncryption with absent parameters: RFC 4055 5 makes "
+                         "accepting them a MUST", san=SAN_DNS))
+    rows.append(cert_row(make_cert(alg=x_alg_pss(256, salt=20), exts=[san]),
+                         "RSASSA-PSS with saltLength omitted, i.e. the DEFAULT 20",
+                         sig_alg=2, sig_hash=1, salt=20, san=SAN_DNS))
+    rows.append(cert_row(make_cert(alg=x_alg_pss(256, trailer=1), exts=[san]),
+                         "RSASSA-PSS with trailerField present at 1: RFC 4055 3.1 tells "
+                         "validators to recognise it", sig_alg=2, sig_hash=1, salt=32,
+                         san=SAN_DNS))
+    rows.append(cert_row(make_cert(exts=[bc_ca, ku_ca], subject="Brisk Test CA"),
+                         "CA: basicConstraints cA, keyCertSign + cRLSign",
+                         key_usage=KU_KEY_CERT_SIGN | KU_CRL_SIGN, is_ca=1))
+    rows.append(cert_row(make_cert(exts=[bc_ca0, ku_ca], subject="Brisk Test CA"),
+                         "CA with pathLenConstraint 0",
+                         key_usage=KU_KEY_CERT_SIGN | KU_CRL_SIGN, is_ca=1, path_len=0))
+    rows.append(cert_row(make_cert(exts=[ku_leaf, san]), "leaf keyUsage dS + kE",
+                         key_usage=KU_DIGITAL_SIGNATURE | KU_KEY_ENCIPHERMENT, san=SAN_DNS))
+    rows.append(cert_row(make_cert(exts=[eku, san]), "EKU serverAuth + clientAuth",
+                         eku=EKU_SERVER | EKU_CLIENT, san=SAN_DNS))
+    rows.append(cert_row(make_cert(exts=[x_ext("2.5.29.37", False, x_seq(x_oid("2.5.29.37.0"))),
+                                         san]),
+                         "EKU anyExtendedKeyUsage", eku=EKU_ANY, san=SAN_DNS))
+    rows.append(cert_row(make_cert(exts=[x_ext("2.5.29.37", True,
+                                               x_seq(x_oid("1.3.6.1.5.5.7.3.9"))), san]),
+                         "EKU with a purpose this client does not name", eku=EKU_OTHER,
+                         san=SAN_DNS))
+    rows.append(cert_row(make_cert(subject=None, exts=[x_ext("2.5.29.17", True, x_seq(SAN_DNS))]),
+                         "empty subject with a critical SAN (4.2.1.6)", san=SAN_DNS))
+    rows.append(cert_row(make_cert(exts=[x_ext("2.5.29.17", False, x_seq(SAN_TWO))]),
+                         "SAN with a dNSName and an iPAddress", san=SAN_TWO))
+    rows.append(cert_row(make_cert(exts=[san, x_ext("1.3.6.1.4.1.11129.2.4.2", False,
+                                                    b"\x04\x02\x00\x01")]),
+                         "unknown NON-critical extension is ignored (4.2)", san=SAN_DNS))
+    rows.append(cert_row(make_cert(serial=b"\x7f" + b"\xff" * 19, exts=[san]),
+                         "a 20-octet serial number (4.1.2.2)", serial=b"\x7f" + b"\xff" * 19,
+                         san=SAN_DNS))
+    rows.append(cert_row(make_cert(serial=b"\x81", exts=[san]),
+                         "a negative serial: non-conforming, kept opaque (4.1.2.2 note)",
+                         serial=b"\x81", san=SAN_DNS))
+    rows.append(cert_row(make_cert(nbf="20200101000000Z", naf="20991231235959Z", exts=[san]),
+                         "GeneralizedTime validity", san=SAN_DNS, nbf="20200101000000Z",
+                         naf="20991231235959Z"))
+    rows.append(cert_row(make_cert(uids=x_ctx(1, bytes([0]) + b"\xaa", constructed=False) +
+                                   x_ctx(2, bytes([0]) + b"\xbb", constructed=False), exts=[san]),
+                         "issuerUniqueID and subjectUniqueID, ignored (4.1.2.8)", san=SAN_DNS))
+    rows.append(cert_row(make_cert(exts=[x_ext("2.5.29.15", True, x_named_bits([8]))]),
+                         "keyUsage decipherOnly alone: bit 8, two octets",
+                         key_usage=0x100))
+
+    # ---------------------------------------------------------------- rejected
+    def bad(der, note):
+        rows.append(cert_row(der, note, reject=1))
+
+    bad(make_cert(exts=[x_ext("2.5.29.30", True, x_seq()), san]),
+        "a CRITICAL extension this client does not implement (4.2, nameConstraints)")
+    bad(make_cert(exts=[ku_leaf, ku_leaf, san]), "keyUsage twice (4.2)")
+    bad(make_cert(exts=[san, san]), "subjectAltName twice (4.2)")
+    bad(make_cert(exts=[x_ext("2.5.29.15", True, x_bits(b"", 0)), san]),
+        "keyUsage with no bits set (4.2.1.3)")
+    bad(make_cert(exts=[x_ext("2.5.29.15", True, x_bits(b"\x80", 0)), san]),
+        "keyUsage with trailing zero bits (X.690 11.2.2)")
+    bad(make_cert(exts=[x_ext("2.5.29.15", True, x_bits(b"\x00\x40", 6)), san]),
+        "keyUsage whose only set bit is 9, above the nine 4.2.1.3 defines")
+    bad(make_cert(subject=None, exts=[x_ext("2.5.29.17", False, x_seq(SAN_DNS))]),
+        "empty subject with a NON-critical subjectAltName (4.1.2.6)")
+    bad(make_cert(subject=None, exts=[bc_ca, ku_ca, x_ext("2.5.29.17", True, x_seq(SAN_DNS))]),
+        "a cA certificate with an empty subject (4.1.2.6)")
+    bad(make_cert(exts=[x_ext("2.5.29.17", False,
+                              x_seq(der_tlv(0x82, b"device.example.com", lenbytes=1)))]),
+        "a dNSName with a non-minimal length inside extnValue (X.690 10.1)")
+    bad(make_cert(exts=[x_ext("2.5.29.15", True, x_named_bits([5])), san]),
+        "keyCertSign without basicConstraints cA (4.2.1.9)")
+    bad(make_cert(exts=[x_ext("2.5.29.19", True, x_seq(x_int(0))), san]),
+        "pathLenConstraint without cA (4.2.1.9)")
+    bad(make_cert(exts=[x_ext("2.5.29.19", True, x_seq(der_tlv(0x01, b"\x00"))), san]),
+        "cA encoded as FALSE instead of omitted (X.690 11.5)")
+    bad(make_cert(exts=[x_seq(x_oid("2.5.29.17"), der_tlv(0x01, b"\x00"),
+                              der_tlv(0x04, x_seq(SAN_DNS)))],),
+        "critical encoded as FALSE instead of omitted (X.690 11.5)")
+    bad(make_cert(exts=[bc_ca0, x_ext("2.5.29.15", True, x_named_bits([6])), ],),
+        "pathLenConstraint with keyUsage that lacks keyCertSign (4.2.1.9)")
+    bad(x_seq(x_seq(x_ctx(0, x_int(0)), x_int(1), x_alg_rsa_pkcs1(), x_name("CA"),
+                    x_seq(x_time("200101000000Z"), x_time("300101000000Z")), x_name("leaf"),
+                    x_spki_rsa()), x_alg_rsa_pkcs1(), x_bits(bytes(64))),
+        "version explicitly encoded as v1 (X.690 11.5)")
+    bad(make_cert(version=4, exts=[san]), "version 4 does not exist (4.1.2.1)")
+    bad(make_cert(version=1, exts=[san]), "extensions in a v1 certificate (4.1.2.9)")
+    bad(make_cert(version=1, uids=x_ctx(1, bytes([0]) + b"\xaa", constructed=False)),
+        "issuerUniqueID in a v1 certificate (4.1.2.8)")
+    bad(make_cert(subject=None, exts=[ku_leaf]),
+        "empty subject with no subjectAltName (4.2.1.6)")
+    bad(make_cert(subject=None), "empty subject and no extensions at all (4.2.1.6)")
+    bad(make_cert(exts=[x_ext("2.5.29.17", True, x_seq())]),
+        "empty subjectAltName sequence (4.2.1.6)")
+    bad(make_cert(exts=[x_ext("2.5.29.37", False, x_seq()), san]),
+        "empty extendedKeyUsage sequence (4.2.1.12)")
+    bad(make_cert(issuer=None, exts=[san]), "empty issuer name (4.1.2.4)")
+    bad(make_cert(exts=[]), "extensions [3] present but the SEQUENCE is empty")
+    bad(make_cert(alg=x_alg_rsa_pkcs1(256), outer_alg=x_alg_rsa_pkcs1(384), exts=[san]),
+        "signatureAlgorithm differs from the TBS signature field (4.1.1.2)")
+    bad(make_cert(alg=x_alg_pss(256), outer_alg=x_alg_pss(256, salt=31), exts=[san]),
+        "signatureAlgorithm differs only in the PSS saltLength (4.1.1.2)")
+    bad(make_cert(alg=x_seq(x_oid("1.2.840.113549.1.1.5"), b"\x05\x00"), exts=[san]),
+        "sha1WithRSAEncryption (RFC 9325 5.1)")
+    bad(make_cert(alg=x_seq(x_oid("1.2.840.10045.4.3.2"), b"\x05\x00"), spki=x_spki_ec(),
+                  exts=[san]),
+        "ecdsa-with-SHA256 with NULL parameters (RFC 5758 3.2 says absent)")
+    bad(make_cert(alg=x_alg_pss(256, mgf_h=384), exts=[san]),
+        "RSASSA-PSS whose MGF1 hash differs from the message hash")
+    bad(make_cert(alg=x_alg_pss(256, trailer=2), exts=[san]),
+        "RSASSA-PSS with trailerField 2 (RFC 4055 3.1: the value MUST be 1)")
+    bad(make_cert(alg=x_alg_pss(256, omit_hash=True), exts=[san]),
+        "RSASSA-PSS with hashAlgorithm omitted, i.e. the SHA-1 default (RFC 9325 4.5)")
+    bad(make_cert(alg=x_alg_pss(256, omit_mgf=True), exts=[san]),
+        "RSASSA-PSS with maskGenAlgorithm omitted, i.e. MGF1-SHA1 (RFC 9846 4.3.3)")
+    bad(make_cert(alg=x_seq(x_oid("1.2.840.113549.1.1.10"),
+                            x_seq(x_ctx(0, x_seq(x_oid("1.3.14.3.2.26"))),
+                                  x_ctx(1, x_seq(x_oid("1.2.840.113549.1.1.8"),
+                                                 x_seq(x_oid("1.3.14.3.2.26")))),
+                                  x_ctx(2, x_int(20)), x_ctx(3, x_int(1)))), exts=[san]),
+        "RSASSA-PSS with SHA-1 (RFC 9325 5.1)")
+    bad(make_cert(spki=x_seq(x_seq(x_oid("1.2.840.10040.4.1")), x_bits(b"\x02\x01\x01")),
+                  exts=[san]), "a DSA public key")
+    bad(make_cert(spki=x_spki_ec("1.3.132.0.10"), alg=x_alg_ecdsa(256), exts=[san]),
+        "secp256k1: a curve this library does not carry")
+    bad(make_cert(spki=x_spki_ec(point=b"\x04" + bytes(63)), alg=x_alg_ecdsa(256), exts=[san]),
+        "a P-256 point one octet short")
+    bad(make_cert(spki=x_spki_ec(point=b"\x02" + bytes(32)), alg=x_alg_ecdsa(256), exts=[san]),
+        "a compressed P-256 point (RFC 5480 2.2)")
+    bad(make_cert(spki=x_seq(x_seq(x_oid("1.2.840.113549.1.1.1"), b"\x05\x00"),
+                             x_bits(x_seq(x_int(3), x_int(65536)), 1)), exts=[san]),
+        "subjectPublicKey BIT STRING with unused bits")
+    bad(make_cert(spki=x_seq(x_seq(x_oid("1.2.840.113549.1.1.1")),
+                             x_bits(x_seq(x_int(3), x_int(65537)))), exts=[san]),
+        "rsaEncryption with the NULL parameters absent (RFC 4055 1.2)")
+    bad(make_cert(nbf="300101000000Z", naf="200101000000Z", exts=[san]),
+        "notBefore after notAfter")
+    bad(make_cert(nbf="201301000000Z", exts=[san]), "notBefore in month 13")
+    bad(make_cert(nbf="2001010000Z", exts=[san]), "a UTCTime without seconds (4.1.2.5.1)")
+    bad(make_cert(exts=[san], sig=bytes(64), sig_unused=1),
+        "signatureValue BIT STRING with unused bits")
+    bad(make_cert(exts=[san], sig=b""), "an empty signatureValue")
+    bad(make_cert(exts=[san]) + b"\x00", "a trailing byte after the certificate")
+    bad(make_cert(exts=[x_seq(x_oid("2.5.29.17"), der_tlv(0x04, x_seq(SAN_DNS) + b"\x05\x00"))]),
+        "extnValue with a second value after the SAN")
+    bad(make_cert(exts=[x_ext("2.5.29.19", True, x_seq(der_tlv(0x01, b"\x01"))), san]),
+        "cA encoded as the BER true 0x01 (X.690 11.1)")
+
+    # ---------------------------------------------------------------- real key material
+    real = x509_real_spkis()
+    for blob, alg, p384, src in real:
+        rows.append(cert_row(make_cert(spki=blob, exts=[san],
+                                       alg=x_alg_ecdsa(256) if alg != 1 else x_alg_rsa_pkcs1()),
+                             f"real SPKI from {src}", key_alg=alg,
+                             sig_alg=3 if alg != 1 else 1, sig_hash=1, san=SAN_DNS,
+                             flags=p384))
+    print(f"  x509: {sum(1 for r in rows if not r[1])} accepted, "
+          f"{sum(1 for r in rows if r[1])} rejected, {len(real)} around real keys")
+    return rows
+
+
 # ---------------------------------------------------------------- C emitters
 def cstr(hx, width=96):
     if not hx:
@@ -3091,6 +3546,9 @@ def main():
     bn = bn_vectors()
     der = der_generated() + der_wycheproof()
     der_val = der_values()
+    check_x509_source_constants()
+    x509_certs = x509_cert_vectors()
+    x509_times = x509_time_vectors()
 
     emit("sha2.inc", "struct hash_kat SHA2_KAT", cavp + dhash, lambda r: f"{r[0]}, {cstr(r[1])}, {cstr(r[2])}")
     emit("sha2_monte.inc", "struct monte_kat SHA2_MONTE", monte,
@@ -3162,6 +3620,13 @@ def main():
          lambda r: f'{cstr(r[0])}, {r[1]}, "{r[2]}"')
     emit("der_val.inc", "struct der_val_kat DER_VAL_KAT", der_val,
          lambda r: f"{r[0]}, {cstr(r[1])}, {r[2]}, {cstr(r[3])}, {r[4]}u")
+
+    emit("x509_time.inc", "struct x509_time_kat X509_TIME_KAT", x509_times,
+         lambda r: f'0x{r[0]:02x}, "{r[1]}", {r[2]}, {r[3]}LL')
+    emit("x509_cert.inc", "struct cert_kat X509_CERT_KAT", x509_certs,
+         lambda r: f'{cstr(r[0])}, {r[1]}, "{r[2]}", {r[3]}, {r[4]}, {r[5]}, {r[6]}, {r[7]}, '
+                   f'{r[8]}, {r[9]}u, {r[10]}u, {r[11]}, {r[12]}, {cstr(r[13])}, {cstr(r[14])}, '
+                   f'{r[15]}LL, {r[16]}LL')
 
     rows = "\n".join(f"| {k} | {u} | `{h}` |" for k, (u, h) in sorted(fetched.items()))
     (OUT / "SOURCES.md").write_text(

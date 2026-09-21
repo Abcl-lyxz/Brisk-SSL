@@ -23,6 +23,7 @@ void test_p256(void);
 void test_p384(void); /* the suite is a no-op stub when BRISK_ENABLE_P384 is 0 */
 void test_rsa(void);
 void test_der(void);
+void test_x509(void);
 void test_ct(void);   /* constant-time smoke run; the real check is `dev.py ct` */
 void test_rand(void); /* Linux only */
 

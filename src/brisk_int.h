@@ -591,8 +591,8 @@ int brisk__rsa_pss_verify(const uint8_t *n, size_t n_len, const uint8_t *e, size
  *   - 11.2.2, a NamedBitList BIT STRING has its trailing zero bits removed: the extension code,
  *     for KeyUsage (RFC 5280 4.2.1.3).
  *   - 11.5, a component equal to its DEFAULT is omitted: the certificate code, for `version`,
- *     `critical`, `cA` (RFC 5280 4.1, 4.2.1.9) and the four RSASSA-PSS-params defaults
- *     (RFC 8017 A.2.3) that RFC 9846 4.3.3 requires to be DER.
+ *     `critical` and `cA` (RFC 5280 4.1, 4.2, 4.2.1.9). NOT for RSASSA-PSS-params, where RFC
+ *     4055 3.1 overrides it with an explicit instruction to validators to accept both forms.
  *   - 10.3 and 11.6, SET component and SET OF ordering: safe to skip only while distinguished
  *     names are compared as raw TLVs, as brisk__der_tlv intends. Re-audit it at the RFC 9525
  *     names item, and before anything compares a DN attribute by attribute.
@@ -611,6 +611,10 @@ int brisk__rsa_pss_verify(const uint8_t *n, size_t n_len, const uint8_t *e, size
  * whose parameters RFC 9846 4.3.3 requires to be DER. The certificate entry point therefore runs
  * brisk__der_walk over the whole encoding ONCE before it parses anything, and the cursor API
  * relies on that gate having passed. Walk first, then cursor.
+ *
+ * One limit of that gate, because it is easy to over-trust: an OCTET STRING is a leaf here,
+ * so the walk does not descend into an X.509 extnValue, which holds a whole DER value of its
+ * own. cert.c walks each recognised extnValue separately for exactly that reason.
  *
  * The error is STICKY: once a read fails the cursor stays failed and every later read is a
  * no-op, so a parser can run a whole chain of reads and check once at the end. Outputs of a
@@ -751,6 +755,155 @@ int brisk__der_bitstring(brisk__der *c, const uint8_t **v, size_t *len, unsigned
  * This is the fuzz entry point (fuzz/fuzz_der.c) and the strictness oracle the tests drive.
  * BRISK_OK or BRISK_E_ARG. */
 int brisk__der_walk(const uint8_t *der, size_t len);
+
+/* ---- x509/cert.c: one certificate, parsed (RFC 5280) ----------------------------------------
+ *
+ * brisk__x509_parse turns a DER Certificate into a brisk__x509_cert: a plain struct of pointers
+ * INTO the caller's buffer plus a handful of decoded scalars. Nothing is copied, nothing is
+ * allocated, and the DER must outlive the struct. It is a parse, not a validation: the
+ * signature is not checked, the dates are decoded but not compared against a clock, and no
+ * chain is built - those are the next three ROADMAP items. What it does decide is whether the
+ * certificate is well formed enough to be worth any of that.
+ *
+ * Every pointer/length pair aims at the ENCODED bytes, never at a decoded copy: issuer and
+ * subject are whole Name TLVs so name chaining is a memcmp (RFC 5280 7.1 canonical comparison
+ * is deliberately not implemented - an exact DER match is what the Web PKI does in practice and
+ * a mismatch only costs a chain that fails to build), `tbs` is what the signature covers
+ * (4.1.1.3), and `spki` is the whole SubjectPublicKeyInfo so an SPKI pin can hash it directly.
+ *
+ * FAIL CLOSED, and the list of what that rejects is the point of this module:
+ *   - anything brisk__der_walk rejects: the whole encoding is walked once, before any field is
+ *     read, because the cursor API validates only the headers it steps over (see the der
+ *     block). Each recognised extension's extnValue is walked again on its own, since an
+ *     OCTET STRING is a leaf to the first pass - without that, a subjectAltName entry could
+ *     carry a BER length all the way to the hostname matcher.
+ *   - a critical extension this client does not recognise (4.2). That includes ones RFC 5280
+ *     says applications MUST recognise but this one does not implement - name constraints
+ *     (4.2.1.10), policy constraints (4.2.1.11), certificate policies (4.2.1.4) and inhibit
+ *     anyPolicy (4.2.1.14). A CA that marks them critical gets its certificate refused rather
+ *     than half-processed. Deliberate: an IoT client that silently ignored a name constraint
+ *     would be exactly the bug this rule exists to prevent.
+ *   - a repeated keyUsage, basicConstraints, subjectAltName or extendedKeyUsage (4.2: "A
+ *     certificate MUST NOT include more than one instance of a particular extension") - the
+ *     classic way to get two parsers to read different values. Extensions this client ignores
+ *     are NOT deduplicated: a second copy changes nothing it decides, and keeping every OID
+ *     seen would cost more than it buys.
+ *   - a unique identifier in a v1 certificate (4.1.2.8) or extensions outside v3 (4.1.2.9).
+ *   - keyUsage with no bit set, or with a bit above decipherOnly(8). 4.2.1.3 defines nine bits
+ *     and says "at least one of the bits MUST be set to 1"; bounding the LENGTH is what keeps
+ *     `key_usage == 0` meaning "absent" instead of also meaning "present, but every bit it
+ *     set is one I do not know about", which chain code would read as unrestricted.
+ *   - keyCertSign asserted without cA (4.2.1.9: "If the cA boolean is not asserted, then the
+ *     keyCertSign bit in the key usage extension MUST NOT be asserted").
+ *   - pathLenConstraint present without cA, or negative (4.2.1.9).
+ *   - an empty subjectAltName sequence (4.2.1.6 "the sequence MUST contain at least one
+ *     entry"), an empty subject whose subjectAltName is not critical, and a cA certificate
+ *     with an empty subject (both 4.1.2.6).
+ *   - an empty extendedKeyUsage sequence (4.2.1.12 SIZE (1..MAX)).
+ *   - signatureAlgorithm different from the `signature` field inside the TBS (4.1.1.2 "This
+ *     field MUST contain the same algorithm identifier"), compared as raw DER so a re-encoding
+ *     of the same algorithm does not pass either.
+ *   - a key or signature algorithm this build cannot use, and any use of SHA-1 (RFC 9325 4.5:
+ *     "SHA-1 or MD5 MUST NOT be used").
+ *   - a date outside 1950..9999, not in Zulu, without seconds, or with a fractional part
+ *     (4.1.2.5.1, 4.1.2.5.2), and notBefore after notAfter.
+ *
+ * Not checked here, on purpose: the signature (next item), whether `now` is inside the validity
+ * window (the time-policy item owns the STRICT / FLOOR / INSECURE_NO_TIME decision), hostname
+ * and IP matching (RFC 9525 item), and the alphabet of any string - this module never looks
+ * inside a Name or a GeneralName, it only records where they are.
+ *
+ * One residual worth naming: a NON-critical nameConstraints, policyConstraints or
+ * inhibitAnyPolicy is ignored, although RFC 5280 4.2 says conforming applications MUST
+ * recognise them. 4.2.1.10 and 4.2.1.11 require those extensions to be critical, so a
+ * conforming certificate is caught by the critical-unknown rule above; a non-conforming
+ * non-critical one is a constraint bypass. Every mainstream implementation behaves this way.
+ */
+
+/* Public key algorithms this client can use. Anything else is BRISK_E_ARG at parse time, which
+ * is bad_certificate rather than a chain failure. */
+enum {
+    BRISK__X509_KEY_RSA = 1,   /* rsaEncryption, 1.2.840.113549.1.1.1 */
+    BRISK__X509_KEY_P256 = 2,  /* id-ecPublicKey + prime256v1 */
+    BRISK__X509_KEY_P384 = 3   /* id-ecPublicKey + secp384r1; needs BRISK_ENABLE_P384 */
+};
+
+/* Signature algorithm families. The digest is kept separately in `sig_hash` so the verifier
+ * does not have to re-derive it, and `sig_salt_len` carries the saltLength an RSASSA-PSS
+ * AlgorithmIdentifier declared (RFC 4055 3.1) - which is why PSS is one token and not three. */
+enum {
+    BRISK__X509_SIG_RSA_PKCS1 = 1, /* RFC 4055 5: sha256/384/512WithRSAEncryption */
+    BRISK__X509_SIG_RSA_PSS = 2,   /* RFC 4055 3.1 id-RSASSA-PSS, MGF1 with the same hash */
+    BRISK__X509_SIG_ECDSA = 3      /* RFC 5758 3.2: ecdsa-with-SHA256/384/512 */
+};
+
+/* extendedKeyUsage, as a bitmask. 0 means the extension was absent, which RFC 5280 4.2.1.12
+ * leaves unconstrained - the chain code decides what to require. */
+#define BRISK__X509_EKU_SERVER 0x01 /* id-kp-serverAuth  1.3.6.1.5.5.7.3.1 */
+#define BRISK__X509_EKU_CLIENT 0x02 /* id-kp-clientAuth  1.3.6.1.5.5.7.3.2 */
+#define BRISK__X509_EKU_ANY    0x04 /* anyExtendedKeyUsage 2.5.29.37.0 */
+#define BRISK__X509_EKU_OTHER  0x08 /* some purpose this client does not name */
+
+/* keyUsage bit i of RFC 5280 4.2.1.3 is 1 << i. A value of 0 means the extension was absent,
+ * which is unambiguous because a present keyUsage is refused unless it sets a bit in 0..8 -
+ * see the rejection list above. */
+#define BRISK__X509_KU_DIGITAL_SIGNATURE 0x0001
+#define BRISK__X509_KU_NON_REPUDIATION   0x0002
+#define BRISK__X509_KU_KEY_ENCIPHERMENT  0x0004
+#define BRISK__X509_KU_DATA_ENCIPHERMENT 0x0008
+#define BRISK__X509_KU_KEY_AGREEMENT     0x0010
+#define BRISK__X509_KU_KEY_CERT_SIGN     0x0020
+#define BRISK__X509_KU_CRL_SIGN          0x0040
+#define BRISK__X509_KU_ENCIPHER_ONLY     0x0080
+#define BRISK__X509_KU_DECIPHER_ONLY     0x0100
+
+typedef struct {
+    /* Every pair below points into the DER the caller passed to brisk__x509_parse. */
+    const uint8_t *raw; /* the whole Certificate TLV */
+    size_t raw_len;
+    const uint8_t *tbs; /* TBSCertificate TLV - the exact bytes the signature covers (4.1.1.3) */
+    size_t tbs_len;
+    const uint8_t *serial; /* INTEGER contents as encoded, sign octet included (4.1.2.2) */
+    size_t serial_len;
+    const uint8_t *issuer; /* Name TLVs; chaining is issuer == the parent's subject, byte-wise */
+    size_t issuer_len;
+    const uint8_t *subject;
+    size_t subject_len;
+    const uint8_t *spki; /* SubjectPublicKeyInfo TLV, the thing an SPKI sha256 pin covers */
+    size_t spki_len;
+    const uint8_t *key; /* subjectPublicKey BIT STRING contents: the RSAPublicKey TLV, or the */
+    size_t key_len;     /* uncompressed EC point, 0x04 || X || Y */
+    const uint8_t *san; /* GeneralNames CONTENTS (4.2.1.6), NULL when the extension is absent */
+    size_t san_len;
+    const uint8_t *sig; /* signatureValue BIT STRING contents */
+    size_t sig_len;
+
+    int64_t not_before, not_after; /* seconds since 1970-01-01T00:00:00Z, may be negative */
+
+    uint16_t key_usage; /* BRISK__X509_KU_*, 0 when the extension is absent */
+    uint8_t version;    /* 1, 2 or 3 - the encoded value plus one */
+    uint8_t key_alg;    /* BRISK__X509_KEY_* */
+    uint8_t sig_alg;    /* BRISK__X509_SIG_* */
+    uint8_t sig_hash;   /* a brisk_hash_alg */
+    uint8_t sig_salt_len; /* RSASSA-PSS saltLength; 0 for the other families */
+    uint8_t eku;          /* BRISK__X509_EKU_*, 0 when the extension is absent */
+    uint8_t is_ca;        /* basicConstraints cA (4.2.1.9); 0 when the extension is absent */
+    int16_t path_len;     /* pathLenConstraint, or -1 for absent / no limit */
+} brisk__x509_cert;
+
+/* Parse one DER Certificate. `der` must stay valid and unchanged for as long as `c` is used.
+ * BRISK_OK, or BRISK_E_ARG for every rejection in the list above - a malformed or unusable
+ * certificate is a parse failure, never BRISK_E_AUTH, which this layer reserves for a signature
+ * that did not verify. `c` is fully overwritten on entry, so a failed parse leaves it zeroed
+ * rather than half-filled. */
+int brisk__x509_parse(brisk__x509_cert *c, const uint8_t *der, size_t len);
+
+/* Seconds since the Unix epoch for a DER UTCTime or GeneralizedTime value (`tag` says which),
+ * with the RFC 5280 4.1.2.5.1 / 4.1.2.5.2 profile applied: Zulu only, seconds mandatory, no
+ * fractional part, and a two-digit year below 50 meaning 20YY. Exposed because the TLS layer
+ * needs the same conversion and because it is where the calendar arithmetic is tested.
+ * BRISK_E_ARG on anything else. */
+int brisk__x509_time(unsigned tag, const uint8_t *v, size_t len, int64_t *out);
 
 /* ---- os/linux_rand.c (Linux builds only): the only randomness source, no userspace DRBG ---- */
 /* len bytes from the kernel CSPRNG: getrandom(2), which blocks until the pool is initialised.
