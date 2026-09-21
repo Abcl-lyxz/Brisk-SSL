@@ -34,6 +34,7 @@ reference before emission. Differential vectors come from a fixed seed.
 | wp_hmac_sha512 | https://raw.githubusercontent.com/C2SP/wycheproof/main/testvectors_v1/hmac_sha512_test.json | `b6c90477bdb4a6fc8ee3d1f7b2c0b69a8dfffab34718abaa6cabd71cc2ba1207` |
 | wp_p256_ecdh | https://raw.githubusercontent.com/C2SP/wycheproof/main/testvectors_v1/ecdh_secp256r1_ecpoint_test.json | `648f16d077caf2400d02331ca51f44744c72c799830c8d0595d0b18b6dd9f886` |
 | wp_p256_ecdsa | https://raw.githubusercontent.com/C2SP/wycheproof/main/testvectors_v1/ecdsa_secp256r1_sha256_p1363_test.json | `c60de693930e386c3a5472d08081623ef8504decc54b38ac01ec6b2a2575c986` |
+| wp_p256_ecdsa_der | https://raw.githubusercontent.com/C2SP/wycheproof/main/testvectors_v1/ecdsa_secp256r1_sha256_test.json | `182db4f3e230f6f9fa9f800d2a614dede30284b8e8438bbfe1171905402e9332` |
 | wp_p384_ecdsa_sha384 | https://raw.githubusercontent.com/C2SP/wycheproof/main/testvectors_v1/ecdsa_secp384r1_sha384_p1363_test.json | `e27344bf6daae75fa19663620883809f91c79fc4b4420eff9eae8036b34476be` |
 | wp_p384_ecdsa_sha512 | https://raw.githubusercontent.com/C2SP/wycheproof/main/testvectors_v1/ecdsa_secp384r1_sha512_p1363_test.json | `d994c43b997760ce51c4bbae4a974bf9f9c61db2c4b0e454c3999179de7aae46` |
 | wp_rsa_pkcs1_2048_sha256 | https://raw.githubusercontent.com/C2SP/wycheproof/main/testvectors_v1/rsa_signature_2048_sha256_test.json | `94a917b01ff50fb874cfc05bf29b4af44868d944a6558201cf18380da93fb393` |
@@ -161,3 +162,30 @@ reference before emission. Differential vectors come from a fixed seed.
   by any official vector and neither can be searched for at P-256 sizes. What stands
   in for a vector is the bounded retry loop, the code review, and the fact that the
   Python generator implements the same rejection logic. A real, accepted coverage gap.
+- **The DER reader has no official vector suite either**, because nobody publishes one
+  for ASN.1 encoding rules - X.690 is a specification, not a test corpus. `der.inc`
+  therefore has three parts, and only the middle one is adversarial data written by
+  someone else: (1) every `publicKeyDer` / `publicKeyAsn` blob in the cached Wycheproof
+  RSA, P-256 and P-384 suites, which a strict reader must accept; (2) the 481 distinct
+  signature blobs of `ecdsa_secp256r1_sha256_test.json` - the DER sibling of the p1363
+  file used for ECDSA itself, carrying 92 `InvalidEncoding`, 7 `BerEncodedSignature`
+  and the `IntegerOverflow` / `ModifiedInteger` families; (3) generated rows, one per
+  X.690 clause, for the shapes no real signature contains (a BIT STRING with 8 unused
+  bits, a 17-deep nesting, a constructed OCTET STRING).
+- The expected verdict for a Wycheproof blob is NEVER read off its flag. A flag
+  describes a *signature*, and a blob can be flawless DER encoding the wrong thing -
+  `InvalidTypesInSignature` (63 rows) is exactly that, valid DER that a signature
+  reader must reject and a DER reader must accept. The verdict comes from
+  `py_der_walk()`, a second implementation of clause 10/11 written against the text;
+  the flags are then asserted on the aggregate - every `valid` row must parse, every
+  `BerEncodedSignature` row must not - so a slip in either implementation fails here.
+- **The two implementations have correlated blind spots**, and saying otherwise would
+  overstate what this buys. `py_der_walk()` mirrors `brisk__der_walk` clause for
+  clause, so it catches a transcription slip but NOT a rule neither author wrote down:
+  the primitive SEQUENCE / SET and reserved-tag-0 acceptances both implementations
+  shared were found by review, not by this oracle, and only then turned into rows.
+  What does cross-check independently is part (1) - 337 DER encodings produced by
+  other people's tools, which pin the accepting side of every rule at once.
+- The DER *string* and *time* types carry no content rule in this layer, so no vector
+  pins one: PrintableString's alphabet and UTCTime's digits are checked by the name and
+  time code of the next ROADMAP items, which is where a violation has a meaning.

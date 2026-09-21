@@ -32,7 +32,7 @@ Tick a box only when the work is green on **every** arch (`python tools/dev.py t
 - [x] P-384 ECDSA verify on the generic bignum (`BRISK_ENABLE_P384`, off in TINY)
 
 ## M2 X.509
-- [ ] DER parser (strict, depth-limited) + fuzz target
+- [x] DER parser (strict, depth-limited) + fuzz target
 - [ ] Certificate parse: basicConstraints, keyUsage, EKU, SAN, validity, unknown-critical reject
 - [ ] Chain building (unordered/extra certs, stop at first trust anchor), signature checks
 - [ ] RFC 9525 hostname / IP matching

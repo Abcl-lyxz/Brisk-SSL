@@ -52,6 +52,7 @@ SRC = {
     "documents/dss/186-3ecdsatestvectors.zip",
     "wp_p256_ecdh": f"{WP}ecdh_secp256r1_ecpoint_test.json",
     "wp_p256_ecdsa": f"{WP}ecdsa_secp256r1_sha256_p1363_test.json",
+    "wp_p256_ecdsa_der": f"{WP}ecdsa_secp256r1_sha256_test.json",
     "wp_p384_ecdsa_sha384": f"{WP}ecdsa_secp384r1_sha384_p1363_test.json",
     "wp_p384_ecdsa_sha512": f"{WP}ecdsa_secp384r1_sha512_p1363_test.json",
     "rfc8017": "https://www.rfc-editor.org/rfc/rfc8017.txt",
@@ -2678,6 +2679,316 @@ def bn_vectors():
             rows.append(row(BN_MODPOW, a, ex.hex(), pow(a, int.from_bytes(ex, "big"), m)))
     return rows
 
+# ---------------------------------------------------------------------- DER (M2 X.509)
+# There is no CAVP or Wycheproof suite for "a DER parser". What stands in for one:
+#   1. every DER blob the already-pinned Wycheproof suites carry as *data* - the
+#      SubjectPublicKeyInfo / RSAPublicKey of every RSA, P-256 and P-384 group - which a strict
+#      reader MUST accept, and
+#   2. ecdsa_secp256r1_sha256_test.json, the DER sibling of the p1363 suite this project uses
+#      for ECDSA itself. Its 481 distinct signature blobs are the only large adversarial DER
+#      corpus that exists: 92 rows flagged InvalidEncoding, 7 BerEncodedSignature, plus
+#      integer-overflow and modified-integer families, all written by people trying to break
+#      ASN.1 parsers. The p1363 API could not use them; a DER reader is exactly what they are for.
+#   3. generated rows, one per X.690 clause the reader enforces, because a corpus of real
+#      signatures does not contain a BIT STRING with 8 unused bits or a 17-deep nesting.
+# The expectation is never read off a Wycheproof flag - those describe a *signature*, and a
+# blob can be a perfectly good DER encoding of the wrong thing. It comes from py_der_walk()
+# below, a second implementation of X.690 clause 10/11 written against the text; the flags are
+# then used as an assertion on the aggregate (every "valid" row parses, every BER row does not).
+DER_MAX_DEPTH = 16  # must match BRISK__DER_MAX_DEPTH in src/brisk_int.h
+
+
+def py_der_hdr(b, i, end):
+    """(tag, content start, content end) or None. Identifier + length, X.690 8.1 and 10.1."""
+    if end - i < 2:
+        return None
+    tag = b[i]
+    if tag & 0x1f == 0x1f:  # 8.1.2.4 high-tag-number form
+        return None
+    i += 1
+    n = b[i]
+    i += 1
+    if n < 0x80:
+        ln = n
+    else:
+        k = n & 0x7f
+        # k == 0 is the indefinite form (8.1.3.6), banned by 10.1; k == 0x7f is reserved;
+        # b[i] == 0 is a non-minimal length (10.1)
+        if k == 0 or k > 4 or end - i < k or b[i] == 0:
+            return None
+        ln = int.from_bytes(b[i:i + k], "big")
+        i += k
+        if ln < 0x80:  # 10.1: the short form was available
+            return None
+    if ln > end - i:
+        return None
+    return tag, i, i + ln
+
+
+def py_der_leaf_ok(tag, v):
+    """DER content rules of the universal primitive types, X.690 8.x + 11.x."""
+    if tag == 0x01:  # BOOLEAN, 11.1
+        return len(v) == 1 and v[0] in (0x00, 0xff)
+    if tag in (0x02, 0x0a):  # INTEGER 8.3.1 / 8.3.2, and ENUMERATED by 8.4
+        return len(v) >= 1 and not (len(v) >= 2 and (
+            (v[0] == 0x00 and not v[1] & 0x80) or (v[0] == 0xff and v[1] & 0x80)))
+    if tag == 0x03:  # BIT STRING, 8.6.2.2 / 8.6.2.3 / 11.2.1
+        if not v or v[0] > 7:
+            return False
+        if len(v) == 1:
+            return v[0] == 0
+        return v[-1] & ((1 << v[0]) - 1) == 0
+    if tag == 0x05:  # NULL, 8.8.2
+        return len(v) == 0
+    if tag in (0x00, 0x10, 0x11):
+        # Universal types that can never be primitive, the mirror of the constructed-form check
+        # in py_der_walk: tag 0 is reserved for BER's end-of-contents (8.1.2.2 table 1), and
+        # 8.9.1 / 8.10.1 say a SEQUENCE and a SET are always constructed.
+        return False
+    if tag == 0x06:  # OBJECT IDENTIFIER, 8.19.2
+        if not v:
+            return False
+        starts = True
+        for x in v:
+            if starts and x == 0x80:
+                return False
+            starts = not x & 0x80
+        return starts
+    return True
+
+
+def py_der_walk(b):
+    """True if b is exactly one strictly DER-encoded value, nested at most DER_MAX_DEPTH deep."""
+    stack, i, end = [], 0, len(b)
+    while True:
+        h = py_der_hdr(b, i, end)
+        if h is None:
+            return False
+        tag, s, e = h
+        if tag & 0x20:
+            if tag & 0xc0 == 0 and tag not in (0x30, 0x31):  # 10.2
+                return False
+            if len(stack) == DER_MAX_DEPTH:
+                return False
+            stack.append(end)
+            i, end = s, e
+        else:
+            if not py_der_leaf_ok(tag, b[s:e]):
+                return False
+            i = e
+        while i == end:
+            if not stack:
+                return True
+            end = stack.pop()
+        if not stack:
+            return False  # a second top-level value: one blob holds one
+
+
+def der_tlv(tag, content, lenbytes=0, ln=None):
+    """Encode one TLV. lenbytes forces the long form to that width (for the non-minimal rows),
+    ln overrides the length field without changing the content (for the truncated rows)."""
+    n = len(content) if ln is None else ln
+    if lenbytes:
+        head = bytes([tag, 0x80 | lenbytes]) + n.to_bytes(lenbytes, "big")
+    elif n < 0x80:
+        head = bytes([tag, n])
+    else:
+        e = n.to_bytes((n.bit_length() + 7) // 8, "big")
+        head = bytes([tag, 0x80 | len(e)]) + e
+    return head + content
+
+
+def der_nest(depth, inner=b"\x05\x00"):
+    for _ in range(depth):
+        inner = der_tlv(0x30, inner)
+    return inner
+
+
+def der_generated():
+    """(bytes, expect_ok, note) for every rule in the brisk__der header block."""
+    long128 = bytes(range(128))  # exactly 0x80 bytes: the first length needing the long form
+    rows = [
+        # --- accepted: the shapes a certificate is actually made of
+        (b"\x05\x00", 1, "NULL"),
+        (b"\x02\x01\x00", 1, "INTEGER 0"),
+        (b"\x02\x01\x7f", 1, "INTEGER 127"),
+        (b"\x02\x02\x00\x80", 1, "INTEGER 128 with the 8.3.2 sign octet"),
+        (b"\x02\x01\x80", 1, "INTEGER -128"),
+        (b"\x02\x02\xff\x7f", 1, "INTEGER -129"),
+        (b"\x01\x01\x00", 1, "BOOLEAN FALSE"),
+        (b"\x01\x01\xff", 1, "BOOLEAN TRUE"),
+        (b"\x03\x01\x00", 1, "BIT STRING, no bits"),
+        (b"\x03\x03\x04\xf0\xf0", 1, "BIT STRING, 4 unused bits, all zero"),
+        (b"\x03\x02\x07\x80", 1, "BIT STRING, one bit set"),
+        (b"\x06\x03\x2a\x86\x48", 1, "OID 1.2.840"),
+        (b"\x06\x09\x2a\x86\x48\x86\xf7\x0d\x01\x01\x0b", 1, "OID sha256WithRSAEncryption"),
+        (b"\x0a\x01\x01", 1, "ENUMERATED 1, a CRLReason as RFC 5280 5.3.1 encodes it"),
+        (b"\x30\x00", 1, "empty SEQUENCE"),
+        (b"\x31\x00", 1, "empty SET"),
+        (b"\x30\x06\x02\x01\x01\x02\x01\x02", 1, "SEQUENCE of two INTEGERs"),
+        (b"\xa0\x03\x02\x01\x02", 1, "[0] EXPLICIT INTEGER, the X.509 version field"),
+        (b"\x82\x0b" + b"example.com", 1, "[2] IMPLICIT IA5String, a dNSName"),
+        (der_tlv(0x04, long128), 1, "OCTET STRING of 128 bytes: the shortest legal long form"),
+        (der_tlv(0x04, bytes(300)), 1, "OCTET STRING of 300 bytes, two length octets"),
+        (der_nest(DER_MAX_DEPTH), 1, f"{DER_MAX_DEPTH} nested SEQUENCEs: exactly the depth cap"),
+        # --- rejected: length and identifier encoding (X.690 8.1, 10.1)
+        (b"", 0, "empty input"),
+        (b"\x05", 0, "identifier octet with no length"),
+        (b"\x04\x03\x01\x02", 0, "length runs past the end"),
+        (b"\x04\x80\x01\x02", 0, "indefinite length (8.1.3.6), forbidden by 10.1"),
+        (b"\x04\xff\x01", 0, "reserved length octet 0xff (8.1.3.5)"),
+        (der_tlv(0x04, long128, lenbytes=2), 0, "non-minimal long form: 0x0080 in two octets"),
+        (der_tlv(0x04, b"\x01" * 0x7f, lenbytes=1), 0, "long form for 127: short form required"),
+        (b"\x1f\x01\x01\x00", 0, "high-tag-number form (8.1.2.4)"),
+        (b"\x3f\x03\x02\x01\x01", 0, "high-tag-number form, constructed"),
+        (b"\x10\x03\x02\x01\x01", 0, "primitive SEQUENCE (8.9.1)"),
+        (b"\x11\x03\x02\x01\x01", 0, "primitive SET (8.10.1)"),
+        (b"\x00\x00", 0, "BER end-of-contents marker, tag 0 is reserved (8.1.2.2)"),
+        (b"\x30\x04\x02\x01\x01\x00\x00", 0, "end-of-contents inside a definite-length SEQUENCE"),
+        (b"\x24\x03\x04\x01\x00", 0, "constructed OCTET STRING (10.2)"),
+        (b"\x23\x03\x03\x01\x00", 0, "constructed BIT STRING (10.2)"),
+        (b"\x2c\x02\x0c\x00", 0, "constructed UTF8String (10.2)"),
+        (b"\x37\x02\x17\x00", 0, "constructed UTCTime (10.2)"),
+        (b"\x22\x03\x02\x01\x01", 0, "constructed INTEGER (8.3.1 makes it primitive-only)"),
+        (der_tlv(0x04, long128, lenbytes=5), 0, "five length octets: more than a size_t holds"),
+        (b"\x0a\x00", 0, "ENUMERATED with no contents octet (8.3.1 via 8.4)"),
+        (b"\x0a\x02\x00\x01", 0, "ENUMERATED with a redundant leading zero (8.3.2 via 8.4)"),
+        (b"\x30\x01\x05", 0, "truncated header inside a SEQUENCE"),
+        (b"\x30\x03\x02\x01\x01\x00", 0, "trailing byte after the top-level value"),
+        (b"\x05\x00\x05\x00", 0, "two top-level values"),
+        (b"\x30\x02\x02\x01\x01", 0, "SEQUENCE that truncates the INTEGER inside it"),
+        # --- rejected: contents (X.690 8.3, 8.6, 8.8, 8.19, 11.1, 11.2.1)
+        (b"\x02\x00", 0, "INTEGER with no octets (8.3.1)"),
+        (b"\x02\x02\x00\x00", 0, "INTEGER 0 with a redundant leading zero (8.3.2)"),
+        (b"\x02\x02\x00\x01", 0, "INTEGER 1 with a redundant leading zero (8.3.2)"),
+        (b"\x02\x02\xff\xff", 0, "INTEGER -1 with redundant leading ones (8.3.2)"),
+        (b"\x02\x02\xff\x80", 0, "INTEGER -128 with redundant leading ones (8.3.2)"),
+        (b"\x01\x00", 0, "BOOLEAN with no octets"),
+        (b"\x01\x01\x01", 0, "BOOLEAN TRUE encoded as 01 (11.1 requires ff)"),
+        (b"\x01\x02\x00\xff", 0, "BOOLEAN of two octets"),
+        (b"\x03\x00", 0, "BIT STRING without the unused-bit count"),
+        (b"\x03\x01\x01", 0, "BIT STRING, no bits but 1 unused (8.6.2.3)"),
+        (b"\x03\x02\x08\x00", 0, "BIT STRING with 8 unused bits (8.6.2.2)"),
+        (b"\x03\x02\x01\xff", 0, "BIT STRING with a set unused bit (11.2.1)"),
+        (b"\x03\x03\x04\xf0\xf1", 0, "BIT STRING with set unused bits (11.2.1)"),
+        (b"\x05\x01\x00", 0, "NULL with contents (8.8.2)"),
+        (b"\x06\x00", 0, "OID with no octets"),
+        (b"\x06\x02\x2a\x80", 0, "OID whose last subidentifier never terminates (8.19.2)"),
+        (b"\x06\x03\x2a\x80\x01", 0, "OID with a padded subidentifier (8.19.2)"),
+        (b"\x06\x01\x80", 0, "OID that is one continuation octet"),
+        (der_nest(DER_MAX_DEPTH + 1), 0, f"{DER_MAX_DEPTH + 1} nested SEQUENCEs: past the depth cap"),
+    ]
+    out = []
+    for b, want, note in rows:
+        got = 1 if py_der_walk(b) else 0
+        if got != want:
+            die(f"der_generated: {note!r} expected {want}, py_der_walk said {got}")
+        out.append((b.hex(), 1 - want, note))
+    return out
+
+
+def der_wycheproof():
+    """Every DER blob the cached Wycheproof suites carry, with py_der_walk's verdict."""
+    rows, seen, stats = [], set(), {"keys": 0, "sigs accepted": 0, "sigs rejected": 0}
+    keys = []
+    for name in list(SRC):
+        if not name.startswith(("wp_rsa_", "wp_p256_", "wp_p384_")):
+            continue
+        for g in json.loads(fetch(name))["testGroups"]:
+            for field in ("publicKeyDer", "publicKeyAsn"):
+                if isinstance(g.get(field), str) and g[field] not in seen:
+                    seen.add(g[field])
+                    keys.append((name, field, g[field]))
+    for name, field, hx in keys:
+        if not py_der_walk(bytes.fromhex(hx)):
+            die(f"{name} {field} is not strict DER: {hx[:64]}...")
+        stats["keys"] += 1
+        rows.append((hx, 0, f"{name} {field}"))
+
+    data = json.loads(fetch("wp_p256_ecdsa_der"))
+    sigs, flags_of, result_of = [], {}, {}
+    for g in data["testGroups"]:
+        for t in g["tests"]:
+            if t["sig"] in seen:
+                continue
+            seen.add(t["sig"])
+            sigs.append(t["sig"])
+            flags_of[t["sig"]] = t.get("flags", [])
+            result_of[t["sig"]] = t["result"]
+    for hx in sigs:
+        ok = py_der_walk(bytes.fromhex(hx))
+        # A Wycheproof "valid" row is a signature that verifies, so its encoding is DER by
+        # construction: if our reader would reject one, the reader is wrong.
+        if result_of[hx] == "valid" and not ok:
+            die(f"wp_p256_ecdsa_der: a valid signature was rejected: {hx}")
+        # BerEncodedSignature is the flag for "BER but not DER" - exactly what clause 10 bans.
+        if "BerEncodedSignature" in flags_of[hx] and ok:
+            die(f"wp_p256_ecdsa_der: a BER-encoded signature was accepted: {hx}")
+        stats["sigs accepted" if ok else "sigs rejected"] += 1
+        flag = flags_of[hx][0] if flags_of[hx] else "-"
+        rows.append((hx, 0 if ok else 1, f"wp ecdsa_secp256r1_sha256 {flag}"))
+    print(f"  DER corpus: {stats}")
+    return rows
+
+
+DER_OP = {"uint": 0, "int": 1, "unsigned": 2, "bool": 3, "oid": 4, "bits": 5, "null": 6}
+
+
+def der_values():
+    """(op, hex, reject, want hex, aux) for the typed readers. want/aux are ignored when the
+    row is a rejection."""
+    rows = []
+
+    def add(op, b, want=b"", aux=0, reject=0):
+        rows.append((DER_OP[op], b.hex(), reject, want.hex(), aux))
+
+    for value in (0, 1, 127, 128, 255, 256, 65535, 65536, 16777215, 16777216, 2 ** 31,
+                  2 ** 32 - 1):
+        n = max(1, (value.bit_length() + 8) // 8)  # DER keeps one sign bit
+        enc = der_tlv(0x02, value.to_bytes(n, "big"))
+        mag = value.to_bytes(max(1, (value.bit_length() + 7) // 8), "big")
+        add("uint", enc, aux=value)
+        add("unsigned", enc, want=mag)
+        add("int", enc, want=value.to_bytes(n, "big"))
+    add("uint", der_tlv(0x02, (2 ** 32).to_bytes(5, "big")), reject=1)  # five magnitude octets
+    add("uint", b"\x02\x01\x81", reject=1)  # negative
+    add("unsigned", b"\x02\x01\x81", reject=1)
+    add("unsigned", b"\x02\x02\xff\x00", reject=1)
+    add("int", b"\x02\x01\x81", want=b"\x81")  # a negative serial number stays opaque
+    add("int", b"\x02\x02\xff\x00", want=b"\xff\x00")
+    add("int", b"\x03\x01\x00", reject=1)  # wrong tag
+    add("uint", b"\x05\x00", reject=1)
+
+    add("bool", b"\x01\x01\x00", aux=0)
+    add("bool", b"\x01\x01\xff", aux=1)
+    add("bool", b"\x01\x01\x01", reject=1)
+    add("bool", b"\x02\x01\x00", reject=1)
+
+    add("null", b"\x05\x00")
+    add("null", b"\x05\x01\x00", reject=1)
+    add("null", b"\x30\x00", reject=1)
+
+    for oid in ("2a8648ce3d030107",  # prime256v1
+                "2a8648ce3d0201",  # id-ecPublicKey
+                "2a864886f70d010101",  # rsaEncryption
+                "551d0f",  # id-ce-keyUsage
+                "2b06010505070301"):  # id-kp-serverAuth
+        add("oid", der_tlv(0x06, bytes.fromhex(oid)), want=bytes.fromhex(oid))
+    add("oid", b"\x06\x02\x2a\x80", reject=1)
+    add("oid", b"\x06\x00", reject=1)
+    add("oid", b"\x04\x03\x2a\x86\x48", reject=1)
+
+    add("bits", b"\x03\x01\x00", want=b"", aux=0)
+    add("bits", b"\x03\x02\x07\x80", want=b"\x80", aux=7)
+    add("bits", b"\x03\x03\x04\xf0\xf0", want=b"\xf0\xf0", aux=4)
+    add("bits", b"\x03\x02\x01\x06", want=b"\x06", aux=1)  # keyUsage digitalSignature+keyCertSign
+    add("bits", b"\x03\x02\x08\x00", reject=1)
+    add("bits", b"\x03\x02\x01\xff", reject=1)
+    add("bits", b"\x03\x00", reject=1)
+    add("bits", b"\x04\x02\x00\xff", reject=1)
+    return rows
+
+
 # ---------------------------------------------------------------- C emitters
 def cstr(hx, width=96):
     if not hx:
@@ -2778,6 +3089,8 @@ def main():
     pkcs1 += rsa_em_corruption()
     pss += rsa_pss_em_corruption()
     bn = bn_vectors()
+    der = der_generated() + der_wycheproof()
+    der_val = der_values()
 
     emit("sha2.inc", "struct hash_kat SHA2_KAT", cavp + dhash, lambda r: f"{r[0]}, {cstr(r[1])}, {cstr(r[2])}")
     emit("sha2_monte.inc", "struct monte_kat SHA2_MONTE", monte,
@@ -2844,6 +3157,11 @@ def main():
     emit("bn_mod.inc", "struct bn_mod BN_MOD", BN_MODULI, lambda r: cstr(r))
     emit("bn.inc", "struct bn_kat BN_KAT", bn,
          lambda r: f"{r[0]}, {r[1]}, {cstr(r[2])}, {cstr(r[3])}, {cstr(r[4])}, {r[5]}")
+
+    emit("der.inc", "struct der_kat DER_KAT", der,
+         lambda r: f'{cstr(r[0])}, {r[1]}, "{r[2]}"')
+    emit("der_val.inc", "struct der_val_kat DER_VAL_KAT", der_val,
+         lambda r: f"{r[0]}, {cstr(r[1])}, {r[2]}, {cstr(r[3])}, {r[4]}u")
 
     rows = "\n".join(f"| {k} | {u} | `{h}` |" for k, (u, h) in sorted(fetched.items()))
     (OUT / "SOURCES.md").write_text(
@@ -2955,7 +3273,34 @@ def main():
         "  `brisk__p256_ecdsa_sign` ship with NO known-answer coverage. Neither can be reached\n"
         "  by any official vector and neither can be searched for at P-256 sizes. What stands\n"
         "  in for a vector is the bounded retry loop, the code review, and the fact that the\n"
-        "  Python generator implements the same rejection logic. A real, accepted coverage gap.\n",
+        "  Python generator implements the same rejection logic. A real, accepted coverage gap.\n"
+        "- **The DER reader has no official vector suite either**, because nobody publishes one\n"
+        "  for ASN.1 encoding rules - X.690 is a specification, not a test corpus. `der.inc`\n"
+        "  therefore has three parts, and only the middle one is adversarial data written by\n"
+        "  someone else: (1) every `publicKeyDer` / `publicKeyAsn` blob in the cached Wycheproof\n"
+        "  RSA, P-256 and P-384 suites, which a strict reader must accept; (2) the 481 distinct\n"
+        "  signature blobs of `ecdsa_secp256r1_sha256_test.json` - the DER sibling of the p1363\n"
+        "  file used for ECDSA itself, carrying 92 `InvalidEncoding`, 7 `BerEncodedSignature`\n"
+        "  and the `IntegerOverflow` / `ModifiedInteger` families; (3) generated rows, one per\n"
+        "  X.690 clause, for the shapes no real signature contains (a BIT STRING with 8 unused\n"
+        "  bits, a 17-deep nesting, a constructed OCTET STRING).\n"
+        "- The expected verdict for a Wycheproof blob is NEVER read off its flag. A flag\n"
+        "  describes a *signature*, and a blob can be flawless DER encoding the wrong thing -\n"
+        "  `InvalidTypesInSignature` (63 rows) is exactly that, valid DER that a signature\n"
+        "  reader must reject and a DER reader must accept. The verdict comes from\n"
+        "  `py_der_walk()`, a second implementation of clause 10/11 written against the text;\n"
+        "  the flags are then asserted on the aggregate - every `valid` row must parse, every\n"
+        "  `BerEncodedSignature` row must not - so a slip in either implementation fails here.\n"
+        "- **The two implementations have correlated blind spots**, and saying otherwise would\n"
+        "  overstate what this buys. `py_der_walk()` mirrors `brisk__der_walk` clause for\n"
+        "  clause, so it catches a transcription slip but NOT a rule neither author wrote down:\n"
+        "  the primitive SEQUENCE / SET and reserved-tag-0 acceptances both implementations\n"
+        "  shared were found by review, not by this oracle, and only then turned into rows.\n"
+        "  What does cross-check independently is part (1) - 337 DER encodings produced by\n"
+        "  other people's tools, which pin the accepting side of every rule at once.\n"
+        "- The DER *string* and *time* types carry no content rule in this layer, so no vector\n"
+        "  pins one: PrintableString's alphabet and UTCTime's digits are checked by the name and\n"
+        "  time code of the next ROADMAP items, which is where a violation has a meaning.\n",
         newline="\n")
     print("ok")
 

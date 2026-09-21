@@ -71,6 +71,30 @@ int main(int argc, char **argv)
         brisk__rsa_pkcs1_verify(out, 32, out, 3, alg, out, 32, out, 32);
         brisk__rsa_pss_verify(out, 32, out, 3, alg, 32, out, 32, out, 32);
     }
+    {
+        brisk__der c, body;
+        const uint8_t *v;
+        size_t n;
+        uint32_t u;
+        unsigned unused;
+        int flag;
+        brisk__der_walk(out, sizeof out);
+        brisk__der_init(&c, out, sizeof out);
+        brisk__der_enter(&c, BRISK__DER_SEQUENCE, &body);
+        brisk__der_value(&body, BRISK__DER_OCTET_STRING, &v, &n);
+        brisk__der_tlv(&body, &v, &n);
+        brisk__der_skip(&body);
+        brisk__der_bool(&body, &flag);
+        brisk__der_null(&body);
+        brisk__der_oid(&body, &v, &n);
+        brisk__der_int(&body, &v, &n);
+        brisk__der_unsigned(&body, &v, &n);
+        brisk__der_uint(&body, &u);
+        brisk__der_bitstring(&body, &v, &n, &unused);
+        brisk__der_close(&c, &body);
+        brisk__der_fail(&c);
+        brisk__der_end(&c);
+    }
 #ifdef __linux__
     brisk__os_random(out, 32);
 #endif

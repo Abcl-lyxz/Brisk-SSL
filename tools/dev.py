@@ -7,6 +7,7 @@
   python tools/dev.py size [--arch all|mipsel..] [--md] [--save] [--check]
                                                  per-module flash/RAM from the linker map (-Os, static)
   python tools/dev.py ct                         constant-time check: the ct suite under valgrind
+  python tools/dev.py fuzz [--seconds N]         libFuzzer over the DER parser, seeded from der.inc
   python tools/dev.py image                      (re)build the brisk-dev Docker image
 
 Docker builds live in the named volume `brisk-build` (fast, and never collide with host builds).
@@ -207,6 +208,44 @@ def cmd_size(archs, md, save, check, jobs):
     return 1 if bad or (check and grew) else 0
 
 
+# ------------------------------------------------------------------------------------------- fuzz
+# One .c file and one entry point, so this drives clang directly instead of teaching CMake about
+# a build type nothing else uses. The seed corpus is not committed: tests/kat/der.inc already
+# holds 874 blobs - real certificate keys and Wycheproof's adversarial ASN.1 - and unpacking them
+# into files beats keeping the same bytes in the tree twice.
+FUZZ = {"der": ("fuzz/fuzz_der.c src/x509/der.c", "tests/kat/der.inc")}
+
+
+def fuzz_corpus(inc, out):
+    out.mkdir(parents=True, exist_ok=True)
+    for f in out.glob("*.der"):
+        f.unlink()
+    rows = re.findall(r'^\s*\{((?:"[0-9a-f]*"\s*)+),', (ROOT / inc).read_text(), re.M)
+    for i, row in enumerate(rows):
+        (out / f"{i:04d}.der").write_bytes(bytes.fromhex("".join(re.findall(r'"([0-9a-f]*)"', row))))
+    return len(rows)
+
+
+def cmd_fuzz(target, seconds):
+    sources, inc = FUZZ[target]
+    corpus = ROOT / ".cache" / "fuzz" / target
+    n = fuzz_corpus(inc, corpus)
+    exe = f"build/fuzz_{target}"
+    # -fno-sanitize-recover: a UBSan finding must abort so libFuzzer records it as a crash.
+    build = ["clang", "-g", "-O1", "-std=c99", "-fsanitize=fuzzer,address,undefined",
+             "-fno-sanitize-recover=all", "-Iinclude", "-Isrc", *sources.split(), "-o", exe]
+    rc, out = run(docker_cmd(build), True)
+    if rc:
+        print(out)
+        return rc
+    rel = str(corpus.relative_to(ROOT)).replace("\\", "/")
+    rc, out = run(docker_cmd([f"./{exe}", rel, f"-max_total_time={seconds}", "-max_len=8192",
+                              "-print_final_stats=1"]), True)
+    print("\n".join(out.splitlines()[-18:]))
+    print(f"fuzz {target}: {'ok' if rc == 0 else 'FAILED'} ({n} seeds, {seconds}s)")
+    return rc
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -220,6 +259,9 @@ def main():
     s.add_argument("--check", action="store_true", help="exit 1 if a total grew > max(1%%, 256 B)")
     s.add_argument("-j", "--jobs", type=int, default=max(1, (os.cpu_count() or 2) // 2))
     sub.add_parser("ct")
+    f = sub.add_parser("fuzz")
+    f.add_argument("target", nargs="?", default="der", choices=sorted(FUZZ))
+    f.add_argument("--seconds", type=int, default=60)
     sub.add_parser("image")
     m = sub.add_parser("_measure")
     m.add_argument("arch")
@@ -230,6 +272,8 @@ def main():
         return cmd_size(a.arch, a.md, a.save, a.check, a.jobs)
     if a.cmd == "ct":
         return cmd_ct()
+    if a.cmd == "fuzz":
+        return cmd_fuzz(a.target, a.seconds)
     if a.cmd == "image":
         return run(["docker", "build", "-t", IMAGE, "docker/"], False)[0]
     if a.cmd == "_measure":

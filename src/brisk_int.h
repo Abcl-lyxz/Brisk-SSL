@@ -555,6 +555,203 @@ int brisk__rsa_pss_verify(const uint8_t *n, size_t n_len, const uint8_t *e, size
                           brisk_hash_alg alg, size_t salt_len, const uint8_t *hash, size_t hash_len,
                           const uint8_t *sig, size_t sig_len);
 
+/* ---- x509/der.c: strict DER reader (ITU-T X.690) --------------------------------------------
+ *
+ * A cursor over a caller-owned buffer. Nothing is copied and nothing is allocated: every reader
+ * hands back a pointer into the original bytes, so the certificate must outlive everything the
+ * parser produced from it.
+ *
+ * Where DER is required: RFC 5280 4.1 encodes the to-be-signed data with DER and 4.1.1.3 signs
+ * "the ASN.1 DER encoded tbsCertificate" - so DER is what the signature is computed over, which
+ * is why a second reading of the same bytes must not be possible. RFC 9846 4.3.3 carries the
+ * only flat MUST: an RSASSA-PSS AlgorithmIdentifier in a certificate signature "MUST be DER
+ * encoded". Neither says every octet of a certificate is DER; this reader requires it anyway,
+ * because a parser that accepts two encodings of one value is a parser other implementations
+ * can be made to disagree with.
+ *
+ * STRICT means both halves are enforced: the plain BER content rules of clause 8, and the DER
+ * restrictions of clauses 10 and 11 that pick one encoding where BER allows several. Rejected:
+ * the indefinite length form (8.1.3.6, banned by 10.1); a long-form length that is not minimal
+ * or that could have used the short form (10.1); a constructed universal type other than
+ * SEQUENCE or SET (10.2 for the string types, 8.2.1 / 8.3.1 / 8.4 / 8.8.1 / 8.19.1 for the
+ * rest, which are primitive-only in BER already); a primitive SEQUENCE or SET (8.9.1, 8.10.1);
+ * the reserved tag 0 (8.1.2.2), which is BER's end-of-contents marker; an INTEGER or ENUMERATED
+ * with no contents octet (8.3.1) or a redundant leading one (8.3.2, 8.4); a BOOLEAN that is not
+ * one octet (8.2.1) of 00 (8.2.2) or FF (11.1); a NULL with contents (8.8.2); a BIT STRING with
+ * no unused-bit count (8.6.2.1), a count above 7 (8.6.2.2), a non-zero count on an empty value
+ * (8.6.2.3) or unused bits left set (11.2.1); and an OBJECT IDENTIFIER with a padded
+ * subidentifier or an unterminated last one (8.19.2). Trailing bytes after a value are an error
+ * the caller sees, never something quietly ignored. The high-tag-number form (8.1.2.4) is
+ * rejected too, and that one is NOT an X.690 restriction - X.690 allows it; it is a local
+ * profile decision, because no X.509 field has a tag number above 30.
+ *
+ * What this layer deliberately does NOT enforce, and who owns each rule instead. None of these
+ * can be checked without knowing the ASN.1 type of the value, which implicit tagging has
+ * erased by the time the bytes get here:
+ *   - 11.2.2, a NamedBitList BIT STRING has its trailing zero bits removed: the extension code,
+ *     for KeyUsage (RFC 5280 4.2.1.3).
+ *   - 11.5, a component equal to its DEFAULT is omitted: the certificate code, for `version`,
+ *     `critical`, `cA` (RFC 5280 4.1, 4.2.1.9) and the four RSASSA-PSS-params defaults
+ *     (RFC 8017 A.2.3) that RFC 9846 4.3.3 requires to be DER.
+ *   - 10.3 and 11.6, SET component and SET OF ordering: safe to skip only while distinguished
+ *     names are compared as raw TLVs, as brisk__der_tlv intends. Re-audit it at the RFC 9525
+ *     names item, and before anything compares a DN attribute by attribute.
+ *   - 11.7 and 11.8, the DER forms of GeneralizedTime and UTCTime, together with the tighter
+ *     profile of RFC 5280 4.1.2.5.1 / 4.1.2.5.2 (Zulu, seconds present, no fractional part):
+ *     the time-policy item. This reader hands those values over unexamined, including empty
+ *     ones.
+ *   - the alphabets of PrintableString, IA5String and friends: X.680, not X.690, so there is
+ *     nothing here to enforce. The names code owes the embedded-NUL and control-character
+ *     checks before any hostname comparison.
+ *
+ * AND THE RULE THAT DECIDES WHERE THE CERTIFICATE PARSER STARTS: two of the checks above - the
+ * constructed-universal-type ban and every leaf content rule - can only run on a value that is
+ * actually read, and brisk__der_tlv / brisk__der_skip read only a header. So a parser built on
+ * the cursor alone would let BER through wherever it skips, including over an AlgorithmIdentifier
+ * whose parameters RFC 9846 4.3.3 requires to be DER. The certificate entry point therefore runs
+ * brisk__der_walk over the whole encoding ONCE before it parses anything, and the cursor API
+ * relies on that gate having passed. Walk first, then cursor.
+ *
+ * The error is STICKY: once a read fails the cursor stays failed and every later read is a
+ * no-op, so a parser can run a whole chain of reads and check once at the end. Outputs of a
+ * failed read are always cleared, never left holding a previous value, and brisk__der_enter
+ * hands back a child cursor that is already failed - so even a caller who ignores every status
+ * reads zeroes rather than garbage. Every error is BRISK_E_ARG: a malformed certificate is a
+ * parse failure, never a cryptographic one.
+ *
+ * NOT constant time, and it does not need to be: a certificate is public, and so is every byte
+ * of a TLS handshake message this reader ever sees. Nothing secret may be parsed with it.
+ */
+
+/* Maximum nesting. X.509 itself needs 9 (Certificate > TBSCertificate > extensions [3] >
+ * Extensions > Extension > extnValue > the extension's own SEQUENCE > ...), so 16 leaves room
+ * for the deeper policy and name structures while keeping brisk__der_walk's end stack at
+ * 16 pointers. */
+#define BRISK__DER_MAX_DEPTH 16
+
+/* Identifier octets (tag class | constructed bit | tag number), i.e. the whole first byte. */
+enum {
+    BRISK__DER_BOOLEAN = 0x01,
+    BRISK__DER_INTEGER = 0x02,
+    BRISK__DER_BIT_STRING = 0x03,
+    BRISK__DER_OCTET_STRING = 0x04,
+    BRISK__DER_NULL = 0x05,
+    BRISK__DER_OID = 0x06,
+    BRISK__DER_ENUMERATED = 0x0a,
+    BRISK__DER_UTF8_STRING = 0x0c,
+    BRISK__DER_PRINTABLE_STRING = 0x13,
+    BRISK__DER_TELETEX_STRING = 0x14,
+    BRISK__DER_IA5_STRING = 0x16,
+    BRISK__DER_UTC_TIME = 0x17,
+    BRISK__DER_GENERALIZED_TIME = 0x18,
+    BRISK__DER_SEQUENCE = 0x30,
+    BRISK__DER_SET = 0x31,
+    /* OR these into a tag number: BRISK__DER_CONTEXT | 2 is [2] IMPLICIT primitive (dNSName),
+     * BRISK__DER_CONTEXT | BRISK__DER_CONSTRUCTED | 3 is [3] EXPLICIT (extensions). */
+    BRISK__DER_CONSTRUCTED = 0x20,
+    BRISK__DER_CONTEXT = 0x80
+};
+
+typedef struct {
+    const uint8_t *p;   /* next unread byte */
+    const uint8_t *end; /* one past the last byte of this value */
+    unsigned depth;     /* nesting level; brisk__der_enter refuses to pass BRISK__DER_MAX_DEPTH */
+    int err;            /* sticky: BRISK_OK or BRISK_E_ARG */
+} brisk__der;
+
+/* A cursor over len bytes at der. len == 0 is legal and every read on it fails, but `der`
+ * itself must not be NULL - pass a real pointer and a zero length for an empty value. */
+static inline void brisk__der_init(brisk__der *c, const uint8_t *der, size_t len)
+{
+    c->p = der;
+    c->end = der + len;
+    c->depth = 0;
+    c->err = BRISK_OK;
+}
+
+/* The sticky status: BRISK_OK if every read so far succeeded. */
+static inline int brisk__der_err(const brisk__der *c)
+{
+    return c->err;
+}
+
+/* The next identifier octet without consuming it, or -1 at the end of the value or on a failed
+ * cursor - which is how an OPTIONAL field is tested for:
+ *     if (brisk__der_peek(&tbs) == (BRISK__DER_CONTEXT | BRISK__DER_CONSTRUCTED | 0)) { ... } */
+static inline int brisk__der_peek(const brisk__der *c)
+{
+    return (c->err != BRISK_OK || c->p == c->end) ? -1 : (int)*c->p;
+}
+
+/* BRISK_E_ARG unless the cursor sits exactly at the end of its value; fails it if not. Call it
+ * on the top-level cursor to reject trailing bytes after a certificate. */
+int brisk__der_end(brisk__der *c);
+
+/* Mark the cursor failed from the caller's own semantic check (a wrong OID, a version this
+ * client will not parse), so the one status check at the end covers those too. Returns
+ * BRISK_E_ARG. */
+int brisk__der_fail(brisk__der *c);
+
+/* Enter a constructed value of exactly `tag`: `body` becomes a cursor over its contents at
+ * depth + 1 and `c` is left positioned after it, so a forgotten read of the body cannot
+ * desynchronise the parent. BRISK_E_ARG on a tag mismatch, on a primitive encoding, or at
+ * BRISK__DER_MAX_DEPTH. On failure `body` is an empty, already-failed cursor. */
+int brisk__der_enter(brisk__der *c, unsigned tag, brisk__der *body);
+
+/* Finish with a child cursor: rejects bytes it left unread and folds its sticky error into the
+ * parent, so only the parent has to be checked. Returns the parent's status. */
+int brisk__der_close(brisk__der *c, brisk__der *body);
+
+/* Contents of a primitive value of exactly `tag`, with that type's DER content rules applied
+ * (see the list above). The pointer aims into the caller's buffer. */
+int brisk__der_value(brisk__der *c, unsigned tag, const uint8_t **v, size_t *len);
+
+/* The next value whatever it is, as a raw TLV *including* its header - the bytes to hash for
+ * TBSCertificate, or to keep for a DN comparison. Only the header is validated (so the length
+ * is in bounds); the contents are whatever they are, which is exactly right for an unknown
+ * non-critical extension RFC 5280 4.2 says to ignore. brisk__der_skip is the same without the
+ * output. */
+int brisk__der_tlv(brisk__der *c, const uint8_t **tlv, size_t *len);
+int brisk__der_skip(brisk__der *c);
+
+/* BOOLEAN -> 0 or 1. NULL -> nothing, it is the check itself. */
+int brisk__der_bool(brisk__der *c, int *out);
+int brisk__der_null(brisk__der *c);
+
+/* OBJECT IDENTIFIER contents, i.e. the value octets without tag or length. COMPARE them against
+ * a stored encoding; do not decode them to dotted numbers. 8.19.2's no-padding rule makes the
+ * encoding of any given OID unique, so memcmp is exact - while a decoder would need overflow
+ * checks on subidentifiers that X.690 does not bound, and none exist here. */
+int brisk__der_oid(brisk__der *c, const uint8_t **v, size_t *len);
+
+/* INTEGER contents exactly as encoded, sign octet and all. For a serial number, which RFC 5280
+ * 4.1.2.2 wants positive and at most 20 octets but which is handled as an opaque string because
+ * non-conforming CAs issue negative and over-long ones. */
+int brisk__der_int(brisk__der *c, const uint8_t **v, size_t *len);
+
+/* A non-negative INTEGER as a magnitude: the 0x00 sign octet DER prepends when the top bit is
+ * set is stripped, so an RSA modulus, an exponent or an ECDSA r/s arrives the way the crypto
+ * layer wants it. Zero comes back as one 0x00 byte, never as an empty string. BRISK_E_ARG if
+ * the value is negative. */
+int brisk__der_unsigned(brisk__der *c, const uint8_t **v, size_t *len);
+
+/* A small non-negative INTEGER: certificate version, pathLenConstraint. BRISK_E_ARG above
+ * 2^32 - 1, which is far past anything those fields may hold - the caller range-checks the
+ * rest. uint32_t rather than uint64_t on purpose: no 64-bit arithmetic on a 32-bit MIPS. */
+int brisk__der_uint(brisk__der *c, uint32_t *out);
+
+/* BIT STRING: *unused is the 0..7 unused trailing bits of the last octet, *v / *len are the
+ * octets after that count. A keyUsage reads bit i as (v[i / 8] >> (7 - i % 8)) & 1 after
+ * checking i / 8 < len; an ECDSA subjectPublicKey requires *unused == 0. */
+int brisk__der_bitstring(brisk__der *c, const uint8_t **v, size_t *len, unsigned *unused);
+
+/* Validate one complete DER value and everything inside it: every header in bounds, every
+ * universal leaf's contents legal, nesting within BRISK__DER_MAX_DEPTH, no trailing bytes.
+ * Iterative with an explicit end stack - attacker-controlled nesting never reaches the C stack.
+ * This is the fuzz entry point (fuzz/fuzz_der.c) and the strictness oracle the tests drive.
+ * BRISK_OK or BRISK_E_ARG. */
+int brisk__der_walk(const uint8_t *der, size_t len);
+
 /* ---- os/linux_rand.c (Linux builds only): the only randomness source, no userspace DRBG ---- */
 /* len bytes from the kernel CSPRNG: getrandom(2), which blocks until the pool is initialised.
  * Only on kernels older than 4.8 that lack it (ENOSYS) or filter it (EPERM): wait once for

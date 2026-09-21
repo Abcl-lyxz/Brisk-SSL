@@ -28,11 +28,13 @@ session ends run **`/handoff`**.
 ```
 include/brisk.h        public API = the reference docs      include/brisk_config.h  the only config
 src/brisk_int.h        internal decls (brisk__ prefix)      src/util.c              ct compare, wipe, build info
-src/crypto/            sha2.c hkdf.c (+ aead, ec, bn next)   src/{x509,tls,quic,http,os}/  later milestones
-tests/test_*.c         suites (runner: tests/test_main.c)    tests/kat/*.inc         generated vectors, don't edit
-tools/dev.py           test / size / image                   tools/kat.py            fetch + verify vectors
-tools/mcp/rfc_server.py  MCP: rfc_get / rfc_search          docker/Dockerfile       cross gcc + qemu image
-docs/ROADMAP.md  docs/ARCHITECTURE.md  docs/CONFIG.md        size/baseline.json      size regression baseline
+src/crypto/            sha2 hkdf aead ec bn rsa             src/x509/               der.c (+ cert, chain, names next)
+src/{tls,quic,http}/   later milestones                     src/os/                 linux_rand.c
+tests/test_*.c         suites (runner: tests/test_main.c)   tests/kat/*.inc         generated vectors, don't edit
+fuzz/fuzz_*.c          libFuzzer entry points               tools/kat.py            fetch + verify vectors
+tools/dev.py           test / size / ct / fuzz / image      tools/mcp/rfc_server.py MCP: rfc_get / rfc_search
+docker/Dockerfile      cross gcc + qemu image               size/baseline.json      size regression baseline
+docs/ROADMAP.md  docs/ARCHITECTURE.md  docs/CONFIG.md
 ```
 
 ## Commands
@@ -41,6 +43,7 @@ docs/ROADMAP.md  docs/ARCHITECTURE.md  docs/CONFIG.md        size/baseline.json 
 | host tests (fast, x64 + x86) | `python tools/dev.py test` |
 | every arch under qemu | `python tools/dev.py test --arch all` (or `--arch mips ppc`) |
 | constant-time check (valgrind) | `python tools/dev.py ct` |
+| fuzz a parser (clang + ASan/UBSan) | `python tools/dev.py fuzz der --seconds 60` |
 | size table / save baseline | `python tools/dev.py size --arch all --md` / `... --save` |
 | regenerate vectors | `python tools/kat.py` |
 | rebuild Docker image | `python tools/dev.py image` |
