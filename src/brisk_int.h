@@ -356,6 +356,52 @@ void brisk__p256_scalar_add(uint8_t r[32], const uint8_t a[32], const uint8_t b[
 void brisk__p256_scalar_mul(uint8_t r[32], const uint8_t a[32], const uint8_t b[32]);
 void brisk__p256_scalar_inv(uint8_t r[32], const uint8_t a[32]); /* a^(n-2) mod n; 0 -> 0 */
 
+#if BRISK_ENABLE_P384
+/* ---- crypto/p384.c: P-384 (secp384r1) ECDSA VERIFY ONLY ---------------------------------------
+ * RFC 9846 4.3.3 (ecdsa_secp384r1_sha384 = 0x0503), 4.3.8.2 (the uncompressed point encoding and
+ * the validation rules); FIPS 186-5 6.4.2 (verify); parameters from RFC 5903 3.2 = SP 800-186
+ * 3.2.1.4 = SEC 2 2.4.3. Behind BRISK_ENABLE_P384 because RFC 9846 9.1 makes only P-256
+ * mandatory; what makes it worth compiling is X.509, since Let's Encrypt Generation Y
+ * intermediates are P-384 (docs/ARCHITECTURE.md 121-122).
+ *
+ * VERIFY ONLY, forever: no keygen, no ECDH (docs/ARCHITECTURE.md locks "no P-384 ECDHE"), no
+ * signing. Every input is public, and the ladder inside branches on the bits of its scalars, so
+ * NOTHING SECRET MAY EVER BE PASSED TO THIS FILE. If a secret scalar is ever needed on P-384,
+ * the ladder needs a fixed-step sibling with a mask select; it must not simply be reused.
+ *
+ * Runs on the generic i31 bignum of bn.c, which needs no change for it. A verify is about 12,000
+ * 13-limb Montgomery multiplications and 2648 B of stack along the deepest chain (verify ->
+ * pt_add -> fe_mul -> brisk__bn_mont_mul), measured with -fstack-usage, gcc 14.2 at -Os on
+ * x86_64, against the 3 KB budget p256.c already carries. Other toolchains differ by a few
+ * hundred bytes; the per-frame breakdown, and the only copy of these figures to update, is the
+ * src/crypto/p384.c header. That accumulator is sized by BRISK_RSA_MAX_BITS - see
+ * docs/CONFIG.md. */
+#    define BRISK__P384_SCALAR_LEN 48
+#    define BRISK__P384_POINT_LEN  97 /* 0x04 || X || Y (RFC 9846 4.3.8.2) */
+#    define BRISK__P384_SIG_LEN    96 /* r || s; DER is the X.509 layer's job */
+
+/* `sig` is r || s, 96 bytes: the DER ECDSA-Sig-Value of RFC 9846 4.3.3 is unwrapped by the caller
+ * (the M2 DER parser). `pub` is the uncompressed 0x04 || X || Y point, which is also the
+ * SubjectPublicKey bit-string body the M2 SPKI parser hands over. `hash` is the message digest;
+ * hash_len must be >= 48 and only the leftmost 48 bytes are read (FIPS 186-5's leftmost-bits
+ * rule), so a P-384 key certified with SHA-512 verifies.
+ *
+ * CONSEQUENCE, recorded rather than fixed here: a P-384 key certified with ecdsa-with-SHA256
+ * exists in some private PKIs and cannot be verified through this API. RFC 9846 4.3.3 pairs the
+ * curve with its own hash, so TLS never asks for that pairing; M2's certificate layer must
+ * reject the mismatch with unsupported_certificate rather than call in with hash_len 32.
+ *
+ * Three outcomes, and the split is what the TLS/X.509 layer needs to pick an alert:
+ *   BRISK_OK     the signature verifies.
+ *   BRISK_E_AUTH it does not - including r or s outside [1, n-1], which FIPS 186-5 6.4.2 calls
+ *                INVALID rather than an error, and R turning out to be the point at infinity.
+ *                A CertificateVerify caller MUST turn this into decrypt_error (RFC 9846 4.5.2).
+ *   BRISK_E_ARG  `pub` is not a point on the curve (malformed key material -> bad_certificate,
+ *                not a failed signature), or hash_len < 48, which is a caller bug. */
+int brisk__p384_ecdsa_verify(const uint8_t pub[97], const uint8_t *hash, size_t hash_len,
+                             const uint8_t sig[96]);
+#endif /* BRISK_ENABLE_P384 */
+
 /* ---- crypto/bn.c: i31 big integers, constant-time Montgomery ---------------------------------
  * Representation (BearSSL's i31 layout): x[0] is the ANNOUNCED BIT LENGTH; x[1...] are 31-bit
  * limbs, least significant first, bit 31 of every limb always 0. A value of `bits` bits occupies

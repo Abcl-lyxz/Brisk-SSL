@@ -54,11 +54,31 @@
 #    define BRISK_ENABLE_MTLS (BRISK_PROFILE >= BRISK_PROFILE_DEFAULT)
 #endif
 
+/* ECDSA P-384 signature VERIFICATION (src/crypto/p384.c). Verify only - no P-384 keygen, ECDH or
+ * signing exists in this library and none is planned. Off in TINY, on from DEFAULT up.
+ *
+ * A knob rather than always-on because RFC 9846 9.1 makes only ecdsa_secp256r1_sha256 (plus
+ * rsa_pkcs1_sha256 and rsa_pss_rsae_sha256) mandatory to implement, and the IANA registry in
+ * RFC 9846 11 lists ecdsa_secp384r1_sha384 as "Recommended" only - unlike p256.c and rsa.c,
+ * which every conformant client must carry. What makes it worth switching ON is X.509, not the
+ * handshake: Let's Encrypt's Generation Y intermediates are P-384, so a chain from them cannot
+ * be verified without it.
+ *
+ * Nothing needs forcing: src/crypto/bn.c is already linked unconditionally for RSA, and p384.c
+ * rides on it unchanged. With the knob off, p384.c compiles to an empty translation unit and
+ * links to nothing. */
+#ifndef BRISK_ENABLE_P384
+#    define BRISK_ENABLE_P384 (BRISK_PROFILE >= BRISK_PROFILE_DEFAULT)
+#endif
+
 /* Largest RSA modulus accepted when verifying a certificate signature, in bits. The project's
  * first VALUE knob - every other one is a tri-state boolean - and it is a STACK lever, not a
- * flash one: it sizes the i31 scratch inside src/crypto/rsa.c and nothing else. Measured at -Os
- * along the deepest call chain, a PSS verify needs 3392 bytes of stack at 4096 and 2064 at 2048;
- * PKCS#1 v1.5 needs 3088 and 1760. The full table is in the src/crypto/rsa.c header.
+ * flash one: it sizes BRISK__BN_MAX_LIMBS, hence both the i31 scratch inside src/crypto/rsa.c and
+ * the CIOS accumulator inside brisk__bn_mont_mul (640 bytes of frame at 4096) - so with
+ * BRISK_ENABLE_P384 on it is a stack lever for src/crypto/p384.c too, whose deepest chain is
+ * 2648 bytes at 4096. Measured at -Os along the deepest call chain, a PSS verify needs 3392 bytes
+ * of stack at 4096 and 2064 at 2048; PKCS#1 v1.5 needs 3088 and 1760. The full table is in the
+ * src/crypto/rsa.c header.
  *
  * 4096 by default because real trust anchors are 4096-bit (ISRG Root X1). Drop it to 2048 only
  * for a private PKI whose largest certificate you control. There is no knob to switch RSA off:

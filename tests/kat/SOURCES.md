@@ -34,6 +34,8 @@ reference before emission. Differential vectors come from a fixed seed.
 | wp_hmac_sha512 | https://raw.githubusercontent.com/C2SP/wycheproof/main/testvectors_v1/hmac_sha512_test.json | `b6c90477bdb4a6fc8ee3d1f7b2c0b69a8dfffab34718abaa6cabd71cc2ba1207` |
 | wp_p256_ecdh | https://raw.githubusercontent.com/C2SP/wycheproof/main/testvectors_v1/ecdh_secp256r1_ecpoint_test.json | `648f16d077caf2400d02331ca51f44744c72c799830c8d0595d0b18b6dd9f886` |
 | wp_p256_ecdsa | https://raw.githubusercontent.com/C2SP/wycheproof/main/testvectors_v1/ecdsa_secp256r1_sha256_p1363_test.json | `c60de693930e386c3a5472d08081623ef8504decc54b38ac01ec6b2a2575c986` |
+| wp_p384_ecdsa_sha384 | https://raw.githubusercontent.com/C2SP/wycheproof/main/testvectors_v1/ecdsa_secp384r1_sha384_p1363_test.json | `e27344bf6daae75fa19663620883809f91c79fc4b4420eff9eae8036b34476be` |
+| wp_p384_ecdsa_sha512 | https://raw.githubusercontent.com/C2SP/wycheproof/main/testvectors_v1/ecdsa_secp384r1_sha512_p1363_test.json | `d994c43b997760ce51c4bbae4a974bf9f9c61db2c4b0e454c3999179de7aae46` |
 | wp_rsa_pkcs1_2048_sha256 | https://raw.githubusercontent.com/C2SP/wycheproof/main/testvectors_v1/rsa_signature_2048_sha256_test.json | `94a917b01ff50fb874cfc05bf29b4af44868d944a6558201cf18380da93fb393` |
 | wp_rsa_pkcs1_2048_sha384 | https://raw.githubusercontent.com/C2SP/wycheproof/main/testvectors_v1/rsa_signature_2048_sha384_test.json | `c571c105d261c0ff588a2888a529f152563fb3b77894b7620d4e4f8f934f2c1d` |
 | wp_rsa_pkcs1_2048_sha512 | https://raw.githubusercontent.com/C2SP/wycheproof/main/testvectors_v1/rsa_signature_2048_sha512_test.json | `16ea24b039905d054bdb6004f5fd179374e150b7b6d73a7ba654b6d00eab12ef` |
@@ -82,6 +84,33 @@ reference before emission. Differential vectors come from a fixed seed.
   `[P-256,SHA-384]` and `[P-256,SHA-512]` sections of the same file ARE used, 15 rows
   each with 12 failing: they are what exercises the FIPS 186-5 6.4.2 leftmost-bits
   rule with official negative vectors.
+- CAVP `PKV.rsp` `[P-384]`: 4 of the 12 rows carry a 385-bit (97 hex char) coordinate,
+  which the 97-byte encoding of RFC 9846 4.3.8.2 cannot express - truncating them would
+  turn them into different points. The remaining 8 are driven through
+  `brisk__p384_ecdsa_verify` with a fixed in-range `(r, s) = (7, 11)` that cannot
+  verify, so a valid point lands on `BRISK_E_AUTH` and an off-curve one on
+  `BRISK_E_ARG`. The in-range half of the coordinate check (p <= coord < 2^384) is
+  pinned by generated `x == p` / `y == p` / `coord == 2^384-1` rows instead.
+- CAVP `SigVer.rsp` `[P-384,SHA-1]`, `[P-384,SHA-224]` and `[P-384,SHA-256]`, and the
+  RFC 6979 A.2.6 SHA-1 / SHA-224 / SHA-256 rows. Skipped for a *behavioural* reason:
+  `brisk__p384_ecdsa_verify` requires `hash_len >= 48` and returns `BRISK_E_ARG` below
+  that (FIPS 186-5 6.4.2 reads only the leftmost 48 octets). RFC 9846 4.3.3 pairs the
+  curve with SHA-384 in `ecdsa_secp384r1_sha384`, so TLS never asks for the shorter
+  pairing; a P-384 key certified with `ecdsa-with-SHA256` exists in some private PKIs
+  and M2's certificate layer must reject it with `unsupported_certificate` rather than
+  call in with `hash_len 32`. The `[P-384,SHA-384]` and `[P-384,SHA-512]` sections ARE
+  used, 15 rows each with 12 failing.
+- `ecdsa_secp384r1_sha384_p1363_test.json` and `ecdsa_secp384r1_sha512_p1363_test.json`:
+  19 of 280 and 19 of 318 rows carry a signature that is not 96 bytes, all of them
+  "invalid". `brisk__p384_ecdsa_verify` takes a fixed `uint8_t[96]`, so the width is
+  settled by the caller that unwraps the DER ECDSA-Sig-Value. Their substance - r or s
+  outside [1, n-1] - is pinned at the right width by generated edge rows (0, n, n+1,
+  2^384-1 on each side). The DER siblings of both files are out of scope for the same
+  reason the P-256 one is.
+- There is no P-384 *keygen*, *ECDH* or *signing* vector set here, and there never will
+  be: docs/ARCHITECTURE.md locks P-384 to verify only, so `KAS_ECC_CDH` `[P-384]`,
+  `KeyPair.rsp` `[P-384]`, `SigGen.txt` `[P-384]` and `ecdh_secp384r1_*` are all out of
+  scope by design rather than forgotten.
 - No Wycheproof ECDSA *signing* suite exists, for `brisk__p256_ecdsa_sign` or for
   anyone else: signing has no attacker-controlled input, so there is nothing for a
   test suite to attack. The invalid half of `p256_sign.inc` is therefore generated -

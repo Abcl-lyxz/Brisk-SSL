@@ -44,6 +44,14 @@ int main(int argc, char **argv)
         brisk__p256_ecdsa_sign(out, out + 32, pt, 32, pt + 32, 32);
 #endif
     }
+#if BRISK_ENABLE_P384
+    {
+        uint8_t pt97[97], sig96[96]; /* sig is 96 bytes: `out` is 64 and would be over-read */
+        memset(pt97, 0x04, sizeof pt97);
+        memset(sig96, 0x11, sizeof sig96);
+        brisk__p384_ecdsa_verify(pt97, out, 48, sig96);
+    }
+#endif
     {
         uint32_t m[BRISK__BN_MAX_LIMBS], x[BRISK__BN_MAX_LIMBS], t[2 * BRISK__BN_MAX_LIMBS];
         /* out still holds whatever the P-256 block left there: force it odd and top-bit set so

@@ -29,7 +29,7 @@ Tick a box only when the work is green on **every** arch (`python tools/dev.py t
 - [x] ECDSA P-256 sign, hedged RFC 6979 (mTLS) + sign-callback hook
 ### M1d Bignum
 - [x] i31 Montgomery bignum (constant-time), RSA PKCS#1 v1.5 + PSS verify 2048-4096
-- [ ] P-384 ECDSA verify on the generic bignum
+- [x] P-384 ECDSA verify on the generic bignum (`BRISK_ENABLE_P384`, off in TINY)
 
 ## M2 X.509
 - [ ] DER parser (strict, depth-limited) + fuzz target

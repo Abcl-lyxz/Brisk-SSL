@@ -52,6 +52,8 @@ SRC = {
     "documents/dss/186-3ecdsatestvectors.zip",
     "wp_p256_ecdh": f"{WP}ecdh_secp256r1_ecpoint_test.json",
     "wp_p256_ecdsa": f"{WP}ecdsa_secp256r1_sha256_p1363_test.json",
+    "wp_p384_ecdsa_sha384": f"{WP}ecdsa_secp384r1_sha384_p1363_test.json",
+    "wp_p384_ecdsa_sha512": f"{WP}ecdsa_secp384r1_sha512_p1363_test.json",
     "rfc8017": "https://www.rfc-editor.org/rfc/rfc8017.txt",
     "cavp_rsa2": "https://csrc.nist.gov/CSRC/media/Projects/Cryptographic-Algorithm-Validation-Program/"
     "documents/dss/186-2rsatestvectors.zip",
@@ -1118,65 +1120,79 @@ def differential_x25519():
 # never typed here, so the generated vectors and tests/kat/p256_params.inc cannot disagree with
 # the spec through a transcription slip. Everything below runs on those parsed values.
 P256 = {}
+P384 = {}  # RFC 5903 3.2, same labels, same parser
 
 
-def rfc5903_params():
-    """RFC 5903 3.1: p, curve b, group order n, and the generator G."""
+def rfc5903_params(sec, bits, curve):
+    """RFC 5903 3.1 / 3.2: p, curve b, group order n, and the generator G, into `curve`."""
     text = "\n".join(rfc_lines(fetch("rfc5903")))
-    s = text[text.index("\n3.1.  256-Bit") : text.index("\n3.2.")]
+    nxt = f"\n{sec[0]}.{int(sec[2]) + 1}."
+    s = text[text.index(f"\n{sec}  {bits}-Bit") : text.index(nxt)]
     want = {"p": "Group Prime/Irreducible Polynomial", "b": "Group Curve b", "n": "Group Order"}
     for key, label in want.items():
         m = re.search(re.escape(label) + r":\n((?:\s+[0-9A-F ]+\n)+)", s)
         if not m:
-            die(f"RFC 5903 3.1: {label} not found")
-        P256[key] = int.from_bytes(hexbytes(m.group(1)), "big")
+            die(f"RFC 5903 {sec} {label} not found")
+        curve[key] = int.from_bytes(hexbytes(m.group(1)), "big")
     for key in ("gx", "gy"):
         m = re.search(r"\n" + key + r":\n((?:\s+[0-9A-F ]+\n)+)", s)
         if not m:
-            die(f"RFC 5903 3.1: generator {key} not found")
-        P256[key] = int.from_bytes(hexbytes(m.group(1)), "big")
+            die(f"RFC 5903 {sec} generator {key} not found")
+        curve[key] = int.from_bytes(hexbytes(m.group(1)), "big")
 
     # Self-consistency of what we parsed, against the closed forms the same section states.
-    if P256["p"] != 2 ** 256 - 2 ** 224 + 2 ** 192 + 2 ** 96 - 1:
-        die("RFC 5903 3.1: p is not 2^256-2^224+2^192+2^96-1")
-    for v in P256.values():
-        if not 0 < v < 2 ** 256:
-            die("RFC 5903 3.1: parameter out of range")
-    if not py_p256_on_curve(P256["gx"], P256["gy"]):
-        die("RFC 5903 3.1: G is not on the curve")
-    if py_p256_mul(P256["n"], (P256["gx"], P256["gy"])) is not None:
-        die("RFC 5903 3.1: n*G is not the point at infinity")
-    return [(k, f"{P256[k]:064x}") for k in ("p", "b", "n", "gx", "gy")]
+    closed = {256: 2 ** 256 - 2 ** 224 + 2 ** 192 + 2 ** 96 - 1,
+              384: 2 ** 384 - 2 ** 128 - 2 ** 96 + 2 ** 32 - 1}[bits]
+    if curve["p"] != closed:
+        die(f"RFC 5903 {sec} p is not the closed form for {bits} bits")
+    for v in curve.values():
+        if not 0 < v < 2 ** bits:
+            die(f"RFC 5903 {sec} parameter out of range")
+    if not py_ec_on_curve(curve, curve["gx"], curve["gy"]):
+        die(f"RFC 5903 {sec} G is not on the curve")
+    if py_ec_mul(curve, curve["n"], (curve["gx"], curve["gy"])) is not None:
+        die(f"RFC 5903 {sec} n*G is not the point at infinity")
+    w = bits // 4
+    return [(k, f"{curve[k]:0{w}x}") for k in ("p", "b", "n", "gx", "gy")]
 
 
-def check_p256_source_constants():
-    """The five curve constants compiled into src/crypto/p256.c, byte-for-byte against the RFC.
+def check_source_constants(path, prefix, width, curve):
+    """The five curve constants compiled into a module, byte-for-byte against the RFC.
 
     This is how "never hand-type vectors" is honoured for the parameters themselves: they are the
     one thing in the module that cannot come from a generated .inc (src/ does not include tests/),
-    so the transcription is checked here instead of trusted. tests/test_p256.c pins G, n and p
-    through behaviour as well; this catches a slip even in b, which no single vector names."""
-    src = (ROOT / "src" / "crypto" / "p256.c").read_text(encoding="utf-8", errors="replace")
-    for name, key in (("P256_P", "p"), ("P256_B", "b"), ("P256_N", "n"), ("P256_GX", "gx"),
-                      ("P256_GY", "gy")):
-        m = re.search(r"static const uint8_t " + name + r"\[32\] = \{(.*?)\};", src, re.S)
+    so the transcription is checked here instead of trusted. tests/test_p256.c and
+    tests/test_p384.c pin G and n through behaviour as well; this catches a slip even in b, which
+    no single vector names."""
+    src = (ROOT / path).read_text(encoding="utf-8", errors="replace")
+    for suffix, key in (("_P", "p"), ("_B", "b"), ("_N", "n"), ("_GX", "gx"), ("_GY", "gy")):
+        name = prefix + suffix
+        m = re.search(r"static const uint8_t " + name + r"\[%d\] = \{(.*?)\};" % width, src, re.S)
         if not m:
-            die(f"src/crypto/p256.c: {name}[32] not found")
+            die(f"{path}: {name}[{width}] not found")
         got = bytes(int(h, 16) for h in re.findall(r"0x([0-9A-Fa-f]{2})", m.group(1)))
-        if got != P256[key].to_bytes(32, "big"):
-            die(f"src/crypto/p256.c: {name} does not match RFC 5903 3.1 ({got.hex()})")
+        if got != curve[key].to_bytes(width, "big"):
+            die(f"{path}: {name} does not match RFC 5903 ({got.hex()})")
 
 
-def py_p256_on_curve(x, y):
-    p = P256["p"]
-    return 0 <= x < p and 0 <= y < p and (y * y - (x * x * x - 3 * x + P256["b"])) % p == 0
+def check_p256_source_constants():
+    check_source_constants("src/crypto/p256.c", "P256", 32, P256)
 
 
-def py_p256_add(A, B):
+def check_p384_source_constants():
+    check_source_constants("src/crypto/p384.c", "P384", 48, P384)
+
+
+def py_ec_on_curve(curve, x, y):
+    p = curve["p"]
+    return 0 <= x < p and 0 <= y < p and (y * y - (x * x * x - 3 * x + curve["b"])) % p == 0
+
+
+def py_ec_add(curve, A, B):
     """Affine addition on y^2 = x^3 - 3x + b. None is the point at infinity."""
     if A is None or B is None:
         return B if A is None else A
-    p = P256["p"]
+    p = curve["p"]
     (x1, y1), (x2, y2) = A, B
     if x1 == x2 and (y1 + y2) % p == 0:
         return None
@@ -1188,13 +1204,25 @@ def py_p256_add(A, B):
     return (x3, (lam * (x1 - x3) - y1) % p)
 
 
-def py_p256_mul(k, A):
-    R, k = None, k % (P256["n"] * 2)
+def py_ec_mul(curve, k, A):
+    R, k = None, k % (curve["n"] * 2)
     while k:
         if k & 1:
-            R = py_p256_add(R, A)
-        A, k = py_p256_add(A, A), k >> 1
+            R = py_ec_add(curve, R, A)
+        A, k = py_ec_add(curve, A, A), k >> 1
     return R
+
+
+def py_p256_on_curve(x, y):
+    return py_ec_on_curve(P256, x, y)
+
+
+def py_p256_add(A, B):
+    return py_ec_add(P256, A, B)
+
+
+def py_p256_mul(k, A):
+    return py_ec_mul(P256, k, A)
 
 
 def p256_enc(A):
@@ -1819,6 +1847,278 @@ def p256_scalar_vectors():
     return rows
 
 
+# ---------------------------------------------------------------- P-384 ECDSA verify (M1d)
+# Verify only: no keygen, no ECDH, no sign, ever (docs/ARCHITECTURE.md line 76 locks "no P-384
+# ECDHE"). The module exists because Let's Encrypt Generation Y issues from P-384 intermediates,
+# so M2 chain building must be able to check that signature.
+P384_OK, P384_AUTH, P384_ARG = 0, 1, 2
+
+
+def p384_enc(A):
+    """RFC 9846 4.3.8.2: 0x04 || X || Y, 48 octets each, left-padded with zeros."""
+    return b"\x04" + A[0].to_bytes(48, "big") + A[1].to_bytes(48, "big")
+
+
+def py_p384_verify(pub, h, sig):
+    """FIPS 186-5 6.4.2. Returns P384_OK / P384_AUTH / P384_ARG.
+
+    The check order mirrors brisk__p384_ecdsa_verify exactly, because the expect code a row
+    carries depends on which check fires first: hash_len, then r/s, then the public point."""
+    n = P384["n"]
+    if len(pub) != 97 or len(sig) != 96 or len(h) < 48:
+        return P384_ARG
+    r, s = int.from_bytes(sig[:48], "big"), int.from_bytes(sig[48:], "big")
+    if not (1 <= r < n and 1 <= s < n):
+        # FIPS 186-5 6.4.2 step 1 says INVALID, not an error: a signature the peer could have
+        # written, so BRISK_E_AUTH -> decrypt_error, not BRISK_E_ARG -> illegal_parameter.
+        return P384_AUTH
+    x, y = int.from_bytes(pub[1:49], "big"), int.from_bytes(pub[49:], "big")
+    if pub[0] != 4 or not py_ec_on_curve(P384, x, y):
+        return P384_ARG  # malformed key material -> bad_certificate, a different condition
+    e = int.from_bytes(h[:48], "big") % n  # leftmost min(bitlen n, bitlen H) bits = first 48 bytes
+    w = pow(s, -1, n)
+    R = py_ec_add(P384, py_ec_mul(P384, e * w % n, P384_G), py_ec_mul(P384, r * w % n, (x, y)))
+    if R is None:
+        return P384_AUTH
+    return P384_OK if R[0] % n == r else P384_AUTH
+
+
+P384_G = None  # set in main() once the parameters are parsed
+
+
+# verify row = (pub97, hash, sig96, expect, deep)
+def verify_row_384(pub, h, sig, deep=0):
+    return (pub.hex(), h.hex(), sig.hex(), py_p384_verify(pub, h, sig), deep)
+
+
+def cavp_p384_sigver():
+    """186-3 ECDSAVS SigVer.rsp [P-384,SHA-384] and [P-384,SHA-512]: 15 rows each, 3 P / 12 F.
+
+    [P-384,SHA-1/224/256] are skipped for the same behavioural reason the P-256 loop skips its
+    short-hash sections: hash_len < 48 is BRISK_E_ARG by design (R8), not a truncated verify."""
+    z = zipfile.ZipFile(io.BytesIO(fetch("cavp_ecdsa")))
+    sections = rsp_sections(z.read("SigVer.rsp").decode("latin-1"))
+    pat = (r"Msg = ([0-9a-f]+)\nQx = ([0-9a-f]+)\nQy = ([0-9a-f]+)\nR = ([0-9a-f]+)\n"
+           r"S = ([0-9a-f]+)\nResult = ([PF])")
+    rows, npass = [], 0
+    for bits, hfn in ((384, hashlib.sha384), (512, hashlib.sha512)):
+        hits = re.findall(pat, sections[f"[P-384,SHA-{bits}]"])
+        if len(hits) != 15:
+            die(f"CAVP SigVer P-384/SHA-{bits}: parsed {len(hits)} of 15 cases")
+        for msg, qx, qy, r, s, res in hits:
+            if len(qx) != 96 or len(qy) != 96 or len(r) != 96 or len(s) != 96:
+                die(f"CAVP SigVer P-384/SHA-{bits}: a field is not 48 bytes")
+            pub = b"\x04" + bytes.fromhex(qx) + bytes.fromhex(qy)
+            sig = bytes.fromhex(r) + bytes.fromhex(s)
+            row = verify_row_384(pub, hfn(bytes.fromhex(msg)).digest(), sig, 1)
+            # A CAVP "F" row is a wrong signature, not malformed key material: every Q here is on
+            # the curve and every R/S is in range, so the verdict must be OK or AUTH, never ARG.
+            if row[3] == P384_ARG:
+                die(f"CAVP SigVer P-384/SHA-{bits}: unexpected BRISK_E_ARG row")
+            if (row[3] == P384_OK) != (res == "P"):
+                die(f"CAVP SigVer P-384/SHA-{bits}: verdict mismatch")
+            npass += res == "P"
+            rows.append(row)
+    if (len(rows), npass) != (30, 6):
+        die(f"CAVP SigVer P-384: {len(rows)} rows, {npass} P, expected 30 / 6")
+    return rows
+
+
+def cavp_p384_pkv():
+    """186-3 ECDSAVS PKV.rsp [P-384]: 12 rows, 4 valid / 8 invalid.
+
+    Driven through verify with a fixed in-range (r, s) that cannot possibly verify, so a valid
+    point lands on BRISK_E_AUTH and an off-curve one on BRISK_E_ARG - which is exactly the split
+    R7 requires. 4 of the 12 carry a 385-bit coordinate that the 97-byte wire encoding of
+    RFC 9846 4.3.8.2 cannot express at all; truncating them would turn them into different
+    points, so they are skipped and the in-range half of the check is pinned by the generated
+    x == p / y == p / coord == 2^384-1 rows in differential_p384()."""
+    z = zipfile.ZipFile(io.BytesIO(fetch("cavp_ecdsa")))
+    body = rsp_sections(z.read("PKV.rsp").decode("latin-1"))["[P-384]"]
+    hits = re.findall(r"Qx = ([0-9a-f]+)\nQy = ([0-9a-f]+)\nResult = ([PF])", body)
+    if len(hits) != 12:
+        die(f"CAVP PKV P-384: parsed {len(hits)} of 12 cases")
+    h0 = hashlib.sha384(b"brisk p384 pkv").digest()
+    sig = (7).to_bytes(48, "big") + (11).to_bytes(48, "big")  # in range, cannot verify
+    rows, used, oversize = [], 0, 0
+    for qx, qy, res in hits:
+        x, y = int(qx, 16), int(qy, 16)
+        if x >= 2 ** 384 or y >= 2 ** 384:
+            oversize += 1
+            continue
+        row = verify_row_384(p384_enc((x, y)), h0, sig, 1)
+        want = P384_AUTH if res == "P" else P384_ARG
+        if row[3] != want:
+            die(f"CAVP PKV P-384: verdict mismatch for {qx}")
+        used += 1
+        rows.append(row)
+    if (used, oversize) != (8, 4):
+        die(f"CAVP PKV P-384: {used} usable / {oversize} oversize rows, expected 8 / 4")
+    return rows
+
+
+def wycheproof_p384_ecdsa(src, hfn, shaname):
+    """ecdsa_secp384r1_sha{384,512}_p1363: raw 96-byte r||s, the shape this module takes."""
+    doc = json.loads(fetch(src))
+    rows, valid, wrong_len, flags = [], 0, 0, {}
+    for g in doc["testGroups"]:
+        if g["type"] != "EcdsaP1363Verify" or g["sha"] != shaname:
+            die(f"Wycheproof {src}: unexpected group {g['type']}/{g['sha']}")
+        pub = bytes.fromhex(g["publicKey"]["uncompressed"])
+        for t in g["tests"]:
+            sig = bytes.fromhex(t["sig"])
+            # brisk__p384_ecdsa_verify takes a fixed uint8_t[96] and uint8_t[97], so a
+            # wrong-width P1363 signature or point cannot be handed to it at all: the width is
+            # settled by the caller that unwraps the DER ECDSA-Sig-Value. What those rows are
+            # really about - r or s outside [1, n-1] - is pinned at the right width by the
+            # generated edge rows in differential_p384().
+            if len(sig) != 96 or len(pub) != 97:
+                wrong_len += 1
+                continue
+            h = hfn(bytes.fromhex(t["msg"])).digest()
+            row = verify_row_384(pub, h, sig, int(t["result"] != "valid"))
+            if (row[3] == P384_OK) != (t["result"] == "valid"):
+                die(f"Wycheproof {src} tcId {t['tcId']}: verdict mismatch")
+            for fl in t.get("flags", []):
+                flags[fl] = flags.get(fl, 0) + 1
+            valid += t["result"] == "valid"
+            rows.append(row)
+    return rows, valid, wrong_len, flags
+
+
+def rfc6979_verify_384():
+    """RFC 6979 A.2.6 (P-384). The SHA-384 and SHA-512 rows for "sample" and "test" are the four
+    official RFC-appendix verify vectors; SHA-1/224/256 are below the 48-byte minimum.
+
+    PARSER NOTE: unlike A.2.5, every A.2.6 hex value wraps across two indented lines, so the
+    fixed-width [0-9A-F]{64} regexes of the P-256 parser match nothing here - silently, which is
+    why each count below is guarded."""
+    text = "\n".join(rfc_lines(fetch("rfc6979")))
+    s = text[text.rindex("A.2.6.  ECDSA, 384 Bits") : text.rindex("A.2.7.")]
+    kv = {}
+    for key in ("x", "Ux", "Uy"):
+        m = re.search(r"\n\s+" + key + r" = ((?:[0-9A-F]+\s*)+)", s)
+        if not m:
+            die(f"RFC 6979 A.2.6: {key} not found")
+        kv[key] = "".join(m.group(1).split())
+        if len(kv[key]) != 96:
+            die(f"RFC 6979 A.2.6: {key} is {len(kv[key])} hex chars, expected 96")
+    pub = p384_enc((int(kv["Ux"], 16), int(kv["Uy"], 16)))
+    if p384_enc(py_ec_mul(P384, int(kv["x"], 16), P384_G)) != pub:
+        die("RFC 6979 A.2.6: U is not x*G")
+    algs = {"384": hashlib.sha384, "512": hashlib.sha512}
+    pat = (r'With SHA-(\d+), message = "(sample|test)":\n'
+           r"\s+k = (?:[0-9A-F]+\s*)+r = ((?:[0-9A-F]+\s*)+)s = ((?:[0-9A-F]+\s*)+)")
+    hits = re.findall(pat, s)
+    if len(hits) != 10:
+        die(f"RFC 6979 A.2.6: parsed {len(hits)} of 10 (hash, message) pairs")
+    rows = []
+    for bits, msg, r, s_ in hits:
+        if bits not in algs:
+            continue
+        r, s_ = "".join(r.split()), "".join(s_.split())
+        if len(r) != 96 or len(s_) != 96:
+            die(f"RFC 6979 A.2.6 SHA-{bits}/{msg}: r or s is not 48 bytes")
+        h = algs[bits](msg.encode()).digest()
+        row = verify_row_384(pub, h, bytes.fromhex(r) + bytes.fromhex(s_), 1)
+        if row[3] != P384_OK:
+            die(f"RFC 6979 A.2.6 SHA-{bits}/{msg}: signature does not verify")
+        rows.append(row)
+    if len(rows) != 4:
+        die(f"RFC 6979 A.2.6: {len(rows)} usable rows, expected 4")
+    return rows
+
+
+def differential_p384():
+    """Seeded edge cases: the r/s range boundary, bad point encodings, and the hash_len rule.
+
+    These are what cover the Wycheproof classes the 96/97-byte width filter drops, and what pins
+    n behaviourally (no vector names n directly)."""
+    p, n = P384["p"], P384["n"]
+    gx, gy = P384["gx"], P384["gy"]
+    rnd = random.Random(20260921)
+    rows = []
+    d = rnd.randrange(1, n)
+    pub = p384_enc(py_ec_mul(P384, d, P384_G))
+    h0 = hashlib.sha384(b"brisk").digest()
+
+    # A real signature, so the negative rows below sit next to something that does verify and the
+    # "different key" row cannot pass by accident.
+    k = rnd.randrange(1, n)
+    R = py_ec_mul(P384, k, P384_G)
+    r = R[0] % n
+    e = int.from_bytes(h0[:48], "big") % n
+    s = pow(k, -1, n) * (e + r * d) % n
+    if not (1 <= r < n and 1 <= s < n):
+        die("differential P-384: degenerate signature, change the seed")
+    good = r.to_bytes(48, "big") + s.to_bytes(48, "big")
+    if py_p384_verify(pub, h0, good) != P384_OK:
+        die("differential P-384: the generated signature does not verify")
+    rows.append(verify_row_384(pub, h0, good, 1))
+    # The same signature under a different key: AUTH, never OK and never ARG.
+    other = p384_enc(py_ec_mul(P384, rnd.randrange(1, n), P384_G))
+    rows.append(verify_row_384(other, h0, good, 1))
+
+    # FIPS 186-5 6.4.2 step 1: r or s outside [1, n-1] is INVALID -> BRISK_E_AUTH, never
+    # BRISK_E_ARG. Returning ARG would emit illegal_parameter and hand the peer an oracle
+    # separating "malformed r/s" from "wrong signature". These rows also pin n.
+    for rr, ss in ((0, s), (r, 0), (n, s), (r, n), (n + 1, s), (r, n + 1),
+                   (2 ** 384 - 1, s), (r, 2 ** 384 - 1), (0, 0), (n - 1, n - 1)):
+        row = verify_row_384(pub, h0, rr.to_bytes(48, "big") + ss.to_bytes(48, "big"), 1)
+        if row[3] != P384_AUTH:
+            die("differential P-384: an out-of-range r/s is not a failed signature")
+        rows.append(row)
+
+    # Bad point encodings. Every one is BRISK_E_ARG, decided before any scalar multiplication.
+    bad = [b"\x04" + p.to_bytes(48, "big") + gy.to_bytes(48, "big"),     # x == p
+           b"\x04" + gx.to_bytes(48, "big") + p.to_bytes(48, "big"),     # y == p
+           b"\x04" + bytes(96),                                          # infinity has no encoding
+           b"\x04" + b"\xff" * 96,                                       # both coords 2^384-1
+           b"\x04" + (2 ** 384 - 1).to_bytes(48, "big") + gy.to_bytes(48, "big"),
+           b"\x04" + gx.to_bytes(48, "big") + (gy ^ 1).to_bytes(48, "big")]  # off the curve
+    for pre in (0x00, 0x02, 0x03, 0x05, 0x06, 0x07):  # compressed/hybrid rejected, not decoded
+        bad.append(bytes([pre]) + gx.to_bytes(48, "big") + gy.to_bytes(48, "big"))
+    # A point on the twist: y^2 = x^3 - 3x + b has no solution for this x.
+    for xt in range(2, 400):
+        if pow((xt ** 3 - 3 * xt + P384["b"]) % p, (p - 1) // 2, p) != 1:
+            bad.append(b"\x04" + xt.to_bytes(48, "big") + bytes(48))
+            break
+    else:
+        die("differential P-384: no twist x found")
+    for enc in bad:
+        row = verify_row_384(enc, h0, good, 1)
+        if row[3] != P384_ARG:
+            die(f"differential P-384: bad encoding {enc[:1].hex()} was accepted")
+        rows.append(row)
+
+    # hash_len < 48 is a caller bug -> BRISK_E_ARG, not a truncated verify (R8). The C test also
+    # checks hash_len 32, the SHA-256-against-a-P-384-key case R8 names.
+    for hlen in (0, 47):
+        row = verify_row_384(pub, h0[:hlen], good, 1)
+        if row[3] != P384_ARG:
+            die("differential P-384: a short hash is not BRISK_E_ARG")
+        rows.append(row)
+
+    # x_R with a leading zero byte: the 48-byte fixed-width comparison against r must not depend
+    # on where the value starts. Searched, because no official vector happens to have one.
+    for kk in range(1, 6000):
+        Rk = py_ec_mul(P384, kk, P384_G)
+        if Rk[0] % n < 1 << 376:
+            dk = rnd.randrange(1, n)
+            pk = p384_enc(py_ec_mul(P384, dk, P384_G))
+            rk = Rk[0] % n
+            ek = int.from_bytes(h0[:48], "big") % n
+            sk = pow(kk, -1, n) * (ek + rk * dk) % n
+            row = verify_row_384(pk, h0, rk.to_bytes(48, "big") + sk.to_bytes(48, "big"), 1)
+            if row[3] != P384_OK or not row[2].startswith("00"):
+                die("differential P-384: leading-zero x_R row is malformed")
+            rows.append(row)
+            break
+    else:
+        die("differential P-384: no k with a leading zero byte in x(k*G) mod n")
+    return rows
+
+
 # ---------------------------------------------------------------- RSA: bignum + RSASSA verify
 # Verdicts, mirroring the C entry points: 0 = BRISK_OK, 1 = BRISK_E_AUTH, 2 = BRISK_E_ARG.
 RSA_OK, RSA_AUTH, RSA_ARG = 0, 1, 2
@@ -2413,7 +2713,7 @@ def main():
     x25519 = x7748 + rfc8448_x25519() + wycheproof_x25519() + differential_x25519()
 
     global P256_G
-    p256_params = rfc5903_params()
+    p256_params = rfc5903_params("3.1.", 256, P256)
     P256_G = (P256["gx"], P256["gy"])
     check_p256_source_constants()
     k5903, e5903 = rfc5903_ecdh()
@@ -2425,6 +2725,26 @@ def main():
     p256_verify = vcavp + wycheproof_p256_ecdsa() + rfc6979_verify() + vdiff + vsgen
     p256_scalar = p256_scalar_vectors()
     p256_sign = rfc6979_sign() + differential_p256_sign()
+
+    global P384_G
+    p384_params = rfc5903_params("3.2.", 384, P384)
+    P384_G = (P384["gx"], P384["gy"])
+    check_p384_source_constants()
+    p384_verify = cavp_p384_sigver() + cavp_p384_pkv() + rfc6979_verify_384()
+    p384_flags = {}
+    for src, hfn, sha in (("wp_p384_ecdsa_sha384", hashlib.sha384, "SHA-384"),
+                          ("wp_p384_ecdsa_sha512", hashlib.sha512, "SHA-512")):
+        rows, valid, wrong_len, flags = wycheproof_p384_ecdsa(src, hfn, sha)
+        print(f"  wycheproof {src}: {len(rows)} rows, {valid} valid, {wrong_len} wrong width")
+        # Pinned to the files named in tests/kat/SOURCES.md: 280 and 318 rows upstream, 19 of
+        # each dropped on the 96/97-byte width filter (R3/R4 fix both widths).
+        want = {"wp_p384_ecdsa_sha384": (261, 193, 19), "wp_p384_ecdsa_sha512": (299, 230, 19)}
+        if (len(rows), valid, wrong_len) != want[src]:
+            die(f"Wycheproof {src}: {len(rows)}/{valid}/{wrong_len}, expected {want[src]}")
+        p384_flags.update({k: p384_flags.get(k, 0) + v for k, v in flags.items()})
+        p384_verify += rows
+    print("  wycheproof P-384 flags:", dict(sorted(p384_flags.items(), key=lambda kv: -kv[1])))
+    p384_verify += differential_p384()
 
     global DIGESTINFO
     DIGESTINFO = rfc8017_digestinfo()
@@ -2510,6 +2830,11 @@ def main():
     emit("p256_sign.inc", "struct p256_sign_kat P256_SIGN_KAT", p256_sign,
          lambda r: f"{cstr(r[0])}, {cstr(r[1])}, {cstr(r[2])}, {cstr(r[3])}, {r[4]}")
 
+    emit("p384_params.inc", "struct p384_param P384_PARAM", p384_params,
+         lambda r: f'"{r[0]}", {cstr(r[1])}')
+    emit("p384_verify.inc", "struct p384_verify_kat P384_VERIFY_KAT", p384_verify,
+         lambda r: f"{cstr(r[0])}, {cstr(r[1])}, {cstr(r[2])}, {r[3]}, {r[4]}")
+
     emit("rsa_key.inc", "struct rsa_key RSA_KEY", RSA_KEYS,
          lambda r: f"{cstr(r[0])}, {cstr(r[1])}")
     emit("rsa_pkcs1.inc", "struct rsa_kat RSA_PKCS1_KAT", pkcs1,
@@ -2554,6 +2879,33 @@ def main():
         "  `[P-256,SHA-384]` and `[P-256,SHA-512]` sections of the same file ARE used, 15 rows\n"
         "  each with 12 failing: they are what exercises the FIPS 186-5 6.4.2 leftmost-bits\n"
         "  rule with official negative vectors.\n"
+        "- CAVP `PKV.rsp` `[P-384]`: 4 of the 12 rows carry a 385-bit (97 hex char) coordinate,\n"
+        "  which the 97-byte encoding of RFC 9846 4.3.8.2 cannot express - truncating them would\n"
+        "  turn them into different points. The remaining 8 are driven through\n"
+        "  `brisk__p384_ecdsa_verify` with a fixed in-range `(r, s) = (7, 11)` that cannot\n"
+        "  verify, so a valid point lands on `BRISK_E_AUTH` and an off-curve one on\n"
+        "  `BRISK_E_ARG`. The in-range half of the coordinate check (p <= coord < 2^384) is\n"
+        "  pinned by generated `x == p` / `y == p` / `coord == 2^384-1` rows instead.\n"
+        "- CAVP `SigVer.rsp` `[P-384,SHA-1]`, `[P-384,SHA-224]` and `[P-384,SHA-256]`, and the\n"
+        "  RFC 6979 A.2.6 SHA-1 / SHA-224 / SHA-256 rows. Skipped for a *behavioural* reason:\n"
+        "  `brisk__p384_ecdsa_verify` requires `hash_len >= 48` and returns `BRISK_E_ARG` below\n"
+        "  that (FIPS 186-5 6.4.2 reads only the leftmost 48 octets). RFC 9846 4.3.3 pairs the\n"
+        "  curve with SHA-384 in `ecdsa_secp384r1_sha384`, so TLS never asks for the shorter\n"
+        "  pairing; a P-384 key certified with `ecdsa-with-SHA256` exists in some private PKIs\n"
+        "  and M2's certificate layer must reject it with `unsupported_certificate` rather than\n"
+        "  call in with `hash_len 32`. The `[P-384,SHA-384]` and `[P-384,SHA-512]` sections ARE\n"
+        "  used, 15 rows each with 12 failing.\n"
+        "- `ecdsa_secp384r1_sha384_p1363_test.json` and `ecdsa_secp384r1_sha512_p1363_test.json`:\n"
+        "  19 of 280 and 19 of 318 rows carry a signature that is not 96 bytes, all of them\n"
+        "  \"invalid\". `brisk__p384_ecdsa_verify` takes a fixed `uint8_t[96]`, so the width is\n"
+        "  settled by the caller that unwraps the DER ECDSA-Sig-Value. Their substance - r or s\n"
+        "  outside [1, n-1] - is pinned at the right width by generated edge rows (0, n, n+1,\n"
+        "  2^384-1 on each side). The DER siblings of both files are out of scope for the same\n"
+        "  reason the P-256 one is.\n"
+        "- There is no P-384 *keygen*, *ECDH* or *signing* vector set here, and there never will\n"
+        "  be: docs/ARCHITECTURE.md locks P-384 to verify only, so `KAS_ECC_CDH` `[P-384]`,\n"
+        "  `KeyPair.rsp` `[P-384]`, `SigGen.txt` `[P-384]` and `ecdh_secp384r1_*` are all out of\n"
+        "  scope by design rather than forgotten.\n"
         "- No Wycheproof ECDSA *signing* suite exists, for `brisk__p256_ecdsa_sign` or for\n"
         "  anyone else: signing has no attacker-controlled input, so there is nothing for a\n"
         "  test suite to attack. The invalid half of `p256_sign.inc` is therefore generated -\n"

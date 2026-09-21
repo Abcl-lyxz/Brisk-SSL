@@ -18,6 +18,7 @@ add_library(brisk STATIC
     src/crypto/x25519.c   # #includes vendor/fiat/curve25519_{32,64}.c (all-static, see VENDORED.md)
     src/crypto/p256.c     # #includes vendor/fiat/p256_{32,64}.c (same rule)
     src/crypto/bn.c       # i31 constant-time Montgomery big integers
+    src/crypto/p384.c     # ECDSA P-384 verify on bn.c (empty TU when BRISK_ENABLE_P384 is 0)
     src/crypto/rsa.c      # RSASSA-PKCS1-v1_5 / RSASSA-PSS verify (RFC 8017)
 )
 if(CMAKE_SYSTEM_NAME STREQUAL "Linux") # src/os/ is Linux-only; the mingw host skips it
@@ -50,7 +51,8 @@ endif()
 if(BRISK_BUILD_TESTS)
     enable_testing()
     add_executable(brisk_tests tests/test_main.c tests/test_hash.c tests/test_aead.c tests/test_aes.c
-                               tests/test_x25519.c tests/test_p256.c tests/test_rsa.c
+                               tests/test_x25519.c tests/test_p256.c tests/test_p384.c
+                               tests/test_rsa.c
                                tests/test_ct.c)
     set_target_properties(brisk_tests PROPERTIES C_STANDARD 99 C_EXTENSIONS OFF)
     target_link_libraries(brisk_tests PRIVATE brisk)
@@ -69,6 +71,12 @@ if(BRISK_BUILD_TESTS)
     set_tests_properties(x25519 PROPERTIES TIMEOUT 900)
     add_test(NAME p256 COMMAND brisk_tests p256)
     set_tests_properties(p256 PROPERTIES TIMEOUT 900)
+    add_test(NAME p384 COMMAND brisk_tests p384)
+    # 900 like the others. The spec budgeted 1800 for this suite; MEASURED on qemu-armv5 it is
+    # 42 s for ~1300 verifies (32 ms each), against 148 s for p256 - so the generic bignum turned
+    # out far cheaper than the "several hundred ms per verify" the risk list assumed, and there is
+    # no reason for a special case here. Re-measure before adding vectors in bulk.
+    set_tests_properties(p384 PROPERTIES TIMEOUT 900)
     add_test(NAME rsa COMMAND brisk_tests rsa)
     set_tests_properties(rsa PROPERTIES TIMEOUT 900)
     add_test(NAME ct COMMAND brisk_tests ct) # under valgrind in `dev.py ct`; here just a smoke run

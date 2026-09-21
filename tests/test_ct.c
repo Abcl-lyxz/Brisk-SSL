@@ -172,6 +172,53 @@ static void ct_p256(void)
 #endif
 }
 
+#if BRISK_ENABLE_P384
+/* P-384: verify only, and every input is public by construction - a certificate, a
+ * CertificateVerify and the verdict all travel in the clear. So the call below is made on buffers
+ * valgrind has marked UNDEFINED and must still report nothing: that proves the three
+ * BRISK__CT_PUBLIC declassifications inside brisk__p384_ecdsa_verify are explicit and that no
+ * other branch escapes them: delete any one of the three and this case reports. Their ORDER is
+ * not testable here - VALGRIND_MAKE_MEM_DEFINED marks a range defined and addressable without
+ * complaint, so moving the `hash` declassification above the hash_len check would be silent to
+ * memcheck; that one is held in place by the comment at its site, not by this test. The ladder
+ * inside deliberately branches on its scalar bits; that is why nothing secret may ever be passed
+ * here. */
+static void ct_p384(void)
+{
+    uint8_t pub[97], sig[96], hash[48];
+    memset(pub, 0x04, sizeof pub); /* 0x04 || 0x04... - not on the curve, which is fine */
+    memset(sig, 0x33, sizeof sig);
+    memset(hash, 0x44, sizeof hash);
+    BRISK__CT_SECRET(pub, sizeof pub);
+    BRISK__CT_SECRET(sig, sizeof sig);
+    BRISK__CT_SECRET(hash, sizeof hash);
+    CHECK(brisk__p384_ecdsa_verify(pub, hash, sizeof hash, sig) == BRISK_E_ARG);
+
+    /* And a point that IS on the curve, so the ladder, both inversions and the final comparison
+     * all run under the same marking rather than being cut short by the decode. */
+    {
+        static const uint8_t
+            g[97] = {0x04, 0xAA, 0x87, 0xCA, 0x22, 0xBE, 0x8B, 0x05, 0x37, 0x8E, 0xB1, 0xC7, 0x1E,
+                     0xF3, 0x20, 0xAD, 0x74, 0x6E, 0x1D, 0x3B, 0x62, 0x8B, 0xA7, 0x9B, 0x98, 0x59,
+                     0xF7, 0x41, 0xE0, 0x82, 0x54, 0x2A, 0x38, 0x55, 0x02, 0xF2, 0x5D, 0xBF, 0x55,
+                     0x29, 0x6C, 0x3A, 0x54, 0x5E, 0x38, 0x72, 0x76, 0x0A, 0xB7, 0x36, 0x17, 0xDE,
+                     0x4A, 0x96, 0x26, 0x2C, 0x6F, 0x5D, 0x9E, 0x98, 0xBF, 0x92, 0x92, 0xDC, 0x29,
+                     0xF8, 0xF4, 0x1D, 0xBD, 0x28, 0x9A, 0x14, 0x7C, 0xE9, 0xDA, 0x31, 0x13, 0xB5,
+                     0xF0, 0xB8, 0xC0, 0x0A, 0x60, 0xB1, 0xCE, 0x1D, 0x7E, 0x81, 0x9D, 0x7A, 0x43,
+                     0x1D, 0x7C, 0x90, 0xEA, 0x0E, 0x5F}; /* the RFC 5903 3.2 generator */
+        memcpy(pub, g, sizeof pub);
+        /* All three, not just pub: BRISK__CT_PUBLIC is VALGRIND_MAKE_MEM_DEFINED, which sticks to
+         * the memory. The first call declassified sig and hash, and the marking survives it, so
+         * without re-marking them here the ladder would run on data valgrind already considers
+         * defined and the declassification of `hash` would never be exercised at all. */
+        BRISK__CT_SECRET(pub, sizeof pub);
+        BRISK__CT_SECRET(sig, sizeof sig);
+        BRISK__CT_SECRET(hash, sizeof hash);
+        CHECK(brisk__p384_ecdsa_verify(pub, hash, sizeof hash, sig) == BRISK_E_AUTH);
+    }
+}
+#endif
+
 static void ct_memeq(void)
 {
     uint8_t copy[16];
@@ -252,6 +299,9 @@ void test_ct(void)
     ct_aes_gcm();
     ct_x25519();
     ct_p256();
+#if BRISK_ENABLE_P384
+    ct_p384();
+#endif
     ct_bn_rsa();
     ct_memeq();
 }
