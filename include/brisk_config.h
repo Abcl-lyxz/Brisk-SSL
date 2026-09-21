@@ -54,4 +54,23 @@
 #    define BRISK_ENABLE_MTLS (BRISK_PROFILE >= BRISK_PROFILE_DEFAULT)
 #endif
 
+/* Largest RSA modulus accepted when verifying a certificate signature, in bits. The project's
+ * first VALUE knob - every other one is a tri-state boolean - and it is a STACK lever, not a
+ * flash one: it sizes the i31 scratch inside src/crypto/rsa.c and nothing else. Measured at -Os
+ * along the deepest call chain, a PSS verify needs 3392 bytes of stack at 4096 and 2064 at 2048;
+ * PKCS#1 v1.5 needs 3088 and 1760. The full table is in the src/crypto/rsa.c header.
+ *
+ * 4096 by default because real trust anchors are 4096-bit (ISRG Root X1). Drop it to 2048 only
+ * for a private PKI whose largest certificate you control. There is no knob to switch RSA off:
+ * RFC 9846 9.1 makes rsa_pkcs1_sha256 (certificates) and rsa_pss_rsae_sha256 (CertificateVerify
+ * and certificates) mandatory to implement, exactly as it does P-256 ECDHE.
+ *
+ * No public struct size depends on this, so the ABI rule at the top of this file still holds. */
+#ifndef BRISK_RSA_MAX_BITS
+#    define BRISK_RSA_MAX_BITS 4096
+#endif
+#if BRISK_RSA_MAX_BITS < 2048 || BRISK_RSA_MAX_BITS > 4096 || (BRISK_RSA_MAX_BITS % 8) != 0
+#    error "BRISK_RSA_MAX_BITS must be 2048..4096 and a multiple of 8"
+#endif
+
 #endif /* BRISK_CONFIG_H */

@@ -44,6 +44,25 @@ int main(int argc, char **argv)
         brisk__p256_ecdsa_sign(out, out + 32, pt, 32, pt + 32, 32);
 #endif
     }
+    {
+        uint32_t m[BRISK__BN_MAX_LIMBS], x[BRISK__BN_MAX_LIMBS], t[2 * BRISK__BN_MAX_LIMBS];
+        /* out still holds whatever the P-256 block left there: force it odd and top-bit set so
+         * decode_mod accepts it, and decode x from a shorter string so x < m holds too. */
+        out[0] |= 0x80;
+        out[31] |= 1;
+        brisk__bn_decode_mod(m, BRISK__BN_MAX_BITS, out, 32);
+        brisk__bn_decode_into(x, m, out + 1, 31);
+        brisk__bn_encode(out, 32, x);
+        brisk__bn_lt(x, m);
+        brisk__bn_add(x, m, 1);
+        brisk__bn_sub(x, m, 1);
+        brisk__bn_mont_mul(x, x, m, m, brisk__bn_ninv31(m));
+        brisk__bn_to_mont(x, m);
+        brisk__bn_from_mont(x, m, brisk__bn_ninv31(m), t);
+        brisk__bn_modpow_pub(x, out, 3, m, t);
+        brisk__rsa_pkcs1_verify(out, 32, out, 3, alg, out, 32, out, 32);
+        brisk__rsa_pss_verify(out, 32, out, 3, alg, 32, out, 32, out, 32);
+    }
 #ifdef __linux__
     brisk__os_random(out, 32);
 #endif

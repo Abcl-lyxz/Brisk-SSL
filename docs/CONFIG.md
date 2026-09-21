@@ -21,6 +21,18 @@ that says how to fix it. Knobs are added as their milestone lands.
 | (always built) SHA-256/384/512, HMAC, HKDF | on | - | see table below |
 | `BRISK_ENABLE_MTLS` — client certificates: ECDSA P-256 signing (hedged RFC 6979) and the `brisk_sign_fn` hook | DEFAULT and FULL | SHA-2, HMAC, P-256 (all already built) | 818 (armv7hf) … 1776 (mips); 1309 on x86_64 |
 
+RSA verification has **no knob**: RFC 9846 9.1 makes `rsa_pkcs1_sha256` (certificates) and
+`rsa_pss_rsae_sha256` (CertificateVerify and certificates) mandatory to implement, so
+`src/crypto/bn.c` and `src/crypto/rsa.c` are in every profile including TINY - exactly as
+`src/crypto/p256.c` is, for ECDHE. Together they cost 2613 (armv7hf) to 4956 (mips64) bytes of
+flash, and that is simply owed: there is no honest knob to hide a mandatory-to-implement
+algorithm behind.
+
+### Value knobs
+| Knob | Default | Range | What it changes |
+|---|---|---|---|
+| `BRISK_RSA_MAX_BITS` | 4096 | 2048 to 4096, multiple of 8 | The largest RSA modulus a certificate signature may use. A **stack** lever, not a flash one: it sizes the i31 scratch in `src/crypto/rsa.c` and nothing else. Measured with `-fstack-usage` at -Os along the deepest call chain, a PSS verify needs 3392 B of stack at 4096 and 2064 B at 2048; PKCS#1 v1.5 needs 3088 B and 1760 B. Flash and the public ABI are unaffected. Drop it to 2048 only for a private PKI whose largest certificate you control - public trust anchors are 4096-bit (ISRG Root X1). |
+
 ## Measured size (M1a, `python tools/dev.py size --arch all`)
 Flash = code + read-only data + data of the library objects actually linked (libc excluded).
 

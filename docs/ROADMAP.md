@@ -28,7 +28,7 @@ Tick a box only when the work is green on **every** arch (`python tools/dev.py t
 - [x] P-256 ECDHE + ECDSA verify (trimmed fiat on 32-bit: square=mul, Fermat inversion)
 - [x] ECDSA P-256 sign, hedged RFC 6979 (mTLS) + sign-callback hook
 ### M1d Bignum
-- [ ] i31 Montgomery bignum (constant-time), RSA PKCS#1 v1.5 + PSS verify 2048-4096
+- [x] i31 Montgomery bignum (constant-time), RSA PKCS#1 v1.5 + PSS verify 2048-4096
 - [ ] P-384 ECDSA verify on the generic bignum
 
 ## M2 X.509

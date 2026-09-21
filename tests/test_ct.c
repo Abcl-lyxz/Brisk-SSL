@@ -181,6 +181,69 @@ static void ct_memeq(void)
     CHECK(brisk__ct_memeq(secret16, copy, sizeof copy) == 0);
 }
 
+/* bn.c / rsa.c. Read the caveat before reading the code: NOTHING here is genuinely secret. RSA is
+ * verify-only and every input - modulus, exponent, signature, digest - is public, and P-384 verify
+ * will be the same. What this case exists to prove is that the i31 kernel a future secret-key
+ * consumer would inherit is branch-free, index-free and division-free on its DATA. So the limbs
+ * are marked secret while the announced bit length is not: the width of a modulus is public by
+ * construction (it is the key size), and every limb count in bn.c is derived from it.
+ *
+ * Exactly two things are declassified, each for a reason written at the point of use: the public
+ * exponent's bits inside brisk__bn_modpow_pub (the _pub in the name, see src/brisk_int.h), and
+ * the final verdict. Any other report from this case is a real finding and must never be silenced
+ * with a third BRISK__CT_PUBLIC.
+ *
+ * The two RSA entry points are called with everything public, because they branch on all of it by
+ * design (RFC 8017 8.2.2 and 9.1.2 are structural checks over public octets). They are here so
+ * that the valgrind run still walks them for memory errors, not as a constant-time claim. */
+static void ct_bn_rsa(void)
+{
+    uint32_t m[BRISK__BN_MAX_LIMBS], x[BRISK__BN_MAX_LIMBS], d[BRISK__BN_MAX_LIMBS];
+    uint32_t t[2 * BRISK__BN_MAX_LIMBS];
+    uint8_t mb[256], xb[256], out[256];
+    static const uint8_t e[3] = {0x01, 0x00, 0x01};
+    uint32_t n0, limbs;
+    size_t i;
+
+    /* Any odd 2048-bit modulus will do; the values never reach a comparison that matters. */
+    memset(mb, 0xA5, sizeof mb);
+    mb[0] = 0xC7;
+    mb[sizeof mb - 1] = 0x8D;
+    for (i = 0; i < sizeof xb; i++) {
+        xb[i] = (uint8_t)(i * 7 + 3);
+    }
+    xb[0] = 0x42; /* keeps x below m */
+    CHECK(brisk__bn_decode_mod(m, BRISK__BN_MAX_BITS, mb, sizeof mb) == BRISK_OK);
+    CHECK(brisk__bn_decode_into(x, m, xb, sizeof xb) == BRISK_OK);
+    limbs = (m[0] + 30) / 31;
+    /* The header word stays public - it is the key size - and the limbs become secret. */
+    BRISK__CT_SECRET(m + 1, limbs * sizeof *m);
+    BRISK__CT_SECRET(x + 1, limbs * sizeof *x);
+    n0 = brisk__bn_ninv31(m);
+    {
+        uint32_t verdict = brisk__bn_lt(x, m);
+        BRISK__CT_PUBLIC(&verdict, sizeof verdict); /* the range check the protocol reveals */
+        CHECK(verdict == 1);
+    }
+    (void)brisk__bn_add(x, m, 0);
+    (void)brisk__bn_sub(x, m, 0);
+    brisk__bn_mont_mul(d, x, x, m, n0);
+    brisk__bn_to_mont(d, m);
+    brisk__bn_from_mont(d, m, n0, t);
+    CHECK(brisk__bn_modpow_pub(x, e, sizeof e, m, t) == BRISK_OK);
+    CHECK(brisk__bn_encode(out, sizeof out, x) == BRISK_OK);
+    BRISK__CT_PUBLIC(out, sizeof out); /* the result is the signature representative: public */
+    BRISK__CT_PUBLIC(m, sizeof m);
+    BRISK__CT_PUBLIC(x, sizeof x);
+    brisk__secure_zero(t, sizeof t);
+
+    /* Public-input smoke run of both verifiers, for the memory check rather than the CT one. */
+    CHECK(brisk__rsa_pkcs1_verify(mb, sizeof mb, e, sizeof e, BRISK_HASH_SHA256, out, 32, xb,
+                                  sizeof xb) != BRISK_OK);
+    CHECK(brisk__rsa_pss_verify(mb, sizeof mb, e, sizeof e, BRISK_HASH_SHA256, 32, out, 32, xb,
+                                sizeof xb) != BRISK_OK);
+}
+
 void test_ct(void)
 {
     mark_secrets();
@@ -189,5 +252,6 @@ void test_ct(void)
     ct_aes_gcm();
     ct_x25519();
     ct_p256();
+    ct_bn_rsa();
     ct_memeq();
 }

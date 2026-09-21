@@ -52,6 +52,17 @@ SRC = {
     "documents/dss/186-3ecdsatestvectors.zip",
     "wp_p256_ecdh": f"{WP}ecdh_secp256r1_ecpoint_test.json",
     "wp_p256_ecdsa": f"{WP}ecdsa_secp256r1_sha256_p1363_test.json",
+    "rfc8017": "https://www.rfc-editor.org/rfc/rfc8017.txt",
+    "cavp_rsa2": "https://csrc.nist.gov/CSRC/media/Projects/Cryptographic-Algorithm-Validation-Program/"
+    "documents/dss/186-2rsatestvectors.zip",
+    "cavp_rsa3": "https://csrc.nist.gov/CSRC/media/Projects/Cryptographic-Algorithm-Validation-Program/"
+    "documents/dss/186-3rsatestvectors.zip",
+    **{f"wp_rsa_pkcs1_{b}_{s}": f"{WP}rsa_signature_{b}_{s}_test.json"
+       for b in (2048, 3072, 4096) for s in ("sha256", "sha384", "sha512")},
+    **{f"wp_rsa_pss_{v}": f"{WP}rsa_pss_{v}_test.json" for v in (
+        "2048_sha256_mgf1_0", "2048_sha256_mgf1_32", "2048_sha384_mgf1_48",
+        "3072_sha256_mgf1_32", "4096_sha256_mgf1_32", "4096_sha384_mgf1_48",
+        "4096_sha512_mgf1_32", "4096_sha512_mgf1_64", "misc")},
 }
 HASH = {256: hashlib.sha256, 384: hashlib.sha384, 512: hashlib.sha512}
 fetched = {}  # name -> (url, sha256 of bytes)
@@ -1808,6 +1819,565 @@ def p256_scalar_vectors():
     return rows
 
 
+# ---------------------------------------------------------------- RSA: bignum + RSASSA verify
+# Verdicts, mirroring the C entry points: 0 = BRISK_OK, 1 = BRISK_E_AUTH, 2 = BRISK_E_ARG.
+RSA_OK, RSA_AUTH, RSA_ARG = 0, 1, 2
+RSA_MIN_BITS, RSA_MAX_BITS = 2048, 4096
+DIGESTINFO = {}  # 256/384/512 -> the DER prefix, parsed out of RFC 8017 9.2 note 1
+
+
+def _gcd(a, b):
+    while b:
+        a, b = b, a % b
+    return a
+
+
+def rfc8017_digestinfo():
+    """The three DER DigestInfo prefixes of RFC 8017 9.2 note 1, parsed out of the RFC text.
+
+    PKCS#1 v2.2 has no test-vector appendix (unlike RFC 8439 / 7748 / 6979), so this is the one
+    thing the RFC itself can pin here - the same trick check_p256_source_constants() uses for the
+    P-256 parameters, and the only way to get this table without hand-typing a vector."""
+    text = "\n".join(rfc_lines(fetch("rfc8017")))
+    out = {}
+    for bits in (256, 384, 512):
+        m = re.search(r"SHA-%d:\s+\(0x\)((?:[0-9a-f]{2}[\s]*)+)\|\|" % bits, text)
+        if not m:
+            die("RFC 8017 9.2: DigestInfo prefix for SHA-%d not found" % bits)
+        pre = hexbytes(m.group(1))
+        # 30 <len> 30 0d 06 09 <oid> 05 00 04 <hlen>: DER SEQUENCE, AlgorithmIdentifier with the
+        # explicit NULL parameters note 1 requires, then the OCTET STRING header for H.
+        if len(pre) != 19 or pre[0] != 0x30 or pre[-4:] != bytes([0x05, 0x00, 0x04, bits // 8]):
+            die("RFC 8017 9.2: SHA-%d prefix parsed as %s" % (bits, pre.hex()))
+        out[bits] = pre
+    if len({v[:15] for v in out.values()}) != 3:
+        die("RFC 8017 9.2: two DigestInfo prefixes collide")
+    return out
+
+
+def check_rsa_source_constants():
+    """The three DigestInfo prefixes in src/crypto/rsa.c must equal RFC 8017 9.2 note 1.
+
+    Pinned here rather than in a .inc, because the library does not export the table and a
+    hand-typed constant is exactly what this project refuses to ship. Same precedent as
+    check_p256_source_constants()."""
+    src = (ROOT / "src" / "crypto" / "rsa.c").read_text()
+    for bits, want in sorted(DIGESTINFO.items()):
+        m = re.search(r"RSA_DI_SHA%d\[RSA_DI_LEN\] = \{([^}]*)\}" % bits, src)
+        if not m:
+            die("src/crypto/rsa.c: RSA_DI_SHA%d not found" % bits)
+        got = bytes(int(x, 16) for x in re.findall(r"0x([0-9a-fA-F]{2})", m.group(1)))
+        if got != want:
+            die("src/crypto/rsa.c: RSA_DI_SHA%d is %s, RFC 8017 9.2 says %s"
+                % (bits, got.hex(), want.hex()))
+
+
+def py_rsa_key_verdict(n, e, max_bits=RSA_MAX_BITS):
+    """RFC 8017 3.1 (n odd, 3 <= e < n) plus the project's 2048..BRISK_RSA_MAX_BITS policy.
+
+    The e < 2^256 cap mirrors rsa_vp1's `e_len > 32`: e < n alone lets an attacker-chosen exponent
+    in a chain certificate cost ~6100 Montgomery multiplications per verification. 2^256 is the
+    ceiling NIST SP 800-89 5.3.3, FIPS 186-5 B.3 and CA/B Forum BR 6.1.6 all agree on, so it
+    refuses no compliant certificate."""
+    bits = n.bit_length()
+    if bits < RSA_MIN_BITS or bits > max_bits or n % 2 == 0:
+        return RSA_ARG
+    if e < 3 or e >= n or e % 2 == 0 or e.bit_length() > 256:
+        return RSA_ARG
+    return RSA_OK
+
+
+def py_rsa_vp1(n, e, sig):
+    """RFC 8017 5.2.2. None means 'signature representative out of range' or the wrong width."""
+    k = (n.bit_length() + 7) // 8
+    if len(sig) != k:  # 8.2.2 step 1 / 8.1.2 step 1
+        return None
+    s = int.from_bytes(sig, "big")
+    if s >= n:  # 5.2.2 step 1
+        return None
+    return pow(s, e, n), k
+
+
+def py_pkcs1_verify(n, e, bits, h, sig, max_bits=RSA_MAX_BITS):
+    """RFC 8017 8.2.2 with the EMSA-PKCS1-v1_5 encoding of 9.2, strict DER (note 2 NOT adopted)."""
+    if py_rsa_key_verdict(n, e, max_bits) != RSA_OK or bits not in DIGESTINFO:
+        return RSA_ARG
+    if len(h) != bits // 8:
+        return RSA_ARG
+    r = py_rsa_vp1(n, e, sig)
+    if r is None:
+        return RSA_AUTH
+    m, k = r
+    t = DIGESTINFO[bits] + h
+    if k < len(t) + 11:  # 9.2 step 3: emLen < tLen + 11
+        return RSA_AUTH
+    want = b"\x00\x01" + b"\xff" * (k - len(t) - 3) + b"\x00" + t
+    return RSA_OK if m.to_bytes(k, "big") == want else RSA_AUTH
+
+
+def py_mgf1(bits, seed, mask_len):
+    """RFC 8017 B.2.1."""
+    out = b""
+    c = 0
+    while len(out) < mask_len:
+        out += HASH[bits](seed + c.to_bytes(4, "big")).digest()
+        c += 1
+    return out[:mask_len]
+
+
+def py_pss_verify(n, e, bits, slen, mh, sig, max_bits=RSA_MAX_BITS):
+    """RFC 8017 8.1.2 + EMSA-PSS-VERIFY 9.1.2. One hash for both the digest and MGF1."""
+    if py_rsa_key_verdict(n, e, max_bits) != RSA_OK or bits not in HASH:
+        return RSA_ARG
+    hlen = bits // 8
+    if len(mh) != hlen:
+        return RSA_ARG
+    r = py_rsa_vp1(n, e, sig)
+    if r is None:
+        return RSA_AUTH
+    m, _ = r
+    embits = n.bit_length() - 1  # 8.1.2 step 2c: emLen = ceil((modBits - 1) / 8)
+    emlen = (embits + 7) // 8
+    if m >= 1 << (8 * emlen):  # I2OSP would fail -> "invalid signature"
+        return RSA_AUTH
+    em = m.to_bytes(emlen, "big")
+    if emlen < hlen + slen + 2:  # 9.1.2 step 3
+        return RSA_AUTH
+    if em[-1] != 0xBC:  # step 4
+        return RSA_AUTH
+    masked, hh = em[: emlen - hlen - 1], em[emlen - hlen - 1: -1]  # step 5
+    top = 8 * emlen - embits  # step 6: the leftmost 8*emLen - emBits bits must be zero
+    if top and masked[0] >> (8 - top):
+        return RSA_AUTH
+    db = bytes(a ^ b for a, b in zip(masked, py_mgf1(bits, hh, len(masked))))  # steps 7-8
+    db = bytes([db[0] & (0xFF >> top)]) + db[1:]  # step 9
+    if any(db[: emlen - hlen - slen - 2]) or db[emlen - hlen - slen - 2] != 0x01:  # step 10-11
+        return RSA_AUTH
+    salt = db[len(db) - slen:] if slen else b""  # step 11
+    hp = HASH[bits](b"\x00" * 8 + mh + salt).digest()  # steps 12-13
+    return RSA_OK if hp == hh else RSA_AUTH  # step 14
+
+
+# rsa row = (key index, hash bits, salt_len (-1 = PKCS#1 v1.5), digest, sig, expect, deep).
+# Keys are pooled: a Wycheproof group or a CAVP [mod = N] section shares one 4096-bit modulus
+# across hundreds of rows, and inlining it in every row would be a megabyte of duplicate hex.
+RSA_KEYS = []
+_rsa_key_idx = {}
+
+
+def rsa_key(n_hex, e_hex):
+    key = (n_hex, e_hex)
+    if key not in _rsa_key_idx:
+        _rsa_key_idx[key] = len(RSA_KEYS)
+        RSA_KEYS.append(key)
+    return _rsa_key_idx[key]
+
+
+def pkcs1_row(n_hex, e_hex, bits, h, sig, deep=0):
+    n, e = int(n_hex, 16), int(e_hex, 16)
+    return (rsa_key(n_hex, e_hex), bits, -1, h.hex(), sig.hex(),
+            py_pkcs1_verify(n, e, bits, h, sig), deep)
+
+
+def pss_row(n_hex, e_hex, bits, slen, h, sig, deep=0):
+    n, e = int(n_hex, 16), int(e_hex, 16)
+    return (rsa_key(n_hex, e_hex), bits, slen, h.hex(), sig.hex(),
+            py_pss_verify(n, e, bits, slen, h, sig), deep)
+
+
+def rsp_mod_sections(text):
+    """Split a CAVP RSA .rsp into {2048: body, ...} on the [mod = N] headers."""
+    out, cur = {}, None
+    for ln in text.replace("\r", "").split("\n"):
+        m = re.fullmatch(r"\[mod = (\d+)\]", ln.strip())
+        if m:
+            cur = int(m.group(1))
+            out.setdefault(cur, [])
+        elif cur is not None:
+            out[cur].append(ln)
+    return {k: "\n".join(v) for k, v in out.items()}
+
+
+# Every CAVS SigVer block, PKCS#1 v1.5 and PSS alike: the v1.5 files carry a vestigial
+# "SaltVal = 00" line from the shared template, so it is optional here rather than a second regex.
+CAVP_RSA_ROW = (r"SHAAlg = SHA(\d+)\ne = ([0-9a-fA-F]+)\nd = [0-9a-fA-F]+\n"
+                r"Msg = ([0-9a-f]*)\nS = ([0-9a-f]+)\n(?:SaltVal = ([0-9a-f]*)\n)?"
+                r"Result = ([PF])")
+
+
+def cavp_pss_saltlens(text):
+    """(mod, sha) -> sLen, from the '# Salt len' / '# Combinations selected' header comment.
+
+    186-2 pins one salt length (10) for the whole file; 186-3 varies it per (mod, hash) and
+    writes 'SaltVal = 00' when sLen is 0, so the SaltVal line cannot give the length."""
+    head = "\n".join(ln for ln in text.replace("\r", "").split("\n") if ln.startswith("#"))
+    m = re.search(r"Salt len:\s*(\d+)\s*$", head, re.M)
+    if m:
+        return {}, int(m.group(1))
+    out = {}
+    # Non-greedy up to the next "Mod Size": the per-hash groups are ';'-separated and the
+    # sections are ';;'-separated, so a greedy scan swallows the whole header into mod 1024.
+    for mod, body in re.findall(r"Mod Size (\d+) with (.*?)(?=Mod Size \d+ with|$)", head, re.S):
+        for sha, sl in re.findall(r"SHA-(\d+)\(Salt len:\s*(\d+)\)", body):
+            out[(int(mod), int(sha))] = int(sl)
+    if not out:
+        die("CAVP PSS: no salt lengths in the file header")
+    return out, None
+
+
+def split_key_blocks(section):
+    """[(n hex, body)] for a CAVP [mod = N] section: one entry per "n = " line.
+
+    A section holds several independent key blocks. Taking the first n for the whole section
+    silently checks most rows against the wrong modulus."""
+    parts = re.split(r"\nn = ([0-9a-f]+)\n", "\n" + section.strip("\n") + "\n")
+    return [(parts[i], parts[i + 1]) for i in range(1, len(parts) - 1, 2)]
+
+
+def cavp_rsa(src, fname, pss):
+    """CAVP SigVer rows for mod >= 2048 with SHA-256/384/512 - the only sizes and digests this
+    library compiles. The 186-2 archive is the ONLY official source with 4096-bit rows."""
+    text = zipfile.ZipFile(io.BytesIO(fetch(src))).read(fname).decode("latin-1")
+    saltmap, saltfix = cavp_pss_saltlens(text) if pss else ({}, None)
+    rows, npass, nfail = [], 0, 0
+    for mod, section in sorted(rsp_mod_sections(text).items()):
+        for n_hex, body in split_key_blocks(section):
+            if int(n_hex, 16).bit_length() != mod:
+                die("%s [mod = %d]: n is %d bits" % (fname, mod, int(n_hex, 16).bit_length()))
+            hits = re.findall(CAVP_RSA_ROW, body)
+            if not hits:
+                die("%s [mod = %d]: no rows parsed" % (fname, mod))
+            for sha, e_hex, msg, sig, salt, res in hits:
+                bits = int(sha)
+                # SHA-1 / SHA-224 have no brisk_hash_alg value; 1024/1536 are below the floor.
+                if bits not in HASH or mod < RSA_MIN_BITS or mod > RSA_MAX_BITS:
+                    continue
+                slen = -1
+                if pss:
+                    slen = saltfix if saltfix is not None else saltmap.get((mod, bits), -1)
+                    if slen < 0:
+                        die("%s: no salt length for mod %d SHA-%d" % (fname, mod, bits))
+                    if salt and len(salt) // 2 not in (slen, 1):
+                        die("%s: SaltVal is %d bytes, header says %d"
+                            % (fname, len(salt) // 2, slen))
+                # A few 186-3 SigVer15 rows print Msg or S with an odd number of hex digits:
+                # CAVS dropped the leading zero nibble. One of them is a P row whose S is
+                # 511 digits - exactly the I2OSP leading-zero case of RFC 8017 4.1 - so the
+                # reading is "pad on the left", and that keeps S at the k octets 8.2.2 step 1
+                # requires. The P/F cross-check below is what proves the reading right.
+                msg = msg if len(msg) % 2 == 0 else "0" + msg
+                sig = sig if len(sig) % 2 == 0 else "0" + sig
+                h = HASH[bits](bytes.fromhex(msg)).digest()
+                e_hex = e_hex if len(e_hex) % 2 == 0 else "0" + e_hex
+                sig = bytes.fromhex(sig)
+                row = (pss_row(n_hex, e_hex, bits, slen, h, sig, 1) if pss
+                       else pkcs1_row(n_hex, e_hex, bits, h, sig, 1))
+                # A CAVP F row is a wrong signature or a corrupted EM, never bad key material.
+                if (row[5] == RSA_OK) != (res == "P"):
+                    die("%s mod %d SHA-%d: verdict mismatch (CAVP says %s)"
+                        % (fname, mod, bits, res))
+                npass += res == "P"
+                nfail += res == "F"
+                rows.append(row)
+    return rows, npass, nfail
+
+
+def wycheproof_rsa(name, pss, deep_max_bits):
+    """One Wycheproof rsassa_{pkcs1,pss}_verify suite, every in-scope row.
+
+    The expectation is recomputed from the value, never taken from the flag: the single
+    'acceptable' MissingNull row is INVALID here, because RFC 8017 9.2 note 2's BER leniency is
+    not adopted (the decision is recorded in tests/kat/SOURCES.md)."""
+    doc = json.loads(fetch(name))
+    rows, counts, flags, skipped = [], {"valid": 0, "invalid": 0, "acceptable": 0}, {}, 0
+    for g in doc["testGroups"]:
+        want = "RsassaPssVerify" if pss else "RsassaPkcs1Verify"
+        if g["type"] != want:
+            die("%s: unexpected group type %s" % (name, g["type"]))
+        m = re.fullmatch(r"SHA-(\d+)", g["sha"])
+        bits = int(m.group(1)) if m else 0
+        # A separate MGF hash is refused by design (one `alg` covers both, RFC 9846 4.3.3), and
+        # SHA-1 / SHA-224 / SHA-512-t have no brisk_hash_alg value.
+        if bits not in HASH or (pss and (g.get("mgf") != "MGF1" or g.get("mgfSha") != g["sha"])):
+            skipped += len(g["tests"])
+            continue
+        n_hex = g["publicKey"]["modulus"]
+        e_hex = g["publicKey"]["publicExponent"]
+        n_hex = n_hex if len(n_hex) % 2 == 0 else "0" + n_hex
+        e_hex = e_hex if len(e_hex) % 2 == 0 else "0" + e_hex
+        slen = int(g["sLen"]) if pss else -1
+        for t in g["tests"]:
+            h = HASH[bits](bytes.fromhex(t["msg"])).digest()
+            sig = bytes.fromhex(t["sig"])
+            # deep costs four verifications; at 4096 bits that is the qemu-armv5 budget, so the
+            # offset pass runs only up to deep_max_bits. See tests/test_rsa.c.
+            deep = int(t["result"] != "valid" and int(g["keySize"]) <= deep_max_bits)
+            row = (pss_row(n_hex, e_hex, bits, slen, h, sig, deep) if pss
+                   else pkcs1_row(n_hex, e_hex, bits, h, sig, deep))
+            if (row[5] == RSA_OK) != (t["result"] == "valid"):
+                if not (t["result"] == "acceptable" and row[5] == RSA_AUTH):
+                    die("%s tcId %d: we say %d, upstream says %s"
+                        % (name, t["tcId"], row[5], t["result"]))
+            counts[t["result"]] += 1
+            for f in t.get("flags", []):
+                flags[f] = flags.get(f, 0) + 1
+            rows.append(row)
+    return rows, counts, flags, skipped
+
+
+def cavp_private_key(fname, mod):
+    """(n_hex, e_hex, d, k) from a 186-2 SigVer section, which publishes n, p and q.
+
+    That is what lets the EM-corruption rows below be *built* rather than hand-typed: no key
+    generation, no primality testing and no randomness enters this file."""
+    text = zipfile.ZipFile(io.BytesIO(fetch("cavp_rsa2"))).read(fname).decode("latin-1")
+    n_hex, body = split_key_blocks(rsp_mod_sections(text)[mod])[0]
+    n = int(n_hex, 16)
+    p = int(re.search(r"\np = ([0-9a-f]+)", body).group(1), 16)
+    q = int(re.search(r"\nq = ([0-9a-f]+)", body).group(1), 16)
+    if p * q != n or n.bit_length() != mod:
+        die("%s [mod = %d]: p*q != n" % (fname, mod))
+    e_hex = re.search(r"\ne = ([0-9a-fA-F]+)\n", body).group(1)
+    e_hex = e_hex if len(e_hex) % 2 == 0 else "0" + e_hex
+    e = int(e_hex, 16)
+    d = pow(e, -1, (p - 1) * (q - 1) // _gcd(p - 1, q - 1))
+    return n_hex, e_hex, n, e, d, mod // 8
+
+
+def rsa_em_corruption():
+    """One row per EMSA-PKCS1-v1_5 rule, built by signing a corrupted EM with a published key.
+
+    No public suite isolates the rules one at a time: Wycheproof's 117 InvalidAsnInPadding and 75
+    ModifiedPadding rows are a net, not a map, so a regression there says 'something in the
+    padding' rather than which rule. These say which rule."""
+    rows = []
+    for mod in (2048, 4096):
+        n_hex, e_hex, n, e, d, k = cavp_private_key("SigVer15_186-3.rsp", mod)
+
+        def sign_em(em):
+            return pow(int.from_bytes(em[:k], "big"), d, n).to_bytes(k, "big")
+
+        for bits in (256, 384, 512):
+            h = HASH[bits](b"brisk EM corruption " + str(mod).encode()).digest()
+            t = DIGESTINFO[bits] + h
+            ps = k - len(t) - 3
+            good = bytes(b"\x00\x01" + b"\xff" * ps + b"\x00" + t)
+            row = pkcs1_row(n_hex, e_hex, bits, h, sign_em(good), 1)
+            if row[5] != RSA_OK:
+                die("EM corruption: the uncorrupted control row does not verify")
+            rows.append(row)
+            bad = []
+            for pos, val in ((0, 0x01),            # first octet != 0x00
+                             (1, 0x02),            # encryption padding type
+                             (1, 0x00),            # block type absent
+                             (2, 0xFE),            # one PS octet != 0xff
+                             (2 + ps // 2, 0x00),  # a 0x00 in the middle of PS
+                             (2 + ps, 0xFF),       # the 0x00 separator missing
+                             (2 + ps + 1, 0x31),   # DigestInfo SEQUENCE tag changed
+                             (k - 1, 0x00)):       # last octet of H changed
+                c = bytearray(good)
+                c[pos] = val
+                bad.append(bytes(c))
+            # PS cut to 7 octets - the short-PS forgery the small-e Bleichenbacher class lives on.
+            bad.append(b"\x00\x01" + b"\xff" * 7 + b"\x00" + t + b"\x00" * (ps - 7))
+            # DigestInfo with the NULL parameters absent: Wycheproof's single "acceptable" row,
+            # at every hash. RFC 8017 9.2 note 1 requires them; note 2's leniency is not adopted.
+            p0 = DIGESTINFO[bits]
+            nonull = (bytes([p0[0], p0[1] - 2, p0[2], p0[3] - 2]) + p0[4:13] + p0[15:])
+            bad.append(b"\x00\x01" + b"\xff" * (k - len(nonull) - len(h) - 3) + b"\x00" +
+                       nonull + h)
+            # a valid DigestInfo followed by trailing garbage (one PS octet eaten)
+            bad.append(b"\x00\x01" + b"\xff" * (ps - 1) + b"\x00" + t + b"\x2a")
+            # DigestInfo for a different hash
+            other = 384 if bits != 384 else 512
+            t2 = DIGESTINFO[other] + HASH[other](b"x").digest()
+            bad.append(b"\x00\x01" + b"\xff" * (k - len(t2) - 3) + b"\x00" + t2)
+            # the hash moved one octet left, pad extended right (NIST failure reason 4)
+            bad.append(b"\x00\x01" + b"\xff" * (ps - 1) + b"\x00" + t + b"\xff")
+            # the trailing 00 of the pad removed, DigestInfo shifted (NIST failure reason 5)
+            bad.append(b"\x00\x01" + b"\xff" * (ps + 1) + t)
+            for em in bad:
+                row = pkcs1_row(n_hex, e_hex, bits, h, sign_em(em), 1)
+                if row[5] != RSA_AUTH:
+                    die("EM corruption: %s was not rejected" % em[:6].hex())
+                rows.append(row)
+    return rows
+
+
+def rsa_odd_modbits_key(want_bits):
+    """A public key whose modulus has want_bits bits with want_bits % 8 == 1, plus its d.
+
+    Needed because emLen = ceil((modBits - 1)/8) is k - 1 only when modBits - 1 is a multiple of
+    8, i.e. when modBits % 8 == 1 - and every published RSA vector in existence uses a modulus of
+    1024, 2048, 3072 or 4096 bits, so NO official source reaches that branch of RFC 8017 8.1.2
+    step 2c. The modulus here is a small published prime times two published CAVP primes, which
+    keeps this file free of primality testing and of randomness; RFC 8017 3.1 asks for a product
+    of odd primes, not for exactly two of them, and nothing on the verify path counts factors.
+
+    ponytail: brute force over the published prime pool, a few thousand big multiplies at
+    generation time. A real key generator would be fifteen more lines and one more thing to get
+    wrong; upgrade only if a future vector needs a modulus this cannot reach."""
+    pool = set()
+    for fname in ("SigVer15_186-3.rsp", "SigVerPSS_186-3.rsp"):
+        text = zipfile.ZipFile(io.BytesIO(fetch("cavp_rsa2"))).read(fname).decode("latin-1")
+        for v in re.findall(r"\n[pq] = ([0-9a-f]+)\n", text.replace("\r", "")):
+            pool.add(int(v, 16))
+    pool = sorted(pool)
+    e = 65537
+    for f in (3, 5, 7, 11, 13, 17, 19, 23, 29, 31, 37, 41, 43, 47, 53, 59, 61, 67, 71, 73):
+        for i, a in enumerate(pool):
+            for b in pool[i + 1:]:
+                n = f * a * b
+                if n.bit_length() != want_bits:
+                    continue
+                lam = (a - 1) * (b - 1) // _gcd(a - 1, b - 1)
+                lam = lam * (f - 1) // _gcd(lam, f - 1)
+                if _gcd(e, lam) != 1:
+                    continue
+                w = (want_bits + 7) // 8
+                return n.to_bytes(w, "big").hex(), "010001", n, pow(e, -1, lam), w
+    die("no %d-bit modulus can be assembled from the published CAVP primes" % want_bits)
+
+
+def pss_build(n, d, k, mod_bits, bits, slen, salt=None, db_pad=None, sep=0x01, trailer=0xBC,
+              hp=None, topbit=0):
+    """(mHash, signature) for an EM built exactly as RFC 8017 9.1.1 would - or deliberately not.
+
+    Every knob is one step of EMSA-PSS-VERIFY (9.1.2), so a row that regresses names the rule it
+    broke instead of just saying "PSS rejected it"."""
+    hlen = bits // 8
+    embits = mod_bits - 1
+    emlen = (embits + 7) // 8
+    top = 8 * emlen - embits
+    mh = HASH[bits](b"brisk PSS " + str(mod_bits).encode()).digest()
+    salt = bytes(range(slen)) if salt is None else salt
+    hh = hp if hp is not None else HASH[bits](bytes(8) + mh + salt).digest()
+    pad = db_pad if db_pad is not None else bytes(emlen - hlen - len(salt) - 2)
+    db = pad + bytes([sep]) + salt
+    masked = bytearray(x ^ y for x, y in zip(db, py_mgf1(bits, hh, len(db))))
+    masked[0] = (masked[0] & (0xFF >> top)) | topbit
+    em = bytes(masked) + hh + bytes([trailer])
+    if len(em) != emlen:
+        die("PSS build: EM is %d octets, emLen is %d" % (len(em), emlen))
+    return mh, pow(int.from_bytes(em, "big"), d, n).to_bytes(k, "big")
+
+
+def rsa_pss_em_corruption():
+    """The RFC 8017 9.1.2 structural rules, one row each, built with a published private key.
+
+    Both emLen shapes of 8.1.2 step 2c are here and both matter:
+      modBits 2048 / 4096 -> emLen == k,     8*emLen - emBits == 1, so the leftmost-bit masking
+                                             of steps 6 and 9 is live;
+      modBits 2049 / 3073 -> emLen == k - 1, no masking at all. No published vector anywhere uses
+                                             a modulus of that shape (see rsa_odd_modbits_key),
+                                             so without these rows that branch ships untested."""
+    rnd = random.Random(20260921)
+    keys, rows = [], []
+    for mod in (2048, 4096):
+        n_hex, e_hex, n, _e, d, k = cavp_private_key("SigVerPSS_186-3.rsp", mod)
+        keys.append((n_hex, e_hex, n, d, k, mod))
+    for mod in (2049, 3073):
+        n_hex, e_hex, n, d, k = rsa_odd_modbits_key(mod)
+        keys.append((n_hex, e_hex, n, d, k, mod))
+    for n_hex, e_hex, n, d, k, mod in keys:
+        emlen = (mod - 1 + 7) // 8
+        for bits in (256, 384, 512):
+            hlen = bits // 8
+            for slen in (0, 10, hlen):
+                mh, sig = pss_build(n, d, k, mod, bits, slen)
+                row = pss_row(n_hex, e_hex, bits, slen, mh, sig, 1)
+                if row[5] != RSA_OK:
+                    die("PSS corruption: an uncorrupted control row does not verify")
+                rows.append(row)
+            slen = hlen
+            mh, sig = pss_build(n, d, k, mod, bits, slen)
+
+            def bld(**kw):
+                return pss_build(n, d, k, mod, bits, slen, **kw)[1]
+
+            bad = [(slen, bld(trailer=0xBD)),                 # trailer octet != 0xbc
+                   (slen, bld(db_pad=bytes(emlen - hlen - slen - 3) + b"\x01")),  # DB lead != 0
+                   (slen, bld(sep=0x00)),                     # the 0x01 separator absent
+                   (slen, bld(sep=0x02)),                     # wrong separator octet
+                   (slen + 1, sig),                           # salt read one octet too long
+                   (slen - 1, sig),                           # salt read one octet too short
+                   (slen, bld(hp=bytes(hlen))),               # H is not Hash(0^8 || mHash || salt)
+                   (slen, bld(salt=bytes(slen),               # salt replaced, H left alone
+                              hp=HASH[bits](bytes(8) + mh + bytes(range(slen))).digest()))]
+            if 8 * emlen - (mod - 1):
+                # Step 6: a set bit among the leftmost 8*emLen - emBits. Only meaningful when
+                # there ARE such bits, i.e. emLen == k; on the emLen == k - 1 keys the count is
+                # zero, and forcing bit 7 there is just another DB corruption - which the row
+                # above already covers, and which is a coin flip to begin with because the bit
+                # may already be set.
+                bad.append((slen, bld(topbit=0x80)))
+            for sl, s2 in bad:
+                row = pss_row(n_hex, e_hex, bits, sl, mh, s2, 1)
+                if row[5] != RSA_AUTH:
+                    die("PSS corruption: a structural row was not rejected")
+                rows.append(row)
+            # emLen < hLen + sLen + 2 is "inconsistent" (BRISK_E_AUTH), never BRISK_E_ARG.
+            for sl in (emlen, emlen - hlen - 1, 4096):
+                rows.append(pss_row(n_hex, e_hex, bits, sl, mh, sig, 1))
+        # In range but EM is noise: the generic 9.1.2 rejection at this width.
+        mh = hashlib.sha256(b"noise").digest()
+        rows.append(pss_row(n_hex, e_hex, 256, 32, mh, rnd.randrange(0, n).to_bytes(k, "big"), 1))
+    if sum(r[5] == RSA_OK for r in rows) != len(keys) * 3 * 3:
+        die("PSS corruption: wrong number of positive control rows")
+    return rows
+
+
+# ---------------------------------------------------------------- i31 bignum differential rows
+# bn row = (op, m, a, b, r, k). Operands are big-endian octet strings at the modulus's byte
+# width; `b` doubles as the exponent octet string for modpow. NO official vector source exists
+# for a bare big-integer library (recorded in tests/kat/SOURCES.md as an accepted gap) - this is
+# a seeded differential set against Python's arbitrary-precision int, sitting on the i31 limb
+# boundaries where an off-by-one in the announced-length header hides and nothing else looks.
+BN_ENCODE, BN_ADD, BN_SUB, BN_MONTMUL, BN_MODPOW = 0, 1, 2, 3, 4
+BN_MODULI = []  # pooled: one 512-octet modulus is shared by every row at that width
+
+
+def bn_vectors():
+    rnd = random.Random(20260921)
+    rows = []
+    # 31*k - 1, 31*k and 31*k + 1 are where the limb count implied by the header word changes,
+    # and 31*k + 1 is also where the top limb holds exactly one bit. 2048 and 4096 are the RSA
+    # widths. Six moduli rather than fifteen: every extra one costs ~230 KB of generated table
+    # for coverage the six already have, and the 4000 RSA rows are the end-to-end net anyway.
+    for i, bits in enumerate([2046, 2047, 2048, 3068, 4092, 4096]):
+        # An odd modulus of exactly `bits` bits; the first one's top limb holds a single bit.
+        m = (1 << (bits - 1)) | 1 if i == 0 else \
+            (1 << (bits - 1)) | (rnd.getrandbits(bits - 2) << 1) | 1
+        w = (bits + 7) // 8
+        limbs = (bits + 30) // 31
+        R = 1 << (31 * limbs)
+        # add/sub are limb-level, so their result is only reduced mod 2^(31*limbs) and can need
+        # more octets than the modulus does: 2048 bits is 67 limbs = 2077 bits = 260 octets.
+        # Everything else is a residue mod m and fits the modulus's own width.
+        wfull = (31 * limbs + 7) // 8
+        mi = len(BN_MODULI)
+        BN_MODULI.append(m.to_bytes(w, "big").hex())
+
+        def row(op, a, b, r, k=0, rw=w):
+            return (op, mi, a.to_bytes(w, "big").hex() if isinstance(a, int) else a,
+                    b.to_bytes(w, "big").hex() if isinstance(b, int) else b,
+                    r.to_bytes(rw, "big").hex() if isinstance(r, int) else r, k)
+
+        vals = [0, 1, m - 1, R % m, rnd.randrange(2, m - 1)]
+        for a in vals:
+            rows.append(row(BN_ENCODE, a, 0, a))
+            for b in vals:
+                rows.append(row(BN_MONTMUL, a, b, a * b * pow(R, -1, m) % m))
+                # k is the carry / borrow, and the borrow is also what brisk__bn_lt must return,
+                # so these rows pin lt too and it needs no op of its own.
+                rows.append(row(BN_ADD, a, b, (a + b) % R, (a + b) >> (31 * limbs), wfull))
+                rows.append(row(BN_SUB, a, b, (a - b) % R, int(a < b), wfull))
+        for ex in (b"\x01", b"\x02", b"\x03", b"\x00\x01\x00\x01", b"\x01\x00\x01", b"\x11",
+                   b"\xff\xff\xff", b"\x00\x00\x01\x00\x01", (m - 2).to_bytes(w, "big")[:5]):
+            a = vals[-1]
+            rows.append(row(BN_MODPOW, a, ex.hex(), pow(a, int.from_bytes(ex, "big"), m)))
+    return rows
+
 # ---------------------------------------------------------------- C emitters
 def cstr(hx, width=96):
     if not hx:
@@ -1855,6 +2425,39 @@ def main():
     p256_verify = vcavp + wycheproof_p256_ecdsa() + rfc6979_verify() + vdiff + vsgen
     p256_scalar = p256_scalar_vectors()
     p256_sign = rfc6979_sign() + differential_p256_sign()
+
+    global DIGESTINFO
+    DIGESTINFO = rfc8017_digestinfo()
+    check_rsa_source_constants()
+    pkcs1, pss = [], []
+    for src, fname in (("cavp_rsa2", "SigVer15_186-3.rsp"), ("cavp_rsa3", "SigVer15_186-3.rsp")):
+        rows, np_, nf = cavp_rsa(src, fname, 0)
+        print(f"  CAVP {src} {fname}: {np_} P / {nf} F")
+        pkcs1 += rows
+    for src, fname in (("cavp_rsa2", "SigVerPSS_186-3.rsp"), ("cavp_rsa3", "SigVerPSS_186-3.rsp")):
+        rows, np_, nf = cavp_rsa(src, fname, 1)
+        print(f"  CAVP {src} {fname}: {np_} P / {nf} F")
+        pss += rows
+    if len(pkcs1) != 216 or len(pss) != 180:
+        die(f"CAVP RSA: {len(pkcs1)} v1.5 and {len(pss)} PSS rows, expected 216 and 180")
+    wp_flags = {}
+    for b in (2048, 3072, 4096):
+        for s in ("sha256", "sha384", "sha512"):
+            rows, counts, flags, skip = wycheproof_rsa(f"wp_rsa_pkcs1_{b}_{s}", 0, 2048)
+            print(f"  wycheproof rsa_signature_{b}_{s}: {counts} (+{skip} out of scope)")
+            wp_flags.update({k: wp_flags.get(k, 0) + v for k, v in flags.items()})
+            pkcs1 += rows
+    for v in ("2048_sha256_mgf1_0", "2048_sha256_mgf1_32", "2048_sha384_mgf1_48",
+              "3072_sha256_mgf1_32", "4096_sha256_mgf1_32", "4096_sha384_mgf1_48",
+              "4096_sha512_mgf1_32", "4096_sha512_mgf1_64", "misc"):
+        rows, counts, flags, skip = wycheproof_rsa(f"wp_rsa_pss_{v}", 1, 2048)
+        print(f"  wycheproof rsa_pss_{v}: {counts} (+{skip} out of scope)")
+        wp_flags.update({k: wp_flags.get(k, 0) + v2 for k, v2 in flags.items()})
+        pss += rows
+    print("  wycheproof RSA flags:", dict(sorted(wp_flags.items(), key=lambda kv: -kv[1])))
+    pkcs1 += rsa_em_corruption()
+    pss += rsa_pss_em_corruption()
+    bn = bn_vectors()
 
     emit("sha2.inc", "struct hash_kat SHA2_KAT", cavp + dhash, lambda r: f"{r[0]}, {cstr(r[1])}, {cstr(r[2])}")
     emit("sha2_monte.inc", "struct monte_kat SHA2_MONTE", monte,
@@ -1907,6 +2510,16 @@ def main():
     emit("p256_sign.inc", "struct p256_sign_kat P256_SIGN_KAT", p256_sign,
          lambda r: f"{cstr(r[0])}, {cstr(r[1])}, {cstr(r[2])}, {cstr(r[3])}, {r[4]}")
 
+    emit("rsa_key.inc", "struct rsa_key RSA_KEY", RSA_KEYS,
+         lambda r: f"{cstr(r[0])}, {cstr(r[1])}")
+    emit("rsa_pkcs1.inc", "struct rsa_kat RSA_PKCS1_KAT", pkcs1,
+         lambda r: f"{r[0]}, {r[1]}, {r[2]}, {cstr(r[3])}, {cstr(r[4])}, {r[5]}, {r[6]}")
+    emit("rsa_pss.inc", "struct rsa_kat RSA_PSS_KAT", pss,
+         lambda r: f"{r[0]}, {r[1]}, {r[2]}, {cstr(r[3])}, {cstr(r[4])}, {r[5]}, {r[6]}")
+    emit("bn_mod.inc", "struct bn_mod BN_MOD", BN_MODULI, lambda r: cstr(r))
+    emit("bn.inc", "struct bn_kat BN_KAT", bn,
+         lambda r: f"{r[0]}, {r[1]}, {cstr(r[2])}, {cstr(r[3])}, {cstr(r[4])}, {r[5]}")
+
     rows = "\n".join(f"| {k} | {u} | `{h}` |" for k, (u, h) in sorted(fetched.items()))
     (OUT / "SOURCES.md").write_text(
         "# Known-answer vector sources\n\n"
@@ -1956,6 +2569,36 @@ def main():
         "- CAVP `SigGenComponent.txt` is not in the 186-3 zip named above (it ships with the\n"
         "  186-4 one). `SigGen.txt` from this zip is used instead and carries d and k, so the\n"
         "  signing core is validated against NIST all the same.\n"
+        "- **The i31 bignum kernel has NO official vector source.** None exists anywhere for a\n"
+        "  bare big-integer library. What stands under `tests/kat/bn.inc` is a seeded\n"
+        "  differential set against Python's arbitrary-precision `int`, generated at the i31 limb\n"
+        "  boundaries (31*k - 1, 31*k, 31*k + 1), plus the NIST and Wycheproof RSA suites as the\n"
+        "  end-to-end net. That is genuinely weaker than what SHA-2 or AES got. Recorded here as\n"
+        "  an accepted gap rather than left implicit.\n"
+        "- Wycheproof `rsa_signature_2048_sha256_test.json` has exactly one `acceptable` row\n"
+        "  (flag `MissingNull`: a DigestInfo without the explicit NULL parameters). This library\n"
+        "  calls it INVALID. RFC 8017 9.2 note 1 fixes T as the DER encoding *with* `05 00`, and\n"
+        "  note 2's BER-lenient variant is explicitly not adopted - so absent NULL parameters,\n"
+        "  BER-encoded padding and trailing octets after the digest are all rejected. That is a\n"
+        "  decision, not a fact about the vector, and `tools/kat.py` maps `acceptable` to\n"
+        "  `BRISK_E_AUTH` on purpose.\n"
+        "- RFC 8017 itself publishes no test vectors. It is fetched and pinned anyway, because\n"
+        "  the three DER DigestInfo prefixes of 9.2 note 1 are parsed out of its text instead of\n"
+        "  being hand-typed - the same trick `check_p256_source_constants()` uses for the P-256\n"
+        "  parameters, and the only way to get that table without typing a vector by hand.\n"
+        "- RSA suites deliberately NOT used: `rsa_pkcs1_<bits>_test.json` and `rsa_oaep_*`\n"
+        "  (encryption - not in this library); `rsa_*_sig_gen_test.json` (signing - locked out,\n"
+        "  RSA is verify only); `rsa_signature_8192_*` (above `BRISK_RSA_MAX_BITS`);\n"
+        "  `rsa_pss_*_params_test.json` and every `publicKeyAsn`/`Der`/`Pem`/`Jwk` field (DER -\n"
+        "  that belongs to M2); every sha1/sha224/sha3/shake/sha512_224/sha512_256 suite and the\n"
+        "  CAVP SHA-1 / SHA-224 sections (no such `brisk_hash_alg` value exists);\n"
+        "  `rsa_pss_2048_sha256_mgf1sha1_20`, `rsa_pss_2048_sha512_mgf1sha256_32` and the\n"
+        "  132 of 150 `rsa_pss_misc` groups whose `mgfSha` differs from `sha` (this API takes one\n"
+        "  `alg` for both, which is what RFC 9846 4.3.3 mandates, so such a parameter set cannot\n"
+        "  be expressed at all - the M2 DER parser rejects it before it gets here); CAVP\n"
+        "  `mod = 1024` and `mod = 1536` sections (below the 2048 floor of NIST SP 800-57 Part 1\n"
+        "  Rev 5 5.6.2); the `*_TruncatedSHAs.rsp` files (SHA-512/224, SHA-512/256); and\n"
+        "  `SigVerRSA.rsp` / `SigVer931*` (X9.31, not PKCS#1).\n"
         "- The r == 0 / s == 0 retry (p ~ 2^-128) and the k-out-of-range retry (p ~ 2^-32) in\n"
         "  `brisk__p256_ecdsa_sign` ship with NO known-answer coverage. Neither can be reached\n"
         "  by any official vector and neither can be searched for at P-256 sizes. What stands\n"

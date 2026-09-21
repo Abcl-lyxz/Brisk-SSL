@@ -61,8 +61,8 @@ static inline void brisk__store_le32(uint8_t *p, uint32_t v)
 #    define BRISK__CT_SECRET(p, n) VALGRIND_MAKE_MEM_UNDEFINED(p, n)
 #    define BRISK__CT_PUBLIC(p, n) VALGRIND_MAKE_MEM_DEFINED(p, n)
 #else
-#    define BRISK__CT_SECRET(p, n) ((void)0)
-#    define BRISK__CT_PUBLIC(p, n) ((void)0)
+#    define BRISK__CT_SECRET(p, n) ((void)(p), (void)(n))
+#    define BRISK__CT_PUBLIC(p, n) ((void)(p), (void)(n))
 #endif
 
 /* Value barrier: launders an integer lvalue through a register so the optimizer forgets what it
@@ -355,6 +355,159 @@ void brisk__p256_scalar_reduce(uint8_t r[32], const uint8_t a[32]);
 void brisk__p256_scalar_add(uint8_t r[32], const uint8_t a[32], const uint8_t b[32]);
 void brisk__p256_scalar_mul(uint8_t r[32], const uint8_t a[32], const uint8_t b[32]);
 void brisk__p256_scalar_inv(uint8_t r[32], const uint8_t a[32]); /* a^(n-2) mod n; 0 -> 0 */
+
+/* ---- crypto/bn.c: i31 big integers, constant-time Montgomery ---------------------------------
+ * Representation (BearSSL's i31 layout): x[0] is the ANNOUNCED BIT LENGTH; x[1...] are 31-bit
+ * limbs, least significant first, bit 31 of every limb always 0. A value of `bits` bits occupies
+ * BRISK__BN_LIMBS(bits) uint32_t words INCLUDING the header word.
+ *
+ * THE ONE FOOTGUN, stated once and enforced by the API below: every operand in a computation
+ * carries the MODULUS's announced length, not its own. Mixing widths silently produces a wrong
+ * answer with no error, which is why there is no general brisk__bn_decode() - only the two
+ * decoders below, one for a modulus and one for a value at a modulus's width.
+ *
+ * Why i31 rather than the fixed 8x32 core already in p256.c: 31-bit limbs leave bit 31 free, so
+ * the add/sub carry chains need only uint32 arithmetic (an armv5/mips32 win), the 31x31 partial
+ * products accumulate in a uint64 with headroom for the CIOS carries, and the announced-length
+ * header makes a variable-width value self-describing. p256.c's scalar core stays exactly as it
+ * is: it is shipped, tested, and faster at its one width.
+ *
+ * Constant time, honestly stated: nothing secret flows through this file today. RSA is verify
+ * only and P-384 will be verify only, so every input - modulus, signature, digest, exponent - is
+ * public. The kernel is nevertheless branch-free, index-free and division-free on its data, so
+ * that a future secret-key consumer inherits safety by construction rather than by audit. The
+ * ONE deliberate exception is brisk__bn_modpow_pub, which branches on the bits of its exponent;
+ * see the warning there. */
+#define BRISK__BN_LIMBS(bits) (((bits) + 30) / 31 + 1)
+#define BRISK__BN_MAX_BITS    BRISK_RSA_MAX_BITS
+#define BRISK__BN_MAX_LIMBS   BRISK__BN_LIMBS(BRISK__BN_MAX_BITS)
+
+/* m <- OS2IP(src) (RFC 8017 4.2), header set to m's TRUE bit length. Leading zero octets are
+ * accepted and dropped. BRISK_E_ARG if the value needs more than max_bits bits, if src_len is 0,
+ * if the value is 0, or if m is even (no Montgomery inverse exists, and an even modulus would
+ * silently produce garbage). m needs BRISK__BN_LIMBS(max_bits) words. On every failure path m[0]
+ * is 0, so brisk__bn_decode_into on an unchecked m is a no-op rather than an overflow. */
+int brisk__bn_decode_mod(uint32_t *m, uint32_t max_bits, const uint8_t *src, size_t src_len);
+
+/* x <- OS2IP(src), zero-extended to m's ANNOUNCED width (x takes m's header word). BRISK_E_ARG
+ * if the value does not fit that width. Does NOT check x < m: the caller does that with
+ * brisk__bn_lt, because RFC 8017 5.2.2 step 1 wants that as a distinct outcome. */
+int brisk__bn_decode_into(uint32_t *x, const uint32_t *m, const uint8_t *src, size_t src_len);
+
+/* dst <- I2OSP(x, dst_len) (RFC 8017 4.1), left-padded with zeros. BRISK_E_ARG, with dst
+ * untouched, if x does not fit in dst_len octets. Byte stores only - safe at any alignment and
+ * on either endianness. */
+int brisk__bn_encode(uint8_t *dst, size_t dst_len, const uint32_t *x);
+
+/* 1 iff a < b, else 0. Both must carry the same announced length. Constant time. */
+uint32_t brisk__bn_lt(const uint32_t *a, const uint32_t *b);
+
+/* a <- a + b (ctl == 1) or a unchanged (ctl == 0); the carry out is returned either way, so a
+ * caller can use the comparison without taking the result. sub is the same with the borrow. Both
+ * operands carry the same announced length. Constant time in the limbs; `ctl` must be 0 or 1
+ * and MAY be secret - brisk__bn_to_mont already passes a value derived from its operand - because
+ * the mask goes through BRISK__CT_BARRIER and the select is branch-free. Never branch on it at
+ * the call site. */
+uint32_t brisk__bn_add(uint32_t *a, const uint32_t *b, uint32_t ctl);
+uint32_t brisk__bn_sub(uint32_t *a, const uint32_t *b, uint32_t ctl);
+
+/* n0 = -m^-1 mod 2^31, by Newton iteration from 1 (m is odd, so 1 is correct mod 2), five rounds,
+ * masked to 31 bits. Derived at run time: no hand-typed Montgomery constant exists to be wrong,
+ * the same rule sc_n0() follows in p256.c. Reads m[1] without consulting m[0], so unlike
+ * brisk__bn_decode_into it is NOT harmless on a modulus whose decode failed: check that status. */
+uint32_t brisk__bn_ninv31(const uint32_t *m);
+
+/* d <- x * y * R^-1 mod m, R = 2^(31 * limbs), CIOS.
+ * PRECONDITION, load-bearing and NOT checked (the same contract sc_mont_mul carries in p256.c):
+ * m odd, m[0] the true bit length, x < m, y < m, all three the same announced width. Feed it an
+ * unreduced operand and the result exceeds what one conditional subtraction can fix - it is then
+ * silently wrong, and no mask trick rescues it. Every entry point in rsa.c establishes x < m by
+ * the RFC 8017 5.2.2 step 1 range check before calling; p384.c must do the same.
+ * d MAY alias x and/or y (the CIOS accumulator is internal); d must NOT alias m.
+ * n0 comes from brisk__bn_ninv31(m). Constant time, branch-free, index-free, division-free. */
+void brisk__bn_mont_mul(uint32_t *d, const uint32_t *x, const uint32_t *y, const uint32_t *m,
+                        uint32_t n0);
+
+/* x <- x * R mod m: 31*limbs modular doublings. Same precondition (x < m, m odd). No scratch and
+ * no n0, which is why its signature differs from from_mont's.
+ * ponytail: ~10 lines and no division helper, instead of BearSSL's muladd_small (which needs a
+ * shift-based constant-time divrem). MEASURED COST, because the earlier "about a quarter" here
+ * was wrong by 3x: at 4096 bits with e = 65537 (gcc 10.3, -Os, x86_64) this is 0.95 ms of a
+ * 1.15 ms brisk__bn_modpow_pub - about 80%, not a quarter. The ratio is width-independent for
+ * an F4 exponent: 31*limbs doublings of three full limb passes each, against ~18 mont_muls of
+ * limbs^2 mul-accumulates. Upgrade path if a 4096-bit verify ever measures too slow on a real
+ * target: bn_muladd_small + a CT divrem (BearSSL i31_muladd / i31_decode_reduce), which is one
+ * pass and stays cheap when P-384 rides on this core. Nothing above this line changes. */
+void brisk__bn_to_mont(uint32_t *x, const uint32_t *m);
+
+/* x <- x * R^-1 mod m, i.e. brisk__bn_mont_mul(x, x, 1). `t` is scratch of
+ * BRISK__BN_LIMBS(m bits) words, wiped on return - needed because the "1" has to live somewhere.
+ */
+void brisk__bn_from_mont(uint32_t *x, const uint32_t *m, uint32_t n0, uint32_t *t);
+
+/* x <- x^e mod m, square-and-multiply over the big-endian octet string e, any e_len.
+ * PRECONDITION x < m, m odd, x at m's announced width. `t` is scratch of
+ * 2 * BRISK__BN_LIMBS(m bits) words, wiped on return. n0 is derived internally.
+ *
+ * THE EXPONENT IS PUBLIC AND ITS BITS REACH A BRANCH. That is deliberate and the only
+ * non-constant-time thing in bn.c: e is the RSA public exponent, or the fixed constants p-2 and
+ * n-2 for P-384 inversion. It is declassified with BRISK__CT_PUBLIC so `dev.py ct` stays
+ * meaningful over the rest of the kernel instead of being silenced wholesale. Nothing secret may
+ * ever be passed as e - hence the _pub suffix. If that ever changes, this function needs a
+ * fixed-window sibling; it must not simply be reused.
+ * BRISK_E_ARG if e is zero after stripping leading zero octets. */
+int brisk__bn_modpow_pub(uint32_t *x, const uint8_t *e, size_t e_len, const uint32_t *m,
+                         uint32_t *t);
+
+/* ---- crypto/rsa.c: RSASSA-PKCS1-v1_5 and RSASSA-PSS verify (RFC 8017) ------------------------
+ * Verify only (locked decision): no signing, no RSAES, no OAEP, no CRT, no key generation, no
+ * primality testing, and this module consumes no randomness. Both halves are mandatory to
+ * implement for a TLS 1.3 client (RFC 9846 9.1: rsa_pkcs1_sha256 for certificates,
+ * rsa_pss_rsae_sha256 for CertificateVerify and certificates), so neither sits behind a config
+ * knob - the same reasoning that keeps p256.c unconditional for ECDHE.
+ *
+ * `n` and `e` are the big-endian modulus and public exponent as the M2 SPKI parser hands them
+ * over; leading zero octets are allowed. `hash` is the already-computed digest, as in
+ * brisk__p256_ecdsa_verify - this library never hashes the message for you.
+ *
+ * Three outcomes, and the split is what the TLS layer needs in order to pick an alert:
+ *   BRISK_OK     the signature verifies.
+ *   BRISK_E_AUTH it does not: s >= n (RFC 8017 5.2.2 step 1), sig_len != k (8.2.2 step 1), bad
+ *                padding, wrong DigestInfo, PSS inconsistency. RFC 9846 4.5.2 makes this
+ *                decrypt_error for a CertificateVerify, and a chain failure for a certificate.
+ *   BRISK_E_ARG  malformed key material or a caller bug -> bad_certificate, not a failed
+ *                signature: modBits outside [2048, BRISK_RSA_MAX_BITS], n even, e even, e < 3,
+ *                e >= n, unknown alg, hash_len != brisk_hash_len(alg).
+ * Every input is public, so these paths may branch on all of them. */
+#define BRISK__RSA_MIN_BITS 2048
+#define BRISK__RSA_MAX_BITS BRISK__BN_MAX_BITS
+
+/* RFC 8017 8.2.2 with the EMSA-PKCS1-v1_5 encoding of 9.2. Strict DER DigestInfo per 9.2 note 1;
+ * the BER leniency of note 2 is NOT adopted, so absent NULL parameters, BER-encoded padding and
+ * trailing octets after the digest are all rejected. `alg` is SHA-256, SHA-384 or SHA-512 - RFC
+ * 9846 4.3.3 leaves SHA-1 legacy-only and brisk_hash_alg has no shorter digest.
+ * Per RFC 9846 4.3.3 the rsa_pkcs1_* schemes "refer solely to signatures which appear in
+ * certificates" and "are not defined for use in signed TLS handshake messages": this is an X.509
+ * (M2) entry point only and a CertificateVerify caller must never reach it. */
+int brisk__rsa_pkcs1_verify(const uint8_t *n, size_t n_len, const uint8_t *e, size_t e_len,
+                            brisk_hash_alg alg, const uint8_t *hash, size_t hash_len,
+                            const uint8_t *sig, size_t sig_len);
+
+/* RFC 8017 8.1.2 + EMSA-PSS-VERIFY 9.1.2, MGF1 per B.2.1. emLen = ceil((modBits - 1)/8) from the
+ * TRUE bit length of n, so it is k - 1 when modBits - 1 is a multiple of 8 and k otherwise.
+ * `salt_len` is explicit rather than fixed to hLen: RFC 9846 4.3.3 requires sLen == hLen for
+ * rsa_pss_rsae_* and rsa_pss_pss_* (the TLS caller passes hash_len), but an X.509 RSASSA-PSS
+ * AlgorithmIdentifier (RFC 4055) carries an arbitrary saltLength and NIST's own vectors use sLen
+ * in {0, 10, 20, 24, 28, 32, 48, 64}. A separate MGF hash is NOT supported: one `alg` covers
+ * both, which is exactly what RFC 9846 4.3.3 mandates, and the M2 DER parser rejects a parameter
+ * set whose mgfHash differs - as it must also reject a trailerField other than 1, the only value
+ * 9.1.2 step 4's 0xbc encodes. sLen is NOT checked against hLen here (sLen = 0 verifies, and NIST
+ * vectors need it), so the TLS entry point MUST pass hash_len and never a parsed saltLength.
+ * BRISK_E_AUTH if emLen < hLen + salt_len + 2, which 9.1.2 step 3 calls "inconsistent" rather
+ * than an error. */
+int brisk__rsa_pss_verify(const uint8_t *n, size_t n_len, const uint8_t *e, size_t e_len,
+                          brisk_hash_alg alg, size_t salt_len, const uint8_t *hash, size_t hash_len,
+                          const uint8_t *sig, size_t sig_len);
 
 /* ---- os/linux_rand.c (Linux builds only): the only randomness source, no userspace DRBG ---- */
 /* len bytes from the kernel CSPRNG: getrandom(2), which blocks until the pool is initialised.
