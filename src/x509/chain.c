@@ -157,6 +157,35 @@ int brisk__x509_signed_by(const brisk__x509_cert *child, const brisk__x509_cert 
     }
 }
 
+/* ------------------------------------------------------------------ validity -------------- */
+
+int brisk__x509_time_ok(const brisk__x509_cert *c, int64_t now)
+{
+    if (c == NULL) {
+        return BRISK_E_ARG;
+    }
+#if BRISK_X509_TIME_POLICY == BRISK_X509_TIME_POLICY_INSECURE_NO_TIME
+    (void)now;
+    return BRISK_OK;
+#else
+    /* A clock below the floor is an unset counter, not a time: the firmware cannot be running
+     * before it was built. cert.c has already refused notBefore > notAfter, so the window is
+     * never inverted here. */
+    if (now < (int64_t)(BRISK_X509_TIME_FLOOR)) {
+#    if BRISK_X509_TIME_POLICY == BRISK_X509_TIME_POLICY_STRICT
+        return BRISK_E_AUTH;
+#    else
+        /* notBefore is unjudgeable in this state - the real time is somewhere above the floor,
+         * so a certificate issued after this build is legitimate and cannot be told apart from
+         * one dated in the future. notAfter can still be judged, and that is the half that
+         * stops a long-dead leaf. */
+        return (c->not_after >= (int64_t)(BRISK_X509_TIME_FLOOR)) ? BRISK_OK : BRISK_E_AUTH;
+#    endif
+    }
+    return (c->not_before <= now && now <= c->not_after) ? BRISK_OK : BRISK_E_AUTH;
+#endif
+}
+
 /* ------------------------------------------------------------------ the walk -------------- */
 
 /* Names chain byte for byte: RFC 5280 6.1.3 (a)(4) with the canonical comparison of 7.1
@@ -203,7 +232,7 @@ static int usable_ca(const brisk__x509_cert *ca, size_t below, int anchor)
     return 1;
 }
 
-int brisk__x509_chain_verify(const brisk__x509_cert *certs, size_t n_certs,
+int brisk__x509_chain_verify(const brisk__x509_cert *certs, size_t n_certs, int64_t now,
                              brisk__x509_anchor_fn find_anchor, void *anchor_ctx)
 {
     const brisk__x509_cert *cur;
@@ -213,6 +242,18 @@ int brisk__x509_chain_verify(const brisk__x509_cert *certs, size_t n_certs,
         return BRISK_E_ARG;
     }
     cur = &certs[0];
+    /* 6.1.3 (a)(2) for the end entity. Every other certificate of the path is checked below, as
+     * a condition for being CHOSEN as the parent - never after the walk has committed to it.
+     * That distinction is the whole difference between refusing an expired chain and refusing a
+     * chain that has an in-date path through it: a CA that re-issues an intermediate under the
+     * same Name and the same key (a rollover, and the shape of every cross-certificate incident
+     * this file already worries about) leaves BOTH on the wire, and the expired one is often
+     * first. Checked as a filter, the walk skips it and takes the live one; checked one level
+     * later, the walk would have thrown the live one away by then. It also means an expired
+     * candidate costs no public-key operation and no verify budget. */
+    if (brisk__x509_time_ok(cur, now) != BRISK_OK) {
+        return BRISK_E_AUTH;
+    }
     for (depth = 0; depth < BRISK__X509_MAX_CHAIN; depth++) {
         const brisk__x509_cert *parent = NULL;
         brisk__x509_cert anchor;
@@ -255,8 +296,8 @@ int brisk__x509_chain_verify(const brisk__x509_cert *certs, size_t n_certs,
             if (p == cur || !name_eq(cur->issuer, cur->issuer_len, p->subject, p->subject_len)) {
                 continue;
             }
-            if (!usable_ca(p, below, 0)) {
-                continue;
+            if (!usable_ca(p, below, 0) || brisk__x509_time_ok(p, now) != BRISK_OK) {
+                continue; /* (k)(l)(m)(n) and (a)(2), all of them selection predicates */
             }
             if (++work > BRISK__X509_MAX_VERIFY) {
                 return BRISK_E_AUTH;

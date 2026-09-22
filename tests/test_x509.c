@@ -203,10 +203,22 @@ struct chain_kat {
     const char *certs[CHAIN_CERTS];     /* [0] is the end entity; NULL ends the list */
     const char *anchors[CHAIN_ANCHORS]; /* the trust store for this row */
     int want;                           /* 0 = BRISK_OK, 1 = BRISK_E_AUTH */
-    int flags;                          /* 1 = the row needs BRISK_ENABLE_P384 */
+    int flags;   /* 1 = the row needs BRISK_ENABLE_P384; 2 = it needs the validity window
+                  * enforced, so an INSECURE_NO_TIME build has to skip it */
+    int64_t now; /* the clock the walk is given, above BRISK_X509_TIME_FLOOR in every row */
     const char *note;
 };
 #include "kat/x509_chain.inc"
+
+/* One certificate against one clock: the policy table, where all three BRISK_X509_TIME_POLICY
+ * answers travel together and the build reads its own column. */
+struct validity_kat {
+    const char *cert;
+    int64_t now;
+    int want[3]; /* STRICT, FLOOR, INSECURE_NO_TIME - indexed by the policy, which is 1-based */
+    const char *note;
+};
+#include "kat/x509_validity.inc"
 
 /* brisk__x509_signed_by on its own, where BRISK_E_ARG and BRISK_E_AUTH are told apart - a chain
  * row cannot do that, it only ever reports that no path was built. */
@@ -218,8 +230,9 @@ struct sig_kat {
 };
 #include "kat/x509_sig.inc"
 
-#define CHAIN_N (sizeof X509_CHAIN_KAT / sizeof X509_CHAIN_KAT[0])
-#define SIG_N   (sizeof X509_SIG_KAT / sizeof X509_SIG_KAT[0])
+#define CHAIN_N    (sizeof X509_CHAIN_KAT / sizeof X509_CHAIN_KAT[0])
+#define SIG_N      (sizeof X509_SIG_KAT / sizeof X509_SIG_KAT[0])
+#define VALIDITY_N (sizeof X509_VALIDITY_KAT / sizeof X509_VALIDITY_KAT[0])
 
 /* One row's certificates, decoded and parsed. The DER has to outlive the parse, which is what
  * the byte arrays are for - brisk__x509_cert only points into them. */
@@ -233,15 +246,28 @@ struct chain_row {
 
 static struct chain_row g_row;
 
-/* Can this row's certificates be parsed by the library as configured? */
+/* Can this row's verdict be reproduced by the library as configured? Bit 1 is a certificate
+ * this build cannot parse (P-384), bit 2 a verdict that only holds where the validity window is
+ * enforced at all, bit 4 one that needs the unset-clock fallback STRICT does not have. */
 static int chain_row_enabled(int flags)
 {
-#if BRISK_ENABLE_P384
+#if !BRISK_ENABLE_P384
+    if (flags & 1) {
+        return 0;
+    }
+#endif
+#if BRISK_X509_TIME_POLICY == BRISK_X509_TIME_POLICY_INSECURE_NO_TIME
+    if (flags & 2) {
+        return 0;
+    }
+#endif
+#if BRISK_X509_TIME_POLICY == BRISK_X509_TIME_POLICY_STRICT
+    if (flags & 4) {
+        return 0;
+    }
+#endif
     (void)flags;
     return 1;
-#else
-    return (flags & 1) == 0;
-#endif
 }
 
 /* The first two-deep accepted row every configuration can run, for the checks that want one
@@ -317,9 +343,30 @@ static void t_chain(void)
         if (!chain_load(k, i)) {
             continue;
         }
-        rc = brisk__x509_chain_verify(g_row.certs, g_row.n_certs, t_find_anchor, &g_row);
+        rc = brisk__x509_chain_verify(g_row.certs, g_row.n_certs, k->now, t_find_anchor, &g_row);
         CHECKI(rc == (k->want ? BRISK_E_AUTH : BRISK_OK), i);
     }
+}
+
+/* The time policy: one certificate, one clock, the verdict this build's BRISK_X509_TIME_POLICY
+ * owes. The row carries all three, so the two policies this binary was not built with are still
+ * written down next to the one it was - and switching the knob re-runs the same table against a
+ * different column instead of needing a table of its own. */
+static void t_validity(void)
+{
+    static uint8_t der[CHAIN_CERT_CAP];
+    size_t i;
+
+    for (i = 0; i < VALIDITY_N; i++) {
+        const struct validity_kat *k = &X509_VALIDITY_KAT[i];
+        brisk__x509_cert c;
+        size_t n = t_unhex(k->cert, der, sizeof der);
+        int want = k->want[BRISK_X509_TIME_POLICY - 1] ? BRISK_E_AUTH : BRISK_OK;
+
+        CHECKI(brisk__x509_parse(&c, der, n) == BRISK_OK, i);
+        CHECKI(brisk__x509_time_ok(&c, k->now) == want, i);
+    }
+    CHECK(brisk__x509_time_ok(NULL, 0) == BRISK_E_ARG);
 }
 
 /* The arguments the walk must refuse or survive on their own, which no vector covers: an empty
@@ -329,10 +376,12 @@ static void t_chain_args(void)
     size_t row = plain_row();
     const struct chain_kat *k = &X509_CHAIN_KAT[row];
 
-    CHECK(brisk__x509_chain_verify(NULL, 0, NULL, NULL) == BRISK_E_ARG);
+    CHECK(brisk__x509_chain_verify(NULL, 0, k->now, NULL, NULL) == BRISK_E_ARG);
     if (chain_load(k, row)) {
-        CHECK(brisk__x509_chain_verify(g_row.certs, 0, t_find_anchor, &g_row) == BRISK_E_ARG);
-        CHECK(brisk__x509_chain_verify(g_row.certs, g_row.n_certs, NULL, NULL) == BRISK_E_AUTH);
+        CHECK(brisk__x509_chain_verify(g_row.certs, 0, k->now, t_find_anchor, &g_row) ==
+              BRISK_E_ARG);
+        CHECK(brisk__x509_chain_verify(g_row.certs, g_row.n_certs, k->now, NULL, NULL) ==
+              BRISK_E_AUTH);
     }
 }
 
@@ -461,6 +510,7 @@ void test_x509(void)
     t_certs();
     t_truncate();
     t_flip();
+    t_validity();
     t_chain();
     t_chain_args();
     t_signed_by();

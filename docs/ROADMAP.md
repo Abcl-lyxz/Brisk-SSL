@@ -36,7 +36,7 @@ Tick a box only when the work is green on **every** arch (`python tools/dev.py t
 - [x] Certificate parse: basicConstraints, keyUsage, EKU, SAN, validity, unknown-critical reject
 - [x] Chain building (unordered/extra certs, stop at first trust anchor), signature checks
 - [x] RFC 9525 hostname / IP matching
-- [ ] Time policy STRICT / FLOOR (default) / INSECURE_NO_TIME; int64 dates
+- [x] Time policy STRICT / FLOOR (default) / INSECURE_NO_TIME; int64 dates
 - [ ] CA bundle autodetect + lazy lookup; SPKI sha256 pins (additive)
 - [ ] x509-limbo suite
 

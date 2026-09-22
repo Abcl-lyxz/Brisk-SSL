@@ -40,6 +40,17 @@ void brisk__secure_zero(void *p, size_t n)
 #    define BRISK__PROFILE_NAME "FULL"
 #endif
 
+/* The default time policy says nothing, so the usual image pays no bytes for it; the two that
+ * deviate from it say so, because "why does this gateway accept an expired certificate?" is a
+ * question that gets asked of a binary nobody has the build flags for any more. */
+#if BRISK_X509_TIME_POLICY == BRISK_X509_TIME_POLICY_STRICT
+#    define BRISK__TIME_NAME " time=strict"
+#elif BRISK_X509_TIME_POLICY == BRISK_X509_TIME_POLICY_INSECURE_NO_TIME
+#    define BRISK__TIME_NAME " time=INSECURE_NO_TIME"
+#else
+#    define BRISK__TIME_NAME ""
+#endif
+
 /* "@(#)" makes `strings`/`what` find the configuration in a shipped firmware image. The consumer
  * links with --gc-sections, which would drop the string unless brisk_build_info() is called, so:
  * `retain` (GCC >= 11, Clang >= 13, binutils >= 2.36) keeps it in .rodata, and on older ELF
@@ -53,13 +64,14 @@ void brisk__secure_zero(void *p, size_t n)
 #    define BRISK__RETAIN
 #    if defined(__ELF__)
 __asm__(".pushsection .comment\n\t.asciz \"@(#)BRISKCFG " BRISK_SSL_VERSION_STRING
-        " profile=" BRISK__PROFILE_NAME "\"\n\t.popsection");
+        " profile=" BRISK__PROFILE_NAME BRISK__TIME_NAME "\"\n\t.popsection");
 #    endif
 #endif
 
 BRISK__RETAIN static const char brisk__build_info[] =
-    "@(#)BRISKCFG " BRISK_SSL_VERSION_STRING " profile=" BRISK__PROFILE_NAME;
+    "@(#)BRISKCFG " BRISK_SSL_VERSION_STRING " profile=" BRISK__PROFILE_NAME BRISK__TIME_NAME;
 #undef BRISK__RETAIN
+#undef BRISK__TIME_NAME
 
 const char *brisk_version(void)
 {

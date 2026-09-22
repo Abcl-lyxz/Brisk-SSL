@@ -4,6 +4,11 @@ project(brisk_ssl VERSION 0.1.0 LANGUAGES C)
 # Empty = let include/brisk_config.h decide (DEFAULT, or whatever a BRISK_USER_CONFIG header sets).
 set(BRISK_PROFILE "" CACHE STRING "Feature profile: TINY, DEFAULT or FULL; empty = header default")
 set_property(CACHE BRISK_PROFILE PROPERTY STRINGS "" TINY DEFAULT FULL)
+# Same rule for the X.509 time policy: empty = the header's default (FLOOR). A cache variable
+# and not a raw -D so the two policies the default build never exercises can be run by name.
+set(BRISK_X509_TIME_POLICY "" CACHE STRING
+    "X.509 validity: STRICT, FLOOR or INSECURE_NO_TIME; empty = header default")
+set_property(CACHE BRISK_X509_TIME_POLICY PROPERTY STRINGS "" STRICT FLOOR INSECURE_NO_TIME)
 option(BRISK_BUILD_TESTS "Build the test suite" ${PROJECT_IS_TOP_LEVEL})
 
 # ponytail: static only until M8 (shared builds need BRISK_SHARED_BUILD + tests on internal symbols)
@@ -34,6 +39,10 @@ target_include_directories(brisk PUBLIC include PRIVATE src vendor)
 # PUBLIC: consumers see exactly the configuration the library was built with.
 if(BRISK_PROFILE)
     target_compile_definitions(brisk PUBLIC BRISK_PROFILE=BRISK_PROFILE_${BRISK_PROFILE})
+endif()
+if(BRISK_X509_TIME_POLICY)
+    target_compile_definitions(brisk PUBLIC
+        BRISK_X509_TIME_POLICY=BRISK_X509_TIME_POLICY_${BRISK_X509_TIME_POLICY})
 endif()
 
 if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")

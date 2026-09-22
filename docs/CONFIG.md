@@ -40,6 +40,43 @@ algorithm behind.
 |---|---|---|---|
 | `BRISK_RSA_MAX_BITS` | 4096 | 2048 to 4096, multiple of 8 | The largest RSA modulus a certificate signature may use. A **stack** lever, not a flash one: it sizes `BRISK__BN_MAX_LIMBS`, which is the CIOS accumulator inside `brisk__bn_mont_mul` (640 B of frame at 4096) as well as the i31 scratch in `src/crypto/rsa.c`. That accumulator sits under every one of the ~12,000 Montgomery multiplications a P-384 verify runs, so with `BRISK_ENABLE_P384` on this knob moves `src/crypto/p384.c`'s stack too - 2648 B at 4096 along its deepest chain. Measured with `-fstack-usage` at -Os along the deepest call chain, a PSS verify needs 3392 B of stack at 4096 and 2064 B at 2048; PKCS#1 v1.5 needs 3088 B and 1760 B. Flash and the public ABI are unaffected. Drop it to 2048 only for a private PKI whose largest certificate you control - public trust anchors are 4096-bit (ISRG Root X1). |
 
+### Time: what an expired certificate means on a device with no clock
+| Knob | Default | Values | What it changes |
+|---|---|---|---|
+| `BRISK_X509_TIME_POLICY` | `..._FLOOR` | `BRISK_X509_TIME_POLICY_STRICT`, `..._FLOOR`, `..._INSECURE_NO_TIME` | What happens when the clock reads below `BRISK_X509_TIME_FLOOR`, i.e. when it has clearly never been set. |
+| `BRISK_X509_TIME_FLOOR` | `1767225600` (2026-01-01Z) | any positive Unix timestamp | The lower bound the firmware carries. Pass your own build time: `-DBRISK_X509_TIME_FLOOR=$(date -u +%s)`. |
+
+A gateway boots with a 1970 RTC, has no battery, and may sit for a week before NTP answers, so
+"compare `notAfter` against the system clock" is not a policy on this hardware. The floor is the
+one thing the firmware knows for free: it cannot be running *earlier* than it was built.
+
+| Clock | STRICT | FLOOR (default) | INSECURE_NO_TIME |
+|---|---|---|---|
+| at or above the floor | `notBefore <= now <= notAfter` | same | not checked |
+| below the floor (unset) | refuse the certificate | `notAfter >= floor` only | not checked |
+
+FLOOR does not check `notBefore` while the clock is unset, and that is not an oversight: the real
+time is somewhere above the floor, so a certificate issued after this firmware was built is
+legitimate and cannot be told apart from one dated in the future. What FLOOR still buys is the
+half that matters against an attacker - a certificate that had already expired when the image was
+built is refused, so a compromised leaf from two years ago cannot be replayed at a device that
+believes it is 1970.
+
+The **trust anchor is exempt** from the window under every policy. An expired root breaks working
+devices with no attacker anywhere near them (DST Root CA X3, 2021); RFC 5280 6.1.1 (d) defines an
+anchor as a name and a key rather than a certificate, so nothing is being bent. The intermediate
+below it is still checked.
+
+Both knobs are ordinary `-D` defines; the policy also has a CMake cache variable, so the two
+non-default policies can be built and tested by name:
+`cmake --preset dev -DBRISK_X509_TIME_POLICY=STRICT` (or `INSECURE_NO_TIME`). The `x509` suite
+carries the verdict for all three and reads the column the build selected.
+
+`INSECURE_NO_TIME` compiles the check out entirely - and says so in `brisk_build_info()`
+(`profile=TINY time=INSECURE_NO_TIME`), so `strings firmware.bin | grep BRISKCFG` answers "why
+does this gateway accept an expired certificate?" on an image nobody has the build flags for any
+more. `STRICT` reports itself the same way; the default stays silent and costs nothing.
+
 ## Measured size (M1a, `python tools/dev.py size --arch all`)
 Flash = code + read-only data + data of the library objects actually linked (libc excluded).
 

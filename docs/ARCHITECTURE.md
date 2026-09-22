@@ -77,9 +77,15 @@ brisk_feed(c, in, n); brisk_pull(c, out, cap);           /* sans-I/O for your ow
 - Signatures accepted: ECDSA P-256/P-384 (SHA-256/384), RSA-PSS and PKCS#1 v1.5 (certs) 2048-4096.
 - TLS 1.2 (M5): ECDHE + AEAD only, EMS required, renegotiation refused, downgrade sentinel checked.
 - No 0-RTT (telemetry POSTs are not replay-safe).
-- Clock policy FLOOR (default): if the wall clock is below max(build date, last good time) the
-  clock is "unsynced" - check notAfter against the floor, skip notBefore. STRICT and
-  INSECURE_NO_TIME exist. Dates are int64, never `time_t` (Y2038, 9999 notAfter).
+- Clock policy FLOOR (default): if the wall clock is below `BRISK_X509_TIME_FLOOR` (the build
+  date) the clock is "unsynced" - check notAfter against the floor, skip notBefore. STRICT
+  refuses instead; INSECURE_NO_TIME skips the window. The floor is compile-time only today: a
+  persisted last-known-good time cannot raise it, and must NOT be passed as `now` instead - that
+  lifts the clock above the floor and re-enables the notBefore check against a stale value, so
+  every freshly issued certificate is refused. A runtime floor belongs to the M3 client config,
+  where the device's storage is already in the picture. The trust anchor is
+  exempt from the window (RFC 5280 6.1.1 (d); DST Root CA X3, 2021). Dates are int64, never
+  `time_t` (Y2038, 9999 notAfter). Knob table in docs/CONFIG.md.
 - SPKI pins are additive (never replace chain validation); pin roots, not leaves/intermediates
   (Let's Encrypt rotates intermediates; certificate lifetimes drop to 47 days by 2029).
 - RNG: getrandom (own per-arch syscall table, checked against the headers). Only on kernels

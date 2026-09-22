@@ -3053,6 +3053,53 @@ def check_x509_source_constants():
     print(f"  cert.c: {len(X509_OIDS)} OIDs match their dotted forms")
 
 
+X509_TIME_FLOOR = None  # BRISK_X509_TIME_FLOOR, read from the header by check_x509_time_config()
+
+
+def check_x509_time_config():
+    """The validity floor and the default policy come from include/brisk_config.h.
+
+    Every validity row below is computed against them, so a header whose floor moved and whose
+    vectors nobody regenerated fails the suite instead of testing a window that no longer
+    exists. Same standard as check_x509_source_constants()."""
+    global X509_TIME_FLOOR
+    src = (ROOT / "include" / "brisk_config.h").read_text()
+    m = re.search(r"#\s*define\s+BRISK_X509_TIME_FLOOR\b\s+(\d+)", src)
+    if not m:
+        die("brisk_config.h: no BRISK_X509_TIME_FLOOR default")
+    X509_TIME_FLOOR = int(m.group(1))
+    m = re.search(r"#\s*define\s+BRISK_X509_TIME_POLICY\s+BRISK_X509_TIME_POLICY_(\w+)", src)
+    if not m or m.group(1) != "FLOOR":
+        die("brisk_config.h: the default BRISK_X509_TIME_POLICY is no longer FLOOR")
+    if not 0 < X509_TIME_FLOOR < 2 ** 31:
+        die("brisk_config.h: BRISK_X509_TIME_FLOOR %d is not a plausible date" % X509_TIME_FLOOR)
+    if CHAIN_NOW <= X509_TIME_FLOOR:
+        die("the chain rows' clock (%d) is below the floor; they would all take the unset-clock "
+            "branch and stop testing the walk" % CHAIN_NOW)
+    print("  brisk_config.h: time floor %d (%s), default policy FLOOR"
+          % (X509_TIME_FLOOR, asn1_time_str(X509_TIME_FLOOR)))
+
+
+def asn1_time_str(secs):
+    """The RFC 5280 4.1.2.5 encoding of an instant: UTCTime through 2049, GeneralizedTime from
+    2050 on, which is exactly the split 4.1.2.5.1 / 4.1.2.5.2 mandate."""
+    t = (datetime.datetime(1970, 1, 1, tzinfo=datetime.timezone.utc)
+         + datetime.timedelta(seconds=secs))
+    return t.strftime("%y%m%d%H%M%SZ" if t.year < 2050 else "%Y%m%d%H%M%SZ")
+
+
+def py_time_verdict(policy, nbf, naf, now, floor):
+    """0 = BRISK_OK, 1 = BRISK_E_AUTH, straight from the BRISK_X509_TIME_POLICY block of
+    include/brisk_config.h: a clock below the floor is an unset counter, and the policy says
+    what an unset counter buys."""
+    if policy == "insecure":
+        return 0
+    if now < floor:
+        return 1 if policy == "strict" else (0 if naf >= floor else 1)
+    return 0 if nbf <= now <= naf else 1
+
+
+
 # ---------------------------------------------------------------- a certificate encoder
 def x_seq(*p):
     return der_tlv(0x30, b"".join(p))
@@ -3232,6 +3279,74 @@ KU_DIGITAL_SIGNATURE, KU_KEY_ENCIPHERMENT, KU_KEY_CERT_SIGN, KU_CRL_SIGN = 0x01,
 EKU_SERVER, EKU_CLIENT, EKU_ANY, EKU_OTHER = 0x01, 0x02, 0x04, 0x08
 SAN_DNS = der_tlv(0x82, b"device.example.com")
 SAN_TWO = SAN_DNS + der_tlv(0x87, bytes([192, 0, 2, 1]))
+
+
+
+def x509_validity_vectors():
+    """(cert, now, [want_strict, want_floor, want_insecure], note) for brisk__x509_time_ok.
+
+    One row per branch of the policy, plus the boundaries on both sides of every comparison -
+    an off-by-one in `now <= notAfter` is the whole bug class this module can have. The three
+    verdicts travel together because the policy is a compile-time knob: whichever one a build
+    chose, the C reads its own column, and a row that is wrong for the other two is still
+    visible here.
+
+    YEARS > 2038 are deliberate. notBefore/notAfter and `now` are int64 everywhere, so a 32-bit
+    build that truncated one of them somewhere would answer these rows backwards."""
+    f = X509_TIME_FLOOR
+    yr = 365 * 86400
+    rows = []
+
+    def row(nbf, naf, now, note, clock="usable"):
+        """`clock` is which branch of the policy this row is FOR. It is checked rather than
+        inferred: a row written to pin a notBefore boundary is worth nothing if its clock sits
+        below the floor, because the unset-clock branch never looks at notBefore and the oracle
+        would quietly relabel the row instead of failing."""
+        if (now >= f) != (clock == "usable"):
+            die("validity row '%s': clock=%s, but now is on the other side of the floor" % (
+                note, clock))
+        nbf_s, naf_s = asn1_time_str(nbf), asn1_time_str(naf)
+        if py_asn1_time(nbf_s) != nbf or py_asn1_time(naf_s) != naf:
+            die("validity row '%s': the encoding does not round-trip" % note)
+        if nbf > naf:
+            die("validity row '%s': cert.c refuses notBefore > notAfter at parse time" % note)
+        want = [py_time_verdict(p, nbf, naf, now, f) for p in ("strict", "floor", "insecure")]
+        rows.append((make_cert(nbf=nbf_s, naf=naf_s).hex(), now, want, note))
+
+    # A clock at or above the floor: the ordinary window check, and its four boundaries.
+    row(f - 10 * yr, f + 10 * yr, f + yr, "a usable clock inside the window")
+    row(f - 10 * yr, f - yr, f + yr, "a usable clock, the certificate expired")
+    row(f + 2 * yr, f + 3 * yr, f + yr, "a usable clock, the certificate is not valid yet")
+    row(f, f + 10 * yr, f, "the clock is exactly the floor")
+    row(f + yr, f + 2 * yr, f + yr, "now == notBefore is inside")
+    row(f - yr, f + yr, f + yr, "now == notAfter is inside")
+    row(f + 1, f + yr, f, "one second before notBefore")
+    row(f - yr, f - 1, f, "one second after notAfter")
+
+    # Below the floor the clock is not a clock. STRICT stops; FLOOR judges notAfter alone.
+    row(f - yr, f + yr, f - 1, "one second below the floor, notAfter is above it", clock="unset")
+    row(f - 10 * yr, f - 5 * yr, f - 1, "below the floor, the certificate died before the build",
+        clock="unset")
+    row(f - yr, f, f - 1, "below the floor, notAfter == the floor exactly", clock="unset")
+    row(f - yr, f - 1, f - 1, "below the floor, notAfter one second under it", clock="unset")
+    row(f - yr, f + yr, 0, "an RTC that has never been set", clock="unset")
+    row(f + 5 * yr, f + 6 * yr, 0, "an unset RTC cannot judge a notBefore in the future", clock="unset")
+    row(f - yr, f + yr, -1, "a clock that reads before the epoch", clock="unset")
+
+    # int64 dates: both sides of the 32-bit second, and the end of GeneralizedTime.
+    row(py_asn1_time("200101000000Z"), py_asn1_time("390101000000Z"), 2 ** 31,
+        "just past the 32-bit second, still inside the window")
+    row(py_asn1_time("200101000000Z"), 2 ** 31 - 1, 2 ** 31,
+        "expired one second before the 32-bit wrap")
+    row(py_asn1_time("200101000000Z"), py_asn1_time("99991231235959Z"), 2 ** 33,
+        "the last instant GeneralizedTime can encode is still ahead")
+    row(py_asn1_time("200101000000Z"), py_asn1_time("300101000000Z"), 2 ** 33,
+        "a clock in the year 2242")
+    row(py_asn1_time("500101000000Z"), f + yr, f,
+        "a notBefore before the epoch is a negative int64")
+
+    print("  x509 validity: %d rows, floor %d" % (len(rows), X509_TIME_FLOOR))
+    return rows
 
 
 def x509_real_spkis():
@@ -3460,6 +3575,15 @@ def x509_cert_vectors():
 # own ROADMAP item. What is here is one row per rule src/x509/chain.c enforces, which is the
 # same standard the cert rows are held to.
 CHAIN_MAX_CERTS = 9  # leaf + 8, which is one past BRISK__X509_MAX_CHAIN on purpose
+# The clock every chain row is judged at unless it says otherwise: inside the 2001..2030
+# window the certificates below are built with, and above BRISK_X509_TIME_FLOOR so the walk
+# takes the ordinary branch. check_x509_time_config() enforces the second half.
+CHAIN_NOW = None  # set in main(), once py_asn1_time exists
+# flags bit 1: the row needs BRISK_ENABLE_P384. Bit 2: it needs the validity window to be
+# ENFORCED, so a BRISK_X509_TIME_POLICY_INSECURE_NO_TIME build skips it.
+# Bit 4: the row runs with a clock BELOW the floor, which only a policy with a fallback can
+# accept - STRICT refuses everything there by design.
+CHAIN_F_P384, CHAIN_F_TIME, CHAIN_F_UNSET = 1, 2, 4
 CHAIN_MAX_ANCHORS = 2
 RSA_CHAIN_KEY = None  # (n_hex, e_hex, n, d, k), built once in main()
 
@@ -3582,16 +3706,18 @@ def cert_kw(issuer_name, subject, signer, key, version=3, exts=None, serial=1):
                 subject=subject, spki=key["spki"], exts=exts)
 
 
-def chain_cert(issuer_name, subject, signer, key, version=3, exts=None, serial=1):
-    """One certificate: `signer` signs it, `key` contributes the subjectPublicKeyInfo."""
+def chain_cert(issuer_name, subject, signer, key, version=3, exts=None, serial=1, **kw):
+    """One certificate: `signer` signs it, `key` contributes the subjectPublicKeyInfo. `kw`
+    reaches make_cert, which is how a row gives one certificate its own validity window."""
     return make_cert(sign=signer["sign"],
-                     **cert_kw(issuer_name, subject, signer, key, version, exts, serial))
+                     **cert_kw(issuer_name, subject, signer, key, version, exts, serial), **kw)
 
 
-def chain_row(certs, anchors, want, note, flags=0):
+def chain_row(certs, anchors, want, note, flags=0, now=None):
     if len(certs) > CHAIN_MAX_CERTS or len(anchors) > CHAIN_MAX_ANCHORS:
         die(f"chain row '{note}' does not fit the fixed arrays")
-    return ([c.hex() for c in certs], [a.hex() for a in anchors], want, flags, note)
+    return ([c.hex() for c in certs], [a.hex() for a in anchors], want, flags,
+            CHAIN_NOW if now is None else now, note)
 
 
 def uint_der(v):
@@ -3815,6 +3941,51 @@ def x509_chain_vectors():
     rows.append(chain_row([chain_cert("Brisk Root", "device.example.com", rsa_issuer(256), leaf,
                                       exts=ee_ext)], [root_c], 1,
                           "an RSA signature under an EC anchor key"))
+
+    # 6.1.3 (a)(2): which certificates of the path the window is checked on, which is the half
+    # brisk__x509_time_ok cannot answer on its own. The policy itself is x509_validity.inc's job,
+    # so every row here runs with a clock above the floor, where all policies bar
+    # INSECURE_NO_TIME agree - and that one skips them (CHAIN_F_TIME).
+    dead = dict(nbf="200101000000Z", naf="210101000000Z")   # expired long before CHAIN_NOW
+    unborn = dict(nbf="400101000000Z", naf="450101000000Z")  # 2040: not valid yet
+    rows.append(chain_row([chain_cert("Brisk Inter", "device.example.com", inter, leaf,
+                                      exts=ee_ext, **dead), inter_c], [root_c], 1,
+                          "6.1.3 (a)(2) an expired end entity", flags=CHAIN_F_TIME))
+    rows.append(chain_row([chain_cert("Brisk Inter", "device.example.com", inter, leaf,
+                                      exts=ee_ext, **unborn), inter_c], [root_c], 1,
+                          "6.1.3 (a)(2) an end entity that is not valid yet", flags=CHAIN_F_TIME))
+    rows.append(chain_row([leaf_c, chain_cert("Brisk Root", "Brisk Inter", root, inter,
+                                              exts=ca_ext, **dead)], [root_c], 1,
+                          "6.1.3 (a)(2) an expired intermediate", flags=CHAIN_F_TIME))
+    # The row that tells "validity filters the candidates" apart from "validity is checked once
+    # the walk has committed": both intermediates carry the same Name AND the same key, so both
+    # verify the leaf, and the expired one is first. A walk that commits to it has thrown the
+    # live one away and fails a chain it was given a complete path for.
+    rows.append(chain_row([leaf_c, chain_cert("Brisk Root", "Brisk Inter", root, inter,
+                                              exts=ca_ext, serial=7, **dead), inter_c],
+                          [root_c], 0,
+                          "an expired same-Name sibling does not hide the live intermediate"))
+
+    # The state a gateway actually boots into: the RTC reads 0, which is below the floor. Under
+    # FLOOR the walk still builds (every certificate here outlives the floor); under STRICT it
+    # cannot, which is what CHAIN_F_UNSET skips.
+    rows.append(chain_row([leaf_c, inter_c], [root_c], 0,
+                          "a clock that was never set still reaches the anchor under FLOOR",
+                          flags=CHAIN_F_UNSET, now=0))
+
+    # The anchor is exempt, on purpose and unlike every other rule the walk applies to it: an
+    # expired root breaks working devices with no attacker in sight (DST Root CA X3, 2021), and
+    # the intermediate below it still has to be current.
+    rows.append(chain_row([leaf_c, inter_c],
+                          [chain_cert("Brisk Root", "Brisk Root", root, root, exts=ca_ext,
+                                      **dead)], 0,
+                          "6.1.1 (d) an expired anchor still anchors"))
+    rows.append(chain_row([leaf_c, chain_cert("Brisk Root", "Brisk Inter", root, inter,
+                                              exts=ca_ext, **dead)],
+                          [chain_cert("Brisk Root", "Brisk Root", root, root, exts=ca_ext,
+                                      **dead)], 1,
+                          "an exempt anchor does not excuse the intermediate under it",
+                          flags=CHAIN_F_TIME))
 
     print(f"  x509 chains: {sum(1 for r in rows if not r[2])} accepted, "
           f"{sum(1 for r in rows if r[2])} rejected")
@@ -4146,8 +4317,12 @@ def main():
     der = der_generated() + der_wycheproof()
     der_val = der_values()
     check_x509_source_constants()
+    global CHAIN_NOW
+    CHAIN_NOW = py_asn1_time("270601000000Z")  # inside every row's window, above the floor
+    check_x509_time_config()
     x509_certs = x509_cert_vectors()
     x509_times = x509_time_vectors()
+    x509_validity = x509_validity_vectors()
     global RSA_CHAIN_KEY
     # 2049 and not 2048: rsa_odd_modbits_key assembles its modulus out of published CAVP primes
     # and no product of those lands on exactly 2048 bits. Nothing in a certificate cares about
@@ -4236,12 +4411,14 @@ def main():
          lambda r: f'{cstr(r[0])}, {r[1]}, "{r[2]}", {r[3]}, {r[4]}, {r[5]}, {r[6]}, {r[7]}, '
                    f'{r[8]}, {r[9]}u, {r[10]}u, {r[11]}, {r[12]}, {cstr(r[13])}, {cstr(r[14])}, '
                    f'{r[15]}LL, {r[16]}LL')
+    emit("x509_validity.inc", "struct validity_kat X509_VALIDITY_KAT", x509_validity,
+         lambda r: f'{cstr(r[0])}, {r[1]}LL, {{{r[2][0]}, {r[2][1]}, {r[2][2]}}}, "{r[3]}"')
     emit("x509_chain.inc", "struct chain_kat X509_CHAIN_KAT", x509_chains,
          lambda r: "{" + ", ".join([cstr(c) for c in r[0]]
                                    + ["NULL"] * (CHAIN_MAX_CERTS - len(r[0]))) + "}, "
                    + "{" + ", ".join([cstr(a) for a in r[1]]
                                      + ["NULL"] * (CHAIN_MAX_ANCHORS - len(r[1]))) + "}, "
-                   + f'{r[2]}, {r[3]}, "{r[4]}"')
+                   + f'{r[2]}, {r[3]}, {r[4]}LL, "{r[5]}"')
     emit("x509_sig.inc", "struct sig_kat X509_SIG_KAT", x509_sigs,
          lambda r: f'{cstr(r[0])}, {cstr(r[1])}, {r[2]}, {r[3]}, "{r[4]}"')
     emit("x509_name.inc", "struct name_kat X509_NAME_KAT", x509_names,

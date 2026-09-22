@@ -598,8 +598,8 @@ int brisk__rsa_pss_verify(const uint8_t *n, size_t n_len, const uint8_t *e, size
  *     names item, and before anything compares a DN attribute by attribute.
  *   - 11.7 and 11.8, the DER forms of GeneralizedTime and UTCTime, together with the tighter
  *     profile of RFC 5280 4.1.2.5.1 / 4.1.2.5.2 (Zulu, seconds present, no fractional part):
- *     the time-policy item. This reader hands those values over unexamined, including empty
- *     ones.
+ *     brisk__x509_time, which cert.c applies. This reader hands those values over unexamined,
+ *     including empty ones.
  *   - the alphabets of PrintableString, IA5String and friends: X.680, not X.690, so there is
  *     nothing here to enforce. The names code owes the embedded-NUL and control-character
  *     checks before any hostname comparison.
@@ -762,7 +762,8 @@ int brisk__der_walk(const uint8_t *der, size_t len);
  * INTO the caller's buffer plus a handful of decoded scalars. Nothing is copied, nothing is
  * allocated, and the DER must outlive the struct. It is a parse, not a validation: the
  * signature is not checked, the dates are decoded but not compared against a clock, and no
- * chain is built - those are the next three ROADMAP items. What it does decide is whether the
+ * chain is built - brisk__x509_signed_by, brisk__x509_time_ok and brisk__x509_chain_verify own
+ * those three. What it does decide is whether the
  * certificate is well formed enough to be worth any of that.
  *
  * Every pointer/length pair aims at the ENCODED bytes, never at a decoded copy: issuer and
@@ -808,9 +809,9 @@ int brisk__der_walk(const uint8_t *der, size_t len);
  *   - a date outside 1950..9999, not in Zulu, without seconds, or with a fractional part
  *     (4.1.2.5.1, 4.1.2.5.2), and notBefore after notAfter.
  *
- * Not checked here, on purpose: the signature (next item), whether `now` is inside the validity
- * window (the time-policy item owns the STRICT / FLOOR / INSECURE_NO_TIME decision), hostname
- * and IP matching (RFC 9525 item), and the alphabet of any string - this module never looks
+ * Not checked here, on purpose: the signature (brisk__x509_signed_by), whether `now` is inside
+ * the validity window (brisk__x509_time_ok owns the STRICT / FLOOR / INSECURE_NO_TIME
+ * decision), hostname and IP matching (brisk__x509_match_host), and the alphabet of any string - this module never looks
  * inside a Name or a GeneralName, it only records where they are.
  *
  * One residual worth naming: a NON-critical nameConstraints, policyConstraints or
@@ -926,6 +927,20 @@ int brisk__x509_time(unsigned tag, const uint8_t *v, size_t len, int64_t *out);
  * halves - and the 3.5 KB budget in src/crypto/rsa.c is the subtree, not the total.
  *
  * WHAT IS CHECKED, per certificate of the path:
+ *   - 6.1.3 (a)(2) `now` is inside the validity window, as brisk__x509_time_ok reads it under
+ *     the configured time policy. For a parent this is a SELECTION predicate, checked exactly
+ *     like (k)..(n) below and before any signature work: an expired candidate is skipped, not
+ *     fatal, so a same-Name rollover pair with the dead certificate first still builds through
+ *     the live one. Checking it after the walk committed would turn that into a chain that
+ *     fails although an in-date path was sitting in the array.
+ *     A TRUST ANCHOR is exempt, and here the exemption is not just the letter of 6.1.1 (d)
+ *     (an anchor is a Name and a key, so 6.1.3 never runs on it): an expired root is the one
+ *     failure that takes out working devices with no attacker anywhere near them. DST Root CA
+ *     X3 expiring in 2021 broke every client that checked it and none of the ones that did not,
+ *     while the intermediate below it - which IS checked here - still had to be current. This
+ *     is the opposite call from cA and keyCertSign below, which the anchor does have to pass,
+ *     and the difference is that those are properties an operator chose once and a date is an
+ *     event that arrives on its own.
  *   - 6.1.3 (a)(4) the issuer Name of the child equals the subject Name of the parent, compared
  *     as raw DER (see the brisk__x509_cert block on why not RFC 5280 7.1).
  *   - 6.1.3 (a)(1) the child's signature verifies under the parent's public key.
@@ -943,9 +958,8 @@ int brisk__x509_time(unsigned tag, const uint8_t *v, size_t len, int64_t *out);
  *     (issuer == subject) does not count, exactly as (l) says, so a CA that cross-signs itself
  *     during a key rollover does not consume its own budget.
  *
- * WHAT IS NOT, on purpose: the validity window (the time-policy item owns notBefore/notAfter
- * and the STRICT / FLOOR / INSECURE_NO_TIME decision), hostname and IP matching (RFC 9525
- * item), EKU policy at the end entity, name constraints, certificate policies and revocation.
+ * WHAT IS NOT, on purpose: hostname and IP matching (brisk__x509_match_host, which the caller
+ * owns), EKU policy at the end entity, name constraints, certificate policies and revocation.
  * A caller that stops after this function has a chain that is well formed and cryptographically
  * intact, and nothing more than that.
  *
@@ -987,6 +1001,28 @@ int brisk__x509_time(unsigned tag, const uint8_t *v, size_t len, int64_t *out);
 typedef int (*brisk__x509_anchor_fn)(void *ctx, const uint8_t *dn, size_t dn_len, size_t index,
                                      brisk__x509_cert *out);
 
+/* Is `now` inside this certificate's validity window, under the policy the build was configured
+ * with? `now` is int64 seconds since the Unix epoch, straight from whatever clock the caller has
+ * - a device that has never been told the time passes what it believes, usually something near
+ * 0, and the policy is what turns that into an answer. WIDEN it, never truncate: a 32-bit
+ * time_t stops in 2038, and a caller that narrowed one would report every certificate as
+ * not-yet-valid the moment it wrapped. The three policies, the floor they compare
+ * against and why the default is not "trust the clock" are documented on BRISK_X509_TIME_POLICY
+ * in include/brisk_config.h; in short:
+ *   now >= BRISK_X509_TIME_FLOOR   notBefore <= now <= notAfter, whatever the policy.
+ *   now <  BRISK_X509_TIME_FLOOR   STRICT refuses, FLOOR demands only notAfter >= the floor,
+ *                                  INSECURE_NO_TIME never got this far.
+ * BRISK_OK, or BRISK_E_AUTH for a certificate that is expired, not yet valid, or unjudgeable -
+ * one code, because the caller sends one alert and an attacker learns nothing from which.
+ * BRISK_E_ARG only for a NULL certificate. With BRISK_X509_TIME_POLICY_INSECURE_NO_TIME the body
+ * is a NULL test and `return BRISK_OK` - the dates are not read, but the call is still a call:
+ * it is a cross-TU symbol and this project does not assume LTO.
+ *
+ * Exposed rather than static because the TLS layer needs the same question answered about a
+ * certificate it did not put in a path (a pinned leaf), and because it is where the policy is
+ * tested. brisk__x509_chain_verify already calls it for every certificate of the path. */
+int brisk__x509_time_ok(const brisk__x509_cert *c, int64_t now);
+
 /* Verify that `child` was signed by the key in `issuer`, and nothing else: the caller owns the
  * name chaining and the CA checks. The digest named by child->sig_hash is taken over
  * child->tbs, then the family in child->sig_alg decides the verifier - which is also where the
@@ -1004,19 +1040,23 @@ typedef int (*brisk__x509_anchor_fn)(void *ctx, const uint8_t *dn, size_t dn_len
 int brisk__x509_signed_by(const brisk__x509_cert *child, const brisk__x509_cert *issuer);
 
 /* certs[0] is the end entity; certs[1..] are whatever else the peer supplied, in any order, and
- * may include certificates that belong to no path at all. `find_anchor` may be NULL, which
+ * may include certificates that belong to no path at all. `now` is the caller's clock in
+ * seconds since the Unix epoch, read by brisk__x509_time_ok under the configured time policy -
+ * an unset clock is a value this function expects, not a caller mistake.
+ * `find_anchor` may be NULL, which
  * means an empty trust store and therefore always BRISK_E_AUTH. n_certs itself is not bounded
  * here - the TLS layer caps the Certificate message it builds the array from - but the WORK is:
  * BRISK__X509_MAX_VERIFY signature verifications in total, however many candidates the peer
  * supplies, so an oversized list costs a scan and not a stall.
  *   BRISK_OK     certs[0] chains to a trust anchor and every signature on the way verified.
- *   BRISK_E_AUTH no such path exists - no anchor was reached, a signature failed, a parent was
+ *   BRISK_E_AUTH no such path exists - no anchor was reached, a signature failed, a certificate
+ *                was outside its validity window, a parent was
  *                not a usable CA, or the walk hit BRISK__X509_MAX_CHAIN or
  *                BRISK__X509_MAX_VERIFY. They are
  *                deliberately one code: an attacker learns nothing from which one it was, and
  *                a TLS caller sends the same alert for all of them.
  *   BRISK_E_ARG  n_certs is 0. */
-int brisk__x509_chain_verify(const brisk__x509_cert *certs, size_t n_certs,
+int brisk__x509_chain_verify(const brisk__x509_cert *certs, size_t n_certs, int64_t now,
                              brisk__x509_anchor_fn find_anchor, void *anchor_ctx);
 
 /* ---- x509/name.c: service identity, i.e. does this certificate speak for this name --------
