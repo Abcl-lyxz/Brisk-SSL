@@ -7,7 +7,7 @@
   python tools/dev.py size [--arch all|mipsel..] [--md] [--save] [--check]
                                                  per-module flash/RAM from the linker map (-Os, static)
   python tools/dev.py ct                         constant-time check: the ct suite under valgrind
-  python tools/dev.py fuzz [--seconds N]         libFuzzer over the DER parser, seeded from der.inc
+  python tools/dev.py fuzz [der|name] [--seconds N]  libFuzzer over a parser, seeded from its .inc
   python tools/dev.py image                      (re)build the brisk-dev Docker image
 
 Docker builds live in the named volume `brisk-build` (fast, and never collide with host builds).
@@ -213,7 +213,9 @@ def cmd_size(archs, md, save, check, jobs):
 # a build type nothing else uses. The seed corpus is not committed: tests/kat/der.inc already
 # holds 874 blobs - real certificate keys and Wycheproof's adversarial ASN.1 - and unpacking them
 # into files beats keeping the same bytes in the tree twice.
-FUZZ = {"der": ("fuzz/fuzz_der.c src/x509/der.c", "tests/kat/der.inc")}
+FUZZ = {"der": ("fuzz/fuzz_der.c src/x509/der.c", "tests/kat/der.inc"),
+        "name": ("fuzz/fuzz_name.c src/x509/name.c src/x509/der.c",
+                 "tests/kat/x509_name.inc")}
 
 
 def fuzz_corpus(inc, out):

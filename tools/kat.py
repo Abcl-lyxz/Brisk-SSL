@@ -11,6 +11,7 @@ import datetime
 import hashlib
 import hmac
 import io
+import ipaddress
 import json
 import random
 import re
@@ -3820,6 +3821,229 @@ def x509_chain_vectors():
     return rows
 
 
+# ------------------------------------------------- X.509 service identity (RFC 9525 names, M2)
+# No official suite exists here either: RFC 9525 carries rules and a few illustrative examples,
+# never a vector file, and x509-limbo (its own ROADMAP item) is the nearest thing. So this is
+# one row per rule src/x509/name.c enforces, with the RFC's own examples folded in where it has
+# them, and the SAN written out as the GeneralNames CONTENTS - exactly the bytes cert.c hands
+# over in brisk__x509_cert.san. want: 0 = BRISK_OK, 1 = BRISK_E_AUTH (no presented identifier
+# matched), 2 = BRISK_E_ARG (the caller's reference identifier is not usable as one).
+
+
+def gn_dns(s):
+    """dNSName [2] IMPLICIT IA5String (RFC 5280 4.2.1.6)."""
+    return x_ctx(2, s if isinstance(s, bytes) else s.encode(), constructed=False)
+
+
+def gn_ip(text):
+    """iPAddress [7] IMPLICIT OCTET STRING: 4 octets for IPv4, 16 for IPv6 (RFC 5280 4.2.1.6).
+    Python's ipaddress is the oracle for the octets, so a typo here is a crash and not a row
+    that quietly tests the wrong address."""
+    return x_ctx(7, ipaddress.ip_address(text).packed, constructed=False)
+
+
+def x509_name_vectors():
+    rows = []
+
+    def row(san, host, want, note):
+        rows.append((b"".join(san).hex(), host, want, note))
+
+    def dns(*names):
+        return [gn_dns(n) for n in names]
+
+    # --- 6.3, exact matching ------------------------------------------------------------------
+    row(dns("www.bigcompany.example"), "www.bigcompany.example", 0, "the identifier itself")
+    row(dns("www.bigcompany.example"), "WWW.BigCompany.Example", 0,
+        "6.3 case-insensitive ASCII, the RFC's own example")
+    row(dns("WWW.BigCompany.Example"), "www.bigcompany.example", 0, "and the other way round")
+    row(dns("www.bigcompany.example"), "web.bigcompany.example", 1, "6.1.2's rejected example")
+    row(dns("www.bigcompany.example"), "bigcompany.example", 1, "a parent is not a match")
+    row(dns("bigcompany.example"), "www.bigcompany.example", 1, "nor is a child")
+    row(dns("www.bigcompany.example.evil.example"), "www.bigcompany.example", 1,
+        "the reference identifier as a PREFIX of a longer presented one")
+    row(dns("evil.example.www.bigcompany.example"), "www.bigcompany.example", 1,
+        "and as a suffix of one")
+    row(dns("a.example", "b.example", "c.example"), "b.example", 0,
+        "7.5: any one of several presented identifiers may match")
+    row(dns("a.example", "b.example"), "c.example", 1, "...and none of them has to")
+    row(dns("my_device.lan"), "my_device.lan", 0,
+        "an underscore: not preferred name syntax, but private PKI issues it and nothing in "
+        "6.3 turns a label alphabet into a matching rule")
+    row(dns("localhost"), "localhost", 0, "a single-label name, which a private PKI does issue")
+
+    # --- 6.3, the wildcard rule ---------------------------------------------------------------
+    row(dns("*.bigcompany.example"), "www.bigcompany.example", 0, "the left-most label")
+    row(dns("*.bigcompany.example"), "WWW.BigCompany.Example", 0, "a wildcard still folds case")
+    row(dns("*.BigCompany.Example"), "www.bigcompany.example", 0, "...from either side")
+    row(dns("*.bigcompany.example"), "bigcompany.example", 1,
+        "6.3: a wildcard matches ONE label, never zero")
+    row(dns("*.bigcompany.example"), "a.b.bigcompany.example", 1, "...and never two")
+    row(dns("*.*.bigcompany.example"), "a.b.bigcompany.example", 1,
+        "6.3 (1): 'There is only one wildcard character'")
+    row(dns("w*.bigcompany.example"), "www.bigcompany.example", 1,
+        "6.3 (2): the complete content of the label, not a prefix of it")
+    row(dns("*w.bigcompany.example"), "ww.bigcompany.example", 1, "...nor a suffix of it")
+    row(dns("www.*.example"), "www.bigcompany.example", 1, "6.3 (2): left-most, not any label")
+    row(dns("*"), "example", 1, "a bare wildcard with no label after it")
+    row(dns("*."), "example", 1, "...and one with an empty label after it")
+    row(dns("*.example"), "www.bigcompany.example", 1, "a wildcard does not waive the suffix")
+    row(dns("*.bigcompany.example"), ".bigcompany.example", 2,
+        "an empty left-most label in the REFERENCE identifier")
+    row(dns("*.bigcompany.example"), "*.bigcompany.example", 2,
+        "6.3: 'This specification covers only wildcard characters in presented identifiers'")
+
+    # --- 6.3, presented identifiers that 'MUST be ignored' ------------------------------------
+    row([gn_dns(b"")], "bigcompany.example", 1, "an empty dNSName")
+    row([gn_dns(b"www.bigcompany.example\x00.evil.example")], "www.bigcompany.example", 1,
+        "an embedded NUL: the classic way to make two parsers read two different names")
+    row([gn_dns(b"www.bigcompany.example\x00")], "www.bigcompany.example", 1,
+        "...including one that only truncates")
+    row([gn_dns(b"www.bigcompany.example\n")], "www.bigcompany.example", 1,
+        "a trailing control character")
+    row([gn_dns(b"www.bigcompany.example ")], "www.bigcompany.example", 1, "a trailing space")
+    row([gn_dns(b"www.bigcompany.example.")], "www.bigcompany.example", 1,
+        "a trailing root dot, which no CA issues and which would need its own comparison rule")
+    row([gn_dns(b".bigcompany.example")], "bigcompany.example", 1, "a leading dot")
+    row([gn_dns(b"www..bigcompany.example")], "www.bigcompany.example", 1, "an empty label")
+    row([gn_dns("hôtel.example".encode())], "xn--htel-fsa.example", 1,
+        "6.3: a U-label is never matched - the comparison is over A-labels only")
+    row(dns("xn--htel-fsa.example"), "xn--htel-fsa.example", 0, "...and an A-label is ASCII")
+    row(dns("xn--htel-fsa.example"), "hôtel.example", 2,
+        "6.3: the caller owes the A-label; this library does not implement IDNA")
+    row(dns("a" * 64 + ".example"), "a" * 64 + ".example", 2,
+        "a label over 63 octets (RFC 1035 2.3.4)")
+    long_name = ".".join(["abcdefgh"] * 29)  # 260 octets
+    row(dns(long_name), long_name, 2, "a name over 255 octets (RFC 1035 2.3.4)")
+    row([], "www.bigcompany.example", 1, "an empty GeneralNames")
+    # 6.3 says an invalid presented identifier "MUST be ignored", which is a statement about
+    # what happens NEXT: every row above has the bad entry alone, so it cannot tell "ignored it
+    # and kept looking" from "aborted the whole search". These can.
+    row([gn_dns(b"*.*.bigcompany.example"), gn_dns("www.bigcompany.example")],
+        "www.bigcompany.example", 0,
+        "6.3: an invalid presented identifier is IGNORED - the search continues past it")
+    row([gn_dns(b"www.bigcompany.example\x00.evil.example"), gn_dns("www.bigcompany.example")],
+        "www.bigcompany.example", 0, "...the same for an embedded NUL")
+    row([gn_dns("a" * 64 + ".example"), gn_dns("www.bigcompany.example")],
+        "www.bigcompany.example", 0, "...and for an over-long label")
+
+    # --- 7.4, spellings of an IPv4 address that are not IP-IDs and must not become DNS-IDs ----
+    for text in ("010.0.0.1", "0x7f.0.0.1", "127.1", "2130706433", "1.2.3.4.5", "192.0.2.107.5"):
+        row(dns(text), text, 2,
+            "7.4: a resolver reads this as an address, so it is not a reference identifier "
+            "this library will treat as a name either")
+    row(dns("3com.example"), "3com.example", 0, "a leading digit is a label, not an address")
+    row(dns("v6.example.1a"), "v6.example.1a", 0, "...and so is a last label that only starts "
+                                                  "with one")
+
+    # --- 1.3 and 6.2: only a dNSName carries a DNS-ID -----------------------------------------
+    row([x_ctx(1, b"admin@bigcompany.example", constructed=False),
+         gn_dns("www.bigcompany.example")], "www.bigcompany.example", 0,
+        "an rfc822Name [1] ahead of the match: skipped, not compared")
+    row([x_ctx(1, b"www.bigcompany.example", constructed=False)], "www.bigcompany.example", 1,
+        "1.3: 'Only check DNS domain names via the subjectAltName extension designed for that "
+        "purpose: dNSName'")
+    row([x_ctx(6, b"https://www.bigcompany.example/", constructed=False)],
+        "www.bigcompany.example", 1, "a URI-ID is not a DNS-ID, and URI-IDs are not implemented")
+    row([x_ctx(0, x_seq(x_oid("1.3.6.1.5.5.7.8.7"),
+                        x_ctx(0, der_tlv(0x16, b"_imaps.isp.example"))))], "isp.example", 1,
+        "an otherName SRV-ID: a constructed entry, skipped whole")
+    row([x_ctx(4, x_name("www.bigcompany.example"))], "www.bigcompany.example", 1,
+        "a directoryName holding the same string")
+    row([x_ctx(4, x_name("www.bigcompany.example")), gn_dns("www.bigcompany.example")],
+        "www.bigcompany.example", 0, "...and the walk still reaches the dNSName after it")
+
+    # --- 6.4, IP-IDs --------------------------------------------------------------------------
+    row([gn_ip("192.0.2.107")], "192.0.2.107", 0, "6.1.2's IPv4 example")
+    row([gn_ip("192.0.2.107")], "192.0.2.108", 1, "6.4 is octet-for-octet")
+    row([gn_ip("2001:db8::abcd")], "2001:db8::abcd", 0, "6.1.2's IPv6 example")
+    row([gn_ip("2001:db8::abcd")], "2001:DB8:0:0:0:0:0:ABCD", 0,
+        "a different text form of the same 16 octets")
+    row([gn_ip("192.0.2.107"), gn_dns("www.bigcompany.example")], "www.bigcompany.example", 0,
+        "an iPAddress ahead of the dNSName that matches")
+    row([gn_dns("192.0.2.107")], "192.0.2.107", 1,
+        "7.4: an IP literal is classified ONCE, and a dNSName never answers an IP-ID")
+    row([gn_ip("192.0.2.107")], "www.bigcompany.example", 1, "nor an iPAddress a DNS-ID")
+    row(dns("*.0.2.107"), "192.0.2.107", 1, "a wildcard never applies to an IP-ID")
+    row([x_ctx(7, ipaddress.ip_address("192.0.2.107").packed + b"\xff\xff\xff\xff",
+               constructed=False)], "192.0.2.107", 1,
+        "an 8-octet iPAddress: a name-constraints CIDR, never a SAN entry (RFC 5280 4.2.1.10)")
+    row([x_ctx(7, b"", constructed=False)], "192.0.2.107", 1, "an empty iPAddress")
+    row([gn_ip("::ffff:192.0.2.107")], "192.0.2.107", 1,
+        "an IPv4-mapped entry is 16 octets and never equals a 4-octet IP-ID")
+    row([gn_ip("::ffff:192.0.2.107")], "::ffff:192.0.2.107", 0,
+        "...but it does equal the literal that produced it")
+    row([gn_ip("192.0.2.107")], "192.0.2.107.", 0,
+        "one trailing root dot comes off the reference identifier BEFORE it is classified, so "
+        "this is still an IP-ID")
+    row([gn_dns("192.0.2.107")], "192.0.2.107.", 1, "...and still never a DNS-ID")
+
+    print(f"  x509 names: {sum(1 for r in rows if r[2] == 0)} matches, "
+          f"{sum(1 for r in rows if r[2] != 0)} refusals")
+    return rows
+
+
+def x509_ip_vectors():
+    """brisk__x509_parse_ip on its own. Python's ipaddress is the oracle for every ACCEPTED
+    row - the octets below are its output, not typed by hand. The rejects are a local profile
+    and are deliberately NOT cross-checked against it: ipaddress takes scope identifiers
+    (fe80::1%eth0) and this parser must not, because no certificate can carry a zone."""
+    rows = []
+    ok = ["0.0.0.0", "255.255.255.255", "192.0.2.107", "1.2.3.4", "127.0.0.1",
+          "::", "::1", "2001:db8::abcd", "2001:0db8:0000:0000:0000:0000:0000:abcd",
+          "2001:DB8::ABCD", "fe80::1", "1:2:3:4:5:6:7:8", "1::8", "1:2:3:4:5:6:7::",
+          "::2:3:4:5:6:7:8", "::ffff:192.0.2.107", "64:ff9b::192.0.2.107",
+          "1:2:3:4:5:6:1.2.3.4"]
+    for text in ok:
+        rows.append((text, ipaddress.ip_address(text).packed.hex(), "accepted"))
+
+    bad = [
+        ("", "the empty string"),
+        ("1.2.3", "three groups"),
+        ("1.2.3.4.5", "five"),
+        ("1.2.3.4.", "a trailing dot"),
+        (".1.2.3.4", "a leading dot"),
+        ("1..2.3", "an empty group"),
+        ("1.2.3.256", "a group over 255"),
+        ("1.2.3.4444", "a group of four digits"),
+        ("01.2.3.4", "a leading zero, which some resolvers read as octal (7.4)"),
+        ("1.2.3.04", "...in any group"),
+        ("1.2.3.+4", "a sign"),
+        (" 1.2.3.4", "a leading space"),
+        ("1.2.3.4 ", "a trailing space"),
+        ("0x7f.0.0.1", "hexadecimal"),
+        ("1.2.3.4:443", "a port"),
+        (":", "a lone colon"),
+        (":::", "three colons"),
+        (":1:2:3:4:5:6:7:8", "one leading colon"),
+        ("1:2:3:4:5:6:7:8:", "one trailing colon"),
+        ("1:2:3:4:5:6:7:8:9", "nine groups"),
+        ("1:2:3:4:5:6:7", "seven groups and no ::"),
+        ("1::2::3", "two :: runs"),
+        ("1:2:3:4:5:6:7:8::", ":: standing for no group at all"),
+        ("12345::", "a group of five hex digits"),
+        ("1::g", "a non-hex digit"),
+        ("fe80::1%eth0", "a scope identifier"),
+        ("[2001:db8::1]", "the URI bracket form (RFC 3986 3.2.2)"),
+        ("::ffff:1.2.3", "a short IPv4 tail"),
+        ("::ffff:192.0.2.107:1", "an IPv4 tail that is not last"),
+        ("1:2:3:4:5:6:7:1.2.3.4", "an IPv4 tail one group too far"),
+        ("www.example", "a host name"),
+    ]
+    for text, note in bad:
+        rows.append((text, "", note))
+    print(f"  x509 ip literals: {len(ok)} accepted, {len(bad)} rejected")
+    return rows
+
+
+def cesc(s):
+    """A C string body. A row whose whole point is a non-ASCII octet (a U-label reference) is
+    written out as escapes, so neither an editor nor -finput-charset can change what it tests;
+    escaping EVERY octet of such a string is what keeps a hex escape unambiguous."""
+    if all(0x20 <= ord(ch) < 0x7f and ch not in ('"', "\\") for ch in s):
+        return s
+    return "".join("\\x%02x" % b for b in s.encode())
+
+
 def cstr(hx, width=96):
     if not hx:
         return '""'
@@ -3932,6 +4156,8 @@ def main():
     RSA_CHAIN_KEY = rsa_odd_modbits_key(2049)
     x509_chains = x509_chain_vectors()
     x509_sigs = x509_sig_vectors()
+    x509_names = x509_name_vectors()
+    x509_ips = x509_ip_vectors()
 
     emit("sha2.inc", "struct hash_kat SHA2_KAT", cavp + dhash, lambda r: f"{r[0]}, {cstr(r[1])}, {cstr(r[2])}")
     emit("sha2_monte.inc", "struct monte_kat SHA2_MONTE", monte,
@@ -4018,6 +4244,10 @@ def main():
                    + f'{r[2]}, {r[3]}, "{r[4]}"')
     emit("x509_sig.inc", "struct sig_kat X509_SIG_KAT", x509_sigs,
          lambda r: f'{cstr(r[0])}, {cstr(r[1])}, {r[2]}, {r[3]}, "{r[4]}"')
+    emit("x509_name.inc", "struct name_kat X509_NAME_KAT", x509_names,
+         lambda r: f'{cstr(r[0])}, "{cesc(r[1])}", {r[2]}, "{r[3]}"')
+    emit("x509_ip.inc", "struct ip_kat X509_IP_KAT", x509_ips,
+         lambda r: f'"{r[0]}", {cstr(r[1])}, "{r[2]}"')
 
     rows = "\n".join(f"| {k} | {u} | `{h}` |" for k, (u, h) in sorted(fetched.items()))
     (OUT / "SOURCES.md").write_text(

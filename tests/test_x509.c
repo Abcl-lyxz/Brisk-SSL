@@ -19,6 +19,21 @@ struct x509_time_kat {
 };
 #include "kat/x509_time.inc"
 
+struct name_kat {
+    const char *san; /* the GeneralNames CONTENTS, i.e. brisk__x509_cert.san */
+    const char *host;
+    int want; /* 0 = BRISK_OK, 1 = BRISK_E_AUTH, 2 = BRISK_E_ARG */
+    const char *note;
+};
+#include "kat/x509_name.inc"
+
+struct ip_kat {
+    const char *text;
+    const char *want; /* the octets, or "" when the literal must be refused */
+    const char *note;
+};
+#include "kat/x509_ip.inc"
+
 struct cert_kat {
     const char *der;
     int reject;
@@ -33,6 +48,8 @@ struct cert_kat {
 #include "kat/x509_cert.inc"
 
 #define TIME_N   (sizeof X509_TIME_KAT / sizeof X509_TIME_KAT[0])
+#define NAME_N   (sizeof X509_NAME_KAT / sizeof X509_NAME_KAT[0])
+#define IP_N     (sizeof X509_IP_KAT / sizeof X509_IP_KAT[0])
 #define CERT_N   (sizeof X509_CERT_KAT / sizeof X509_CERT_KAT[0])
 #define CERT_CAP 8192
 
@@ -368,6 +385,76 @@ static void t_sig(void)
     }
 }
 
+/* RFC 9525 matching, one row per rule (src/x509/name.c). The vector carries only the SAN,
+ * because that is all the matcher is allowed to look at: the rest of the certificate is left
+ * zeroed on purpose, so a rule that quietly consulted the subject or the validity dates would
+ * read a NULL here rather than pass. */
+static void t_name(void)
+{
+    static uint8_t san[1025];
+    size_t i;
+
+    for (i = 0; i < NAME_N; i++) {
+        const struct name_kat *k = &X509_NAME_KAT[i];
+        brisk__x509_cert c;
+        size_t n = t_unhex(k->san, san + 1, sizeof san - 1);
+        int want = (k->want == 0) ? BRISK_OK : (k->want == 1) ? BRISK_E_AUTH : BRISK_E_ARG;
+
+        memset(&c, 0, sizeof c);
+        c.san = san + 1; /* unaligned on purpose */
+        c.san_len = n;
+        CHECKI(brisk__x509_match_host(&c, k->host, strlen(k->host)) == want, i);
+    }
+}
+
+/* The two rules no SAN vector can carry: a certificate with no subjectAltName at all, and RFC
+ * 9525 1.3's ban on falling back to the subject. The fixture is written out rather than
+ * generated because it is one GeneralName and its point is that it is NOT the reference. */
+static void t_name_args(void)
+{
+    static const char host[] = "device.example.com";
+    static const uint8_t other[] = {0x82, 0x09, 'o', 't', 'h', 'e', 'r', '.', 'c', 'o', 'm'};
+    brisk__x509_cert c;
+
+    memset(&c, 0, sizeof c);
+    CHECK(brisk__x509_match_host(NULL, host, strlen(host)) == BRISK_E_ARG);
+    CHECK(brisk__x509_match_host(&c, NULL, 0) == BRISK_E_ARG);
+    CHECK(brisk__x509_match_host(&c, host, 0) == BRISK_E_ARG);
+    CHECK(brisk__x509_match_host(&c, ".", 1) == BRISK_E_ARG);
+    CHECK(brisk__x509_match_host(&c, host, strlen(host)) == BRISK_E_AUTH); /* no SAN at all */
+
+    /* A subject that IS the reference identifier, over a SAN that is not: the answer must not
+     * change. */
+    c.san = other;
+    c.san_len = sizeof other;
+    c.subject = (const uint8_t *)host;
+    c.subject_len = strlen(host);
+    CHECK(brisk__x509_match_host(&c, host, strlen(host)) == BRISK_E_AUTH);
+    CHECK(brisk__x509_match_host(&c, "other.com", 9) == BRISK_OK);
+    CHECK(brisk__x509_match_host(&c, "other.com.", 10) == BRISK_OK); /* one root dot, stripped */
+}
+
+/* brisk__x509_parse_ip: the classifier both the matcher and (later) SNI hang off. */
+static void t_ip(void)
+{
+    size_t i;
+
+    for (i = 0; i < IP_N; i++) {
+        const struct ip_kat *k = &X509_IP_KAT[i];
+        uint8_t want[16], got[16];
+        size_t n = t_unhex(k->want, want, sizeof want);
+        size_t rc = brisk__x509_parse_ip(k->text, strlen(k->text), got);
+
+        CHECKI(rc == n, i);
+        if (rc == n && n > 0) {
+            CHECKI(memcmp(got, want, n) == 0, i);
+        }
+    }
+    CHECK(brisk__x509_parse_ip(NULL, 4, NULL) == 0);
+    /* Not NUL-terminated and not NUL-scanned: the length is the only thing that ends it. */
+    CHECK(brisk__x509_parse_ip("192.0.2.1junk", 9, (uint8_t[16]){0}) == 4);
+}
+
 void test_x509(void)
 {
     t_time();
@@ -378,4 +465,7 @@ void test_x509(void)
     t_chain_args();
     t_signed_by();
     t_sig();
+    t_name();
+    t_name_args();
+    t_ip();
 }

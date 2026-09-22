@@ -1019,6 +1019,106 @@ int brisk__x509_signed_by(const brisk__x509_cert *child, const brisk__x509_cert 
 int brisk__x509_chain_verify(const brisk__x509_cert *certs, size_t n_certs,
                              brisk__x509_anchor_fn find_anchor, void *anchor_ctx);
 
+/* ---- x509/name.c: service identity, i.e. does this certificate speak for this name --------
+ *
+ * RFC 9525 (which obsoletes RFC 6125), from the point of view of a client that has ONE
+ * reference identifier: a host name or an IP literal, whatever the user configured. The
+ * certificate chain says the peer holds a key some CA vouched for; this says the peer is the
+ * host that was asked for. Both are required and neither implies the other.
+ *
+ * WHAT IS MATCHED:
+ *   - a DNS-ID against every dNSName [2] in subjectAltName, case-insensitive ASCII (6.3). Both
+ *     sides have passed the same shape check by then, so "each label MUST match" is one length
+ *     test and one byte-wise fold, not a label walk.
+ *   - a wildcard in a PRESENTED identifier, under 6.3's two requirements: one wildcard
+ *     character, and only as the complete content of the left-most label. It consumes exactly
+ *     one reference label, so *.a.example is x.a.example and is neither a.example nor
+ *     x.y.a.example.
+ *   - an IP-ID against every iPAddress [7], "octet-for-octet" (6.4), 4 octets for IPv4 and 16
+ *     for IPv6. The reference identifier is classified ONCE, by brisk__x509_parse_ip: a string
+ *     that parses as an address is an IP-ID and is never compared against a dNSName, and one
+ *     that does not is a DNS-ID and is never compared against an iPAddress. 7.4 is a section
+ *     about precisely the bug where two components classify the same string differently.
+ *
+ * WHAT IS REFUSED, and the first one is the reason this module exists:
+ *   - the subject Common Name, always. 1.3: "Do not include or check strings that look like
+ *     domain names in the subject's Common Name." A certificate with no subjectAltName has no
+ *     identity here, whatever its subject says, and there is no opt-out knob.
+ *   - a presented identifier outside the LDH alphabet plus '_' and the label separator, which
+ *     is where the embedded NUL, the control character and the raw UTF-8 U-label are stopped.
+ *     The rule is 2: "any characters outside the range described in [US-ASCII] are prohibited,
+ *     and internationalized domain labels are represented as A-labels". An identifier this
+ *     client will not compare is simply not a match and the search moves on to the next entry
+ *     - which is also what 6.3 requires of an invalid WILDCARD ("the presented identifier is
+ *     invalid and MUST be ignored"), and what the multi-entry vectors pin down.
+ *   - a reference identifier whose right-most label is all digits - 010.0.0.1, 127.1,
+ *     2130706433, 0x7f.0.0.1. RFC 1123 2.1 gives no real host name an all-numeric top label,
+ *     while a resolver turns every one of those into an address: accepting them as DNS-IDs
+ *     would be the split classification 7.4 warns about, with the socket on an address and the
+ *     matcher on a name. BRISK_E_ARG, so the caller writes the address it means.
+ *   - an empty label, a leading dot or a trailing root dot in a presented identifier, a label
+ *     over 63 octets and a name over 255 (RFC 1035 2.3.4).
+ *   - a wildcard that is not the whole left-most label (w*.a.example, *w.a.example,
+ *     a.*.example), or that appears twice (*.*.a.example).
+ *   - a wildcard in the REFERENCE identifier, with BRISK_E_ARG: 6.3 covers wildcards in
+ *     presented identifiers only, so a caller that passes one is asking a question this
+ *     document does not define.
+ *   - a reference identifier that is not a usable one at all - empty, over 255 octets, outside
+ *     the alphabet (a U-label included: A-labels are the caller's job, see below) - with
+ *     BRISK_E_ARG, so a configuration mistake is not reported as an authentication failure.
+ *
+ * NOT IMPLEMENTED, on purpose, and each one fails closed:
+ *   - SRV-IDs and URI-IDs (1.3, 7.2). An otherName or uniformResourceIdentifier entry is
+ *     skipped like any other GeneralName, so a certificate that carries only those does not
+ *     match. This is a TLS library for devices that connect to a configured host, not an XMPP
+ *     or SIP stack; the day one needs an SRV-ID, it is a new entry tag in the same loop.
+ *   - IDNA. 6.3 requires U-labels to be converted to A-labels BEFORE comparison, and a
+ *     punycode encoder plus the IDNA 2008 tables is larger than this whole module. The caller
+ *     owes an A-label; a reference identifier with a non-ASCII octet is BRISK_E_ARG rather
+ *     than a comparison that would silently never match.
+ *   - public suffix protection: a presented *.com or *.co.uk is accepted as a wildcard, and
+ *     7.1 puts that "beyond the scope of this document". A list of suffixes does not belong in
+ *     a 60 KB library, and name constraints are the mechanism a private PKI should use.
+ *   - the application service type of 6.5, which needs an SRV-ID or a URI-ID to begin with.
+ *
+ * The caller owns the ORDER of the two checks, and both are required: brisk__x509_chain_verify
+ * says the key is vouched for, this says the name is right. Neither reads the other's verdict.
+ */
+/* RFC 1035 2.3.4: 255 octets for a whole name, 63 for one label. A presentation-form name is
+ * not quite the wire form these bound, but no real name comes near either, and a ceiling is
+ * what keeps a pathological SAN entry from costing a long scan. */
+#define BRISK__X509_MAX_NAME  255
+#define BRISK__X509_MAX_LABEL 63
+
+/* An IPv4 or IPv6 literal in presentation form as the octets an iPAddress SAN entry holds.
+ * Returns 4, 16, or 0 when `s` is not an address - which is also how a caller asks "is this
+ * string a host name?", and the ONLY place that question is answered (RFC 9525 7.4). `out`
+ * needs room for 16 octets and holds nothing meaningful unless 4 or 16 comes back.
+ *
+ * Accepted: dotted-quad IPv4 with no leading zeros (010.0.0.1 is octal to some resolvers and
+ * decimal to others, so it is refused rather than guessed), and the three RFC 4291 2.2 forms
+ * of IPv6 including one "::" run and a dotted-quad tail. Refused: a scope identifier
+ * (fe80::1%eth0), the URI bracket form ([2001:db8::1]), and any surrounding space - none of
+ * them can appear in a certificate, so accepting them would only widen what counts as an
+ * IP-ID. Not constant time and it does not need to be: a host name is public. */
+size_t brisk__x509_parse_ip(const char *s, size_t len, uint8_t *out);
+
+/* Does `c` speak for `host`? `host` is a reference identifier of exactly one kind - a host name
+ * or an IP literal, in presentation form, NOT NUL-terminated (host_len decides), and one
+ * trailing root dot is stripped from it before anything else. `c` must have come from
+ * brisk__x509_parse, whose brisk__der_walk gate is what lets the SAN entries be read here
+ * without re-validating their headers.
+ *   BRISK_OK     some presented identifier matched.
+ *   BRISK_E_AUTH none did, or the certificate has no subjectAltName at all. A TLS caller turns
+ *                this into a fatal alert; it is the same code a failed chain gives, because
+ *                the peer is not the host either way.
+ *   BRISK_E_ARG  `host` is not a usable reference identifier - NULL, empty, over 255 octets, a
+ *                label over 63 or an empty one (so a leading dot or "www..example" too),
+ *                outside the DNS alphabet, a wildcard, or an all-digit right-most label. That
+ *                is the caller's bug, not the peer's, which is why it is not folded into
+ *                BRISK_E_AUTH. */
+int brisk__x509_match_host(const brisk__x509_cert *c, const char *host, size_t host_len);
+
 /* ---- os/linux_rand.c (Linux builds only): the only randomness source, no userspace DRBG ---- */
 /* len bytes from the kernel CSPRNG: getrandom(2), which blocks until the pool is initialised.
  * Only on kernels older than 4.8 that lack it (ENOSYS) or filter it (EPERM): wait once for

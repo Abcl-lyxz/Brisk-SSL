@@ -23,6 +23,7 @@ add_library(brisk STATIC
     src/x509/der.c        # strict DER reader (ITU-T X.690), the X.509 foundation
     src/x509/cert.c       # one certificate: fields, extensions, validity dates
     src/x509/chain.c      # path building to a trust anchor + the signature checks
+    src/x509/name.c       # RFC 9525 service identity: host name / IP against the SAN
 )
 if(CMAKE_SYSTEM_NAME STREQUAL "Linux") # src/os/ is Linux-only; the mingw host skips it
     target_sources(brisk PRIVATE src/os/linux_rand.c)

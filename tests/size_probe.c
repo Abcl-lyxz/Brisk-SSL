@@ -102,6 +102,8 @@ int main(int argc, char **argv)
         brisk__x509_time(BRISK__DER_UTC_TIME, out, sizeof out, &when);
         brisk__x509_chain_verify(&xc, 1, NULL, NULL);
         brisk__x509_signed_by(&xc, &xc);
+        brisk__x509_match_host(&xc, "a.example", 9);
+        brisk__x509_parse_ip("192.0.2.1", 9, out);
     }
 #ifdef __linux__
     brisk__os_random(out, 32);
