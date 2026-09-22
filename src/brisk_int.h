@@ -811,8 +811,8 @@ int brisk__der_walk(const uint8_t *der, size_t len);
  *
  * Not checked here, on purpose: the signature (brisk__x509_signed_by), whether `now` is inside
  * the validity window (brisk__x509_time_ok owns the STRICT / FLOOR / INSECURE_NO_TIME
- * decision), hostname and IP matching (brisk__x509_match_host), and the alphabet of any string - this module never looks
- * inside a Name or a GeneralName, it only records where they are.
+ * decision), hostname and IP matching (brisk__x509_match_host), and the alphabet of any string -
+ * this module never looks inside a Name or a GeneralName, it only records where they are.
  *
  * One residual worth naming: a NON-critical nameConstraints, policyConstraints or
  * inhibitAnyPolicy is ignored, although RFC 5280 4.2 says conforming applications MUST
@@ -1001,6 +1001,34 @@ int brisk__x509_time(unsigned tag, const uint8_t *v, size_t len, int64_t *out);
 typedef int (*brisk__x509_anchor_fn)(void *ctx, const uint8_t *dn, size_t dn_len, size_t index,
                                      brisk__x509_cert *out);
 
+/* Everything the walk is told to trust: a store to look anchors up in, and an optional set of
+ * SPKI pins. One struct and not four arguments because these are one decision - "what does this
+ * connection trust" - and M3 keeps exactly one of them per client config.
+ *
+ * A PIN is sha256 over a certificate's whole SubjectPublicKeyInfo TLV (brisk__x509_cert.spki),
+ * the same preimage as RFC 7469's Base64(SHA-256(SPKI)) without the base64, so a pin published
+ * for HPKP or generated with `openssl x509 -pubkey | openssl dgst -sha256` transfers unchanged.
+ *
+ * Pins are ADDITIVE: with n_pins > 0 a path must both chain to an anchor AND carry at least one
+ * pinned SubjectPublicKeyInfo. They can only ever REFUSE a connection an unpinned build would
+ * have accepted - there is no code path where a pin supplies trust the chain did not, which is
+ * what keeps "pinned" from quietly meaning "unverified but familiar".
+ *
+ * Only certificates the walk COMMITS to count: the end entity, each parent it chose, and the
+ * anchor it stopped at. A peer that appends the real pinned root to its Certificate message
+ * does not thereby satisfy the pin, because that copy is on no path.
+ *
+ * Pin ROOTS. A leaf or an intermediate is a moving target - Let's Encrypt rotates intermediates
+ * and certificate lifetimes drop to 47 days by 2029 - and a pin that outlives its key is an
+ * outage no server-side fix can reach. Pinning them is allowed here because a private PKI with
+ * one long-lived leaf is a real IoT shape, not because it is the safe default. */
+typedef struct {
+    brisk__x509_anchor_fn find_anchor; /* NULL = an empty trust store, so nothing can verify */
+    void *anchor_ctx;
+    const uint8_t (*pins)[BRISK_SHA256_LEN]; /* n_pins sha256 digests; NULL = no pinning */
+    size_t n_pins;
+} brisk__x509_trust;
+
 /* Is `now` inside this certificate's validity window, under the policy the build was configured
  * with? `now` is int64 seconds since the Unix epoch, straight from whatever clock the caller has
  * - a device that has never been told the time passes what it believes, usually something near
@@ -1043,7 +1071,7 @@ int brisk__x509_signed_by(const brisk__x509_cert *child, const brisk__x509_cert 
  * may include certificates that belong to no path at all. `now` is the caller's clock in
  * seconds since the Unix epoch, read by brisk__x509_time_ok under the configured time policy -
  * an unset clock is a value this function expects, not a caller mistake.
- * `find_anchor` may be NULL, which
+ * `trust` may be NULL, and so may trust->find_anchor, either of which
  * means an empty trust store and therefore always BRISK_E_AUTH. n_certs itself is not bounded
  * here - the TLS layer caps the Certificate message it builds the array from - but the WORK is:
  * BRISK__X509_MAX_VERIFY signature verifications in total, however many candidates the peer
@@ -1051,13 +1079,70 @@ int brisk__x509_signed_by(const brisk__x509_cert *child, const brisk__x509_cert 
  *   BRISK_OK     certs[0] chains to a trust anchor and every signature on the way verified.
  *   BRISK_E_AUTH no such path exists - no anchor was reached, a signature failed, a certificate
  *                was outside its validity window, a parent was
- *                not a usable CA, or the walk hit BRISK__X509_MAX_CHAIN or
- *                BRISK__X509_MAX_VERIFY. They are
+ *                not a usable CA, no certificate on the path matched a pin, or the walk hit
+ *                BRISK__X509_MAX_CHAIN or BRISK__X509_MAX_VERIFY. They are
  *                deliberately one code: an attacker learns nothing from which one it was, and
  *                a TLS caller sends the same alert for all of them.
  *   BRISK_E_ARG  n_certs is 0. */
 int brisk__x509_chain_verify(const brisk__x509_cert *certs, size_t n_certs, int64_t now,
-                             brisk__x509_anchor_fn find_anchor, void *anchor_ctx);
+                             const brisk__x509_trust *trust);
+
+/* ---- x509/bundle.c: PEM certificates out of a byte stream, sans-I/O ------------------------
+ *
+ * A CA bundle is a 200 KB text file with ~140 roots in it, and an IoT gateway is not going to
+ * hold that in RAM to answer one lookup. So this decodes ONE certificate at a time out of
+ * whatever slice of the file the caller happens to have read: feed bytes in, take a certificate
+ * out, feed the rest. All the state is in the struct, so a certificate may straddle any number
+ * of read() boundaries - which is also what makes the decoder testable without a filesystem,
+ * and why the syscalls live in os/linux_ca.c instead of here.
+ *
+ * WHAT IT ACCEPTS (RFC 7468 4, read leniently, because the file belongs to root and the
+ * certificates in it are verified afterwards anyway):
+ *   - "-----BEGIN CERTIFICATE-----" AT THE START OF A LINE (RFC 7468 3), then base64, then
+ *     "-----END CERTIFICATE-----". The END line is not spelled out: the first '-' after the
+ *     body ends it, which is also what recovers a block truncated mid-file. The line anchor is
+ *     what keeps this from being a parser DIFFERENTIAL against OpenSSL's PEM_read_bio, which
+ *     anchors too - an indented block that only Brisk could see would be a trust anchor no
+ *     tooling an integrator audits the bundle with would ever show them.
+ *   - anything between blocks, which is how the human-readable subject headers Debian's
+ *     ca-certificates.crt and Mozilla's PEM export put above each certificate are skipped.
+ *   - other PEM labels - a private key, a CRL, "TRUSTED CERTIFICATE" - are not certificates and
+ *     never start a block, because the BEGIN line is matched whole.
+ *   - '=', CR, LF, space and tab inside the body, ignored wherever they fall.
+ *
+ * A DELIBERATE deviation: RFC 7468 2 says parsers "SHOULD ignore whitespace and other
+ * non-base64 characters", and this drops the whole block instead. RFC 4648 3.3 is the other
+ * half of that tension ("MUST reject the encoded data if it contains characters outside the
+ * base alphabet") and it is the right half for a trust store - a stray byte that silently
+ * shifted a root's bytes is not a root anyone chose. The cost is availability, never trust:
+ * a dropped block is a root that is not there.
+ * A block whose base64 holds any other byte, or whose DER is longer than
+ * BRISK__X509_ANCHOR_MAX, is DROPPED and the scan resumes at the next BEGIN - one unreadable
+ * entry in a bundle must not cost the other 139. Nothing here judges the DER: a dropped block
+ * and a block that decodes to garbage are both the caller's problem, and the caller is
+ * brisk__x509_parse. */
+#define BRISK__X509_ANCHOR_MAX 2048 /* a 4096-bit RSA root is ~1.4 KB (ISRG Root X1: 1391 B) */
+
+typedef struct {
+    uint8_t der[BRISK__X509_ANCHOR_MAX]; /* the certificate just decoded, der_len bytes */
+    size_t der_len;
+    uint32_t acc;  /* base64 bit accumulator; only its low `bits` + 6 bits ever matter */
+    uint8_t bits;  /* bits held in acc, 0..6 */
+    uint8_t tok;   /* how much of the BEGIN line has matched so far */
+    uint8_t state; /* 0 = looking for a BEGIN line, 1 = decoding a body */
+    uint8_t over;  /* this body has already outgrown der[], so drop it at the END line */
+    uint8_t bol;   /* the next byte starts a line, so a BEGIN line may begin there */
+} brisk__x509_pem;
+
+void brisk__x509_pem_init(brisk__x509_pem *p);
+
+/* Consume bytes from **in until a certificate is complete or the input runs out. On return *in
+ * points at the first byte NOT consumed and *len is how many are left, so the same call is made
+ * again to collect a second certificate from the same buffer.
+ *   1  p->der[0..p->der_len) is a complete block, valid until the next call.
+ *   0  the input is exhausted; hand over more, or stop.
+ * There is no error return: a malformed block is skipped, not reported (see above). */
+int brisk__x509_pem_feed(brisk__x509_pem *p, const uint8_t **in, size_t *len);
 
 /* ---- x509/name.c: service identity, i.e. does this certificate speak for this name --------
  *
@@ -1170,5 +1255,37 @@ int brisk__os_random(uint8_t *out, size_t len);
 #define BRISK__RAND_FALLBACK 1
 int brisk__os_getrandom(uint8_t *out, size_t len);
 int brisk__os_urandom(uint8_t *out, size_t len);
+
+/* ---- os/linux_ca.c (Linux builds only): the system CA bundle as a trust store --------------
+ *
+ * The distribution's PEM bundle, used LAZILY: every lookup opens the file, scans it for a
+ * subject Name and closes it again. That is one open() and one pass over ~200 KB per anchor
+ * asked for, against ~350 KB of RAM to hold every root parsed - on the hardware this library
+ * targets that trade is not close, and the walk asks for an anchor a handful of times per
+ * handshake. The page cache does the rest.
+ *
+ * ponytail: the file is re-opened and re-scanned for every `index` of every lookup, so N roots
+ * sharing one Name cost N passes. N is at most BRISK__X509_MAX_ANCHORS and in practice 1.
+ * Cache the offset of the last hit if a profile ever shows this. */
+typedef struct {
+    /* The bundle to read. NULL means "find one", and the first lookup fills this in with the
+     * first readable path of the list in linux_ca.c, so the search happens once. Set it
+     * yourself to pin a private bundle and no autodetection runs at all. */
+    const char *path;
+    brisk__x509_pem pem; /* decode scratch; the anchor handed back points INTO it */
+} brisk__x509_bundle;
+
+/* The first readable well-known CA bundle path, or NULL when the device has none. The string is
+ * static storage, never freed. Only the presence of the file is checked here - an unreadable or
+ * empty bundle is indistinguishable from one that holds no matching root, and both end as
+ * BRISK_E_AUTH from the walk. */
+const char *brisk__os_ca_path(void);
+
+/* A brisk__x509_anchor_fn over a brisk__x509_bundle (passed as `ctx`). `*out` stays valid until
+ * the next call with the same ctx, which is exactly as long as brisk__x509_chain_verify uses
+ * it. BRISK_OK, or BRISK_E_ARG for "no more" - including a bundle that could not be found or
+ * opened at all. */
+int brisk__os_ca_anchor(void *ctx, const uint8_t *dn, size_t dn_len, size_t index,
+                        brisk__x509_cert *out);
 
 #endif /* BRISK_INT_H */

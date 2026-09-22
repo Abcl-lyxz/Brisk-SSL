@@ -29,9 +29,10 @@ add_library(brisk STATIC
     src/x509/cert.c       # one certificate: fields, extensions, validity dates
     src/x509/chain.c      # path building to a trust anchor + the signature checks
     src/x509/name.c       # RFC 9525 service identity: host name / IP against the SAN
+    src/x509/bundle.c     # PEM certificates out of a byte stream, sans-I/O
 )
 if(CMAKE_SYSTEM_NAME STREQUAL "Linux") # src/os/ is Linux-only; the mingw host skips it
-    target_sources(brisk PRIVATE src/os/linux_rand.c)
+    target_sources(brisk PRIVATE src/os/linux_rand.c src/os/linux_ca.c)
 endif()
 set_target_properties(brisk PROPERTIES C_STANDARD 99 C_STANDARD_REQUIRED ON C_EXTENSIONS OFF
                                        C_VISIBILITY_PRESET hidden)

@@ -98,9 +98,20 @@ int main(int argc, char **argv)
     {
         brisk__x509_cert xc;
         int64_t when;
+        brisk__x509_trust trust;
         brisk__x509_parse(&xc, out, sizeof out);
         brisk__x509_time(BRISK__DER_UTC_TIME, out, sizeof out, &when);
-        brisk__x509_chain_verify(&xc, 1, when, NULL, NULL);
+#ifdef __linux__
+        trust.find_anchor = brisk__os_ca_anchor;
+#else
+        trust.find_anchor = NULL;
+#endif
+        trust.anchor_ctx = NULL;
+        trust.pins = (const uint8_t (*)[BRISK_SHA256_LEN])out;
+        /* 1, not argc: `pins` aims at a 64-byte buffer, so anything above 2 would make
+         * pinned() read past it if this probe were ever RUN under a sanitizer. */
+        trust.n_pins = 1;
+        brisk__x509_chain_verify(&xc, 1, when, &trust);
         brisk__x509_time_ok(&xc, when);
         brisk__x509_signed_by(&xc, &xc);
         brisk__x509_match_host(&xc, "a.example", 9);
@@ -108,7 +119,20 @@ int main(int argc, char **argv)
     }
 #ifdef __linux__
     brisk__os_random(out, 32);
+    {
+        static brisk__x509_bundle bundle; /* 2 KB: the probe reports it as linux_ca's RAM */
+        brisk__x509_cert anchor;
+        brisk__os_ca_path();
+        brisk__os_ca_anchor(&bundle, out, 8, 0, &anchor);
+    }
 #endif
+    {
+        brisk__x509_pem pem;
+        const uint8_t *p = out;
+        size_t left = sizeof out;
+        brisk__x509_pem_init(&pem);
+        brisk__x509_pem_feed(&pem, &p, &left);
+    }
     return out[0] + (brisk_build_info()[0] == brisk_version()[0]) +
            brisk__ct_memeq(out, out + 1, 8);
 }

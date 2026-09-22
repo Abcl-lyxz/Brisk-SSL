@@ -6,6 +6,12 @@
  * so a field that silently reads the wrong bytes fails here and not three milestones later.
  * tests/kat/x509_time.inc drives brisk__x509_time on its own, where the calendar lives.
  */
+/* O_CLOEXEC and O_NOFOLLOW, used by the Linux-only CA bundle test at the bottom of this file:
+ * POSIX 2008, which glibc hides under a bare -std=c99. Must precede every #include. */
+#if !defined(_POSIX_C_SOURCE) || _POSIX_C_SOURCE < 200809L
+#    undef _POSIX_C_SOURCE
+#    define _POSIX_C_SOURCE 200809L
+#endif
 #include <string.h>
 
 #include "brisk_int.h"
@@ -230,7 +236,45 @@ struct sig_kat {
 };
 #include "kat/x509_sig.inc"
 
+/* The PEM decoder on its own: a file's text in, a list of decoded blobs out. The base64 rows
+ * come from RFC 4648 section 10, so the alphabet is pinned by the RFC rather than by a
+ * certificate that a subtly wrong decoder would still round-trip. */
+#define BUNDLE_BLOBS 7
+struct bundle_kat {
+    const char *pem;
+    const char *blobs[BUNDLE_BLOBS]; /* hex, in order; NULL ends the list, "" is a real entry */
+    const char *note;
+};
+#include "kat/x509_bundle.inc"
+
+/* A whole chain against a bundle FILE, which is what exercises src/os/linux_ca.c: autodetect
+ * skipped (the row names its own path), open, scan, match a Name, walk `index`, close. */
+#define STORE_CERTS 3
+struct store_kat {
+    const char *pem;
+    const char *certs[STORE_CERTS];
+    int want; /* 0 = BRISK_OK, 1 = BRISK_E_AUTH */
+    int64_t now;
+    const char *note;
+};
+#include "kat/x509_store.inc"
+
+/* brisk__x509_trust.pins. Same shape as a chain row plus the pin set. */
+#define PIN_MAX 3
+struct pin_kat {
+    const char *certs[CHAIN_CERTS];
+    const char *anchors[CHAIN_ANCHORS];
+    const char *pins[PIN_MAX]; /* sha256(SPKI) as hex; NULL ends the list */
+    int want;
+    int64_t now;
+    const char *note;
+};
+#include "kat/x509_pin.inc"
+
 #define CHAIN_N    (sizeof X509_CHAIN_KAT / sizeof X509_CHAIN_KAT[0])
+#define BUNDLE_N   (sizeof X509_BUNDLE_KAT / sizeof X509_BUNDLE_KAT[0])
+#define STORE_N    (sizeof X509_STORE_KAT / sizeof X509_STORE_KAT[0])
+#define PIN_N      (sizeof X509_PIN_KAT / sizeof X509_PIN_KAT[0])
 #define SIG_N      (sizeof X509_SIG_KAT / sizeof X509_SIG_KAT[0])
 #define VALIDITY_N (sizeof X509_VALIDITY_KAT / sizeof X509_VALIDITY_KAT[0])
 
@@ -304,23 +348,40 @@ static int t_find_anchor(void *ctx, const uint8_t *dn, size_t dn_len, size_t ind
     return BRISK_E_ARG;
 }
 
+/* The trust store of whatever row is loaded in g_row, with no pins. Rebuilt on every call so a
+ * pin row that borrowed the same static cannot leave its pins behind. */
+static const brisk__x509_trust *row_trust(void)
+{
+    static brisk__x509_trust t;
+    t.find_anchor = t_find_anchor;
+    t.anchor_ctx = &g_row;
+    t.pins = NULL;
+    t.n_pins = 0;
+    return &t;
+}
+
 /* Parse every certificate of a row. A row whose own fixtures do not parse is a broken vector,
- * not a chain failure, so this is checked rather than folded into the verdict. */
-static int chain_load(const struct chain_kat *k, size_t idx)
+ * not a chain failure, so this is checked rather than folded into the verdict. Takes the two
+ * arrays rather than a struct, because the pin and store tables carry the same pair with other
+ * columns around it. `anchors` may be NULL for a table that has none. */
+static int row_load(const char *const *certs, size_t n_max, const char *const *anchors, size_t idx)
 {
     size_t i, n;
     int ok = 1;
 
+    /* n_max is the caller's ARRAY LENGTH, not CHAIN_CERTS: a store row's certs[] is shorter,
+     * and a full row has no NULL in it to stop on. Scanning past the end would read the int
+     * and int64 that follow the array - a wild pointer on the targets with no padding there. */
     g_row.n_certs = g_row.n_anchors = 0;
-    for (i = 0; i < CHAIN_CERTS && k->certs[i] != NULL; i++) {
-        n = t_unhex(k->certs[i], g_row.der[i], CHAIN_CERT_CAP);
+    for (i = 0; i < n_max && certs[i] != NULL; i++) {
+        n = t_unhex(certs[i], g_row.der[i], CHAIN_CERT_CAP);
         if (brisk__x509_parse(&g_row.certs[i], g_row.der[i], n) != BRISK_OK) {
             ok = 0;
         }
         g_row.n_certs++;
     }
-    for (i = 0; i < CHAIN_ANCHORS && k->anchors[i] != NULL; i++) {
-        n = t_unhex(k->anchors[i], g_row.anchor_der[i], CHAIN_CERT_CAP);
+    for (i = 0; anchors != NULL && i < CHAIN_ANCHORS && anchors[i] != NULL; i++) {
+        n = t_unhex(anchors[i], g_row.anchor_der[i], CHAIN_CERT_CAP);
         if (brisk__x509_parse(&g_row.anchors[i], g_row.anchor_der[i], n) != BRISK_OK) {
             ok = 0;
         }
@@ -328,6 +389,11 @@ static int chain_load(const struct chain_kat *k, size_t idx)
     }
     CHECKI(ok, idx);
     return ok;
+}
+
+static int chain_load(const struct chain_kat *k, size_t idx)
+{
+    return row_load(k->certs, CHAIN_CERTS, k->anchors, idx);
 }
 
 static void t_chain(void)
@@ -343,7 +409,7 @@ static void t_chain(void)
         if (!chain_load(k, i)) {
             continue;
         }
-        rc = brisk__x509_chain_verify(g_row.certs, g_row.n_certs, k->now, t_find_anchor, &g_row);
+        rc = brisk__x509_chain_verify(g_row.certs, g_row.n_certs, k->now, row_trust());
         CHECKI(rc == (k->want ? BRISK_E_AUTH : BRISK_OK), i);
     }
 }
@@ -376,11 +442,14 @@ static void t_chain_args(void)
     size_t row = plain_row();
     const struct chain_kat *k = &X509_CHAIN_KAT[row];
 
-    CHECK(brisk__x509_chain_verify(NULL, 0, k->now, NULL, NULL) == BRISK_E_ARG);
+    brisk__x509_trust storeless = {NULL, NULL, NULL, 0};
+
+    CHECK(brisk__x509_chain_verify(NULL, 0, k->now, NULL) == BRISK_E_ARG);
     if (chain_load(k, row)) {
-        CHECK(brisk__x509_chain_verify(g_row.certs, 0, k->now, t_find_anchor, &g_row) ==
-              BRISK_E_ARG);
-        CHECK(brisk__x509_chain_verify(g_row.certs, g_row.n_certs, k->now, NULL, NULL) ==
+        CHECK(brisk__x509_chain_verify(g_row.certs, 0, k->now, row_trust()) == BRISK_E_ARG);
+        /* No trust at all, spelled both ways: no struct, and a struct with no store in it. */
+        CHECK(brisk__x509_chain_verify(g_row.certs, g_row.n_certs, k->now, NULL) == BRISK_E_AUTH);
+        CHECK(brisk__x509_chain_verify(g_row.certs, g_row.n_certs, k->now, &storeless) ==
               BRISK_E_AUTH);
     }
 }
@@ -504,6 +573,210 @@ static void t_ip(void)
     CHECK(brisk__x509_parse_ip("192.0.2.1junk", 9, (uint8_t[16]){0}) == 4);
 }
 
+/* -------------------------------------------------------------- PEM + pins + store -------- */
+
+static size_t bundle_expected(const struct bundle_kat *k)
+{
+    size_t n = 0;
+    while (n < BUNDLE_BLOBS && k->blobs[n] != NULL) {
+        n++;
+    }
+    return n;
+}
+
+/* The decoder, fed at every chunk size that can cut a block in a different place: one byte at a
+ * time catches anything that was left in a local instead of the struct, 2/3/7 straddle base64
+ * groups and line endings, and the whole file in one call is the ordinary case. A decoder whose
+ * answer depends on how the file was read is the bug this is shaped to find - and it is the
+ * realistic one, because read() returns what it feels like. */
+static void t_pem(void)
+{
+    static const size_t chunks[] = {1, 2, 3, 7, 64, 0}; /* 0 = everything in one call */
+    static uint8_t want[CHAIN_CERT_CAP];
+    static brisk__x509_pem pem; /* 2 KB: too big for this frame */
+    size_t i, ci;
+
+    for (i = 0; i < BUNDLE_N; i++) {
+        const struct bundle_kat *k = &X509_BUNDLE_KAT[i];
+        size_t pem_len = strlen(k->pem), n_want = bundle_expected(k);
+
+        for (ci = 0; ci < sizeof chunks / sizeof chunks[0]; ci++) {
+            size_t step = chunks[ci] != 0 ? chunks[ci] : (pem_len != 0 ? pem_len : 1);
+            size_t off = 0, got = 0;
+            int ok = 1;
+
+            brisk__x509_pem_init(&pem);
+            while (off < pem_len && ok) {
+                size_t take = pem_len - off < step ? pem_len - off : step;
+                const uint8_t *p = (const uint8_t *)k->pem + off;
+                size_t left = take;
+
+                off += take;
+                while (brisk__x509_pem_feed(&pem, &p, &left) == 1) {
+                    size_t n;
+                    if (got == n_want) {
+                        ok = 0; /* a block the vector says is not there */
+                        break;
+                    }
+                    n = t_unhex(k->blobs[got], want, sizeof want);
+                    if (pem.der_len != n || (n != 0 && memcmp(pem.der, want, n) != 0)) {
+                        ok = 0;
+                    }
+                    got++;
+                }
+            }
+            CHECKI(ok && got == n_want, i);
+        }
+    }
+    /* The arguments a caller can get wrong. A NULL anywhere is "no bytes", never a read. */
+    {
+        const uint8_t *p = (const uint8_t *)"";
+        size_t left = 0;
+        brisk__x509_pem_init(NULL);
+        CHECK(brisk__x509_pem_feed(NULL, &p, &left) == 0);
+        CHECK(brisk__x509_pem_feed(&pem, NULL, &left) == 0);
+        CHECK(brisk__x509_pem_feed(&pem, &p, NULL) == 0);
+    }
+}
+
+/* brisk__x509_trust.pins: additive, path members only, and a selection predicate at the anchor
+ * rather than a verdict applied once the walk has committed. */
+static void t_pin(void)
+{
+    static uint8_t pins[PIN_MAX][BRISK_SHA256_LEN];
+    size_t i, j;
+
+    for (i = 0; i < PIN_N; i++) {
+        const struct pin_kat *k = &X509_PIN_KAT[i];
+        brisk__x509_trust trust;
+        size_t n_pins = 0;
+
+        if (!row_load(k->certs, CHAIN_CERTS, k->anchors, i)) {
+            continue;
+        }
+        for (j = 0; j < PIN_MAX && k->pins[j] != NULL; j++) {
+            CHECKI(t_unhex(k->pins[j], pins[j], BRISK_SHA256_LEN) == BRISK_SHA256_LEN, i);
+            n_pins++;
+        }
+        /* A row with no anchors is the "pins are not a trust store" case, and it is spelled the
+         * way a caller would spell it: no callback at all, not a callback with nothing behind
+         * it. */
+        trust.find_anchor = g_row.n_anchors != 0 ? t_find_anchor : NULL;
+        trust.anchor_ctx = &g_row;
+        trust.pins = n_pins != 0 ? (const uint8_t (*)[BRISK_SHA256_LEN])pins : NULL;
+        trust.n_pins = n_pins;
+        CHECKI(brisk__x509_chain_verify(g_row.certs, g_row.n_certs, k->now, &trust) ==
+                   (k->want != 0 ? BRISK_E_AUTH : BRISK_OK),
+               i);
+    }
+
+    /* The half-configured trust store M3's brisk_cfg makes easy to write: a pin COUNT with no
+     * pin ARRAY behind it. It has to mean "a pin nothing can satisfy" - so a chain that would
+     * otherwise verify is refused - and not a NULL dereference on a gateway. Driven from a row
+     * that is known to pass with no pins at all, so only the pins can be what refuses it. */
+    for (i = 0; i < PIN_N; i++) {
+        const struct pin_kat *k = &X509_PIN_KAT[i];
+        brisk__x509_trust trust;
+
+        if (k->want != 0 || k->pins[0] != NULL || !row_load(k->certs, CHAIN_CERTS, k->anchors, i)) {
+            continue;
+        }
+        trust.find_anchor = t_find_anchor;
+        trust.anchor_ctx = &g_row;
+        trust.pins = NULL;
+        trust.n_pins = 0;
+        CHECKI(brisk__x509_chain_verify(g_row.certs, g_row.n_certs, k->now, &trust) == BRISK_OK, i);
+        trust.n_pins = 3; /* ... and the same call with a count but no array fails closed */
+        CHECKI(brisk__x509_chain_verify(g_row.certs, g_row.n_certs, k->now, &trust) == BRISK_E_AUTH,
+               i);
+        break;
+    }
+}
+
+#ifdef __linux__
+#    include <fcntl.h>
+#    include <unistd.h>
+
+/* The CA bundle as a trust store, through a real file. Everything below this line is Linux
+ * only, because src/os/ is: the mingw host build does not compile linux_ca.c at all. */
+static int write_bundle(const char *path, const char *text)
+{
+    size_t len = strlen(text), off = 0;
+    /* O_NOFOLLOW: this path is predictable, so a symlink planted there must make the test fail
+     * rather than make it write through. O_EXCL is not usable - the file is rewritten per row. */
+    int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC | O_NOFOLLOW | O_CLOEXEC, 0600);
+
+    if (fd < 0) {
+        return 0;
+    }
+    while (off < len) {
+        ssize_t n = write(fd, text + off, len - off);
+        if (n <= 0) {
+            close(fd);
+            return 0;
+        }
+        off += (size_t)n;
+    }
+    return close(fd) == 0;
+}
+
+static void t_store(void)
+{
+    static const char path[] = "/tmp/brisk_ca_bundle_test.pem";
+    static brisk__x509_bundle bundle;
+    brisk__x509_cert anchor;
+    size_t i;
+
+    for (i = 0; i < STORE_N; i++) {
+        const struct store_kat *k = &X509_STORE_KAT[i];
+        brisk__x509_trust trust;
+        int wrote = write_bundle(path, k->pem);
+
+        CHECKI(wrote, i);
+        if (!wrote || !row_load(k->certs, STORE_CERTS, NULL, i)) {
+            continue;
+        }
+        bundle.path = path; /* named, so no autodetection runs and the row decides the file */
+        trust.find_anchor = brisk__os_ca_anchor;
+        trust.anchor_ctx = &bundle;
+        trust.pins = NULL;
+        trust.n_pins = 0;
+        CHECKI(brisk__x509_chain_verify(g_row.certs, g_row.n_certs, k->now, &trust) ==
+                   (k->want != 0 ? BRISK_E_AUTH : BRISK_OK),
+               i);
+    }
+
+    /* The lookup's own argument handling, which no row reaches: a Name nobody has, an empty
+     * Name, a bundle whose path does not exist, and a NULL context. */
+    bundle.path = path;
+    CHECK(brisk__os_ca_anchor(&bundle, (const uint8_t *)"nope", 4, 0, &anchor) == BRISK_E_ARG);
+    CHECK(brisk__os_ca_anchor(&bundle, (const uint8_t *)"", 0, 0, &anchor) == BRISK_E_ARG);
+    CHECK(brisk__os_ca_anchor(&bundle, (const uint8_t *)"nope", 4, 0, NULL) == BRISK_E_ARG);
+    CHECK(brisk__os_ca_anchor(NULL, (const uint8_t *)"nope", 4, 0, &anchor) == BRISK_E_ARG);
+    unlink(path);
+    bundle.path = "/nonexistent/brisk/ca-bundle.pem";
+    CHECK(brisk__os_ca_anchor(&bundle, (const uint8_t *)"nope", 4, 0, &anchor) == BRISK_E_ARG);
+
+    /* Autodetection. A build host has a bundle and a scratch container may not, so the verdict
+     * is not "a path was found" - it is that whatever comes back is one of the paths the module
+     * offers and that it really opens. */
+    {
+        const char *found = brisk__os_ca_path();
+        if (found != NULL) {
+            int fd = open(found, O_RDONLY | O_CLOEXEC);
+            CHECK(fd >= 0);
+            if (fd >= 0) {
+                close(fd);
+            }
+            /* And a bundle that was never given a path finds the same one. */
+            bundle.path = NULL;
+            (void)brisk__os_ca_anchor(&bundle, (const uint8_t *)"nope", 4, 0, &anchor);
+            CHECK(bundle.path == found);
+        }
+    }
+}
+#endif /* __linux__ */
+
 void test_x509(void)
 {
     t_time();
@@ -518,4 +791,9 @@ void test_x509(void)
     t_name();
     t_name_args();
     t_ip();
+    t_pem();
+    t_pin();
+#ifdef __linux__
+    t_store();
+#endif
 }

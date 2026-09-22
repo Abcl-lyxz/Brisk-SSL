@@ -6,6 +6,7 @@ here instead of silently weakening the C tests. Downloads are cached in .cache/k
 
     python tools/kat.py            # regenerate tests/kat/*.inc + tests/kat/SOURCES.md
 """
+import base64
 import calendar
 import datetime
 import hashlib
@@ -3992,6 +3993,244 @@ def x509_chain_vectors():
     return rows
 
 
+# ----------------------------------------------------- CA bundles and SPKI pins (M2)
+# Three tables, because three separate things can break.
+#   x509_bundle.inc  the PEM decoder on its own (brisk__x509_pem_feed), driven by the base64
+#                    vectors of RFC 4648 section 10 wrapped in BEGIN/END lines - so the alphabet
+#                    and the padding are tested against the RFC rather than against a
+#                    certificate that would also pass with a subtly wrong decoder.
+#   x509_store.inc   a whole chain verified against a bundle FILE, which is the only thing that
+#                    exercises the lazy lookup in src/os/linux_ca.c end to end: open, scan,
+#                    match a subject Name, walk `index`, close.
+#   x509_pin.inc     brisk__x509_trust.pins: additive, path-members-only, and a selection
+#                    predicate rather than a verdict passed after the walk has committed.
+BUNDLE_MAX_BLOBS = 7
+STORE_MAX_CERTS = 3
+PIN_MAX = 3
+X509_ANCHOR_MAX = None  # BRISK__X509_ANCHOR_MAX, read from src/brisk_int.h
+
+
+def check_x509_anchor_max():
+    """BRISK__X509_ANCHOR_MAX decides which PEM block is too big to decode, and the oversize row
+    below is built to sit exactly one byte past it. Read it rather than repeat it."""
+    global X509_ANCHOR_MAX
+    src = (ROOT / "src" / "brisk_int.h").read_text()
+    m = re.search(r"#\s*define\s+BRISK__X509_ANCHOR_MAX\s+(\d+)", src)
+    if not m:
+        die("brisk_int.h: no BRISK__X509_ANCHOR_MAX")
+    X509_ANCHOR_MAX = int(m.group(1))
+    if not 512 <= X509_ANCHOR_MAX <= 1 << 16:
+        die(f"brisk_int.h: BRISK__X509_ANCHOR_MAX {X509_ANCHOR_MAX} is not a plausible cap")
+    print(f"  brisk_int.h: anchor buffer {X509_ANCHOR_MAX} B")
+
+
+def pem_block(der, label="CERTIFICATE", cols=64, eol="\n", body=None):
+    """One PEM block (RFC 7468 4). `body` overrides the base64, which is how a corrupt or
+    oversized block is written."""
+    b64 = base64.b64encode(der).decode() if body is None else body
+    lines = [b64[i:i + cols] for i in range(0, len(b64), cols)] or [""]
+    return f"-----BEGIN {label}-----{eol}" + eol.join(lines) + eol + f"-----END {label}-----{eol}"
+
+
+def x509_bundle_vectors():
+    """(pem text, [decoded blob hex, ...], note) for brisk__x509_pem_feed."""
+    rows = []
+
+    def row(pem, blobs, note):
+        if len(blobs) > BUNDLE_MAX_BLOBS:
+            die(f"bundle row '{note}' does not fit the fixed array")
+        rows.append((pem, [b.hex() for b in blobs], note))
+
+    # RFC 4648 section 10, the base64 test vectors, each one made into a block. They are the
+    # reason this table exists: they pin the alphabet and every padding length, and "" pins the
+    # empty body, which the decoder must hand over as a zero-length block rather than swallow.
+    rfc4648 = [(b"", ""), (b"f", "Zg=="), (b"fo", "Zm8="), (b"foo", "Zm9v"),
+               (b"foob", "Zm9vYg=="), (b"fooba", "Zm9vYmE="), (b"foobar", "Zm9vYmFy")]
+    for plain, b64 in rfc4648:
+        row(pem_block(None, body=b64), [plain],
+            "RFC 4648 10: %r is %s" % (plain.decode(), b64 or "an empty body"))
+    row("".join(pem_block(None, body=b) for _, b in rfc4648), [p for p, _ in rfc4648],
+        "RFC 4648 10: all seven back to back, so one block's padding cannot leak into the next")
+
+    # Real certificates, in the shapes a bundle file actually arrives in.
+    root = ec_issuer(P256, 0x5EED0001, 256)
+    inter = ec_issuer(P256, 0x5EED0002, 256)
+    ca_ext = [x_bc(True), x_ku(KU_BIT_KEY_CERT_SIGN)]
+    root_c = chain_cert("Brisk Root", "Brisk Root", root, root, exts=ca_ext)
+    inter_c = chain_cert("Brisk Root", "Brisk Inter", root, inter, exts=ca_ext)
+    rsa_c = chain_cert("Brisk RSA", "Brisk RSA", rsa_issuer(256), rsa_issuer(256), exts=ca_ext)
+
+    row(pem_block(root_c), [root_c], "one certificate, the ordinary 64-column wrapping")
+    row(pem_block(root_c, cols=76), [root_c], "76-column wrapping, which some exports use")
+    row(pem_block(root_c, cols=4), [root_c], "a pathologically short line length")
+    row(pem_block(root_c, eol="\r\n"), [root_c], "CRLF line endings (RFC 7468 3)")
+    row(pem_block(root_c)[:-1], [root_c], "no newline after the END line")
+    row(pem_block(rsa_c), [rsa_c], "an RSA root, the 1.2 KB shape a real bundle is full of")
+    row(pem_block(root_c) + pem_block(inter_c), [root_c, inter_c], "two certificates, no filler")
+    row("Brisk Root\n==========\n" + pem_block(root_c)
+        + "\nBrisk Inter\n===========\n" + pem_block(inter_c), [root_c, inter_c],
+        "the subject headers Debian's ca-certificates.crt writes above each certificate")
+
+    # Labels that are not CERTIFICATE. The BEGIN line is matched whole, so none of them opens a
+    # block - and the certificate that FOLLOWS is what proves the scan resynchronised rather
+    # than merely failed (the lesson of the RFC 9525 multi-entry rows).
+    for label in ("RSA PRIVATE KEY", "TRUSTED CERTIFICATE", "X509 CRL", "CERTIFICATE REQUEST"):
+        row(pem_block(root_c, label=label) + pem_block(inter_c), [inter_c],
+            f"{label} is not a certificate, and the next block still decodes")
+
+    # Damage, always followed by a good certificate for the same reason.
+    row(pem_block(None, body="AAAA!AAA") + pem_block(inter_c), [inter_c],
+        "a byte outside the base64 alphabet drops its block")
+    row(pem_block(root_c).replace("-----END CERTIFICATE-----\n", "") + pem_block(inter_c),
+        [root_c, inter_c], "a block with no END line is ended by the next BEGIN, and a body "
+                           "that is complete still decodes - the same rule that recovers the "
+                           "block after a file truncated mid-write")
+    big = base64.b64encode(bytes(X509_ANCHOR_MAX + 1)).decode()
+    row(pem_block(None, body=big) + pem_block(inter_c), [inter_c],
+        f"a block past BRISK__X509_ANCHOR_MAX ({X509_ANCHOR_MAX} B) is dropped, not truncated")
+    # One base64 group short: still a whole number of groups, so it decodes cleanly to a DER
+    # that is three bytes shy of a certificate - a silent truncation if nobody parses it.
+    short = base64.b64encode(root_c[:-3]).decode()
+    row(pem_block(None, body=short) + pem_block(inter_c), [root_c[:-3], inter_c],
+        "base64 cut short decodes to a short blob, which is the parser's problem and not the "
+        "decoder's")
+
+    # Whitespace inside a body. Not RFC 7468, and accepted anyway: a bundle pasted into a config
+    # file arrives indented, and the certificate is verified afterwards regardless.
+    b64 = base64.b64encode(root_c).decode()
+    row("-----BEGIN CERTIFICATE-----\n"
+        + "".join(f"  {b64[i:i + 32]} \n" for i in range(0, len(b64), 32))
+        + "-----END CERTIFICATE-----\n", [root_c], "an indented body, spaces and all")
+    row("", [], "an empty file yields nothing and must not hang")
+    row("no PEM here at all\n" * 8, [], "a file with no block in it")
+
+    print(f"  x509 bundles: {len(rows)} PEM rows")
+    return rows
+
+
+def x509_store_vectors():
+    """(pem text, [chain cert hex, ...], want, flags, now, note): a chain against a bundle FILE."""
+    rows = []
+    root = ec_issuer(P256, 0x5EED0001, 256)
+    root2 = ec_issuer(P256, 0x5EED0007, 256)  # a second key under the SAME root Name
+    inter = ec_issuer(P256, 0x5EED0002, 256)
+    leaf = ec_issuer(P256, 0x5EED0004, 256)
+    other = ec_issuer(P256, 0x5EED0005, 256)
+    ca_ext = [x_bc(True), x_ku(KU_BIT_KEY_CERT_SIGN)]
+    ee_ext = [x_bc(False), x_ku(KU_BIT_DIGITAL_SIGNATURE)]
+
+    root_c = chain_cert("Brisk Root", "Brisk Root", root, root, exts=ca_ext)
+    root2_c = chain_cert("Brisk Root", "Brisk Root", root2, root2, exts=ca_ext, serial=2)
+    other_c = chain_cert("Brisk Other", "Brisk Other", other, other, exts=ca_ext)
+    inter_c = chain_cert("Brisk Root", "Brisk Inter", root, inter, exts=ca_ext)
+    leaf_c = chain_cert("Brisk Inter", "device.example.com", inter, leaf, exts=ee_ext)
+    chain = [leaf_c, inter_c]
+
+    def row(pem, certs, want, note):
+        if len(certs) > STORE_MAX_CERTS:
+            die(f"store row '{note}' does not fit the fixed array")
+        rows.append((pem, [c.hex() for c in certs], want, CHAIN_NOW, note))
+
+    row(pem_block(root_c), chain, 0, "the root is in the bundle")
+    row(pem_block(other_c) + pem_block(root_c), chain, 0,
+        "the root is the SECOND entry, so the scan does not stop at the first subject it sees")
+    row("Brisk Other\n" + pem_block(other_c) + "Brisk Root\n" + pem_block(root_c)
+        + pem_block(other_c, label="RSA PRIVATE KEY"), chain, 0,
+        "headers and a private key between the entries change nothing")
+    # Two roots share one subject Name and only the second signed this path: the lookup has to
+    # keep walking `index` for the same Name instead of reporting the first hit and stopping.
+    row(pem_block(root2_c) + pem_block(root_c), chain, 0,
+        "a same-Name root that did not sign this path is walked past, not taken as the answer")
+    row(pem_block(other_c), chain, 1, "a bundle without the root")
+    row(pem_block(None, body="AAAA!AAA"), chain, 1, "a bundle whose only entry is corrupt")
+    row("", chain, 1, "an empty bundle file")
+    # The BEGIN line must sit at the start of a line: an indented block is invisible to
+    # OpenSSL's PEM_read_bio too, and a root only THIS library can see is a root nobody audited.
+    row("  " + pem_block(root_c), chain, 1, "an indented BEGIN line is not a trust anchor")
+    row("junk -----BEGIN CERTIFICATE-----\n" + pem_block(root_c)[28:], chain, 1,
+        "a BEGIN line that starts mid-line is not a trust anchor either")
+    # RFC 5280 6.1.1 (d) exempts the anchor from the validity window, and the bundle is where
+    # that decision actually bites: a distro bundle really does carry dead roots (DST Root CA
+    # X3, 2021). Locked in ARCHITECTURE.md; this is the end-to-end proof through a real file.
+    row(pem_block(chain_cert("Brisk Root", "Brisk Root", root, root, exts=ca_ext,
+                             nbf="200101000000Z", naf="210101000000Z")), chain, 0,
+        "6.1.1 (d) an expired root in the bundle still anchors")
+    print(f"  x509 stores: {sum(1 for r in rows if not r[2])} accepted, "
+          f"{sum(1 for r in rows if r[2])} rejected")
+    return rows
+
+
+def x509_pin_vectors():
+    """(certs, anchors, pins, want, flags, now, note) for brisk__x509_trust.pins."""
+    rows = []
+    root = ec_issuer(P256, 0x5EED0001, 256)
+    root2 = ec_issuer(P256, 0x5EED0007, 256)
+    inter = ec_issuer(P256, 0x5EED0002, 256)
+    leaf = ec_issuer(P256, 0x5EED0004, 256)
+    other = ec_issuer(P256, 0x5EED0005, 256)
+    ca_ext = [x_bc(True), x_ku(KU_BIT_KEY_CERT_SIGN)]
+    ee_ext = [x_bc(False), x_ku(KU_BIT_DIGITAL_SIGNATURE)]
+
+    root_c = chain_cert("Brisk Root", "Brisk Root", root, root, exts=ca_ext)
+    root2_c = chain_cert("Brisk Root 2", "Brisk Root 2", root2, root2, exts=ca_ext)
+    inter_c = chain_cert("Brisk Root", "Brisk Inter", root, inter, exts=ca_ext)
+    leaf_c = chain_cert("Brisk Inter", "device.example.com", inter, leaf, exts=ee_ext)
+    other_c = chain_cert("Brisk Other", "Brisk Other", other, other, exts=ca_ext)
+    # The DST Root CA X3 shape: the old root is still an anchor, and the peer also ships a
+    # cross-certificate that carries the OLD key under a NEW root's signature.
+    cross_c = chain_cert("Brisk Root 2", "Brisk Root", root2, root, exts=ca_ext, serial=3)
+
+    def pin(issuer):
+        return hashlib.sha256(issuer["spki"]).hexdigest()
+
+    def row(certs, anchors, pins, want, note):
+        if len(pins) > PIN_MAX:
+            die(f"pin row '{note}' does not fit the fixed array")
+        rows.append(([c.hex() for c in certs], [a.hex() for a in anchors], pins, want,
+                     CHAIN_NOW, note))
+
+    chain = [leaf_c, inter_c]
+    row(chain, [root_c], [], 0, "no pins at all: the ordinary chain verdict is unchanged")
+    row(chain, [root_c], [pin(root)], 0, "the anchor's key is pinned")
+    row(chain, [root_c], [pin(inter)], 0, "an intermediate ON the path is pinned")
+    row(chain, [root_c], [pin(leaf)], 0, "the end entity is pinned")
+    row(chain, [root_c], [pin(other), pin(root)], 0,
+        "one pin of two matches, which is what a rollover pin set looks like")
+    row(chain, [root_c], [pin(other)], 1, "a pin no certificate on the path satisfies")
+    # The whole reason pins are checked on path MEMBERS: otherwise a peer satisfies a pin by
+    # attaching the pinned certificate to a chain it has nothing to do with.
+    row([leaf_c, inter_c, other_c], [root_c], [pin(other)], 1,
+        "a pinned certificate the peer merely ATTACHED is not on the path")
+    # Additive, structurally: with no trust store there is no path, so no pin can rescue it.
+    # The test drives this row with find_anchor == NULL as well, where the anchor list is unused.
+    row(chain, [], [pin(leaf)], 1, "pins never stand in for a trust store")
+    # A pin that fails at the first anchor must not end the walk: the longer path through the
+    # cross-certificate reaches an anchor that IS pinned, and that is the chain to build.
+    row([leaf_c, inter_c, cross_c], [root_c, root2_c], [pin(root2)], 0,
+        "the pin picks the cross-signed path over the shorter one that does not satisfy it")
+    row([leaf_c, inter_c, cross_c], [root_c, root2_c], [pin(other)], 1,
+        "the same two paths, neither of them pinned")
+    # The KNOWN LIMIT, written down as a vector so it cannot be forgotten and so the day
+    # src/x509/chain.c grows a depth-first search this row FAILS and whoever did the work is
+    # told to flip it to 0. Two intermediates share a Name and a key, so both verify the leaf;
+    # the first chains to the unpinned root and the second to the pinned one. A walk that
+    # commits to the first candidate that verifies can never reach the pinned path. This is the
+    # real rollover shape - the legacy cross-certificate goes first on the wire - which is
+    # exactly why it is worth a row rather than a comment.
+    inter_old = chain_cert("Brisk Root", "Brisk Inter", root, inter, exts=ca_ext, serial=11)
+    inter_new = chain_cert("Brisk Root 2", "Brisk Inter", root2, inter, exts=ca_ext, serial=12)
+    row([leaf_c, inter_old, inter_new], [root_c, root2_c], [pin(root2)], 1,
+        "KNOWN LIMIT: no backtracking, so the pinned path behind a same-Name sibling is missed")
+    # The same three certificates with no pins: here the FIRST candidate does reach an anchor,
+    # so the greedy walk is right and this row proves the pair above fails for the pin reason
+    # and not because the fixtures do not chain.
+    row([leaf_c, inter_old, inter_new], [root_c, root2_c], [], 0,
+        "the same three certificates without pins, where the greedy first choice does anchor")
+    print(f"  x509 pins: {sum(1 for r in rows if not r[3])} accepted, "
+          f"{sum(1 for r in rows if r[3])} rejected")  # r[3] is `want`
+    return rows
+
+
 # ------------------------------------------------- X.509 service identity (RFC 9525 names, M2)
 # No official suite exists here either: RFC 9525 carries rules and a few illustrative examples,
 # never a vector file, and x509-limbo (its own ROADMAP item) is the nearest thing. So this is
@@ -4215,6 +4454,28 @@ def cesc(s):
     return "".join("\\x%02x" % b for b in s.encode())
 
 
+def cpem(text):
+    """A PEM fixture as one C string literal per line, so the file reads like the file it is.
+
+    cstr() must not be used for this: it chops a string every 96 characters, which would cut an
+    escape sequence in half. Only the four escapes below can occur - anything else in these
+    fixtures would be a byte nobody meant to put there, so it dies rather than being encoded."""
+    esc = {'"': '\\"', "\\": "\\\\", "\r": "\\r", "\t": "\\t"}
+    lines = text.split("\n")
+    out = []
+    for i, ln in enumerate(lines):
+        body = ""
+        for ch in ln:
+            if ch in esc:
+                body += esc[ch]
+            elif 0x20 <= ord(ch) < 0x7f:
+                body += ch
+            else:
+                die("cpem: unexpected byte %#04x in a PEM fixture" % ord(ch))
+        out.append('"' + body + ("\\n" if i < len(lines) - 1 else "") + '"')
+    return " ".join(out)
+
+
 def cstr(hx, width=96):
     if not hx:
         return '""'
@@ -4320,6 +4581,7 @@ def main():
     global CHAIN_NOW
     CHAIN_NOW = py_asn1_time("270601000000Z")  # inside every row's window, above the floor
     check_x509_time_config()
+    check_x509_anchor_max()
     x509_certs = x509_cert_vectors()
     x509_times = x509_time_vectors()
     x509_validity = x509_validity_vectors()
@@ -4333,6 +4595,9 @@ def main():
     x509_sigs = x509_sig_vectors()
     x509_names = x509_name_vectors()
     x509_ips = x509_ip_vectors()
+    x509_bundles = x509_bundle_vectors()
+    x509_stores = x509_store_vectors()
+    x509_pins = x509_pin_vectors()
 
     emit("sha2.inc", "struct hash_kat SHA2_KAT", cavp + dhash, lambda r: f"{r[0]}, {cstr(r[1])}, {cstr(r[2])}")
     emit("sha2_monte.inc", "struct monte_kat SHA2_MONTE", monte,
@@ -4425,6 +4690,24 @@ def main():
          lambda r: f'{cstr(r[0])}, "{cesc(r[1])}", {r[2]}, "{r[3]}"')
     emit("x509_ip.inc", "struct ip_kat X509_IP_KAT", x509_ips,
          lambda r: f'"{r[0]}", {cstr(r[1])}, "{r[2]}"')
+    emit("x509_bundle.inc", "struct bundle_kat X509_BUNDLE_KAT", x509_bundles,
+         lambda r: f'{cpem(r[0])}, '
+                   + "{" + ", ".join([cstr(b) for b in r[1]]
+                                     + ["NULL"] * (BUNDLE_MAX_BLOBS - len(r[1]))) + "}, "
+                   + f'"{r[2]}"')
+    emit("x509_store.inc", "struct store_kat X509_STORE_KAT", x509_stores,
+         lambda r: f'{cpem(r[0])}, '
+                   + "{" + ", ".join([cstr(c) for c in r[1]]
+                                     + ["NULL"] * (STORE_MAX_CERTS - len(r[1]))) + "}, "
+                   + f'{r[2]}, {r[3]}LL, "{r[4]}"')
+    emit("x509_pin.inc", "struct pin_kat X509_PIN_KAT", x509_pins,
+         lambda r: "{" + ", ".join([cstr(c) for c in r[0]]
+                                   + ["NULL"] * (CHAIN_MAX_CERTS - len(r[0]))) + "}, "
+                   + "{" + ", ".join([cstr(a) for a in r[1]]
+                                     + ["NULL"] * (CHAIN_MAX_ANCHORS - len(r[1]))) + "}, "
+                   + "{" + ", ".join([f'"{h}"' for h in r[2]]
+                                     + ["NULL"] * (PIN_MAX - len(r[2]))) + "}, "
+                   + f'{r[3]}, {r[4]}LL, "{r[5]}"')
 
     rows = "\n".join(f"| {k} | {u} | `{h}` |" for k, (u, h) in sorted(fetched.items()))
     (OUT / "SOURCES.md").write_text(

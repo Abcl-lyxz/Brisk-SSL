@@ -232,16 +232,50 @@ static int usable_ca(const brisk__x509_cert *ca, size_t below, int anchor)
     return 1;
 }
 
-int brisk__x509_chain_verify(const brisk__x509_cert *certs, size_t n_certs, int64_t now,
-                             brisk__x509_anchor_fn find_anchor, void *anchor_ctx)
+/* ------------------------------------------------------------------ pins ----------------- */
+
+/* Does this certificate's SubjectPublicKeyInfo hash to one of the pins? Public data on both
+ * sides - the key is in the certificate the peer sent and the pin is in the firmware - so an
+ * ordinary memcmp and an early exit are right; there is no secret here to leak the timing of.
+ * The whole SPKI TLV is the preimage, which is RFC 7469 3's fingerprint without the base64. */
+static int pinned(const brisk__x509_trust *t, const brisk__x509_cert *c)
 {
+    uint8_t h[BRISK_SHA256_LEN];
+    size_t i;
+
+    /* pins == NULL with n_pins > 0 is a caller that half-configured its trust - the shape M3's
+     * brisk_cfg will make easy to write. It means "no pin can ever match", so every path fails
+     * the additive test and the connection is refused; it must not mean memcmp(h, NULL, 32). */
+    if (c->spki == NULL || t->pins == NULL) {
+        return 0;
+    }
+    brisk_sha256(c->spki, c->spki_len, h);
+    for (i = 0; i < t->n_pins; i++) {
+        if (memcmp(h, t->pins[i], sizeof h) == 0) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+int brisk__x509_chain_verify(const brisk__x509_cert *certs, size_t n_certs, int64_t now,
+                             const brisk__x509_trust *trust)
+{
+    static const brisk__x509_trust empty = {NULL, NULL, NULL, 0};
     const brisk__x509_cert *cur;
     size_t depth, below = 0, work = 0;
+    int pin_hit;
 
     if (certs == NULL || n_certs == 0) {
         return BRISK_E_ARG;
     }
+    if (trust == NULL) {
+        trust = &empty;
+    }
     cur = &certs[0];
+    /* With no pins configured every path is "pinned" from the start, so the one test at the
+     * anchor below covers both worlds and nothing hashes anything it did not have to. */
+    pin_hit = trust->n_pins == 0 || pinned(trust, cur);
     /* 6.1.3 (a)(2) for the end entity. Every other certificate of the path is checked below, as
      * a condition for being CHOSEN as the parent - never after the walk has committed to it.
      * That distinction is the whole difference between refusing an expired chain and refusing a
@@ -261,8 +295,9 @@ int brisk__x509_chain_verify(const brisk__x509_cert *certs, size_t n_certs, int6
 
         /* Trust anchors first, which is what makes a stale cross-certificate at the end of the
          * peer's list harmless: the path stops here and the tail is never looked at. */
-        for (i = 0; find_anchor != NULL && i < BRISK__X509_MAX_ANCHORS; i++) {
-            if (find_anchor(anchor_ctx, cur->issuer, cur->issuer_len, i, &anchor) != BRISK_OK) {
+        for (i = 0; trust->find_anchor != NULL && i < BRISK__X509_MAX_ANCHORS; i++) {
+            if (trust->find_anchor(trust->anchor_ctx, cur->issuer, cur->issuer_len, i, &anchor) !=
+                BRISK_OK) {
                 break;
             }
             /* 6.1.3 (a)(4) is checked here and not left to the store: a lookup that buckets
@@ -277,9 +312,31 @@ int brisk__x509_chain_verify(const brisk__x509_cert *certs, size_t n_certs, int6
             if (++work > BRISK__X509_MAX_VERIFY) {
                 return BRISK_E_AUTH;
             }
-            if (brisk__x509_signed_by(cur, &anchor) == BRISK_OK) {
+            if (brisk__x509_signed_by(cur, &anchor) != BRISK_OK) {
+                continue;
+            }
+            if (pin_hit || pinned(trust, &anchor)) {
                 return BRISK_OK;
             }
+            /* A complete, verified path that satisfies no pin is NOT the verdict - it is one
+             * candidate that failed a selection predicate, exactly like an expired sibling
+             * above. Keep walking: the shape this is here for is a cross-signed rollover, where
+             * the peer also ships the old root under the NEW root's signature, and the longer
+             * path through it ends at the anchor the pin names. Returning here would refuse a
+             * chain the device was given every certificate for.
+             *
+             * HOW FAR THAT GOES, precisely, because it is less far than it looks: this recovers
+             * the longer path only when every level BELOW has one candidate. The peer loop
+             * below still commits to the first certificate that verifies and never revisits it
+             * (the "no backtracking ACROSS levels" limit in the brisk_int.h block), so a
+             * rollover that ALSO ships two same-Name intermediates - one chaining to the old
+             * root, one to the pinned new one - is refused if the old one arrives first, which
+             * on the wire it does. Pins make that reachable far more often than plain chain
+             * building did, because a pin miss now forces the walk down here at a depth where
+             * it used to return. The fix is a depth-first search with a resume index per level,
+             * bounded by BRISK__X509_MAX_VERIFY as this already is; it is its own ROADMAP line
+             * because it changes path construction for every chain, not just pinned ones.
+             * Until then the failure is closed and loud: a connection that does not build. */
         }
 
         /* Then the certificates the peer supplied, in whatever order they arrived. Every
@@ -314,6 +371,12 @@ int brisk__x509_chain_verify(const brisk__x509_cert *certs, size_t n_certs, int6
             below++; /* (l): the parent now stands between the next one and the end entity */
         }
         cur = parent;
+        /* Only now, with the walk committed to this parent, does its key count towards the
+         * pins: a candidate that was tried and rejected is on no path, and neither is a
+         * certificate the peer attached that the walk never chose. */
+        if (!pin_hit && pinned(trust, cur)) {
+            pin_hit = 1;
+        }
     }
     return BRISK_E_AUTH; /* BRISK__X509_MAX_CHAIN levels and still no anchor */
 }
