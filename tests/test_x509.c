@@ -173,10 +173,209 @@ static void t_flip(void)
     }
 }
 
+/* The fixed widths tools/kat.py emits its chain rows into, and a cap that fits any certificate
+ * those rows hold - they are built here, none of them reaches 1 KB. CHAIN_CERTS is one past
+ * BRISK__X509_MAX_CHAIN so a row can hold a path that is deliberately too long. */
+#define CHAIN_CERTS    9
+#define CHAIN_ANCHORS  2
+#define CHAIN_CERT_CAP 2048
+
+/* ---------------------------------------------------------------------- chains ----------- */
+
+struct chain_kat {
+    const char *certs[CHAIN_CERTS];     /* [0] is the end entity; NULL ends the list */
+    const char *anchors[CHAIN_ANCHORS]; /* the trust store for this row */
+    int want;                           /* 0 = BRISK_OK, 1 = BRISK_E_AUTH */
+    int flags;                          /* 1 = the row needs BRISK_ENABLE_P384 */
+    const char *note;
+};
+#include "kat/x509_chain.inc"
+
+/* brisk__x509_signed_by on its own, where BRISK_E_ARG and BRISK_E_AUTH are told apart - a chain
+ * row cannot do that, it only ever reports that no path was built. */
+struct sig_kat {
+    const char *child, *issuer;
+    int want; /* 0 = BRISK_OK, 1 = BRISK_E_AUTH, 2 = BRISK_E_ARG */
+    int flags;
+    const char *note;
+};
+#include "kat/x509_sig.inc"
+
+#define CHAIN_N (sizeof X509_CHAIN_KAT / sizeof X509_CHAIN_KAT[0])
+#define SIG_N   (sizeof X509_SIG_KAT / sizeof X509_SIG_KAT[0])
+
+/* One row's certificates, decoded and parsed. The DER has to outlive the parse, which is what
+ * the byte arrays are for - brisk__x509_cert only points into them. */
+struct chain_row {
+    uint8_t der[CHAIN_CERTS][CHAIN_CERT_CAP];
+    uint8_t anchor_der[CHAIN_ANCHORS][CHAIN_CERT_CAP];
+    brisk__x509_cert certs[CHAIN_CERTS];
+    brisk__x509_cert anchors[CHAIN_ANCHORS];
+    size_t n_certs, n_anchors;
+};
+
+static struct chain_row g_row;
+
+/* Can this row's certificates be parsed by the library as configured? */
+static int chain_row_enabled(int flags)
+{
+#if BRISK_ENABLE_P384
+    (void)flags;
+    return 1;
+#else
+    return (flags & 1) == 0;
+#endif
+}
+
+/* The first two-deep accepted row every configuration can run, for the checks that want one
+ * concrete chain rather than the whole table. */
+static size_t plain_row(void)
+{
+    size_t i;
+    for (i = 0; i < CHAIN_N; i++) {
+        const struct chain_kat *k = &X509_CHAIN_KAT[i];
+        if (chain_row_enabled(k->flags) && k->want == 0 && k->certs[1] != NULL &&
+            k->certs[2] == NULL && k->anchors[0] != NULL) {
+            return i;
+        }
+    }
+    return 0;
+}
+
+/* The trust store of one row, looked up the way a CA bundle would be: by subject Name, with
+ * `index` walking the certificates that share one. */
+static int t_find_anchor(void *ctx, const uint8_t *dn, size_t dn_len, size_t index,
+                         brisk__x509_cert *out)
+{
+    const struct chain_row *r = ctx;
+    size_t i, hit = 0;
+
+    for (i = 0; i < r->n_anchors; i++) {
+        if (r->anchors[i].subject_len == dn_len && memcmp(r->anchors[i].subject, dn, dn_len) == 0) {
+            if (hit++ == index) {
+                *out = r->anchors[i];
+                return BRISK_OK;
+            }
+        }
+    }
+    return BRISK_E_ARG;
+}
+
+/* Parse every certificate of a row. A row whose own fixtures do not parse is a broken vector,
+ * not a chain failure, so this is checked rather than folded into the verdict. */
+static int chain_load(const struct chain_kat *k, size_t idx)
+{
+    size_t i, n;
+    int ok = 1;
+
+    g_row.n_certs = g_row.n_anchors = 0;
+    for (i = 0; i < CHAIN_CERTS && k->certs[i] != NULL; i++) {
+        n = t_unhex(k->certs[i], g_row.der[i], CHAIN_CERT_CAP);
+        if (brisk__x509_parse(&g_row.certs[i], g_row.der[i], n) != BRISK_OK) {
+            ok = 0;
+        }
+        g_row.n_certs++;
+    }
+    for (i = 0; i < CHAIN_ANCHORS && k->anchors[i] != NULL; i++) {
+        n = t_unhex(k->anchors[i], g_row.anchor_der[i], CHAIN_CERT_CAP);
+        if (brisk__x509_parse(&g_row.anchors[i], g_row.anchor_der[i], n) != BRISK_OK) {
+            ok = 0;
+        }
+        g_row.n_anchors++;
+    }
+    CHECKI(ok, idx);
+    return ok;
+}
+
+static void t_chain(void)
+{
+    size_t i;
+    for (i = 0; i < CHAIN_N; i++) {
+        const struct chain_kat *k = &X509_CHAIN_KAT[i];
+        int rc;
+
+        if (!chain_row_enabled(k->flags)) {
+            continue;
+        }
+        if (!chain_load(k, i)) {
+            continue;
+        }
+        rc = brisk__x509_chain_verify(g_row.certs, g_row.n_certs, t_find_anchor, &g_row);
+        CHECKI(rc == (k->want ? BRISK_E_AUTH : BRISK_OK), i);
+    }
+}
+
+/* The arguments the walk must refuse or survive on their own, which no vector covers: an empty
+ * certificate list, and a trust store that is not there at all. */
+static void t_chain_args(void)
+{
+    size_t row = plain_row();
+    const struct chain_kat *k = &X509_CHAIN_KAT[row];
+
+    CHECK(brisk__x509_chain_verify(NULL, 0, NULL, NULL) == BRISK_E_ARG);
+    if (chain_load(k, row)) {
+        CHECK(brisk__x509_chain_verify(g_row.certs, 0, t_find_anchor, &g_row) == BRISK_E_ARG);
+        CHECK(brisk__x509_chain_verify(g_row.certs, g_row.n_certs, NULL, NULL) == BRISK_E_AUTH);
+    }
+}
+
+/* brisk__x509_signed_by on its own: the row that chains cleanly says OK for the pair it was
+ * built from and AUTH for every other pairing, so a verifier that ignored the key would show up
+ * here rather than as a chain that happens to succeed. */
+static void t_signed_by(void)
+{
+    size_t row = plain_row();
+
+    if (!chain_load(&X509_CHAIN_KAT[row], row)) {
+        return;
+    }
+    CHECK(g_row.n_certs == 2 && g_row.n_anchors == 1);
+    CHECK(brisk__x509_signed_by(NULL, &g_row.certs[1]) == BRISK_E_ARG);
+    CHECK(brisk__x509_signed_by(&g_row.certs[0], NULL) == BRISK_E_ARG);
+    CHECK(brisk__x509_signed_by(&g_row.certs[0], &g_row.certs[1]) == BRISK_OK);
+    CHECK(brisk__x509_signed_by(&g_row.certs[1], &g_row.anchors[0]) == BRISK_OK);
+    CHECK(brisk__x509_signed_by(&g_row.certs[0], &g_row.anchors[0]) == BRISK_E_AUTH);
+    CHECK(brisk__x509_signed_by(&g_row.certs[1], &g_row.certs[0]) == BRISK_E_AUTH);
+    CHECK(brisk__x509_signed_by(&g_row.certs[0], &g_row.certs[0]) == BRISK_E_AUTH);
+}
+
+/* The two DER parsers brisk__x509_signed_by owns - an ECDSA-Sig-Value and an RSAPublicKey,
+ * both inside BIT STRINGs that brisk__der_walk treats as leaves - and the pairings it refuses.
+ * Nothing else in the suite tells BRISK_E_ARG from BRISK_E_AUTH here. */
+static void t_sig(void)
+{
+    static uint8_t child_der[CHAIN_CERT_CAP], issuer_der[CHAIN_CERT_CAP];
+    size_t i;
+
+    for (i = 0; i < SIG_N; i++) {
+        const struct sig_kat *k = &X509_SIG_KAT[i];
+        brisk__x509_cert child, issuer;
+        size_t cn, in;
+        int want;
+
+        if (!chain_row_enabled(k->flags)) {
+            continue;
+        }
+        cn = t_unhex(k->child, child_der, sizeof child_der);
+        in = t_unhex(k->issuer, issuer_der, sizeof issuer_der);
+        if (brisk__x509_parse(&child, child_der, cn) != BRISK_OK ||
+            brisk__x509_parse(&issuer, issuer_der, in) != BRISK_OK) {
+            CHECKI(0, i); /* a fixture that does not parse is a broken vector, not a verdict */
+            continue;
+        }
+        want = (k->want == 0) ? BRISK_OK : (k->want == 1) ? BRISK_E_AUTH : BRISK_E_ARG;
+        CHECKI(brisk__x509_signed_by(&child, &issuer) == want, i);
+    }
+}
+
 void test_x509(void)
 {
     t_time();
     t_certs();
     t_truncate();
     t_flip();
+    t_chain();
+    t_chain_args();
+    t_signed_by();
+    t_sig();
 }

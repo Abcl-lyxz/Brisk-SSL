@@ -22,6 +22,7 @@ add_library(brisk STATIC
     src/crypto/rsa.c      # RSASSA-PKCS1-v1_5 / RSASSA-PSS verify (RFC 8017)
     src/x509/der.c        # strict DER reader (ITU-T X.690), the X.509 foundation
     src/x509/cert.c       # one certificate: fields, extensions, validity dates
+    src/x509/chain.c      # path building to a trust anchor + the signature checks
 )
 if(CMAKE_SYSTEM_NAME STREQUAL "Linux") # src/os/ is Linux-only; the mingw host skips it
     target_sources(brisk PRIVATE src/os/linux_rand.c)

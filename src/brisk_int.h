@@ -823,9 +823,9 @@ int brisk__der_walk(const uint8_t *der, size_t len);
 /* Public key algorithms this client can use. Anything else is BRISK_E_ARG at parse time, which
  * is bad_certificate rather than a chain failure. */
 enum {
-    BRISK__X509_KEY_RSA = 1,   /* rsaEncryption, 1.2.840.113549.1.1.1 */
-    BRISK__X509_KEY_P256 = 2,  /* id-ecPublicKey + prime256v1 */
-    BRISK__X509_KEY_P384 = 3   /* id-ecPublicKey + secp384r1; needs BRISK_ENABLE_P384 */
+    BRISK__X509_KEY_RSA = 1,  /* rsaEncryption, 1.2.840.113549.1.1.1 */
+    BRISK__X509_KEY_P256 = 2, /* id-ecPublicKey + prime256v1 */
+    BRISK__X509_KEY_P384 = 3  /* id-ecPublicKey + secp384r1; needs BRISK_ENABLE_P384 */
 };
 
 /* Signature algorithm families. The digest is kept separately in `sig_hash` so the verifier
@@ -880,11 +880,11 @@ typedef struct {
 
     int64_t not_before, not_after; /* seconds since 1970-01-01T00:00:00Z, may be negative */
 
-    uint16_t key_usage; /* BRISK__X509_KU_*, 0 when the extension is absent */
-    uint8_t version;    /* 1, 2 or 3 - the encoded value plus one */
-    uint8_t key_alg;    /* BRISK__X509_KEY_* */
-    uint8_t sig_alg;    /* BRISK__X509_SIG_* */
-    uint8_t sig_hash;   /* a brisk_hash_alg */
+    uint16_t key_usage;   /* BRISK__X509_KU_*, 0 when the extension is absent */
+    uint8_t version;      /* 1, 2 or 3 - the encoded value plus one */
+    uint8_t key_alg;      /* BRISK__X509_KEY_* */
+    uint8_t sig_alg;      /* BRISK__X509_SIG_* */
+    uint8_t sig_hash;     /* a brisk_hash_alg */
     uint8_t sig_salt_len; /* RSASSA-PSS saltLength; 0 for the other families */
     uint8_t eku;          /* BRISK__X509_EKU_*, 0 when the extension is absent */
     uint8_t is_ca;        /* basicConstraints cA (4.2.1.9); 0 when the extension is absent */
@@ -904,6 +904,120 @@ int brisk__x509_parse(brisk__x509_cert *c, const uint8_t *der, size_t len);
  * needs the same conversion and because it is where the calendar arithmetic is tested.
  * BRISK_E_ARG on anything else. */
 int brisk__x509_time(unsigned tag, const uint8_t *v, size_t len, int64_t *out);
+
+/* ---- x509/chain.c: build a path to a trust anchor and check every signature ----------------
+ *
+ * brisk__x509_chain_verify takes the certificates a server sent, in the order it sent them or
+ * in any other, and answers one question: does certs[0] chain to something the caller trusts?
+ * It is the RFC 5280 6.1 path validation algorithm with the parts this client does not
+ * implement left out, and the parts it does implement are named below with their step letters.
+ *
+ * Nothing is copied or allocated here either: the certs stay where the caller parsed them and
+ * the only state is loop variables plus one brisk__x509_cert for the anchor under inspection.
+ * STACK: this is the top of the deepest call chain in the library, because verifying one
+ * certificate signature enters the RSA verifier from here. Measured with -fstack-usage at -Os,
+ * gcc 14, BRISK_RSA_MAX_BITS 4096, summed along brisk__x509_chain_verify -> signed_by ->
+ * brisk__rsa_pss_verify -> rsa_vp1 -> brisk__bn_modpow_pub -> brisk__bn_mont_mul:
+ *   armv7hf 3784 = 168 + 408 + 2488 + 40 + 64 + 616
+ *   mips    3872 = 184 + 416 + 2520 + 64 + 88 + 600
+ *   x86_64  4176 = 288 + 496 + 2560 + 80 + 112 + 640
+ * So a thread that runs a handshake wants 4 KB for this path alone at 4096-bit RSA, on top of
+ * whatever the TLS layer holds. BRISK_RSA_MAX_BITS is the lever - at 2048 the RSA part roughly
+ * halves - and the 3.5 KB budget in src/crypto/rsa.c is the subtree, not the total.
+ *
+ * WHAT IS CHECKED, per certificate of the path:
+ *   - 6.1.3 (a)(4) the issuer Name of the child equals the subject Name of the parent, compared
+ *     as raw DER (see the brisk__x509_cert block on why not RFC 5280 7.1).
+ *   - 6.1.3 (a)(1) the child's signature verifies under the parent's public key.
+ *   - 6.1.4 (k) a parent is a v3 certificate with basicConstraints cA TRUE. A v1 or v2
+ *     intermediate is refused outright, which (k) explicitly allows.
+ *     A TRUST ANCHOR is the one exception, and it cuts both ways. 6.1.1 (d) defines an anchor
+ *     as a Name and a key, never as certificate i of 6.1.3, so (k) does not reach it: a v1 or
+ *     v2 anchor is accepted, because the operator put it in the store on purpose and a private
+ *     PKI older than RFC 2459 should not be unusable. The other three rules ARE applied to the
+ *     anchor although the RFC does not ask for them - a v3 root still has to say cA TRUE, still
+ *     has to allow keyCertSign, and its pathLenConstraint still counts.
+ *   - 6.1.4 (n) if the parent has a keyUsage, keyCertSign is set in it.
+ *   - 6.1.4 (l) and (m) pathLenConstraint: a parent that declares one must not sit further than
+ *     that many non-self-issued certificates above the end entity. A self-issued certificate
+ *     (issuer == subject) does not count, exactly as (l) says, so a CA that cross-signs itself
+ *     during a key rollover does not consume its own budget.
+ *
+ * WHAT IS NOT, on purpose: the validity window (the time-policy item owns notBefore/notAfter
+ * and the STRICT / FLOOR / INSECURE_NO_TIME decision), hostname and IP matching (RFC 9525
+ * item), EKU policy at the end entity, name constraints, certificate policies and revocation.
+ * A caller that stops after this function has a chain that is well formed and cryptographically
+ * intact, and nothing more than that.
+ *
+ * SEARCH STRATEGY, and its one honest limit: the walk is greedy, upward, one level at a time.
+ * At each level the trust anchors are asked FIRST - which is what "stop at the first trust
+ * anchor" means and what makes a cross-signed root work: when a chain arrives with the old
+ * cross-certificate still attached, the intermediate's issuer is already in the store and the
+ * useless tail is never looked at. Only then are the certificates the peer supplied searched,
+ * and every candidate with a matching subject is tried until one verifies, so two intermediates
+ * that share a Name (the usual shape of a key rollover) do not depend on their order.
+ * There is NO backtracking ACROSS levels: once a level's candidate verifies, the walk commits
+ * to it. Constructing a case that needs more means issuing two certificates with the same
+ * subject Name AND the same key, differing only in a constraint - at which point the failure is
+ * a chain that does not build, never one that wrongly does. Fail closed, so a DFS can wait
+ * until a real deployment needs it.
+ *
+ * BRISK__X509_MAX_CHAIN bounds the walk whatever the inputs look like, so a peer that sends a
+ * cycle of self-issued certificates gets BRISK_E_AUTH after a bounded number of verifications
+ * rather than a hang. */
+#define BRISK__X509_MAX_CHAIN 8 /* end entity + 7; the Web PKI's deepest real chain is 4 */
+/* Candidates offered for ONE issuer Name by the trust store, i.e. how many roots may share a
+ * subject during a key rollover. Its own constant and not MAX_CHAIN: trimming the depth limit
+ * for flash must not quietly shrink what a CA bundle may hold. */
+#define BRISK__X509_MAX_ANCHORS 4
+/* Total signature verifications one walk may perform, anchors and peer candidates together.
+ * A real chain needs at most one per level; this is the ceiling that keeps a peer from turning
+ * a long Certificate message into minutes of CPU on a 200 MHz core. */
+#define BRISK__X509_MAX_VERIFY 32
+
+/* Trust anchor lookup, called with the issuer Name TLV the walk is looking for.
+ *
+ * `index` counts up from 0 for the SAME `dn` until the callback stops finding candidates, so a
+ * store holding two roots with one subject Name - a key rollover, which the Web PKI does have -
+ * can offer both, and at most BRISK__X509_MAX_ANCHORS of them are asked for per level, so a
+ * store that never says "no more" cannot hang the walk. Fill `*out` with a parsed anchor and return
+ * BRISK_OK, or return any negative code to say "no more"; the walk then moves on and never calls
+ * the callback again for that level. The lookup is by Name alone, so it can stay lazy: the CA
+ * bundle item scans its file for a matching subject instead of parsing every root into RAM. */
+typedef int (*brisk__x509_anchor_fn)(void *ctx, const uint8_t *dn, size_t dn_len, size_t index,
+                                     brisk__x509_cert *out);
+
+/* Verify that `child` was signed by the key in `issuer`, and nothing else: the caller owns the
+ * name chaining and the CA checks. The digest named by child->sig_hash is taken over
+ * child->tbs, then the family in child->sig_alg decides the verifier - which is also where the
+ * signature and the key stop being opaque, because the DER inside a BIT STRING is the one part
+ * of a certificate brisk__der_walk cannot reach (an ECDSA-Sig-Value and an RSAPublicKey both
+ * live there). Both are parsed with the strict cursor here, so neither reaches the crypto layer
+ * unvalidated.
+ *   BRISK_OK     the signature verifies.
+ *   BRISK_E_AUTH it does not, or the issuer's key algorithm cannot produce this signature.
+ *   BRISK_E_ARG  the signature or the public key is not well-formed DER, or this build cannot
+ *                verify the pairing at all - P-384 with BRISK_ENABLE_P384 off, or a digest
+ *                narrower than the issuer's field, which RFC 5480 4 does not pair and the M1
+ *                verifiers refuse. A TLS caller turns that into unsupported_certificate, which
+ *                is why it is not folded into BRISK_E_AUTH. */
+int brisk__x509_signed_by(const brisk__x509_cert *child, const brisk__x509_cert *issuer);
+
+/* certs[0] is the end entity; certs[1..] are whatever else the peer supplied, in any order, and
+ * may include certificates that belong to no path at all. `find_anchor` may be NULL, which
+ * means an empty trust store and therefore always BRISK_E_AUTH. n_certs itself is not bounded
+ * here - the TLS layer caps the Certificate message it builds the array from - but the WORK is:
+ * BRISK__X509_MAX_VERIFY signature verifications in total, however many candidates the peer
+ * supplies, so an oversized list costs a scan and not a stall.
+ *   BRISK_OK     certs[0] chains to a trust anchor and every signature on the way verified.
+ *   BRISK_E_AUTH no such path exists - no anchor was reached, a signature failed, a parent was
+ *                not a usable CA, or the walk hit BRISK__X509_MAX_CHAIN or
+ *                BRISK__X509_MAX_VERIFY. They are
+ *                deliberately one code: an attacker learns nothing from which one it was, and
+ *                a TLS caller sends the same alert for all of them.
+ *   BRISK_E_ARG  n_certs is 0. */
+int brisk__x509_chain_verify(const brisk__x509_cert *certs, size_t n_certs,
+                             brisk__x509_anchor_fn find_anchor, void *anchor_ctx);
 
 /* ---- os/linux_rand.c (Linux builds only): the only randomness source, no userspace DRBG ---- */
 /* len bytes from the kernel CSPRNG: getrandom(2), which blocks until the pool is initialised.

@@ -100,6 +100,8 @@ int main(int argc, char **argv)
         int64_t when;
         brisk__x509_parse(&xc, out, sizeof out);
         brisk__x509_time(BRISK__DER_UTC_TIME, out, sizeof out, &when);
+        brisk__x509_chain_verify(&xc, 1, NULL, NULL);
+        brisk__x509_signed_by(&xc, &xc);
     }
 #ifdef __linux__
     brisk__os_random(out, 32);

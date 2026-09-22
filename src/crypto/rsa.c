@@ -44,6 +44,9 @@
  * (rsa_em_scratch below); and comparing e against n as octet strings in rsa_vp1 rather than
  * decoding e into a second i31 value, which alone was 536 bytes on the deepest chain.
  * Re-measure if the -Os pin in CMakeLists.txt ever moves.
+ * NOT the whole story for a certificate: brisk__x509_signed_by enters this file with ~400 more
+ * bytes already on the stack (the x509/chain.c block in brisk_int.h carries the end-to-end
+ * figure). Size a handshake thread from that total, never from the budget on this line.
  *
  * File-local statics carry an rsa_ prefix so the M8 amalgamation has nothing to collide with.
  *

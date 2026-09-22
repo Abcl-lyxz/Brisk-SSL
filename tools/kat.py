@@ -3151,7 +3151,8 @@ def x_time(text):
 
 def make_cert(version=3, serial=1, alg=None, outer_alg=None, issuer="Brisk Test CA",
               subject="device.example.com", nbf="200101000000Z", naf="300101000000Z",
-              spki=None, exts=None, sig=None, sig_unused=0, uids=b"", extra_tbs=b""):
+              spki=None, exts=None, sig=None, sig_unused=0, uids=b"", extra_tbs=b"",
+              sign=None):
     alg = x_alg_rsa_pkcs1() if alg is None else alg
     spki = x_spki_rsa() if spki is None else spki
     parts = []
@@ -3160,6 +3161,8 @@ def make_cert(version=3, serial=1, alg=None, outer_alg=None, issuer="Brisk Test 
     parts += [x_int(serial), alg, x_name(issuer), x_seq(x_time(nbf), x_time(naf)), x_name(subject),
               spki]
     tbs = x_seq(*parts, uids, extra_tbs, x_ctx(3, x_seq(*exts)) if exts is not None else b"")
+    if sign is not None:  # a chain row: the signature is over these exact bytes (4.1.1.3)
+        sig = sign(tbs)
     return x_seq(tbs, outer_alg if outer_alg is not None else alg,
                  x_bits(sig if sig is not None else bytes(64), sig_unused))
 
@@ -3445,6 +3448,378 @@ def x509_cert_vectors():
 
 
 # ---------------------------------------------------------------- C emitters
+# ------------------------------------------------------------------- X.509 chains (M2)
+# The certificates above carry nonsense signatures because a parser does not look at them. A
+# chain does, so every certificate below is REALLY signed: small PKIs are built here, each
+# signature is produced with the pure-Python signer and then re-verified with the pure-Python
+# verifier (py_p256_verify, py_p384_verify, py_pkcs1_verify, py_pss_verify) before it is
+# emitted, so a broken signer cannot quietly turn into a C test that passes.
+#
+# There is no official suite to take these from - x509-limbo is the nearest thing and it is its
+# own ROADMAP item. What is here is one row per rule src/x509/chain.c enforces, which is the
+# same standard the cert rows are held to.
+CHAIN_MAX_CERTS = 9  # leaf + 8, which is one past BRISK__X509_MAX_CHAIN on purpose
+CHAIN_MAX_ANCHORS = 2
+RSA_CHAIN_KEY = None  # (n_hex, e_hex, n, d, k), built once in main()
+
+
+def py_ec_sign(curve, d, digest, k):
+    """(r, s) with the nonce given. FIPS 186-5 6.4.1, leftmost-bits rule of 6.4.
+
+    A nonce of our own choosing is fine here and RFC 6979 would only be noise: these signatures
+    are test fixtures over public data, not a demonstration that the signer is safe. What does
+    matter is that each one verifies, which the caller checks."""
+    n = curve["n"]
+    flen = (n.bit_length() + 7) // 8
+    z = int.from_bytes(digest[:flen], "big") % n
+    R = py_ec_mul(curve, k, (curve["gx"], curve["gy"]))
+    if R is None:
+        return None
+    r = R[0] % n
+    s = pow(k, -1, n) * (z + r * d) % n
+    return None if r == 0 or s == 0 else (r, s)
+
+
+def ec_issuer(curve, d, hbits):
+    """A signing identity: its SubjectPublicKeyInfo, its AlgorithmIdentifier, and sign(tbs)."""
+    n = curve["n"]
+    pub = py_ec_mul(curve, d, (curve["gx"], curve["gy"]))
+    flen = (n.bit_length() + 7) // 8
+    point = b"\x04" + pub[0].to_bytes(flen, "big") + pub[1].to_bytes(flen, "big")
+    curve_oid = "1.2.840.10045.3.1.7" if flen == 32 else "1.3.132.0.34"
+
+    state = {}
+
+    def sign(tbs):
+        h = HASH[hbits](tbs).digest()
+        for i in range(1, 64):
+            k = int.from_bytes(hashlib.sha512(b"brisk chain k" + bytes([i]) + tbs).digest(),
+                               "big") % n
+            if not 1 <= k < n:
+                continue
+            rs = py_ec_sign(curve, d, h, k)
+            if rs is None:
+                continue
+            sig = rs[0].to_bytes(flen, "big") + rs[1].to_bytes(flen, "big")
+            if flen == 32:
+                ok = py_p256_verify(point, h, sig) == P256_OK
+            else:
+                ok = py_p384_verify(point, h, sig) == P384_OK
+            if not ok:
+                die("chain: an EC signature this file produced does not verify")
+            state["rs"] = rs
+            return x_seq(x_int(rs[0]), x_int(rs[1]))
+        die("chain: no usable EC nonce in 64 tries")
+
+    return {"spki": x_spki_ec(curve_oid, point), "alg": x_alg_ecdsa(hbits), "sign": sign,
+            "state": state}
+
+
+def py_pkcs1_sign(n, d, k, hbits, tbs):
+    """RFC 8017 9.2 EMSA-PKCS1-v1_5, then RSASP1 of 8.2.1."""
+    di = DIGESTINFO[hbits] + HASH[hbits](tbs).digest()
+    em = b"\x00\x01" + b"\xff" * (k - len(di) - 3) + b"\x00" + di
+    return pow(int.from_bytes(em, "big"), d, n).to_bytes(k, "big")
+
+
+def py_pss_sign(n, d, k, mod_bits, hbits, slen, tbs):
+    """RFC 8017 9.1.1 EMSA-PSS-ENCODE then 8.1.1, with a fixed salt (see py_ec_sign on nonces)."""
+    hlen = hbits // 8
+    embits = mod_bits - 1
+    emlen = (embits + 7) // 8
+    mh = HASH[hbits](tbs).digest()
+    salt = HASH[hbits](b"brisk chain salt" + mh).digest()[:slen]
+    hh = HASH[hbits](bytes(8) + mh + salt).digest()
+    db = bytes(emlen - hlen - slen - 2) + b"\x01" + salt
+    masked = bytearray(x ^ y for x, y in zip(db, py_mgf1(hbits, hh, len(db))))
+    masked[0] &= 0xFF >> (8 * emlen - embits)
+    em = bytes(masked) + hh + b"\xbc"
+    return mh, pow(int.from_bytes(em, "big"), d, n).to_bytes(k, "big")
+
+
+def rsa_issuer(hbits, pss_salt=None):
+    """An RSA signing identity, PKCS#1 v1.5 or - when pss_salt is given - RSASSA-PSS."""
+    n_hex, e_hex, n, d, k = RSA_CHAIN_KEY
+    mod_bits = n.bit_length()
+    e = int(e_hex, 16)
+
+    def sign(tbs):
+        if pss_salt is None:
+            sig = py_pkcs1_sign(n, d, k, hbits, tbs)
+            if py_pkcs1_verify(n, e, hbits, HASH[hbits](tbs).digest(), sig) != RSA_OK:
+                die("chain: a PKCS#1 signature this file produced does not verify")
+        else:
+            mh, sig = py_pss_sign(n, d, k, mod_bits, hbits, pss_salt, tbs)
+            if py_pss_verify(n, e, hbits, pss_salt, mh, sig) != RSA_OK:
+                die("chain: a PSS signature this file produced does not verify")
+        return sig
+
+    alg = x_alg_pss(hbits, salt=pss_salt) if pss_salt is not None else x_alg_rsa_pkcs1(hbits)
+    return {"spki": x_spki_rsa(n_hex, e_hex), "alg": alg, "sign": sign}
+
+
+def x_bc(ca=True, path_len=None):
+    """basicConstraints, critical as RFC 5280 4.2.1.9 requires of a CA certificate."""
+    inner = (der_tlv(0x01, b"\xff") if ca else b"") + (b"" if path_len is None else x_int(path_len))
+    return x_ext("2.5.29.19", True, x_seq(inner))
+
+
+# BIT NUMBERS of RFC 5280 4.2.1.3, which is what x_named_bits wants - not the KU_* masks above,
+# which are the decoded value a cert row carries.
+KU_BIT_DIGITAL_SIGNATURE = 0
+KU_BIT_KEY_CERT_SIGN = 5
+
+
+def x_ku(*bits):
+    return x_ext("2.5.29.15", True, x_named_bits(list(bits)))
+
+
+def cert_kw(issuer_name, subject, signer, key, version=3, exts=None, serial=1):
+    """Everything about a certificate except its signature, so the same TBS can be emitted
+    twice: once really signed, once with a signature a row built to be wrong."""
+    return dict(version=version, serial=serial, alg=signer["alg"], issuer=issuer_name,
+                subject=subject, spki=key["spki"], exts=exts)
+
+
+def chain_cert(issuer_name, subject, signer, key, version=3, exts=None, serial=1):
+    """One certificate: `signer` signs it, `key` contributes the subjectPublicKeyInfo."""
+    return make_cert(sign=signer["sign"],
+                     **cert_kw(issuer_name, subject, signer, key, version, exts, serial))
+
+
+def chain_row(certs, anchors, want, note, flags=0):
+    if len(certs) > CHAIN_MAX_CERTS or len(anchors) > CHAIN_MAX_ANCHORS:
+        die(f"chain row '{note}' does not fit the fixed arrays")
+    return ([c.hex() for c in certs], [a.hex() for a in anchors], want, flags, note)
+
+
+def uint_der(v):
+    """The contents octets of a DER INTEGER holding the non-negative v (X.690 8.3.2)."""
+    n = max(1, (v.bit_length() + 8) // 8)
+    return v.to_bytes(n, "big")
+
+
+def x509_sig_vectors():
+    """brisk__x509_signed_by on its own: the two DER parsers it owns, and the pairings it must
+    refuse. want: 0 = BRISK_OK, 1 = BRISK_E_AUTH, 2 = BRISK_E_ARG.
+
+    These are the only structures in a certificate the peer controls that brisk__der_walk never
+    validates - an ECDSA-Sig-Value and an RSAPublicKey both live inside a BIT STRING, which the
+    walk treats as a leaf - so every one of their rejections gets a row. A chain vector cannot
+    reach them: it only ever reports that no path was built."""
+    rows = []
+    root = ec_issuer(P256, 0x5EED0001, 256)
+    inter = ec_issuer(P256, 0x5EED0002, 256)
+    leaf = ec_issuer(P256, 0x5EED0004, 256)
+    ee_ext = [x_bc(False), x_ku(KU_BIT_DIGITAL_SIGNATURE)]
+    ca_ext = [x_bc(True), x_ku(KU_BIT_KEY_CERT_SIGN)]
+
+    kw = cert_kw("Brisk Inter", "device.example.com", inter, leaf, exts=ee_ext)
+    good = make_cert(sign=inter["sign"], **kw)
+    r, s = inter["state"]["rs"]
+    inter_c = chain_cert("Brisk Root", "Brisk Inter", root, inter, exts=ca_ext)
+    root_c = chain_cert("Brisk Root", "Brisk Root", root, root, exts=ca_ext)
+
+    def sig_row(sig, want, note):
+        rows.append((make_cert(sig=sig, **kw).hex(), inter_c.hex(), want, 0, note))
+
+    rows.append((good.hex(), inter_c.hex(), 0, 0, "the signature the issuer really made"))
+    rows.append((good.hex(), root_c.hex(), 1, 0, "the right shape under the wrong key"))
+    sig_row(x_seq(x_int(r), x_int(s)) + b"\x00", 2, "a trailing octet after the SEQUENCE")
+    sig_row(x_seq(x_int(r)), 2, "an ECDSA-Sig-Value with no s")
+    sig_row(der_tlv(0x04, x_int(r) + x_int(s)), 2, "an OCTET STRING instead of a SEQUENCE")
+    sig_row(x_seq(der_tlv(0x02, b"\x00" + uint_der(r)), x_int(s)), 2,
+            "a non-minimal INTEGER for r (X.690 8.3.2)")
+    sig_row(x_seq(der_tlv(0x02, b"\xff" + uint_der(r)[1:]), x_int(s)), 2, "a negative r")
+    sig_row(x_seq(der_tlv(0x02, b"\x01" + uint_der(r)), x_int(s)), 2,
+            "an r wider than the field")
+    sig_row(x_seq(x_int(0), x_int(s)), 1, "r = 0, which FIPS 186-5 6.4.2 calls INVALID")
+    sig_row(x_seq(x_int(r), x_int(0)), 1, "s = 0")
+
+    # An RSAPublicKey that is not one. cert.c hands the BIT STRING over without looking inside
+    # (read_spki only bounds an EC point), so this reaches rsa_key and nothing earlier.
+    rsa_ca = rsa_issuer(256)
+    broken = dict(rsa_ca)
+    broken["spki"] = x_seq(x_seq(x_oid("1.2.840.113549.1.1.1"), b"\x05\x00"), x_bits(x_seq()))
+    rows.append((chain_cert("Brisk RSA", "device.example.com", rsa_ca, leaf, exts=ee_ext).hex(),
+                 chain_cert("Brisk RSA", "Brisk RSA", rsa_ca, broken, exts=ca_ext).hex(), 2, 0,
+                 "an RSAPublicKey with no modulus"))
+
+    # A P-384 key with a SHA-256 signature: producible per FIPS 186-5, not a pairing RFC 5480 4
+    # names, and not one the M1 verifiers take. The signature bytes are never reached.
+    p384 = ec_issuer(P384, 0x5EED0006, 384)
+    rows.append((make_cert(alg=x_alg_ecdsa(256), issuer="Brisk 384", subject="device.example.com",
+                           spki=leaf["spki"], exts=ee_ext).hex(),
+                 chain_cert("Brisk 384", "Brisk 384", p384, p384, exts=ca_ext).hex(), 2, 1,
+                 "a P-384 key under a SHA-256 signature"))
+    print(f"  x509 signatures: {len(rows)} rows")
+    return rows
+
+
+def x509_chain_vectors():
+    """One row per rule src/x509/chain.c enforces. want: 0 = BRISK_OK, 1 = BRISK_E_AUTH."""
+    rows = []
+    root = ec_issuer(P256, 0x5EED0001, 256)
+    inter = ec_issuer(P256, 0x5EED0002, 256)
+    inter2 = ec_issuer(P256, 0x5EED0003, 256)  # a second CA that shares inter's Name
+    leaf = ec_issuer(P256, 0x5EED0004, 256)
+    other = ec_issuer(P256, 0x5EED0005, 256)  # never part of any path
+
+    ca_ext = [x_bc(True), x_ku(KU_BIT_KEY_CERT_SIGN)]
+    ee_ext = [x_bc(False), x_ku(KU_BIT_DIGITAL_SIGNATURE)]
+
+    root_c = chain_cert("Brisk Root", "Brisk Root", root, root, exts=ca_ext)
+    inter_c = chain_cert("Brisk Root", "Brisk Inter", root, inter, exts=ca_ext)
+    leaf_c = chain_cert("Brisk Inter", "device.example.com", inter, leaf, exts=ee_ext)
+    alien = chain_cert("Somewhere Else", "unrelated.example", other, other, exts=ca_ext)
+
+    rows.append(chain_row([leaf_c, inter_c], [root_c], 0, "leaf -> intermediate -> root"))
+    rows.append(chain_row([leaf_c, alien, inter_c], [root_c], 0,
+                          "the intermediate is not the first extra"))
+    rows.append(chain_row([leaf_c, inter_c, alien], [root_c, alien], 0,
+                          "an unrelated certificate is also trusted"))
+    rows.append(chain_row([chain_cert("Brisk Root", "device.example.com", root, leaf,
+                                      exts=ee_ext)], [root_c], 0,
+                          "the root issued the leaf itself"))
+    rows.append(chain_row([leaf_c], [root_c], 1, "the intermediate was not sent"))
+    rows.append(chain_row([leaf_c, inter_c], [], 1, "an empty trust store"))
+    rows.append(chain_row([leaf_c, inter_c], [alien], 1, "the trust store holds the wrong root"))
+    rows.append(chain_row([root_c], [], 1, "a self-signed certificate is not its own anchor"))
+
+    # A tampered signature has to survive the parse to reach the verifier, so flip a bit of the
+    # signatureValue - the one field cert.c copies out without looking at it.
+    bad_leaf, bad_inter = bytearray(leaf_c), bytearray(inter_c)
+    bad_leaf[-1] ^= 0x01
+    bad_inter[-1] ^= 0x01
+    rows.append(chain_row([bytes(bad_leaf), inter_c], [root_c], 1,
+                          "the leaf signature was altered"))
+    rows.append(chain_row([leaf_c, bytes(bad_inter)], [root_c], 1,
+                          "the intermediate signature was altered"))
+
+    # RFC 5280 6.1.4 (k), (n): what makes a certificate usable as a parent.
+    # No keyUsage on this one: cert.c already refuses keyCertSign without cA (4.2.1.9), so
+    # asserting both here would test the parser a second time instead of testing 6.1.4 (k).
+    rows.append(chain_row([leaf_c, chain_cert("Brisk Root", "Brisk Inter", root, inter,
+                                              exts=[x_bc(False)])],
+                          [root_c], 1, "6.1.4 (k) the intermediate is not a CA"))
+    rows.append(chain_row([leaf_c, chain_cert("Brisk Root", "Brisk Inter", root, inter)],
+                          [root_c], 1, "6.1.4 (k) the intermediate has no basicConstraints"))
+    rows.append(chain_row([leaf_c, chain_cert("Brisk Root", "Brisk Inter", root, inter,
+                                              version=1)],
+                          [root_c], 1, "6.1.4 (k) a v1 intermediate is refused"))
+    rows.append(chain_row([leaf_c, chain_cert("Brisk Root", "Brisk Inter", root, inter,
+                                              exts=[x_bc(True), x_ku(KU_BIT_DIGITAL_SIGNATURE)])],
+                          [root_c], 1, "6.1.4 (n) the intermediate cannot sign certificates"))
+    rows.append(chain_row([leaf_c, chain_cert("Brisk Root", "Brisk Inter", root, inter,
+                                              exts=[x_bc(True)])],
+                          [root_c], 0, "6.1.4 (n) no keyUsage leaves signing unconstrained"))
+    rows.append(chain_row([leaf_c, inter_c],
+                          [chain_cert("Brisk Root", "Brisk Root", root, root,
+                                      exts=[x_bc(True), x_ku(KU_BIT_DIGITAL_SIGNATURE)])],
+                          1, "6.1.4 (n) the same rule applies to the anchor"))
+
+    # 6.1.4 (l), (m): pathLenConstraint counts the non-self-issued certificates BELOW.
+    root0 = chain_cert("Brisk Root", "Brisk Root", root, root,
+                       exts=[x_bc(True, 0), x_ku(KU_BIT_KEY_CERT_SIGN)])
+    root1 = chain_cert("Brisk Root", "Brisk Root", root, root,
+                       exts=[x_bc(True, 1), x_ku(KU_BIT_KEY_CERT_SIGN)])
+    rows.append(chain_row([leaf_c, inter_c], [root0], 1,
+                          "6.1.4 (m) pathLen 0 with an intermediate below"))
+    rows.append(chain_row([leaf_c, inter_c], [root1], 0,
+                          "6.1.4 (m) pathLen 1 allows exactly that one"))
+    rows.append(chain_row([chain_cert("Brisk Root", "device.example.com", root, leaf,
+                                      exts=ee_ext)], [root0], 0,
+                          "6.1.4 (m) pathLen 0 still issues end entities"))
+    rows.append(chain_row([leaf_c, chain_cert("Brisk Root", "Brisk Inter", root, inter,
+                                              exts=[x_bc(True, 0), x_ku(KU_BIT_KEY_CERT_SIGN)])],
+                          [root_c], 0, "6.1.4 (m) pathLen 0 on the issuing intermediate"))
+    # A self-issued certificate sits in the path but does not consume the budget, so this fits
+    # under a pathLen of 1 although three certificates lie between the leaf and the root.
+    rows.append(chain_row([leaf_c, chain_cert("Brisk Inter", "Brisk Inter", inter, inter,
+                                              exts=ca_ext, serial=9), inter_c],
+                          [root1], 0,
+                          "6.1.4 (l) a self-issued certificate does not consume the budget"))
+
+    # Two CAs with the same subject Name: only one of them signed the leaf (a key rollover).
+    leaf2 = chain_cert("Brisk Inter", "device.example.com", inter2, leaf, exts=ee_ext, serial=2)
+    inter2_c = chain_cert("Brisk Root", "Brisk Inter", root, inter2, serial=2, exts=ca_ext)
+    rows.append(chain_row([leaf2, inter_c, inter2_c], [root_c], 0,
+                          "the wrong same-Name intermediate comes first"))
+    rows.append(chain_row([leaf2, inter2_c, inter_c], [root_c], 0,
+                          "the right same-Name intermediate comes first"))
+    rows.append(chain_row([leaf2, inter_c], [root_c], 1,
+                          "only the wrong same-Name intermediate was sent"))
+
+    # A trust anchor is a Name and a key (6.1.1 (d)), not certificate i of 6.1.3, so the
+    # version rule of (k) does not reach it - but the other three do, deliberately.
+    rows.append(chain_row([leaf_c, inter_c],
+                          [chain_cert("Brisk Root", "Brisk Root", root, root, version=1)], 0,
+                          "6.1.1 (d) a v1 anchor is still an anchor"))
+    rows.append(chain_row([leaf_c, inter_c],
+                          [chain_cert("Brisk Root", "Brisk Root", root, root, exts=[x_bc(False)])],
+                          1, "a v3 anchor that says cA FALSE means it"))
+
+    # pathLenConstraint two levels up, which is the row that tells `path_len < below` apart
+    # from `path_len <= below`: interB may have one certificate under it, and it has two.
+    inter_b = ec_issuer(P256, 0x5EED0007, 256)
+    b_c = chain_cert("Brisk Root", "Brisk B", root, inter_b,
+                     exts=[x_bc(True, 0), x_ku(KU_BIT_KEY_CERT_SIGN)])
+    a_c = chain_cert("Brisk B", "Brisk Inter", inter_b, inter, exts=ca_ext)
+    rows.append(chain_row([leaf_c, a_c, b_c], [root_c], 1,
+                          "6.1.4 (m) pathLen 0 two levels above the end entity"))
+    rows.append(chain_row([leaf_c, a_c, chain_cert("Brisk Root", "Brisk B", root, inter_b,
+                                                   exts=[x_bc(True, 1),
+                                                         x_ku(KU_BIT_KEY_CERT_SIGN)])],
+                          [root_c], 0, "6.1.4 (m) pathLen 1 two levels above the end entity"))
+
+    # The depth bound itself: BRISK__X509_MAX_CHAIN is 8, so an end entity with 7 intermediates
+    # under an anchor is the longest path that may build, and one more must not.
+    def ladder(n):
+        """leaf <- I1 <- ... <- In <- root, as a row's certificate list (leaf first)."""
+        cas = [ec_issuer(P256, 0x5EED0100 + j, 256) for j in range(n)]
+        certs = [chain_cert("CA 0", "device.example.com", cas[0], leaf, exts=ee_ext)]
+        for j in range(n):
+            up = cas[j + 1] if j + 1 < n else root
+            up_name = "CA %d" % (j + 1) if j + 1 < n else "Brisk Root"
+            certs.append(chain_cert(up_name, "CA %d" % j, up, cas[j], exts=ca_ext, serial=j + 1))
+        return certs
+
+    rows.append(chain_row(ladder(7), [root_c], 0, "the longest path that fits the depth bound"))
+    rows.append(chain_row(ladder(8), [root_c], 1, "one certificate past the depth bound"))
+
+    # Loop bait: a certificate that issues itself and is not an anchor. A walk that did not
+    # bound itself would follow it forever.
+    rows.append(chain_row([chain_cert("Loop", "device.example.com", other, leaf, exts=ee_ext),
+                           chain_cert("Loop", "Loop", other, other, exts=ca_ext)],
+                          [], 1, "a self-issued cycle terminates"))
+
+    # The other signature families, in the same shape.
+    for note, ca, sub in (("RSA PKCS#1 v1.5 throughout", rsa_issuer(256), rsa_issuer(256)),
+                          ("RSASSA-PSS throughout", rsa_issuer(256, 32), rsa_issuer(256, 32)),
+                          ("an RSA root over an EC intermediate", rsa_issuer(384), inter)):
+        rows.append(chain_row(
+            [chain_cert("Brisk Inter", "device.example.com", sub, leaf, exts=ee_ext),
+             chain_cert("Brisk Root", "Brisk Inter", ca, sub, exts=ca_ext)],
+            [chain_cert("Brisk Root", "Brisk Root", ca, ca, exts=ca_ext)], 0, note))
+
+    # P-384, which only a build with BRISK_ENABLE_P384 can follow.
+    p384 = ec_issuer(P384, 0x5EED0006, 384)
+    rows.append(chain_row(
+        [chain_cert("Brisk Inter 384", "device.example.com", inter, leaf, exts=ee_ext),
+         chain_cert("Brisk Root 384", "Brisk Inter 384", p384, inter, exts=ca_ext)],
+        [chain_cert("Brisk Root 384", "Brisk Root 384", p384, p384, exts=ca_ext)], 0,
+        "a P-384 root", flags=1))
+
+    # An EC key cannot verify an RSA signature, whatever the Names say.
+    rows.append(chain_row([chain_cert("Brisk Root", "device.example.com", rsa_issuer(256), leaf,
+                                      exts=ee_ext)], [root_c], 1,
+                          "an RSA signature under an EC anchor key"))
+
+    print(f"  x509 chains: {sum(1 for r in rows if not r[2])} accepted, "
+          f"{sum(1 for r in rows if r[2])} rejected")
+    return rows
+
+
 def cstr(hx, width=96):
     if not hx:
         return '""'
@@ -3549,6 +3924,14 @@ def main():
     check_x509_source_constants()
     x509_certs = x509_cert_vectors()
     x509_times = x509_time_vectors()
+    global RSA_CHAIN_KEY
+    # 2049 and not 2048: rsa_odd_modbits_key assembles its modulus out of published CAVP primes
+    # and no product of those lands on exactly 2048 bits. Nothing in a certificate cares about
+    # the size, and modBits % 8 == 1 puts the PSS rows on the emLen = k - 1 branch of RFC 8017
+    # 8.1.2 step 2c for free.
+    RSA_CHAIN_KEY = rsa_odd_modbits_key(2049)
+    x509_chains = x509_chain_vectors()
+    x509_sigs = x509_sig_vectors()
 
     emit("sha2.inc", "struct hash_kat SHA2_KAT", cavp + dhash, lambda r: f"{r[0]}, {cstr(r[1])}, {cstr(r[2])}")
     emit("sha2_monte.inc", "struct monte_kat SHA2_MONTE", monte,
@@ -3627,6 +4010,14 @@ def main():
          lambda r: f'{cstr(r[0])}, {r[1]}, "{r[2]}", {r[3]}, {r[4]}, {r[5]}, {r[6]}, {r[7]}, '
                    f'{r[8]}, {r[9]}u, {r[10]}u, {r[11]}, {r[12]}, {cstr(r[13])}, {cstr(r[14])}, '
                    f'{r[15]}LL, {r[16]}LL')
+    emit("x509_chain.inc", "struct chain_kat X509_CHAIN_KAT", x509_chains,
+         lambda r: "{" + ", ".join([cstr(c) for c in r[0]]
+                                   + ["NULL"] * (CHAIN_MAX_CERTS - len(r[0]))) + "}, "
+                   + "{" + ", ".join([cstr(a) for a in r[1]]
+                                     + ["NULL"] * (CHAIN_MAX_ANCHORS - len(r[1]))) + "}, "
+                   + f'{r[2]}, {r[3]}, "{r[4]}"')
+    emit("x509_sig.inc", "struct sig_kat X509_SIG_KAT", x509_sigs,
+         lambda r: f'{cstr(r[0])}, {cstr(r[1])}, {r[2]}, {r[3]}, "{r[4]}"')
 
     rows = "\n".join(f"| {k} | {u} | `{h}` |" for k, (u, h) in sorted(fetched.items()))
     (OUT / "SOURCES.md").write_text(
