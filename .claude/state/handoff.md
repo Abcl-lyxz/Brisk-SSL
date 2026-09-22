@@ -1,44 +1,45 @@
-# Handoff - 2026-09-22 (session 12)
+# Handoff - 2026-09-22 (session 13)
 
 ## Done
-- 56effd5 **x509: the validity window and its time policy. M2 line 5 closed.**
-  `BRISK_X509_TIME_POLICY` = STRICT / FLOOR (default) / INSECURE_NO_TIME plus
-  `BRISK_X509_TIME_FLOOR` (build date, 2026-09-01 by default, never `__DATE__`) in
-  `include/brisk_config.h`; `brisk__x509_time_ok` in `src/x509/chain.c`;
-  `brisk__x509_chain_verify` gained an `int64_t now`. 20 policy vectors
-  (`tests/kat/x509_validity.inc`, all three columns per row) + 7 chain rows. CMake has a
-  `BRISK_X509_TIME_POLICY` cache variable, so `cmake --preset dev -DBRISK_X509_TIME_POLICY=STRICT`
-  runs the other columns. chain.c +72 (riscv64) .. +244 (mips) B, RAM unchanged. 11 archs +
-  asan, TINY, STRICT, INSECURE_NO_TIME, ct all green; baseline re-saved.
+- 52799f1 **x509: CA bundle as a lazy trust store + additive SPKI pins. M2 line 6 closed.**
+  `src/x509/bundle.c` is a sans-I/O PEM decoder (RFC 7468) - bytes in, one DER out, all state in
+  `brisk__x509_pem`, BEGIN matched whole and ANCHORED to a line start (no differential against
+  OpenSSL's `PEM_read_bio`). `src/os/linux_ca.c` autodetects among 6 distro paths, requiring a
+  non-empty REGULAR file, and `brisk__os_ca_anchor` is a `brisk__x509_anchor_fn` that opens,
+  scans, matches a subject Name and closes. `find_anchor`/`anchor_ctx` became one
+  `const brisk__x509_trust *` carrying sha256 SPKI pins. 44 new vectors (base64 from RFC 4648
+  s10; decoder fed at chunk sizes 1/2/3/7/64/whole).
+- 0870d67 **x509: the walk became a depth-first search WITH BACKTRACKING. M2 line 7 closed.**
+  `chosen[]` is the path and each level's resume position at once; `pin_mask` is a bitmask so an
+  abandoned parent's pin contribution can be undone; `below` unwinds on backtrack.
+  `BRISK__X509_MAX_LOOKUPS` (16) is a new budget - see gotchas. chain +152..+280 B, stack
+  +40..+64 B, no RAM change. 11 archs + asan, TINY, STRICT, INSECURE_NO_TIME, ct all green;
+  baseline re-saved after each commit.
 
 ## In progress
-- Nothing. The tree is clean.
+- Nothing. The tree is clean and pushed.
 
 ## Next up
-- M2 line 6: `CA bundle autodetect + lazy lookup; SPKI sha256 pins (additive)`. The anchor
-  callback it plugs into already exists and is documented: `brisk__x509_anchor_fn` in
-  `src/brisk_int.h` (lookup by issuer Name, `index` walks same-Name roots, returning any
-  negative code means "no more") - that signature was designed for exactly this, so the bundle
-  scans its file per lookup instead of parsing every root into RAM. `spki`/`spki_len` in
-  `brisk__x509_cert` is already the whole SubjectPublicKeyInfo TLV a sha256 pin hashes.
-  File reading belongs in `src/os/`; nothing outside it may touch a syscall.
+- M2 line 8, the last one: **x509-limbo suite**. Expect it to hit path building hardest - that
+  is what the two commits above just rewrote, so read the SEARCH STRATEGY block in
+  `src/brisk_int.h` before starting. `tools/kat.py` has no downloader for it yet; `fetch()` at
+  the top of that file is the pattern, and `tests/kat/SOURCES.md` is generated from it.
 
 ## Decisions / gotchas
-- **Both reviewers earn their keep again - run `rfc-auditor` AND `portability-reviewer` on every
-  x509 change.** rfc-auditor caught a real regression: validity was checked one level LATE, so
-  an expired same-Name sibling shadowed the live intermediate and a buildable chain failed. The
-  rule: in that walk, every path property is a SELECTION predicate on the candidate
-  (`name_eq`, `usable_ca`, now the window) - anything checked after the walk commits silently
-  removes the backtracking the candidate loop was written to provide. portability-reviewer
-  caught `tests/size_probe.c` still calling the 4-argument `chain_verify`, which breaks
-  `dev.py size` on every arch - **any signature change has to touch that file too**.
-- **A KAT row can drift to the wrong side of a constant and still pass.** One row meant to pin
-  the `now == notBefore` boundary sat below the floor, where notBefore is never read: the oracle
-  simply relabelled it and nothing failed. `row()` in `x509_validity_vectors()` now takes
-  `clock="usable"|"unset"` and dies if `now` is on the other side. Any future vector table built
-  around a threshold owes the same assertion.
-- The floor is compile-time only. A persisted last-known-good time must NOT be passed as `now`
-  instead (it lifts the clock above the floor, so notBefore is enforced against a stale value and
-  every fresh certificate is refused) - a runtime floor is an M3 client-config decision.
-- Still true from session 11: this Bash tool's heredoc eats backslashes, so patch scripts with
-  escapes go through the Write tool; and .c fragments must not be written into the scratchpad.
+- **Both reviewers found the SAME regression, and neither found it by reading the diff alone** -
+  they modelled the cost. Backtracking moved the anchor block from "once per level" to "once per
+  DESCENT", and a store lookup is NOT paid for out of `BRISK__X509_MAX_VERIFY` (a candidate
+  refused on its Name or CA bits never reaches `++work`). With the CA bundle behind it that is
+  an `open()` + a ~200 KB pass per miss, 33 of them per handshake. **Any new loop in chain.c
+  needs its own budget question asked separately for I/O and for crypto.**
+- **Mutation-test a vector that guards a fail-OPEN invariant.** `pin_mask &= ~(...)` and
+  `below--` could both be DELETED with the whole suite green. The rows that now catch them
+  (pin 12, chain 48) were each confirmed by removing the line and watching exactly one row fail.
+  Same trick proved the three backtracking rows fail against `git show HEAD:src/x509/chain.c`.
+- A `.c` file written into the scratchpad gets compiled by the post-edit hook AND reformatted at
+  80 columns. Use `.txt` for a code fragment and splice it in, then `clang-format -i`.
+- Still true: this Bash tool's heredoc eats backslashes AND runs backticks - patch scripts with
+  either go through the Write tool.
+- `x509-limbo` aside, the two remaining known gaps are recorded in the ROADMAP M8 lines:
+  `fuzz_pem` has no harness, and `src/os/` has a feature-test-macro ordering blocker for the
+  amalgamation.
