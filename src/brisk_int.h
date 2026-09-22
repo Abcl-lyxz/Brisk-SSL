@@ -1330,4 +1330,65 @@ const char *brisk__os_ca_path(void);
 int brisk__os_ca_anchor(void *ctx, const uint8_t *dn, size_t dn_len, size_t index,
                         brisk__x509_cert *out);
 
+/* ---- tls/keyschedule.c: TLS 1.3 key schedule (RFC 9846 sect 7.1) --------------------------------
+ *
+ * Composition over brisk__hkdf_extract and brisk__hkdf_expand_label from M1a; nothing new is
+ * measured against a KAT here that expand_label.inc + hkdf_extract.inc have not already
+ * verified. The RFC 8448 sect 3 trace uses this cascade byte for byte, so every stage output is
+ * the expected value in tests/kat/expand_label.inc; the test only wires the stages together.
+ *
+ * NOTHING SECRET REACHES A BRANCH here: branches are on the requested algorithm, a NULL PSK
+ * pointer and the return codes of the primitives. Intermediate secrets are wiped on every path.
+ *
+ * The engine (tls/handshake.c) owns the transcript hash and hands it in; this module never
+ * sees a handshake message. Same rule as picotls: the key schedule and the wire protocol are
+ * separated so QUIC (RFC 9001 sect 5.1) reuses the same schedule unchanged. */
+typedef struct {
+    uint8_t secret[BRISK_HASH_MAX_LEN]; /* current stage secret (early / handshake / master) */
+    brisk_hash_alg alg;                 /* SHA-256 for suites 0x1301/0x1303, SHA-384 for 0x1302 */
+} brisk__tls_ks;
+
+/* early_secret = HKDF-Extract(0^HashLen, PSK|0^HashLen). psk == NULL or psk_len == 0 means
+ * the external-PSK case is absent, so IKM is HashLen zeros (RFC 9846 sect 7.1). BRISK_E_ARG on
+ * an unknown alg; ks->secret is HashLen bytes on success. */
+int brisk__tls_ks_init(brisk__tls_ks *ks, brisk_hash_alg alg, const uint8_t *psk, size_t psk_len);
+
+/* Advance early -> handshake and derive the two handshake traffic secrets. `dhe` is the (EC)DHE
+ * shared secret (X25519 or the X of P-256's shared point, kept with its leading zeros). `th_ch_sh`
+ * is Transcript-Hash(ClientHello..ServerHello), HashLen bytes. Each output is HashLen bytes.
+ * ks->secret is left holding the handshake_secret for the next stage. */
+int brisk__tls_ks_derive_handshake(brisk__tls_ks *ks, const uint8_t *dhe, size_t dhe_len,
+                                   const uint8_t *th_ch_sh, uint8_t *c_hs_ts, uint8_t *s_hs_ts);
+
+/* Advance handshake -> master and derive the two application traffic secrets and the exporter
+ * master secret. `th_ch_sf` is TH(CH..server Finished), HashLen bytes. Each output is HashLen
+ * bytes. ks->secret is left holding the master_secret for the resumption stage. */
+int brisk__tls_ks_derive_application(brisk__tls_ks *ks, const uint8_t *th_ch_sf, uint8_t *c_ap_ts,
+                                     uint8_t *s_ap_ts, uint8_t *exporter_ms);
+
+/* resumption_master_secret = Derive-Secret(master_secret, "res master", CH..client Finished).
+ * Called by the handshake engine after emitting the client Finished. */
+int brisk__tls_ks_derive_resumption(brisk__tls_ks *ks, const uint8_t *th_ch_cf, uint8_t *res_ms);
+
+/* verify_data for a TLS 1.3 Finished (RFC 9846 sect 4.5.3):
+ *     finished_key = HKDF-Expand-Label(base_key, "finished", "", HashLen)
+ *     verify_data  = HMAC(finished_key, transcript_hash)
+ * `base_key` is the client or server handshake traffic secret (HashLen bytes); `transcript_hash`
+ * is HashLen bytes; `out` receives HashLen bytes. The finished_key is wiped before return; the
+ * COMPARE against the peer's verify_data is the handshake engine's brisk__ct_memeq. */
+int brisk__tls_finished_mac(brisk_hash_alg alg, const uint8_t *base_key,
+                            const uint8_t *transcript_hash, uint8_t *out);
+
+/* TLS 1.3 exporter (RFC 9846 sect 7.5): TLS-Exporter(label, ctx, L) =
+ *     HKDF-Expand-Label(Derive-Secret(exporter_master, label, ""), "exporter", Hash(ctx), L).
+ * `exporter_ms` is the exporter_master_secret produced by brisk__tls_ks_derive_application.
+ * `ctx` may be NULL when ctx_len == 0. Required by QUIC (RFC 9001) transport-parameter export
+ * and by application code that wants channel bindings. BRISK_E_ARG on an unknown alg or
+ * out_len > 255 * HashLen (from HKDF-Expand). */
+int brisk__tls_ks_exporter(brisk_hash_alg alg, const uint8_t *exporter_ms, const char *label,
+                           const uint8_t *ctx, size_t ctx_len, uint8_t *out, size_t out_len);
+
+/* Wipe every secret in ks. Safe on NULL. */
+void brisk__tls_ks_wipe(brisk__tls_ks *ks);
+
 #endif /* BRISK_INT_H */

@@ -133,6 +133,16 @@ int main(int argc, char **argv)
         brisk__x509_pem_init(&pem);
         brisk__x509_pem_feed(&pem, &p, &left);
     }
+    {
+        brisk__tls_ks ks;
+        brisk__tls_ks_init(&ks, alg, NULL, 0);
+        brisk__tls_ks_derive_handshake(&ks, out, 32, out, out, out + 32);
+        brisk__tls_ks_derive_application(&ks, out, out, out + 16, out + 32);
+        brisk__tls_ks_derive_resumption(&ks, out, out);
+        brisk__tls_finished_mac(alg, out, out, out);
+        brisk__tls_ks_exporter(alg, out, "exp", out, 8, out, 32);
+        brisk__tls_ks_wipe(&ks);
+    }
     return out[0] + (brisk_build_info()[0] == brisk_version()[0]) +
            brisk__ct_memeq(out, out + 1, 8);
 }
