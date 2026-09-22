@@ -232,6 +232,11 @@ static int usable_ca(const brisk__x509_cert *ca, size_t below, int anchor)
     return 1;
 }
 
+/* One pin bit per path level plus the bit-31 marker has to fit in the uint32_t below. The
+ * failure this stops is silent and fail-OPEN - at MAX_CHAIN 32 the top level's bit IS the
+ * marker - and the constant sits in another file with a comment inviting people to tune it. */
+typedef char brisk__chain_pin_bits_fit[BRISK__X509_MAX_CHAIN <= 31 ? 1 : -1];
+
 /* ------------------------------------------------------------------ pins ----------------- */
 
 /* Does this certificate's SubjectPublicKeyInfo hash to one of the pins? Public data on both
@@ -262,9 +267,19 @@ int brisk__x509_chain_verify(const brisk__x509_cert *certs, size_t n_certs, int6
                              const brisk__x509_trust *trust)
 {
     static const brisk__x509_trust empty = {NULL, NULL, NULL, 0};
+    /* The path under construction. chosen[d] is the parent taken at depth d, and it is BOTH
+     * halves of the search state: it is the path, and because it points into certs[] its index
+     * plus one is where depth d's scan resumes when everything above it dead-ends. That is why
+     * there is no separate resume array - the stack budget in brisk_int.h has no room for one,
+     * and a second array would be a second thing to keep in step. */
+    const brisk__x509_cert *chosen[BRISK__X509_MAX_CHAIN];
     const brisk__x509_cert *cur;
-    size_t depth, below = 0, work = 0;
-    int pin_hit;
+    /* Bit d: chosen[d]'s SubjectPublicKeyInfo matched a pin. Bit 31 is the end entity's, and
+     * doubles as the "no pins configured" marker, so `pin_mask != 0` is the one question the
+     * anchor test asks in both worlds. A mask and not a flag because backtracking has to UNDO
+     * what a parent it is abandoning contributed, and a bool cannot be un-set. */
+    uint32_t pin_mask;
+    size_t depth = 0, resume = 1, below = 0, work = 0, lookups = 0;
 
     if (certs == NULL || n_certs == 0) {
         return BRISK_E_ARG;
@@ -273,110 +288,149 @@ int brisk__x509_chain_verify(const brisk__x509_cert *certs, size_t n_certs, int6
         trust = &empty;
     }
     cur = &certs[0];
-    /* With no pins configured every path is "pinned" from the start, so the one test at the
-     * anchor below covers both worlds and nothing hashes anything it did not have to. */
-    pin_hit = trust->n_pins == 0 || pinned(trust, cur);
     /* 6.1.3 (a)(2) for the end entity. Every other certificate of the path is checked below, as
-     * a condition for being CHOSEN as the parent - never after the walk has committed to it.
+     * a condition for being CHOSEN as the parent - never after the search has committed to it.
      * That distinction is the whole difference between refusing an expired chain and refusing a
      * chain that has an in-date path through it: a CA that re-issues an intermediate under the
      * same Name and the same key (a rollover, and the shape of every cross-certificate incident
      * this file already worries about) leaves BOTH on the wire, and the expired one is often
-     * first. Checked as a filter, the walk skips it and takes the live one; checked one level
-     * later, the walk would have thrown the live one away by then. It also means an expired
-     * candidate costs no public-key operation and no verify budget. */
+     * first. Checked as a filter, the search skips it and takes the live one. It also means an
+     * expired candidate costs no public-key operation and no verify budget. */
     if (brisk__x509_time_ok(cur, now) != BRISK_OK) {
         return BRISK_E_AUTH;
     }
-    for (depth = 0; depth < BRISK__X509_MAX_CHAIN; depth++) {
+    pin_mask = (trust->n_pins == 0 || pinned(trust, cur)) ? 0x80000000u : 0;
+
+    for (;;) {
         const brisk__x509_cert *parent = NULL;
-        brisk__x509_cert anchor;
         size_t i;
 
         /* Trust anchors first, which is what makes a stale cross-certificate at the end of the
-         * peer's list harmless: the path stops here and the tail is never looked at. */
-        for (i = 0; trust->find_anchor != NULL && i < BRISK__X509_MAX_ANCHORS; i++) {
-            if (trust->find_anchor(trust->anchor_ctx, cur->issuer, cur->issuer_len, i, &anchor) !=
-                BRISK_OK) {
-                break;
+         * peer's list harmless: the path stops here and the tail is never looked at.
+         *
+         * The depth bound is on this block as well as on the descent below, and that is what
+         * makes BRISK__X509_MAX_CHAIN mean "end entity + 7 certificates" rather than "+ 8": a
+         * path that needs an anchor above the last certificate the bound allows is one
+         * certificate too long, and it has to fail rather than be rescued by an anchor lookup
+         * the bound never budgeted for.
+         *
+         * Only on FIRST arrival at this depth (resume == 1). Coming back here from a dead end
+         * above means these same anchors were already tried against this same `cur`, under a
+         * pin_mask that can only have been larger - so re-asking the store would buy nothing
+         * and would spend the verify budget twice for it.
+         *
+         * And at most BRISK__X509_MAX_LOOKUPS times in the whole search, which is a budget of
+         * its own because the other two do not cover this one. Depth used to: the anchor block
+         * lived inside a loop that ran BRISK__X509_MAX_CHAIN times, so a handshake could ask
+         * the store at most 8 * MAX_ANCHORS times. Backtracking runs it once per fresh DESCENT
+         * instead, and descents are capped by MAX_VERIFY, so the ceiling would quietly become
+         * 33 * MAX_ANCHORS - and a store lookup is NOT paid for out of the verify budget,
+         * because a candidate refused by name_eq or usable_ca never reaches ++work. That is
+         * not academic with the CA bundle behind it: one miss is an open() and a full pass over
+         * ~200 KB of PEM, and a peer that sends ~40 certificates which all sign the leaf and
+         * all name an issuer nobody has would buy itself 33 of those for one handshake, on a
+         * 200 MHz router, before authenticating anything. */
+        if (resume == 1 && depth < BRISK__X509_MAX_CHAIN && ++lookups <= BRISK__X509_MAX_LOOKUPS) {
+            brisk__x509_cert anchor;
+            for (i = 0; trust->find_anchor != NULL && i < BRISK__X509_MAX_ANCHORS; i++) {
+                if (trust->find_anchor(trust->anchor_ctx, cur->issuer, cur->issuer_len, i,
+                                       &anchor) != BRISK_OK) {
+                    break;
+                }
+                /* 6.1.3 (a)(4) is checked here and not left to the store: a lookup that buckets
+                 * by a hash of the Name, or one that just enumerates its roots, must not be able
+                 * to hand back an anchor whose subject is not the issuer that was asked for. */
+                if (!name_eq(cur->issuer, cur->issuer_len, anchor.subject, anchor.subject_len)) {
+                    continue;
+                }
+                if (!usable_ca(&anchor, below, 1)) {
+                    continue;
+                }
+                if (++work > BRISK__X509_MAX_VERIFY) {
+                    return BRISK_E_AUTH;
+                }
+                if (brisk__x509_signed_by(cur, &anchor) != BRISK_OK) {
+                    continue;
+                }
+                if (pin_mask != 0 || pinned(trust, &anchor)) {
+                    return BRISK_OK;
+                }
+                /* A complete, verified path that satisfies no pin is NOT the verdict - it is one
+                 * candidate that failed a selection predicate, exactly like an expired sibling.
+                 * Fall through and keep searching: the shape this is here for is a cross-signed
+                 * rollover, where the peer also ships the old root under the NEW root's
+                 * signature and the longer path through it ends at the anchor the pin names.
+                 * Returning here would refuse a chain the device holds every certificate for. */
             }
-            /* 6.1.3 (a)(4) is checked here and not left to the store: a lookup that buckets
-             * by a hash of the Name, or one that just enumerates its roots, must not be able to
-             * hand back an anchor whose subject is not the issuer that was asked for. */
-            if (!name_eq(cur->issuer, cur->issuer_len, anchor.subject, anchor.subject_len)) {
-                continue;
-            }
-            if (!usable_ca(&anchor, below, 1)) {
-                continue;
-            }
-            if (++work > BRISK__X509_MAX_VERIFY) {
-                return BRISK_E_AUTH;
-            }
-            if (brisk__x509_signed_by(cur, &anchor) != BRISK_OK) {
-                continue;
-            }
-            if (pin_hit || pinned(trust, &anchor)) {
-                return BRISK_OK;
-            }
-            /* A complete, verified path that satisfies no pin is NOT the verdict - it is one
-             * candidate that failed a selection predicate, exactly like an expired sibling
-             * above. Keep walking: the shape this is here for is a cross-signed rollover, where
-             * the peer also ships the old root under the NEW root's signature, and the longer
-             * path through it ends at the anchor the pin names. Returning here would refuse a
-             * chain the device was given every certificate for.
-             *
-             * HOW FAR THAT GOES, precisely, because it is less far than it looks: this recovers
-             * the longer path only when every level BELOW has one candidate. The peer loop
-             * below still commits to the first certificate that verifies and never revisits it
-             * (the "no backtracking ACROSS levels" limit in the brisk_int.h block), so a
-             * rollover that ALSO ships two same-Name intermediates - one chaining to the old
-             * root, one to the pinned new one - is refused if the old one arrives first, which
-             * on the wire it does. Pins make that reachable far more often than plain chain
-             * building did, because a pin miss now forces the walk down here at a depth where
-             * it used to return. The fix is a depth-first search with a resume index per level,
-             * bounded by BRISK__X509_MAX_VERIFY as this already is; it is its own ROADMAP line
-             * because it changes path construction for every chain, not just pinned ones.
-             * Until then the failure is closed and loud: a connection that does not build. */
         }
 
-        /* Then the certificates the peer supplied, in whatever order they arrived. Every
-         * candidate that carries the right Name is tried, so two intermediates sharing one - a
-         * key rollover - do not depend on which came first.
+        /* Then the certificates the peer supplied: from 1 on the way down, from one past the
+         * candidate being abandoned on the way back up. Every candidate carrying the right Name
+         * is tried, so two intermediates sharing one - a key rollover - do not depend on which
+         * came first, and a wrong first pick is no longer fatal, because the search returns.
          *
-         * This level is re-scanned at every depth, so without a cap a peer that sent n
-         * plausible same-Name candidates would cost BRISK__X509_MAX_CHAIN * n public-key
-         * verifications - tens of seconds of pre-auth CPU on an armv5 router at 4096-bit RSA,
-         * from one handshake. BRISK__X509_MAX_VERIFY bounds the total instead, because n
-         * belongs to the peer and this function is documented as safe on peer input. */
-        for (i = 1; i < n_certs; i++) {
-            const brisk__x509_cert *p = &certs[i];
-            if (p == cur || !name_eq(cur->issuer, cur->issuer_len, p->subject, p->subject_len)) {
-                continue;
-            }
-            if (!usable_ca(p, below, 0) || brisk__x509_time_ok(p, now) != BRISK_OK) {
-                continue; /* (k)(l)(m)(n) and (a)(2), all of them selection predicates */
-            }
-            if (++work > BRISK__X509_MAX_VERIFY) {
-                return BRISK_E_AUTH;
-            }
-            if (brisk__x509_signed_by(cur, p) == BRISK_OK) {
-                parent = p;
-                break;
+         * A level is re-scanned at every depth and now once per backtrack as well, so without a
+         * cap a peer that sent n plausible same-Name candidates could cost a multiple of n
+         * public-key verifications - tens of seconds of pre-auth CPU on an armv5 router at
+         * 4096-bit RSA, from one handshake. BRISK__X509_MAX_VERIFY bounds the total instead,
+         * and it bounds the SEARCH with it: every descent costs at least one verification, so
+         * the number of paths explored cannot outrun the budget however the peer shapes its
+         * list. */
+        if (depth < BRISK__X509_MAX_CHAIN) {
+            for (i = resume; i < n_certs; i++) {
+                const brisk__x509_cert *p = &certs[i];
+                if (p == cur ||
+                    !name_eq(cur->issuer, cur->issuer_len, p->subject, p->subject_len)) {
+                    continue;
+                }
+                if (!usable_ca(p, below, 0) || brisk__x509_time_ok(p, now) != BRISK_OK) {
+                    continue; /* (k)(l)(m)(n) and (a)(2), all of them selection predicates */
+                }
+                if (++work > BRISK__X509_MAX_VERIFY) {
+                    return BRISK_E_AUTH;
+                }
+                if (brisk__x509_signed_by(cur, p) == BRISK_OK) {
+                    parent = p;
+                    break;
+                }
             }
         }
-        if (parent == NULL) {
+
+        if (parent != NULL) { /* descend */
+            chosen[depth] = parent;
+            if (!self_issued(parent)) {
+                below++; /* (l): the parent now stands between the next one and the end entity */
+            }
+            /* Only now, with the search committed to this parent, does its key count towards the
+             * pins: a candidate that was tried and rejected is on no path, and neither is a
+             * certificate the peer attached that the search never chose. */
+            if (trust->n_pins != 0 && pinned(trust, parent)) {
+                pin_mask |= (uint32_t)1 << depth;
+            }
+            cur = parent;
+            depth++;
+            resume = 1;
+            continue;
+        }
+
+        /* Dead end: no anchor above `cur` and no untried candidate either. Back up one level and
+         * resume that level's scan just past the certificate being given up, undoing everything
+         * it contributed on the way down. Depth 0 has nothing below it, so that is where the
+         * SEARCH fails rather than just this branch of it. */
+        if (depth == 0) {
             return BRISK_E_AUTH;
         }
-        if (!self_issued(parent)) {
-            below++; /* (l): the parent now stands between the next one and the end entity */
+        depth--;
+        resume = (size_t)(chosen[depth] - certs) + 1;
+        if (!self_issued(chosen[depth])) {
+            below--;
         }
-        cur = parent;
-        /* Only now, with the walk committed to this parent, does its key count towards the
-         * pins: a candidate that was tried and rejected is on no path, and neither is a
-         * certificate the peer attached that the walk never chose. */
-        if (!pin_hit && pinned(trust, cur)) {
-            pin_hit = 1;
-        }
+        /* (uint32_t)1 and not 1u: on a target with a 16-bit int the complement of an
+         * unsigned int would be computed at 16 bits and zero-extended, clearing bit 31 - the
+         * "no pins configured" marker - so every unpinned chain would start failing the moment
+         * the search backtracked once. None of the ten targets has one; it costs nothing to
+         * stop the coupling existing. */
+        pin_mask &= ~((uint32_t)1 << depth);
+        cur = depth == 0 ? &certs[0] : chosen[depth - 1];
     }
-    return BRISK_E_AUTH; /* BRISK__X509_MAX_CHAIN levels and still no anchor */
 }

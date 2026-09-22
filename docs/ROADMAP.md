@@ -38,14 +38,12 @@ Tick a box only when the work is green on **every** arch (`python tools/dev.py t
 - [x] RFC 9525 hostname / IP matching
 - [x] Time policy STRICT / FLOOR (default) / INSECURE_NO_TIME; int64 dates
 - [x] CA bundle autodetect + lazy lookup; SPKI sha256 pins (additive)
-- [ ] Path building: depth-first search with a resume index per level, replacing the greedy
-      "first candidate that verifies wins" in `src/x509/chain.c`. Today a rollover that ships
-      two same-Name intermediates - one chaining to an old root, one to the pinned/live one -
-      is refused when the legacy one arrives first, which on the wire it does. SPKI pins made
-      this reachable far more often (a pin miss now forces the walk into the peer loop at a
-      depth where it used to return), so it is its own line rather than a footnote.
-      `tests/kat/x509_pin.inc` carries the case as a `want = 1` row labelled KNOWN LIMIT - when
-      this lands, that row flips to 0. `BRISK__X509_MAX_VERIFY` already bounds the work.
+- [x] Path building: depth-first search with backtracking, replacing the greedy "first
+      candidate that verifies wins". A CA rollover puts two certificates with one subject Name
+      and one key on the wire and the useless legacy cross-certificate goes first, so a greedy
+      walk refused chains it held every certificate for; SPKI pins made that reachable far more
+      often. Costs one pointer per level (32 B on 32-bit, 64 on 64-bit) and no extra bound:
+      every descent already costs a signature verification, which MAX_VERIFY caps.
 - [ ] x509-limbo suite
 
 ## M3 TLS 1.3 client

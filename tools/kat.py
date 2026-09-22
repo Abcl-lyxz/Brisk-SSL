@@ -3988,6 +3988,53 @@ def x509_chain_vectors():
                           "an exempt anchor does not excuse the intermediate under it",
                           flags=CHAIN_F_TIME))
 
+    # BACKTRACKING. Every row above has at most one usable candidate per level, so they pass
+    # with a greedy walk too; these are the ones that need the search to come back. The shape is
+    # not exotic - it is a CA rollover seen from the client, where two certificates share a
+    # subject Name and a key and differ only in who signed them, and the useless one is first on
+    # the wire because it is the legacy cross-certificate the server kept for old clients.
+    # 0x5EED0008 and not 0007: inter_b above already holds 0007, and one key wearing two
+    # identities is how a vector ends up passing for a reason nobody intended.
+    root2 = ec_issuer(P256, 0x5EED0008, 256)
+    root2_c = chain_cert("Brisk Root 2", "Brisk Root 2", root2, root2, exts=ca_ext)
+    # Same subject and same KEY as inter_c, so it verifies the leaf just as well - and then
+    # leads nowhere, because nothing anchors or continues "Brisk Nowhere".
+    inter_dead = chain_cert("Brisk Nowhere", "Brisk Inter", other, inter, exts=ca_ext, serial=21)
+    rows.append(chain_row([leaf_c, inter_dead, inter_c], [root_c], 0,
+                          "the first same-Name intermediate dead-ends and the search returns "
+                          "for the second"))
+    rows.append(chain_row([leaf_c, inter_c, inter_dead], [root_c], 0,
+                          "the same pair in the other order, where greedy already worked"))
+    inter_dead2 = chain_cert("Brisk Nowhere 2", "Brisk Inter", other, inter, exts=ca_ext,
+                             serial=22)
+    rows.append(chain_row([leaf_c, inter_dead, inter_dead2], [root_c], 1,
+                          "two dead ends and no third candidate is still a refusal"))
+    # Two independent backtracks, at two different depths, so the resume index, `below` and the
+    # path itself all have to unwind correctly rather than merely not crash. The root level has
+    # the same trap as the intermediate level: two certificates with subject "Brisk Root"
+    # carrying the root's key, only the second of which reaches the anchor that IS in the store.
+    cross_dead = chain_cert("Brisk Nowhere", "Brisk Root", other, root, exts=ca_ext, serial=23)
+    cross_live = chain_cert("Brisk Root 2", "Brisk Root", root2, root, exts=ca_ext, serial=24)
+    rows.append(chain_row([leaf_c, inter_dead, inter_c, cross_dead, cross_live], [root2_c], 0,
+                          "two backtracks at two depths: a dead intermediate AND a dead "
+                          "cross-certificate above the live one"))
+    rows.append(chain_row([leaf_c, inter_dead, inter_c, cross_dead], [root2_c], 1,
+                          "the same list without the live cross-certificate"))
+    # `below` has to be RESTORED on the way back, not just incremented on the way down, and
+    # nothing above reads it: every row so far uses a CA with no pathLenConstraint, so
+    # usable_ca's `path_len >= below` branch is never taken on a row that backtracks. Here the
+    # abandoned branch (inter_dead, non-self-issued) would leave below one too high, and the
+    # live path then needs every bit of "Brisk B"'s pathLen 1 - so a leaked count refuses a
+    # chain the device holds every certificate for. b_c above is the pathLen 0 version of the
+    # same identity, which is why this one is built rather than reused.
+    b_pl1 = chain_cert("Brisk Root", "Brisk B", root, inter_b,
+                       exts=[x_bc(True, 1), x_ku(KU_BIT_KEY_CERT_SIGN)])
+    rows.append(chain_row([leaf_c, inter_dead, a_c, b_pl1], [root_c], 0,
+                          "6.1.4 (l) below is restored after a backtrack, so pathLen 1 still "
+                          "fits"))
+    rows.append(chain_row([leaf_c, inter_dead, a_c, b_c], [root_c], 1,
+                          "the same shape at pathLen 0, which does not fit either way"))
+
     print(f"  x509 chains: {sum(1 for r in rows if not r[2])} accepted, "
           f"{sum(1 for r in rows if r[2])} rejected")
     return rows
@@ -4219,13 +4266,24 @@ def x509_pin_vectors():
     # exactly why it is worth a row rather than a comment.
     inter_old = chain_cert("Brisk Root", "Brisk Inter", root, inter, exts=ca_ext, serial=11)
     inter_new = chain_cert("Brisk Root 2", "Brisk Inter", root2, inter, exts=ca_ext, serial=12)
-    row([leaf_c, inter_old, inter_new], [root_c, root2_c], [pin(root2)], 1,
-        "KNOWN LIMIT: no backtracking, so the pinned path behind a same-Name sibling is missed")
+    row([leaf_c, inter_old, inter_new], [root_c, root2_c], [pin(root2)], 0,
+        "backtracking: the first same-Name intermediate dead-ends at an unpinned root and the "
+        "search comes back for the second, which reaches the pinned one")
     # The same three certificates with no pins: here the FIRST candidate does reach an anchor,
     # so the greedy walk is right and this row proves the pair above fails for the pin reason
     # and not because the fixtures do not chain.
     row([leaf_c, inter_old, inter_new], [root_c, root2_c], [], 0,
         "the same three certificates without pins, where the greedy first choice does anchor")
+    # The OTHER half of backtracking and pins, and the one that fails OPEN if it breaks: a pin
+    # satisfied on a branch the search then ABANDONS must not count for the path it settles on.
+    # inter_dead leads only to nowhere_c, whose key is the pinned one; the search commits it,
+    # dead-ends one level further, unwinds both levels and comes back for inter_c - which
+    # reaches the anchor with nothing pinned on it. Drop the pin_mask clear in chain.c and this
+    # row starts returning BRISK_OK while every other row in the suite still passes.
+    inter_dead = chain_cert("Brisk Nowhere", "Brisk Inter", other, inter, exts=ca_ext, serial=21)
+    nowhere_c = chain_cert("Brisk Dead End", "Brisk Nowhere", other, other, exts=ca_ext)
+    row([leaf_c, inter_dead, nowhere_c, inter_c], [root_c], [pin(other)], 1,
+        "a pin satisfied only on a branch the search abandons is not satisfied")
     print(f"  x509 pins: {sum(1 for r in rows if not r[3])} accepted, "
           f"{sum(1 for r in rows if r[3])} rejected")  # r[3] is `want`
     return rows

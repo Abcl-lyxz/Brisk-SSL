@@ -1,6 +1,6 @@
 {
  "aarch64": {
-  "TOTAL flash": 43893,
+  "TOTAL flash": 44069,
   "TOTAL ram": 60,
   "aes_ct": 0,
   "aes_ct64": 2962,
@@ -8,7 +8,7 @@
   "bundle": 524,
   "cert": 4692,
   "chacha20_poly1305": 2468,
-  "chain": 1584,
+  "chain": 1760,
   "der": 1678,
   "gcm": 1588,
   "hkdf": 1271,
@@ -23,7 +23,7 @@
   "x25519": 3928
  },
  "armv5": {
-  "TOTAL flash": 54633,
+  "TOTAL flash": 54857,
   "TOTAL ram": 32,
   "aes_ct": 2930,
   "aes_ct64": 0,
@@ -31,7 +31,7 @@
   "bundle": 544,
   "cert": 5012,
   "chacha20_poly1305": 2776,
-  "chain": 1696,
+  "chain": 1920,
   "der": 1734,
   "gcm": 2308,
   "hkdf": 1095,
@@ -46,7 +46,7 @@
   "x25519": 7444
  },
  "armv7hf": {
-  "TOTAL flash": 37617,
+  "TOTAL flash": 37769,
   "TOTAL ram": 32,
   "aes_ct": 2056,
   "aes_ct64": 0,
@@ -54,7 +54,7 @@
   "bundle": 416,
   "cert": 3388,
   "chacha20_poly1305": 1974,
-  "chain": 1102,
+  "chain": 1254,
   "der": 970,
   "gcm": 1502,
   "hkdf": 729,
@@ -69,7 +69,7 @@
   "x25519": 5286
  },
  "i686": {
-  "TOTAL flash": 62327,
+  "TOTAL flash": 62557,
   "TOTAL ram": 32,
   "aes_ct": 3037,
   "aes_ct64": 0,
@@ -77,7 +77,7 @@
   "bundle": 617,
   "cert": 5046,
   "chacha20_poly1305": 2977,
-  "chain": 2055,
+  "chain": 2285,
   "der": 1479,
   "gcm": 2484,
   "hkdf": 1212,
@@ -92,7 +92,7 @@
   "x25519": 9222
  },
  "mips": {
-  "TOTAL flash": 70100,
+  "TOTAL flash": 70356,
   "TOTAL ram": 32,
   "aes_ct": 3552,
   "aes_ct64": 0,
@@ -100,7 +100,7 @@
   "bundle": 568,
   "cert": 6456,
   "chacha20_poly1305": 3400,
-  "chain": 2268,
+  "chain": 2524,
   "der": 2304,
   "gcm": 2720,
   "hkdf": 1736,
@@ -115,7 +115,7 @@
   "x25519": 8888
  },
  "mips64": {
-  "TOTAL flash": 60860,
+  "TOTAL flash": 61140,
   "TOTAL ram": 60,
   "aes_ct": 0,
   "aes_ct64": 4440,
@@ -123,7 +123,7 @@
   "bundle": 560,
   "cert": 6128,
   "chacha20_poly1305": 3704,
-  "chain": 2048,
+  "chain": 2328,
   "der": 2500,
   "gcm": 2544,
   "hkdf": 1684,
@@ -138,7 +138,7 @@
   "x25519": 5916
  },
  "mipsel": {
-  "TOTAL flash": 70016,
+  "TOTAL flash": 70272,
   "TOTAL ram": 32,
   "aes_ct": 3560,
   "aes_ct64": 0,
@@ -146,7 +146,7 @@
   "bundle": 568,
   "cert": 6456,
   "chacha20_poly1305": 3376,
-  "chain": 2268,
+  "chain": 2524,
   "der": 2304,
   "gcm": 2744,
   "hkdf": 1740,
@@ -161,7 +161,7 @@
   "x25519": 8952
  },
  "ppc": {
-  "TOTAL flash": 57227,
+  "TOTAL flash": 57431,
   "TOTAL ram": 32,
   "aes_ct": 2838,
   "aes_ct64": 0,
@@ -169,7 +169,7 @@
   "bundle": 644,
   "cert": 5052,
   "chacha20_poly1305": 2932,
-  "chain": 1888,
+  "chain": 2092,
   "der": 2080,
   "gcm": 2300,
   "hkdf": 1243,
@@ -184,7 +184,7 @@
   "x25519": 8364
  },
  "riscv64": {
-  "TOTAL flash": 38612,
+  "TOTAL flash": 38786,
   "TOTAL ram": 60,
   "aes_ct": 0,
   "aes_ct64": 3402,
@@ -192,7 +192,7 @@
   "bundle": 462,
   "cert": 3508,
   "chacha20_poly1305": 2810,
-  "chain": 1120,
+  "chain": 1294,
   "der": 1368,
   "gcm": 1672,
   "hkdf": 1041,
@@ -207,7 +207,7 @@
   "x25519": 3854
  },
  "x86_64": {
-  "TOTAL flash": 48016,
+  "TOTAL flash": 48229,
   "TOTAL ram": 60,
   "aes_ct": 0,
   "aes_ct64": 4000,
@@ -215,7 +215,7 @@
   "bundle": 569,
   "cert": 4954,
   "chacha20_poly1305": 2699,
-  "chain": 1712,
+  "chain": 1925,
   "der": 1549,
   "gcm": 1858,
   "hkdf": 1098,

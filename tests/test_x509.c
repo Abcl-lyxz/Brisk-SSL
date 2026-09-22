@@ -286,6 +286,7 @@ struct chain_row {
     brisk__x509_cert certs[CHAIN_CERTS];
     brisk__x509_cert anchors[CHAIN_ANCHORS];
     size_t n_certs, n_anchors;
+    size_t lookups; /* find_anchor calls for this row; the only way its budget is testable */
 };
 
 static struct chain_row g_row;
@@ -334,8 +335,10 @@ static size_t plain_row(void)
 static int t_find_anchor(void *ctx, const uint8_t *dn, size_t dn_len, size_t index,
                          brisk__x509_cert *out)
 {
-    const struct chain_row *r = ctx;
+    struct chain_row *r = ctx;
     size_t i, hit = 0;
+
+    r->lookups++;
 
     for (i = 0; i < r->n_anchors; i++) {
         if (r->anchors[i].subject_len == dn_len && memcmp(r->anchors[i].subject, dn, dn_len) == 0) {
@@ -373,6 +376,7 @@ static int row_load(const char *const *certs, size_t n_max, const char *const *a
      * and a full row has no NULL in it to stop on. Scanning past the end would read the int
      * and int64 that follow the array - a wild pointer on the targets with no padding there. */
     g_row.n_certs = g_row.n_anchors = 0;
+    g_row.lookups = 0;
     for (i = 0; i < n_max && certs[i] != NULL; i++) {
         n = t_unhex(certs[i], g_row.der[i], CHAIN_CERT_CAP);
         if (brisk__x509_parse(&g_row.certs[i], g_row.der[i], n) != BRISK_OK) {
@@ -411,6 +415,11 @@ static void t_chain(void)
         }
         rc = brisk__x509_chain_verify(g_row.certs, g_row.n_certs, k->now, row_trust());
         CHECKI(rc == (k->want ? BRISK_E_AUTH : BRISK_OK), i);
+        /* The trust store is I/O - for the real one, a pass over ~200 KB of PEM per miss - and
+         * backtracking made the depth limit stop bounding how often it is asked. Nothing else
+         * in the suite would notice that budget going away, because a bigger budget only ever
+         * accepts MORE. So it is asserted here, on every row, against the documented ceiling. */
+        CHECKI(g_row.lookups <= BRISK__X509_MAX_LOOKUPS * BRISK__X509_MAX_ANCHORS, i);
     }
 }
 

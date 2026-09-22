@@ -100,8 +100,9 @@ int brisk__os_ca_anchor(void *ctx, const uint8_t *dn, size_t dn_len, size_t inde
     /* A STACK buffer, and that is what sizes it: this frame sits under brisk__x509_parse on a
      * device whose threads get 8 KB, so 256 B is the budget, not the throughput optimum. It
      * costs ~800 read() calls over a 200 KB bundle - about a millisecond of syscall overhead
-     * per lookup against a page-cached file, once or twice per handshake. Raise it only
-     * together with a fresh stack measurement. */
+     * per lookup against a page-cached file, and BRISK__X509_MAX_LOOKUPS caps how many of
+     * those one handshake can be made to do. Raise this buffer only with a fresh stack
+     * measurement. */
     uint8_t buf[256];
     size_t hit = 0;
     int fd, rc = BRISK_E_ARG;

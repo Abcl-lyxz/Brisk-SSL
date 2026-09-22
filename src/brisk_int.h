@@ -914,15 +914,22 @@ int brisk__x509_time(unsigned tag, const uint8_t *v, size_t len, int64_t *out);
  * implement left out, and the parts it does implement are named below with their step letters.
  *
  * Nothing is copied or allocated here either: the certs stay where the caller parsed them and
- * the only state is loop variables plus one brisk__x509_cert for the anchor under inspection.
+ * the only state is loop variables, the BRISK__X509_MAX_CHAIN pointers of the search path, and
+ * one brisk__x509_cert for the anchor under inspection.
  * STACK: this is the top of the deepest call chain in the library, because verifying one
  * certificate signature enters the RSA verifier from here. Measured with -fstack-usage at -Os,
  * gcc 14, BRISK_RSA_MAX_BITS 4096, summed along brisk__x509_chain_verify -> signed_by ->
  * brisk__rsa_pss_verify -> rsa_vp1 -> brisk__bn_modpow_pub -> brisk__bn_mont_mul:
- *   armv7hf 3784 = 168 + 408 + 2488 + 40 + 64 + 616
- *   mips    3872 = 184 + 416 + 2520 + 64 + 88 + 600
- *   x86_64  4176 = 288 + 496 + 2560 + 80 + 112 + 640
- * So a thread that runs a handshake wants 4 KB for this path alone at 4096-bit RSA, on top of
+ *   armv7hf 3824 = 208 + 408 + 2488 + 40 + 64 + 616
+ *   mips    3928 = 240 + 416 + 2520 + 64 + 88 + 600
+ *   x86_64  4240 = 352 + 496 + 2560 + 80 + 112 + 640
+ * The first term grew by 40 (armv7hf), 56 (mips) and 64 (x86_64) bytes when the greedy walk
+ * became a backtracking search. The path array - one pointer per level, so 32 or 64 bytes - is
+ * most of that; the rest is the extra live ranges around it. Treat the figure below as a FLOOR
+ * rather than a number: it is gcc 14 -Os on three of the ten archs, and the same six-frame sum
+ * under gcc 10 on x86_64 is 4528. aarch64, mips64, riscv64 and ppc are unmeasured, and
+ * aarch64's 16-byte frame alignment tends to inflate.
+ * So a thread that runs a handshake wants 4.5 KB for this path alone at 4096-bit RSA, on top of
  * whatever the TLS layer holds. BRISK_RSA_MAX_BITS is the lever - at 2048 the RSA part roughly
  * halves - and the 3.5 KB budget in src/crypto/rsa.c is the subtree, not the total.
  *
@@ -963,23 +970,47 @@ int brisk__x509_time(unsigned tag, const uint8_t *v, size_t len, int64_t *out);
  * A caller that stops after this function has a chain that is well formed and cryptographically
  * intact, and nothing more than that.
  *
- * SEARCH STRATEGY, and its one honest limit: the walk is greedy, upward, one level at a time.
+ * SEARCH STRATEGY: a depth-first search upward, one level at a time, WITH backtracking.
  * At each level the trust anchors are asked FIRST - which is what "stop at the first trust
  * anchor" means and what makes a cross-signed root work: when a chain arrives with the old
  * cross-certificate still attached, the intermediate's issuer is already in the store and the
  * useless tail is never looked at. Only then are the certificates the peer supplied searched,
- * and every candidate with a matching subject is tried until one verifies, so two intermediates
- * that share a Name (the usual shape of a key rollover) do not depend on their order.
- * There is NO backtracking ACROSS levels: once a level's candidate verifies, the walk commits
- * to it. Constructing a case that needs more means issuing two certificates with the same
- * subject Name AND the same key, differing only in a constraint - at which point the failure is
- * a chain that does not build, never one that wrongly does. Fail closed, so a DFS can wait
- * until a real deployment needs it.
+ * and every candidate with a matching subject is tried until one verifies.
  *
- * BRISK__X509_MAX_CHAIN bounds the walk whatever the inputs look like, so a peer that sends a
- * cycle of self-issued certificates gets BRISK_E_AUTH after a bounded number of verifications
- * rather than a hang. */
-#define BRISK__X509_MAX_CHAIN 8 /* end entity + 7; the Web PKI's deepest real chain is 4 */
+ * If a level later turns out to lead nowhere, the search RETURNS to it and resumes one past the
+ * candidate it gave up on. That matters because the case is not exotic: a CA rollover puts two
+ * certificates with one subject Name and one key on the wire, differing only in who signed
+ * them, and the useless one goes first because it is the legacy cross-certificate kept for old
+ * clients. A greedy walk takes it and reports a chain that does not build, holding every
+ * certificate it needed. SPKI pins made that reachable far more often - a pin miss sends the
+ * search back down a level where it would otherwise have returned - which is what finally
+ * bought the 64 bytes (32 on a 32-bit target) this costs: one pointer per level, doubling as
+ * the path and as each level's resume position.
+ *
+ * Three bounds keep it finite on peer input, and none of them depends on the peer being
+ * reasonable. BRISK__X509_MAX_CHAIN bounds the depth, so a cycle of self-issued certificates
+ * ends in BRISK_E_AUTH rather than a hang. BRISK__X509_MAX_VERIFY bounds the total signature
+ * verifications - and with them the number of paths explored, because every descent costs at
+ * least one. BRISK__X509_MAX_LOOKUPS bounds how often the trust store is consulted, which is a
+ * budget of its own precisely because the other two do not cover it: the store is asked once
+ * per fresh descent rather than once per level, and a candidate refused on its Name or its CA
+ * bits never reaches a signature, so it is free of the verify budget. BRISK__X509_MAX_ANCHORS
+ * bounds what the store may offer per Name, and anchors are asked only on first arrival. */
+/* Depth: end entity + 7; the Web PKI's deepest real chain is 4. It must stay <= 31, because
+ * x509/chain.c packs one pin bit per level into a uint32_t whose bit 31 is the "no pins
+ * configured" marker - at 32 the two would alias and a certificate committed at the top level
+ * would make every anchor pass the pin test, which is the fail-OPEN direction. chain.c carries
+ * the compile-time assertion; this is the note for whoever comes here to raise the number. */
+#define BRISK__X509_MAX_CHAIN 8
+/* Times the trust store may be consulted in ONE search, each consultation asking for up to
+ * BRISK__X509_MAX_ANCHORS candidates. Its own budget because neither of the other two covers
+ * it: the depth limit stopped bounding it when the walk gained backtracking (the store is asked
+ * once per fresh descent, not once per level), and a lookup is not paid for out of
+ * BRISK__X509_MAX_VERIFY, since a candidate refused on its Name or its CA bits never reaches a
+ * signature. 2 * MAX_CHAIN: the straight path needs one per level, and the slack is what a real
+ * rollover's dead branches cost. It bounds pre-auth I/O, which for the CA bundle store is a
+ * ~200 KB pass per miss - the thing a peer would otherwise get 33 of per handshake. */
+#define BRISK__X509_MAX_LOOKUPS 16
 /* Candidates offered for ONE issuer Name by the trust store, i.e. how many roots may share a
  * subject during a key rollover. Its own constant and not MAX_CHAIN: trimming the depth limit
  * for flash must not quietly shrink what a CA bundle may hold. */
@@ -1266,7 +1297,18 @@ int brisk__os_urandom(uint8_t *out, size_t len);
  *
  * ponytail: the file is re-opened and re-scanned for every `index` of every lookup, so N roots
  * sharing one Name cost N passes. N is at most BRISK__X509_MAX_ANCHORS and in practice 1.
- * Cache the offset of the last hit if a profile ever shows this. */
+ * Cache the offset of the last hit if a profile ever shows this.
+ *
+ * HOW OFTEN the search asks is what makes that affordable, and it is a bound rather than a
+ * hope: BRISK__X509_MAX_LOOKUPS consultations per search, each for up to
+ * BRISK__X509_MAX_ANCHORS candidates. A straight chain spends one per level; the slack is what
+ * a peer can force by sending certificates that chain plausibly and name an issuer nobody has.
+ *
+ * Re-opening per lookup also means a bundle REWRITTEN between two `index` values - which is
+ * what update-ca-certificates does, by rename - can shift the numbering and make the search
+ * skip a same-Name candidate. Transient and fail-closed (a chain that does not build), so it is
+ * recorded rather than fixed; holding one fd open for the whole search is the fix if it ever
+ * matters. */
 typedef struct {
     /* The bundle to read. NULL means "find one", and the first lookup fills this in with the
      * first readable path of the list in linux_ca.c, so the search happens once. Set it
