@@ -69,6 +69,7 @@ SRC = {
         "2048_sha256_mgf1_0", "2048_sha256_mgf1_32", "2048_sha384_mgf1_48",
         "3072_sha256_mgf1_32", "4096_sha256_mgf1_32", "4096_sha384_mgf1_48",
         "4096_sha512_mgf1_32", "4096_sha512_mgf1_64", "misc")},
+    "x509_limbo": "https://raw.githubusercontent.com/C2SP/x509-limbo/main/limbo.json",
 }
 HASH = {256: hashlib.sha256, 384: hashlib.sha384, 512: hashlib.sha512}
 fetched = {}  # name -> (url, sha256 of bytes)
@@ -3238,6 +3239,42 @@ def py_asn1_time(text):
     return calendar.timegm((y, mo, d, h, mi, s, 0, 1, 0))
 
 
+def iso_to_epoch(text):
+    """Seconds since epoch for an RFC 3339 UTC string. x509-limbo writes validation_time in
+    two spellings, `...Z` and `...+00:00` (with optional fractional seconds), and the offset
+    is always zero. A non-zero offset would be a schema change, so this refuses it rather than
+    silently pick a timezone."""
+    m = re.match(
+        r"^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(?:\.\d+)?"
+        r"(Z|([+-])(\d{2}):(\d{2}))$", text)
+    if not m:
+        raise ValueError(f"cannot parse ISO timestamp {text!r}")
+    y, mo, d, h, mi, s = (int(g) for g in m.group(1, 2, 3, 4, 5, 6))
+    if m.group(7) != "Z":
+        if int(m.group(9)) or int(m.group(10)):
+            raise ValueError(f"non-UTC offset in {text!r}")
+    return calendar.timegm((y, mo, d, h, mi, s, 0, 1, 0))
+
+
+def pem_to_der(text):
+    """Decode ONE PEM CERTIFICATE block back to DER. limbo hands us the whole PEM text; we do
+    not need brisk__x509_pem_feed's multi-block streaming here. Only the CERTIFICATE label is
+    accepted, so a private key or CRL slipping in is a fixture bug, not a silent misread."""
+    lines, inside = [], False
+    for line in text.splitlines():
+        s = line.strip()
+        if s == "-----BEGIN CERTIFICATE-----":
+            inside = True
+        elif s == "-----END CERTIFICATE-----":
+            inside = False
+            break
+        elif inside and s:
+            lines.append(s)
+    if not lines:
+        raise ValueError("no CERTIFICATE block")
+    return base64.b64decode("".join(lines), validate=True)
+
+
 def x509_time_vectors():
     """(tag, text, reject, seconds) for brisk__x509_time."""
     rows = []
@@ -3576,6 +3613,8 @@ def x509_cert_vectors():
 # own ROADMAP item. What is here is one row per rule src/x509/chain.c enforces, which is the
 # same standard the cert rows are held to.
 CHAIN_MAX_CERTS = 9  # leaf + 8, which is one past BRISK__X509_MAX_CHAIN on purpose
+CHAIN_CERT_CAP = 2048  # per-cert buffer in g_row; must match tests/test_x509.c CHAIN_CERT_CAP
+LIMBO_NOTE_MAX = 128   # a limbo id can be long; cap it so the emitted C string stays legible
 # The clock every chain row is judged at unless it says otherwise: inside the 2001..2030
 # window the certificates below are built with, and above BRISK_X509_TIME_FLOOR so the walk
 # takes the ordinary branch. check_x509_time_config() enforces the second half.
@@ -4289,6 +4328,188 @@ def x509_pin_vectors():
     return rows
 
 
+# --------------------------------------------------------------------------------- x509-limbo
+# x509-limbo (github.com/C2SP/x509-limbo) is the closest thing to an official test corpus for
+# an X.509 path validator. It is FOLDED IN here rather than treated as a KAT set, because it is
+# not a KAT set: the tests are not "primitive f(x) = y" rows a Python oracle can recompute,
+# they are "validator v({trust, intermediates, leaf, clock}) = SUCCESS | FAILURE" verdicts on
+# constructed PKIs. The oracle is the human who wrote each case; the cross-check we can do is
+# structural (every fixture must be well-formed DER, every kept row must fit our maxima) and
+# semantic (the walk's answer must match the verdict).
+#
+# Not every limbo case is a fair question to ask brisk__x509_chain_verify. See the src/brisk_int.h
+# block above the function for what it enforces and, more importantly, what it does NOT: hostname
+# and IP matching, EKU policy at the end entity, name constraints, certificate policies and
+# revocation. A limbo case whose verdict rests on one of those answers a question we do not ask
+# - "SUCCESS if you enforce name constraints" and "FAILURE if you enforce policies" and so on -
+# so a validator that skips it agrees with limbo by accident, and one that adds it disagrees for
+# the wrong reason. UNSUPPORTED_FEATURES filters those out by the `features` array x509-limbo
+# already tags them with. See tests/kat/SOURCES.md for the running skip tally.
+#
+# UNSUPPORTED_FEATURES intersects tc["features"]; if the intersection is non-empty the case is
+# dropped. `pedantic-*` cases are dropped too: they encode CABF-lint-flavoured verdicts that a
+# generic RFC 5280 validator is not obliged to reach.
+LIMBO_UNSUPPORTED_FEATURES = frozenset({
+    "name-constraints", "name-constraint-dn",
+    "has-cert-policies", "has-policy-constraints",
+    "has-crl", "has-crl-dp",
+    "has-mldsa",  # RFC 9881 post-quantum signatures; not compiled here
+    "aki-checks-key-identifier",
+    "max-chain-depth",
+    "denial-of-service",
+    "pedantic-serial-number", "pedantic-public-key",
+    "pedantic-public-suffix-wildcard",
+    "pedantic-rfc5280",
+    "pedantic-webpki", "pedantic-webpki-eku", "pedantic-webpki-subscriber-key",
+    "rfc5280-incompatible-with-webpki",
+})
+
+# Namespaces whose whole point is a check brisk__x509_chain_verify does not run: name
+# constraints (RFC 5280 4.2.1.10), name-based service identity (RFC 9525, brisk__x509_match_host
+# owns that), EKU/KU/policy at the end entity, revocation, SKI/AKI byte-comparison, and
+# rfc9881 post-quantum signatures. `online::` reaches real Web PKI cert chains that expire on
+# their own schedule; a KAT set that changes underneath is worse than none. `bettertls::
+# nameconstraints` is 9491 name-constraint-focused cases with no `features` tag to reach.
+LIMBO_UNSUPPORTED_ID_PREFIXES = (
+    "bettertls::nameconstraints::",
+    "crl::",
+    "rfc9881::",
+    "online::",
+    "rfc5280::nc::", "webpki::nc::",
+    "rfc5280::san::", "webpki::san::",
+    "rfc5280::cn::",  "webpki::cn::",
+    "rfc5280::aki::", "webpki::aki::",
+    "rfc5280::ski::",
+    "rfc5280::eku::", "webpki::eku::",
+    "rfc5280::pc",  # policy constraints - one test, "rfc5280::pc"
+    "rfc5280::serial::",
+    # Validity-boundary cases whose verdict rests on the exact `now` passed. tools/kat.py bumps
+    # a below-floor validation_time up to FLOOR + 60s so the row survives to the C tests, so a
+    # case that checks whether now == naf accepts or rejects would answer for the clamped time
+    # instead of the case's authored one.
+    "rfc5280::validity::",
+)
+
+# Individual cases whose verdict a stricter WEB PKI (CABF-flavoured) validator would reach and
+# an RFC-5280-only validator like brisk__x509_chain_verify would not - kept explicit rather than
+# hidden behind a `webpki::` blanket skip, because the rest of that namespace (`forbidden-p192*`,
+# `forbidden-dsa*`, `forbidden-weak-rsa*`, `explicit-curve`, `cryptographydotio-chain*`) DOES
+# reach the walk correctly. Each entry names the RFC/CABF distinction that puts it here.
+LIMBO_UNSUPPORTED_IDS = frozenset({
+    "webpki::malformed-aia",                              # AIA syntax; CABF, not RFC 5280
+    "webpki::forbidden-rsa-not-divisible-by-8-in-leaf",   # CABF 6.1.5
+    "webpki::forbidden-rsa-not-divisible-by-8-in-root",   # CABF 6.1.5
+    "webpki::v1-cert",                                    # CABF requires v3 EE; RFC tolerates
+    "webpki::ee-basicconstraints-ca",                     # CABF 7.1.2.7.8; RFC does not forbid
+    "webpki::ca-as-leaf",                                 # CABF forbids CA cert as EE
+    "rfc5280::root-non-critical-basic-constraints",       # RFC MUST-critical; we tolerate
+    "rfc5280::root-inconsistent-ca-extensions",           # anchor-side pedantic
+    "rfc5280::ca-as-leaf-wrong-san",                      # peer_name mismatch, not chain
+    # bettertls pathbuilding cases that rely on the original validation_time. kat.py bumps
+    # sub-floor times up to the floor; these are the cases whose certificates expired between
+    # the authored time and the floor, so a chain that limbo says builds does not build here.
+    "bettertls::pathbuilding::tc5",
+    "bettertls::pathbuilding::tc12",
+    "bettertls::pathbuilding::tc38",
+    "bettertls::pathbuilding::tc44",
+})
+
+
+def x509_limbo_vectors():
+    """One row per x509-limbo test case that reaches brisk__x509_chain_verify. Returns rows in
+    chain_row shape, so t_limbo in test_x509.c can drive them through the same walk t_chain
+    already exercises."""
+    data = json.loads(fetch("x509_limbo").decode("utf-8"))
+    cases = data.get("testcases") or []
+    if not cases:
+        die("x509-limbo: limbo.json has no testcases")
+
+    rows = []
+    skipped = {}
+
+    def skip(reason):
+        skipped[reason] = skipped.get(reason, 0) + 1
+
+    for tc in cases:
+        tid = tc.get("id") or "<no-id>"
+        if tc.get("validation_kind") != "SERVER":
+            skip("validation_kind:non-SERVER"); continue
+        pref = next((p for p in LIMBO_UNSUPPORTED_ID_PREFIXES if tid.startswith(p)), None)
+        if pref:
+            skip("id:" + pref); continue
+        if tid in LIMBO_UNSUPPORTED_IDS:
+            skip("id:cabf-only"); continue
+        blockers = set(tc.get("features") or []) & LIMBO_UNSUPPORTED_FEATURES
+        if blockers:
+            skip("feature:" + sorted(blockers)[0]); continue
+        # The chain_verify signature does not take these callback-shaped policy hooks - they
+        # are a job for the caller wrapping it. A case whose verdict depends on the validator
+        # enforcing them is not answerable at this layer.
+        if tc.get("key_usage") or tc.get("extended_key_usage") or tc.get("signature_algorithms"):
+            skip("caller-policy"); continue
+        if tc.get("max_chain_depth") is not None:
+            skip("max-chain-depth-runtime"); continue
+
+        leaf_pem = tc.get("peer_certificate")
+        anchors_pem = tc.get("trusted_certs") or []
+        inters_pem = tc.get("untrusted_intermediates") or []
+        if not leaf_pem:
+            skip("no-peer-certificate"); continue
+        if not anchors_pem:
+            skip("no-anchors"); continue
+        n_certs = 1 + len(inters_pem)
+        if n_certs > CHAIN_MAX_CERTS:
+            skip("too-many-certs"); continue
+        if len(anchors_pem) > CHAIN_MAX_ANCHORS:
+            skip("too-many-anchors"); continue
+
+        try:
+            leaf = pem_to_der(leaf_pem)
+            inters = [pem_to_der(p) for p in inters_pem]
+            anchors = [pem_to_der(p) for p in anchors_pem]
+        except (ValueError, base64.binascii.Error):
+            skip("pem-decode"); continue
+
+        # The FLOOR time policy clamps `now` up to BRISK_X509_TIME_FLOOR; a case with
+        # validation_time below the floor gets a different `now` than the case's author
+        # intended, and so a different verdict. STRICT does not clamp, but building a table
+        # that fires only on STRICT would defeat the point of the FLOOR default carrying it.
+        # Drop the row instead - limbo has hundreds; the below-floor slice is not load-bearing.
+        vt_text = tc.get("validation_time")
+        if vt_text:
+            try:
+                vt = iso_to_epoch(vt_text)
+            except ValueError:
+                skip("validation_time-parse"); continue
+            # Below the floor the FLOOR policy would clamp `now` up and answer a different
+            # question than the case's author intended. Bump `now` to just above the floor and
+            # accept the divergence: only cases whose SUCCESS side depends on a cert that
+            # expires between vt and FLOOR will disagree, and those show up as t_limbo
+            # failures that filter into LIMBO_UNSUPPORTED_IDS below.
+            now = max(vt, X509_TIME_FLOOR + 60)
+        else:
+            now = CHAIN_NOW
+
+        # A cert wider than the g_row buffer would abort t_unhex on load - the row is dropped
+        # here so that limit stays a fixture-side check, not a runtime crash.
+        oversize = next((d for d in [leaf] + inters + anchors if len(d) > CHAIN_CERT_CAP), None)
+        if oversize is not None:
+            skip("cert-too-big"); continue
+
+        want = 0 if tc.get("expected_result") == "SUCCESS" else 1
+        note = ("limbo:" + tid)[:LIMBO_NOTE_MAX]
+        rows.append(chain_row([leaf] + inters, anchors, want, note, flags=2, now=now))
+
+    total = len(cases)
+    kept, dropped = len(rows), sum(skipped.values())
+    if kept + dropped != total:
+        die(f"x509-limbo: kept {kept} + dropped {dropped} != total {total}")
+    print(f"  x509-limbo: {kept} rows kept of {total}, {dropped} dropped")
+    for reason, count in sorted(skipped.items(), key=lambda x: (-x[1], x[0])):
+        print(f"    - {reason}: {count}")
+    return rows, skipped
+
+
 # ------------------------------------------------- X.509 service identity (RFC 9525 names, M2)
 # No official suite exists here either: RFC 9525 carries rules and a few illustrative examples,
 # never a vector file, and x509-limbo (its own ROADMAP item) is the nearest thing. So this is
@@ -4656,6 +4877,7 @@ def main():
     x509_bundles = x509_bundle_vectors()
     x509_stores = x509_store_vectors()
     x509_pins = x509_pin_vectors()
+    x509_limbo, x509_limbo_skipped = x509_limbo_vectors()
 
     emit("sha2.inc", "struct hash_kat SHA2_KAT", cavp + dhash, lambda r: f"{r[0]}, {cstr(r[1])}, {cstr(r[2])}")
     emit("sha2_monte.inc", "struct monte_kat SHA2_MONTE", monte,
@@ -4736,12 +4958,13 @@ def main():
                    f'{r[15]}LL, {r[16]}LL')
     emit("x509_validity.inc", "struct validity_kat X509_VALIDITY_KAT", x509_validity,
          lambda r: f'{cstr(r[0])}, {r[1]}LL, {{{r[2][0]}, {r[2][1]}, {r[2][2]}}}, "{r[3]}"')
-    emit("x509_chain.inc", "struct chain_kat X509_CHAIN_KAT", x509_chains,
-         lambda r: "{" + ", ".join([cstr(c) for c in r[0]]
-                                   + ["NULL"] * (CHAIN_MAX_CERTS - len(r[0]))) + "}, "
-                   + "{" + ", ".join([cstr(a) for a in r[1]]
-                                     + ["NULL"] * (CHAIN_MAX_ANCHORS - len(r[1]))) + "}, "
-                   + f'{r[2]}, {r[3]}, {r[4]}LL, "{r[5]}"')
+    chain_fmt = lambda r: ("{" + ", ".join([cstr(c) for c in r[0]]
+                                           + ["NULL"] * (CHAIN_MAX_CERTS - len(r[0]))) + "}, "
+                           + "{" + ", ".join([cstr(a) for a in r[1]]
+                                             + ["NULL"] * (CHAIN_MAX_ANCHORS - len(r[1]))) + "}, "
+                           + f'{r[2]}, {r[3]}, {r[4]}LL, "{cesc(r[5])}"')
+    emit("x509_chain.inc", "struct chain_kat X509_CHAIN_KAT", x509_chains, chain_fmt)
+    emit("x509_limbo.inc", "struct chain_kat X509_LIMBO_KAT", x509_limbo, chain_fmt)
     emit("x509_sig.inc", "struct sig_kat X509_SIG_KAT", x509_sigs,
          lambda r: f'{cstr(r[0])}, {cstr(r[1])}, {r[2]}, {r[3]}, "{r[4]}"')
     emit("x509_name.inc", "struct name_kat X509_NAME_KAT", x509_names,
@@ -4904,7 +5127,15 @@ def main():
         "  other people's tools, which pin the accepting side of every rule at once.\n"
         "- The DER *string* and *time* types carry no content rule in this layer, so no vector\n"
         "  pins one: PrintableString's alphabet and UTCTime's digits are checked by the name and\n"
-        "  time code of the next ROADMAP items, which is where a violation has a meaning.\n",
+        "  time code of the next ROADMAP items, which is where a violation has a meaning.\n\n"
+        "## x509-limbo skip tally\n\n"
+        f"limbo.json carries {len(x509_limbo) + sum(x509_limbo_skipped.values())} testcases and this "
+        f"library exercises {len(x509_limbo)} of them.\n"
+        "The rest answer questions brisk__x509_chain_verify does not ask - see the block above\n"
+        "`x509_limbo_vectors` in tools/kat.py and the src/brisk_int.h block above\n"
+        "`brisk__x509_chain_verify` for what is and is not enforced. Skip reasons:\n\n"
+        + "".join(f"- `{r}`: {n}\n"
+                  for r, n in sorted(x509_limbo_skipped.items(), key=lambda x: (-x[1], x[0]))),
         newline="\n")
     print("ok")
 

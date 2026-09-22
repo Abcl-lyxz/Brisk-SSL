@@ -215,6 +215,7 @@ struct chain_kat {
     const char *note;
 };
 #include "kat/x509_chain.inc"
+#include "kat/x509_limbo.inc"
 
 /* One certificate against one clock: the policy table, where all three BRISK_X509_TIME_POLICY
  * answers travel together and the build reads its own column. */
@@ -272,6 +273,7 @@ struct pin_kat {
 #include "kat/x509_pin.inc"
 
 #define CHAIN_N    (sizeof X509_CHAIN_KAT / sizeof X509_CHAIN_KAT[0])
+#define LIMBO_N    (sizeof X509_LIMBO_KAT / sizeof X509_LIMBO_KAT[0])
 #define BUNDLE_N   (sizeof X509_BUNDLE_KAT / sizeof X509_BUNDLE_KAT[0])
 #define STORE_N    (sizeof X509_STORE_KAT / sizeof X509_STORE_KAT[0])
 #define PIN_N      (sizeof X509_PIN_KAT / sizeof X509_PIN_KAT[0])
@@ -398,6 +400,75 @@ static int row_load(const char *const *certs, size_t n_max, const char *const *a
 static int chain_load(const struct chain_kat *k, size_t idx)
 {
     return row_load(k->certs, CHAIN_CERTS, k->anchors, idx);
+}
+
+/* Like chain_load, but a certificate that does not parse is a valid input to the walk, not a
+ * broken fixture. x509-limbo hands validators malformed certs on purpose (webpki::forbidden-
+ * dsa-root, webpki::forbidden-p192-root, rfc5280::unknown-critical-extension-*, ...) to check
+ * they are refused rather than misparsed. A caller feeding brisk__x509_chain_verify over the
+ * wire would drop the bad cert and try the rest, and this loader does the same:
+ *   - a leaf (index 0) that does not parse returns 0 - the walk has nothing to build from,
+ *     which is AUTH-equivalent; t_limbo then asserts want == 1;
+ *   - an intermediate that does not parse is skipped (rfc5280::unknown-critical-extension-
+ *     unrelated-intermediate exercises this: a good path exists and the bad ICA sits beside
+ *     it);
+ *   - an anchor that does not parse is absent from the store (rfc5280::unknown-critical-
+ *     extension-unrelated-root; webpki::forbidden-p192-root, whose parse refuses P-192 and
+ *     leaves the walk with an empty store, which returns AUTH and matches the case). */
+static int limbo_load(const struct chain_kat *k, size_t idx)
+{
+    size_t i, n, slot;
+
+    (void)idx;
+    g_row.n_certs = g_row.n_anchors = 0;
+    g_row.lookups = 0;
+    for (i = 0; i < CHAIN_CERTS && k->certs[i] != NULL; i++) {
+        slot = g_row.n_certs;
+        n = t_unhex(k->certs[i], g_row.der[slot], CHAIN_CERT_CAP);
+        if (brisk__x509_parse(&g_row.certs[slot], g_row.der[slot], n) != BRISK_OK) {
+            if (i == 0) {
+                return 0;
+            }
+            continue;
+        }
+        g_row.n_certs++;
+    }
+    for (i = 0; i < CHAIN_ANCHORS && k->anchors[i] != NULL; i++) {
+        slot = g_row.n_anchors;
+        n = t_unhex(k->anchors[i], g_row.anchor_der[slot], CHAIN_CERT_CAP);
+        if (brisk__x509_parse(&g_row.anchors[slot], g_row.anchor_der[slot], n) != BRISK_OK) {
+            continue;
+        }
+        g_row.n_anchors++;
+    }
+    return 1;
+}
+
+/* x509-limbo (github.com/C2SP/x509-limbo) as one row per case that survives the tools/kat.py
+ * filter - see tests/kat/SOURCES.md for what and why. Rows come in `chain_kat` shape, but a
+ * limbo case may deliberately hand a validator a malformed certificate, so a parse failure
+ * lands on AUTH-equivalent here (chain not buildable) rather than being a fixture error. */
+static void t_limbo(void)
+{
+    size_t i;
+    for (i = 0; i < LIMBO_N; i++) {
+        const struct chain_kat *k = &X509_LIMBO_KAT[i];
+        int rc;
+
+        if (!chain_row_enabled(k->flags)) {
+            continue;
+        }
+        if (!limbo_load(k, i)) {
+            /* The leaf did not parse. chain_verify has nothing to build from, so this equals
+             * AUTH from the walk's point of view. Accept only if that is what the case
+             * expected. */
+            CHECKI(k->want == 1, i);
+            continue;
+        }
+        rc = brisk__x509_chain_verify(g_row.certs, g_row.n_certs, k->now, row_trust());
+        CHECKI(rc == (k->want ? BRISK_E_AUTH : BRISK_OK), i);
+        CHECKI(g_row.lookups <= BRISK__X509_MAX_LOOKUPS * BRISK__X509_MAX_ANCHORS, i);
+    }
 }
 
 static void t_chain(void)
@@ -794,6 +865,7 @@ void test_x509(void)
     t_flip();
     t_validity();
     t_chain();
+    t_limbo();
     t_chain_args();
     t_signed_by();
     t_sig();

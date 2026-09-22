@@ -56,6 +56,7 @@ reference before emission. Differential vectors come from a fixed seed.
 | wp_rsa_pss_4096_sha512_mgf1_64 | https://raw.githubusercontent.com/C2SP/wycheproof/main/testvectors_v1/rsa_pss_4096_sha512_mgf1_64_test.json | `c93ceaa56a190c9fd4707441c5c6a75839f108202d88aec891697f9623042547` |
 | wp_rsa_pss_misc | https://raw.githubusercontent.com/C2SP/wycheproof/main/testvectors_v1/rsa_pss_misc_test.json | `1fac515f67fea8ccbf44ea08fde2de00cd76169f774a54ce2994c9963c31e84f` |
 | wp_x25519 | https://raw.githubusercontent.com/C2SP/wycheproof/main/testvectors_v1/x25519_test.json | `35c3f5231cf25cc640b524d403461deee9e49441d5d915a3a25b2c8ff5adbe7d` |
+| x509_limbo | https://raw.githubusercontent.com/C2SP/x509-limbo/main/limbo.json | `563805f46937ad25ac9d4e41341c414070aced32a22294821b5c5fe526e2c52d` |
 
 ## Deliberately not used
 
@@ -189,3 +190,36 @@ reference before emission. Differential vectors come from a fixed seed.
 - The DER *string* and *time* types carry no content rule in this layer, so no vector
   pins one: PrintableString's alphabet and UTCTime's digits are checked by the name and
   time code of the next ROADMAP items, which is where a violation has a meaning.
+
+## x509-limbo skip tally
+
+limbo.json carries 9793 testcases and this library exercises 96 of them.
+The rest answer questions brisk__x509_chain_verify does not ask - see the block above
+`x509_limbo_vectors` in tools/kat.py and the src/brisk_int.h block above
+`brisk__x509_chain_verify` for what is and is not enforced. Skip reasons:
+
+- `id:bettertls::nameconstraints::`: 9491
+- `id:rfc5280::nc::`: 45
+- `too-many-certs`: 21
+- `id:webpki::san::`: 19
+- `id:online::`: 14
+- `id:cabf-only`: 12
+- `id:rfc5280::validity::`: 11
+- `validation_kind:non-SERVER`: 10
+- `id:webpki::cn::`: 9
+- `id:crl::`: 8
+- `feature:denial-of-service`: 7
+- `id:rfc9881::`: 6
+- `feature:max-chain-depth`: 5
+- `id:rfc5280::aki::`: 5
+- `id:webpki::aki::`: 5
+- `feature:pedantic-webpki-subscriber-key`: 4
+- `id:rfc5280::san::`: 4
+- `id:webpki::eku::`: 4
+- `id:webpki::nc::`: 4
+- `id:rfc5280::eku::`: 3
+- `id:rfc5280::serial::`: 3
+- `id:rfc5280::ski::`: 3
+- `caller-policy`: 2
+- `id:rfc5280::pc`: 1
+- `max-chain-depth-runtime`: 1

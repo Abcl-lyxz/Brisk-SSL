@@ -44,7 +44,7 @@ Tick a box only when the work is green on **every** arch (`python tools/dev.py t
       walk refused chains it held every certificate for; SPKI pins made that reachable far more
       often. Costs one pointer per level (32 B on 32-bit, 64 on 64-bit) and no extra bound:
       every descent already costs a signature verification, which MAX_VERIFY caps.
-- [ ] x509-limbo suite
+- [x] x509-limbo suite
 
 ## M3 TLS 1.3 client
 - [ ] Handshake engine (messages + epochs, exports secrets), HRR, key schedule
