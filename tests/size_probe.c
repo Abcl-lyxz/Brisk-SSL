@@ -222,6 +222,22 @@ int main(int argc, char **argv)
         }
 #endif
     }
+#if BRISK_ENABLE_H2
+    {
+        /* HPACK: the ring and scratch are the probe's BSS, not the library's RAM */
+        static uint8_t ring[BRISK_H2_HEADER_TABLE_SIZE + 1], scr[256];
+        brisk__hpack_dec hd;
+        brisk__hpack_enc he;
+        brisk__hpack_field hf = {out, 3, out + 3, 3, 0};
+        size_t n;
+        brisk__hpack_dec_init(&hd, ring, BRISK_H2_HEADER_TABLE_SIZE);
+        brisk__hpack_decode(&hd, out, sizeof out, scr, sizeof scr, 4096, NULL, NULL);
+        brisk__hpack_enc_init(&he);
+        brisk__hpack_enc_peer_max(&he, (uint32_t)argc);
+        brisk__hpack_encode(&he, &hf, 1, out, sizeof out, &n);
+        brisk__huff_decode(out, 8, scr, sizeof scr, &n);
+    }
+#endif
     return out[0] + (brisk_build_info()[0] == brisk_version()[0]) +
            brisk__ct_memeq(out, out + 1, 8);
 }

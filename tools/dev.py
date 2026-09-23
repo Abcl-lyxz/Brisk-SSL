@@ -7,7 +7,7 @@
   python tools/dev.py size [--arch all|mipsel..] [--md] [--save] [--check]
                                                  per-module flash/RAM from the linker map (-Os, static)
   python tools/dev.py ct                         constant-time check: the ct suite under valgrind
-  python tools/dev.py fuzz [der|name|tls13_hs|tls13_rec|ticket|conn] [--seconds N]  libFuzzer over a parser, seeded from its .inc
+  python tools/dev.py fuzz [der|name|tls13_hs|tls13_rec|ticket|conn|hpack] [--seconds N]  libFuzzer over a parser, seeded from its .inc
   python tools/dev.py interop                    brisk_get vs openssl s_server, nginx, Caddy (test PKI)
   python tools/dev.py badssl                     brisk_get vs badssl.com (needs internet)
   python tools/dev.py image                      (re)build the brisk-dev Docker image
@@ -242,7 +242,11 @@ FUZZ = {"der": ("fuzz/fuzz_der.c src/x509/der.c", "tests/kat/der.inc"),
                  "tests/kat/tls13_conn_fuzz.inc"),
         # The resumption ticket blob: the one parser of caller-stored bytes (src/tls/ticket.c).
         "ticket": ("fuzz/fuzz_ticket.c src/tls/ticket.c src/util.c",
-                   "tests/kat/tls13_ticket_fuzz.inc")}
+                   "tests/kat/tls13_ticket_fuzz.inc"),
+        # HPACK (RFC 7541): block sequences through one decoder + Huffman + encoder round trip.
+        # BRISK_ENABLE_H2 is on in the default profile, which is what this build uses.
+        "hpack": ("fuzz/fuzz_hpack.c src/http/hpack.c src/http/huffman.c src/util.c",
+                  "tests/kat/hpack_fuzz.inc")}
 
 
 def fuzz_corpus(inc, out):

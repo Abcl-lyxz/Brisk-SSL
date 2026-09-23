@@ -2018,6 +2018,81 @@ int brisk__conn_anchor(void *ctx, const uint8_t *dn, size_t dn_len, size_t index
  * BRISK_E_ARG on an empty name or more than cap bytes. NULL list = *out_len 0. */
 int brisk__alpn_encode(const char *list, uint8_t *out, size_t cap, size_t *out_len);
 
+#if BRISK_ENABLE_H2
+/* ---- http/huffman.c + http/hpack.c: HTTP/2 HPACK (RFC 7541) ----------------------------------
+ * Sans-I/O, no malloc, no globals: the caller owns the dynamic-table ring and the scratch.
+ * Not constant time (header fields are not secrets in this client). Every decoding error is
+ * BRISK_E_PROTO = HTTP/2 COMPRESSION_ERROR, a CONNECTION error (RFC 9113 4.3).
+ *
+ * NOT done here, and owed by the h2 layer (M4 line 2): the RFC 9113 8.2.1 / 8.3 receive-side
+ * field checks (malformed = stream error) - name/value octets, pseudo-header order and presence,
+ * connection-specific fields. Run them in the decode callback. HPACK itself accepts any octets. */
+
+/* huffman.c - shared with QPACK (RFC 9204 4.1.1/4.1.2) in M7 */
+/* RFC 7541 5.1 prefixed integer. p[0]'s low `n` bits (1..8) start it; the flag bits above them are
+ * ignored. On success *v holds the value and *used the octets consumed. BRISK_E_PROTO when the
+ * input is truncated, the value exceeds 2^32-1 or there are more than 5 continuation octets;
+ * BRISK_E_ARG for NULL pointers or n outside 1..8. */
+int brisk__hpack_int_decode(const uint8_t *p, size_t len, unsigned n, uint32_t *v, size_t *used);
+/* RFC 7541 5.2 + Appendix B. BRISK_E_PROTO on EOS, padding > 7 bits, non-EOS padding, or output
+ * longer than cap (a local limit). An empty input is an empty string. */
+int brisk__huff_decode(const uint8_t *in, size_t len, uint8_t *out, size_t cap, size_t *out_len);
+
+/* hpack.c */
+#    define BRISK__HPACK_NEVER_INDEXED 1u /* 6.2.3: decoder reports it; encoder input asks for it  \
+                                           */
+
+typedef struct {
+    const uint8_t *name;
+    size_t name_len;
+    const uint8_t *value;
+    size_t value_len;
+    unsigned flags; /* BRISK__HPACK_NEVER_INDEXED for Authorization / Cookie style values */
+} brisk__hpack_field;
+
+/* Return 0 to continue; any nonzero value aborts the block and is returned as-is. The decoder is
+ * then dead. name/value point into the caller's scratch and are valid only during the call.
+ * Fields delivered before a later error in the same block must be discarded by the caller: the
+ * whole block, and the connection, failed. */
+typedef int (*brisk__hpack_field_fn)(void *ctx, const uint8_t *name, size_t name_len,
+                                     const uint8_t *value, size_t value_len, unsigned flags);
+
+typedef struct {
+    uint8_t *mem;        /* ring, `limit` bytes, caller-owned */
+    uint32_t limit;      /* our advertised SETTINGS_HEADER_TABLE_SIZE (<= 65535) */
+    uint32_t max;        /* current max from the last 6.3 update (<= limit) */
+    uint32_t size;       /* 4.1 accounted size, <= max */
+    uint32_t head;       /* ring offset of the oldest entry */
+    uint32_t used;       /* ring bytes in use (n + v + 4 per entry) */
+    uint32_t count;      /* entries */
+    uint8_t need_update; /* RFC 9113 4.3.1: limit < 4096, next block must start with 6.3 */
+    uint8_t dead;        /* sticky after any error (RFC 9113 4.3: connection error) */
+} brisk__hpack_dec;
+
+/* BRISK_E_ARG if limit > 65535 or (mem == NULL && limit > 0). */
+int brisk__hpack_dec_init(brisk__hpack_dec *d, uint8_t *mem, size_t limit);
+/* Decode ONE complete field block (HEADERS + CONTINUATION already joined by the h2 layer).
+ * scratch/scratch_cap bounds one decoded field (name || value); max_list is our
+ * SETTINGS_MAX_HEADER_LIST_SIZE (sum of n + v + 32). BRISK_OK, BRISK_E_PROTO
+ * (COMPRESSION_ERROR, sticky), BRISK_E_ARG (NULL arguments), or the callback's nonzero value. */
+int brisk__hpack_decode(brisk__hpack_dec *d, const uint8_t *blk, size_t len, uint8_t *scratch,
+                        size_t scratch_cap, size_t max_list, brisk__hpack_field_fn fn, void *ctx);
+
+typedef struct {
+    uint32_t cur;    /* table max the peer's decoder believes we use: 4096, then 0 once signalled */
+    uint8_t pending; /* emit 0x20 (size update 0) at the start of the next block */
+} brisk__hpack_enc;
+
+void brisk__hpack_enc_init(brisk__hpack_enc *e);
+/* Peer's SETTINGS_HEADER_TABLE_SIZE on receipt of its SETTINGS. Sets pending when v < cur. */
+void brisk__hpack_enc_peer_max(brisk__hpack_enc *e, uint32_t v);
+/* Encode n fields as one block. BRISK_OK with *out_len set, or BRISK_E_ARG (invalid field per
+ * RFC 9113 8.2.1, or out too small) with *out_len = 0 and the state unchanged. Never indexes and
+ * never Huffman-encodes (RFC 7541 7.1: no compression-oracle surface) - keep it that way. */
+int brisk__hpack_encode(brisk__hpack_enc *e, const brisk__hpack_field *f, size_t n, uint8_t *out,
+                        size_t cap, size_t *out_len);
+#endif /* BRISK_ENABLE_H2 */
+
 /* ---- os/linux_net.c (Linux builds only): clocks and TCP -------------------------------------- */
 int64_t brisk__os_wall_ms(void); /* CLOCK_REALTIME, widened; 0 if the clock cannot be read */
 int64_t brisk__os_mono_ms(void); /* CLOCK_MONOTONIC: deadlines only */

@@ -15,10 +15,35 @@ reference before emission. Differential vectors come from a fixed seed.
 | cavp_rsa2 | https://csrc.nist.gov/CSRC/media/Projects/Cryptographic-Algorithm-Validation-Program/documents/dss/186-2rsatestvectors.zip | `65ea8af4bf3d4ecd09222cf24458b997d6b393d4cd49be32114116f32f42c0df` |
 | cavp_rsa3 | https://csrc.nist.gov/CSRC/media/Projects/Cryptographic-Algorithm-Validation-Program/documents/dss/186-3rsatestvectors.zip | `8405aeb3572a4f98ed4b1a3ccb3f2f49e725462dd28ec4759d6a15d88855d19c` |
 | cavp_sha | https://csrc.nist.gov/CSRC/media/Projects/Cryptographic-Algorithm-Validation-Program/documents/shs/shabytetestvectors.zip | `929ef80b7b3418aca026643f6f248815913b60e01741a44bba9e118067f4c9b8` |
+| hpack_go_hpack_00 | https://raw.githubusercontent.com/http2jp/hpack-test-case/8a1406e7d14bfcb6c046021f13cc15cfb162726d/go-hpack/story_00.json | `9b24b3356f17b439a0a52ae2f907d8417a4b69ee70f54616f2a8927ba76dbb6c` |
+| hpack_go_hpack_02 | https://raw.githubusercontent.com/http2jp/hpack-test-case/8a1406e7d14bfcb6c046021f13cc15cfb162726d/go-hpack/story_02.json | `5649a28baa8569d927db505b754179ced762a0c80a1e002eea9e8777fd9f68bd` |
+| hpack_go_hpack_08 | https://raw.githubusercontent.com/http2jp/hpack-test-case/8a1406e7d14bfcb6c046021f13cc15cfb162726d/go-hpack/story_08.json | `ee97c65144dbae127966bd48fcde9b71d781e6d755a9dcfd2f4f356d04b958e1` |
+| hpack_haskell_http2_linear_huffman_00 | https://raw.githubusercontent.com/http2jp/hpack-test-case/8a1406e7d14bfcb6c046021f13cc15cfb162726d/haskell-http2-linear-huffman/story_00.json | `00cea13c83f7f3b2c122998a07af3d80b0d86d02ef5a97d2ca7b2c83205abbb4` |
+| hpack_haskell_http2_linear_huffman_02 | https://raw.githubusercontent.com/http2jp/hpack-test-case/8a1406e7d14bfcb6c046021f13cc15cfb162726d/haskell-http2-linear-huffman/story_02.json | `ddf41eae970a6387e3f1bdd06101d5a30208b9fcf71e5e172363067d21a2c7fe` |
+| hpack_haskell_http2_linear_huffman_08 | https://raw.githubusercontent.com/http2jp/hpack-test-case/8a1406e7d14bfcb6c046021f13cc15cfb162726d/haskell-http2-linear-huffman/story_08.json | `fcf4b583b84014c47ee16975e273cdad6dd67df083f02919aabab7ff3018adf5` |
+| hpack_nghttp2_00 | https://raw.githubusercontent.com/http2jp/hpack-test-case/8a1406e7d14bfcb6c046021f13cc15cfb162726d/nghttp2/story_00.json | `5e81604eceb6cc9e5b4861b024f20166b82159f90ed3dec9ce44313e6652dfa4` |
+| hpack_nghttp2_02 | https://raw.githubusercontent.com/http2jp/hpack-test-case/8a1406e7d14bfcb6c046021f13cc15cfb162726d/nghttp2/story_02.json | `85c19598e5d019836689ffc94416a3f4c1feb9f1db341e6a6ed9467285d13037` |
+| hpack_nghttp2_08 | https://raw.githubusercontent.com/http2jp/hpack-test-case/8a1406e7d14bfcb6c046021f13cc15cfb162726d/nghttp2/story_08.json | `6e984acf51c2a69c16e29b86db990cf061de37b4675372cb21aa4aab6f6fc9a5` |
+| hpack_nghttp2_16384_4096_00 | https://raw.githubusercontent.com/http2jp/hpack-test-case/8a1406e7d14bfcb6c046021f13cc15cfb162726d/nghttp2-16384-4096/story_00.json | `8494826b50a502f7e323d5754147b5d19e915d93a1f4fa3d3e9f27e38bc5dc86` |
+| hpack_nghttp2_16384_4096_02 | https://raw.githubusercontent.com/http2jp/hpack-test-case/8a1406e7d14bfcb6c046021f13cc15cfb162726d/nghttp2-16384-4096/story_02.json | `66496effba0761788db10b5a63e2fcc6af4c1c7526cf3d31989f5f5351b870d1` |
+| hpack_nghttp2_16384_4096_08 | https://raw.githubusercontent.com/http2jp/hpack-test-case/8a1406e7d14bfcb6c046021f13cc15cfb162726d/nghttp2-16384-4096/story_08.json | `4419984d9e8aa1d0e7cf0aeb671e6d12cfb99f7c5342dbc9e992990812443c4b` |
+| hpack_nghttp2_change_table_size_00 | https://raw.githubusercontent.com/http2jp/hpack-test-case/8a1406e7d14bfcb6c046021f13cc15cfb162726d/nghttp2-change-table-size/story_00.json | `fe3659321acb0865e961f2c13673d7ca06d3fdf5da776b2afa576731aaf247b7` |
+| hpack_nghttp2_change_table_size_02 | https://raw.githubusercontent.com/http2jp/hpack-test-case/8a1406e7d14bfcb6c046021f13cc15cfb162726d/nghttp2-change-table-size/story_02.json | `5093af89bdf85b41695836abbab8f94ec899598cd9d5d8f0ebf34a7c17a1924e` |
+| hpack_nghttp2_change_table_size_08 | https://raw.githubusercontent.com/http2jp/hpack-test-case/8a1406e7d14bfcb6c046021f13cc15cfb162726d/nghttp2-change-table-size/story_08.json | `6c9e1ab51c371498b4c048f653d054653b10d5d367b7c53349ebf7996499a158` |
+| hpack_node_http2_hpack_00 | https://raw.githubusercontent.com/http2jp/hpack-test-case/8a1406e7d14bfcb6c046021f13cc15cfb162726d/node-http2-hpack/story_00.json | `61ed5dde9abd0c8add662e3934ea6cba651265cf17e9c190fa466e3fec3ed973` |
+| hpack_node_http2_hpack_02 | https://raw.githubusercontent.com/http2jp/hpack-test-case/8a1406e7d14bfcb6c046021f13cc15cfb162726d/node-http2-hpack/story_02.json | `8d5b6aa5e07ad1c2cd35916d191b8cf583b607a341502c590fcaad600efe5107` |
+| hpack_node_http2_hpack_08 | https://raw.githubusercontent.com/http2jp/hpack-test-case/8a1406e7d14bfcb6c046021f13cc15cfb162726d/node-http2-hpack/story_08.json | `5595b655fa171f39032689b4c8ee014760d35a0d7739abe420b19a702071338c` |
+| hpack_python_hpack_00 | https://raw.githubusercontent.com/http2jp/hpack-test-case/8a1406e7d14bfcb6c046021f13cc15cfb162726d/python-hpack/story_00.json | `00fdbb280925a297cc688ebc62fba41ad297076f62832d9035749da2a97b87d2` |
+| hpack_python_hpack_02 | https://raw.githubusercontent.com/http2jp/hpack-test-case/8a1406e7d14bfcb6c046021f13cc15cfb162726d/python-hpack/story_02.json | `b62696890f26b75f61fc8efac2bd2ea04ed1e2b43c11bb65eb44b592724e6ff9` |
+| hpack_python_hpack_08 | https://raw.githubusercontent.com/http2jp/hpack-test-case/8a1406e7d14bfcb6c046021f13cc15cfb162726d/python-hpack/story_08.json | `2bf650a8c02707adc7f1adffcc4b4525a6e456ffd71d3c6ca112768417e878f4` |
+| hpack_swift_nio_hpack_huffman_00 | https://raw.githubusercontent.com/http2jp/hpack-test-case/8a1406e7d14bfcb6c046021f13cc15cfb162726d/swift-nio-hpack-huffman/story_00.json | `3e7f76ec2000e462fb06d10b25630dca3eba6fb65b30f49b727324aecd46c881` |
+| hpack_swift_nio_hpack_huffman_02 | https://raw.githubusercontent.com/http2jp/hpack-test-case/8a1406e7d14bfcb6c046021f13cc15cfb162726d/swift-nio-hpack-huffman/story_02.json | `fd74c184250bd9f2a718692bd3f622a6d00064562aaa38f5a7b95ce4e98831fb` |
+| hpack_swift_nio_hpack_huffman_08 | https://raw.githubusercontent.com/http2jp/hpack-test-case/8a1406e7d14bfcb6c046021f13cc15cfb162726d/swift-nio-hpack-huffman/story_08.json | `270863e03878eeb9bccb8e83ca1f22993f5a5fa9d5f81e51d05827f3f07559ba` |
 | rfc4231 | https://www.rfc-editor.org/rfc/rfc4231.txt | `72178527ce93500e730bc8eb182b857e583096d652b64ece0879c52ba1df973b` |
 | rfc5869 | https://www.rfc-editor.org/rfc/rfc5869.txt | `7a40eb3835b35fc947eb12a2ed614db079d43b26e50dbc537c31fba16397089c` |
 | rfc5903 | https://www.rfc-editor.org/rfc/rfc5903.txt | `939fab548a6e6bb49a5b3c4dd24a3c5df54a46645447b2d6f4df4fd88ff2d69f` |
 | rfc6979 | https://www.rfc-editor.org/rfc/rfc6979.txt | `456e8f17558fdbd206f968b96fc6f1b4a71ea331ab30ad17f711ab3adaa7d701` |
+| rfc7541 | https://www.rfc-editor.org/rfc/rfc7541.txt | `2239d7f8fb839b69ae2e928e685559b11376888269f131512197a0e3bacf7f7a` |
 | rfc7748 | https://www.rfc-editor.org/rfc/rfc7748.txt | `279ca0ecc5e92e2962e27b846986aeb74729d9dd34bd4a04a362f80dcb596ad3` |
 | rfc8017 | https://www.rfc-editor.org/rfc/rfc8017.txt | `1e72dc473d18df3fc5598cdc12795a9f18f36f1aef15abc23a55eb0d58151d11` |
 | rfc8439 | https://www.rfc-editor.org/rfc/rfc8439.txt | `25bef70fbf7a07ff45c2fe4cb7c6ce954eac687413d8610603268b4e4415324c` |
@@ -231,6 +256,19 @@ reference before emission. Differential vectors come from a fixed seed.
 - The DER *string* and *time* types carry no content rule in this layer, so no vector
   pins one: PrintableString's alphabet and UTCTime's digits are checked by the name and
   time code of the next ROADMAP items, which is where a violation has a meaning.
+
+- **HPACK (RFC 7541) has no Wycheproof or NIST CAVP suite** - none exists for header
+  compression. `hpack.inc` is: RFC 7541 Appendix C.1-C.6 (integers, the four single
+  representations, the request and response sequences with and without Huffman, the
+  256-octet eviction runs), each checked against the RFC's own 'Dynamic Table (after
+  decoding)' listing by an independent Python decoder; three stories from each of eight
+  hpack-test-case encoders (commit-pinned rows above); and GENERATED rows - every
+  invalid case (index 0 / out of range, bad integer, bad Huffman padding, EOS, size
+  update mid-block / above the limit, RFC 9113 4.3.1, local scratch and max_list
+  limits), the Huffman symbol/padding sweep and a seeded differential set. The static
+  table and the Huffman code are parsed out of Appendices A and B, the code is asserted
+  canonical, and both are compared to the tables compiled into src/http/.
+  summerwind/h2spec's hpack group is left for M4 line 3 (interop).
 
 ## x509-limbo skip tally
 

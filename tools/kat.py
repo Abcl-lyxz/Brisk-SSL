@@ -72,6 +72,14 @@ SRC = {
         "3072_sha256_mgf1_32", "4096_sha256_mgf1_32", "4096_sha384_mgf1_48",
         "4096_sha512_mgf1_32", "4096_sha512_mgf1_64", "misc")},
     "x509_limbo": "https://raw.githubusercontent.com/C2SP/x509-limbo/main/limbo.json",
+    "rfc7541": "https://www.rfc-editor.org/rfc/rfc7541.txt",
+    # http2jp/hpack-test-case, pinned by commit (never master): real captures from independent
+    # encoders. The cache file is named after the SRC key (every story is called story_NN.json).
+    **{f"hpack_{e.replace('-', '_')}_{s}": "https://raw.githubusercontent.com/http2jp/hpack-test-case/"
+       f"8a1406e7d14bfcb6c046021f13cc15cfb162726d/{e}/story_{s}.json"
+       for e in ("nghttp2", "go-hpack", "python-hpack", "node-http2-hpack",
+                 "nghttp2-change-table-size", "nghttp2-16384-4096", "swift-nio-hpack-huffman",
+                 "haskell-http2-linear-huffman") for s in ("00", "02", "08")},
 }
 HASH = {256: hashlib.sha256, 384: hashlib.sha384, 512: hashlib.sha512}
 fetched = {}  # name -> (url, sha256 of bytes)
@@ -107,6 +115,8 @@ def fetch(name):
         PINS = pinned_sha256()
     url = SRC[name]
     path = CACHE / url.rsplit("/", 1)[1]
+    if name.startswith("hpack_"):  # story_NN.json repeats across encoders
+        path = CACHE / f"{name}.json"
     if not path.exists():
         CACHE.mkdir(parents=True, exist_ok=True)
         req = urllib.request.Request(url, headers={"User-Agent": "brisk-kat/1"})
@@ -6164,6 +6174,594 @@ def tls13_records():
     return rows, nonces, hsmsg, seeds, s_ap
 
 
+# ---------------------------------------------------------------- HPACK (RFC 7541)
+# A second, independent HPACK: the static table and the Huffman code are PARSED out of the RFC
+# text (Appendix A, B), the Huffman decoder is a dict walk rather than the canonical-count walk
+# of src/http/huffman.c, and every emitted row is re-decoded here before it is written.
+HPACK_STATIC = []   # [(name, value)], index 1..61 at position 0..60
+HPACK_HUFF = {}     # sym 0..256 -> (code, bits)
+HPACK_HUFF_DEC = {}  # (bits, code) -> sym
+HPACK_SCRATCH = 16384  # must match T_SCRATCH in tests/test_hpack.c
+HPACK_MAX_LIST = 1 << 20
+
+
+def rfc7541_static():
+    rows = []
+    for ln in rfc_lines(fetch("rfc7541")):
+        m = re.match(r"^\s+\| (\d+)\s+\| ([:a-z][a-z-]*)\s+\|(.*)\|$", ln)  # not the bit diagrams
+        if m:
+            rows.append((int(m.group(1)), m.group(2).encode(), m.group(3).strip().encode()))
+    if [r[0] for r in rows] != list(range(1, 62)):
+        die("RFC 7541 Appendix A: expected indices 1..61")
+    HPACK_STATIC[:] = [(n, v) for _, n, v in rows]
+
+
+def rfc7541_huffman():
+    for ln in rfc_lines(fetch("rfc7541")):
+        m = re.match(r"^\s+.*\(\s*(\d+)\)\s+\|([01|]+)\s+([0-9a-f]+)\s+\[\s*(\d+)\]$", ln)
+        if not m:
+            continue
+        sym, bits, hx, n = int(m.group(1)), m.group(2).replace("|", ""), int(m.group(3), 16), int(m.group(4))
+        if len(bits) != n or int(bits, 2) != hx or sym in HPACK_HUFF:
+            die(f"RFC 7541 Appendix B: inconsistent row for symbol {sym}")
+        HPACK_HUFF[sym] = (hx, n)
+    if sorted(HPACK_HUFF) != list(range(257)):
+        die("RFC 7541 Appendix B: expected symbols 0..256")
+    # Canonical: codes consecutive within each length, and each new length starts at
+    # (previous code + 1) << (length step). src/http/huffman.c's decoder depends on it.
+    order = sorted(range(257), key=lambda s: (HPACK_HUFF[s][1], HPACK_HUFF[s][0]))
+    code, bits = -1, HPACK_HUFF[order[0]][1]
+    for s in order:
+        c, n = HPACK_HUFF[s]
+        if c != (code + 1) << (n - bits):
+            die(f"RFC 7541 Appendix B is not canonical at symbol {s}")
+        code, bits = c, n
+    if order[-1] != 256 or HPACK_HUFF[256] != ((1 << 30) - 1, 30):
+        die("RFC 7541 Appendix B: EOS is not the last, all-ones 30-bit code")
+    HPACK_HUFF_DEC.update({(n, c): s for s, (c, n) in HPACK_HUFF.items()})
+    counts = [0] * 31
+    for s in order:
+        counts[HPACK_HUFF[s][1]] += 1
+    return counts, order[:256]
+
+
+def check_hpack_source_constants(counts, syms):
+    """The static table (hpack.c) and the Huffman tables (huffman.c), byte for byte against the
+    RFC text - src/ cannot include tests/, so the transcription is checked here instead."""
+    src = (ROOT / "src/http/huffman.c").read_text()
+    for name, want in (("huff_count", counts), ("huff_sym", syms)):
+        m = re.search(r"static const uint8_t " + name + r"\[%d\] = \{(.*?)\};" % len(want), src, re.S)
+        if not m:
+            die(f"src/http/huffman.c: {name}[{len(want)}] not found")
+        body = re.sub(r"/\*.*?\*/", "", m.group(1), flags=re.S)
+        got = [int(x, 0) for x in re.findall(r"\b(0x[0-9a-fA-F]+|\d+)\b", body)]
+        if got != want:
+            die(f"src/http/huffman.c: {name} does not match RFC 7541 Appendix B")
+    src = (ROOT / "src/http/hpack.c").read_text()
+    m = re.search(r"static const char hpack_static\[\] =(.*?);", src, re.S)
+    if not m:
+        die("src/http/hpack.c: hpack_static[] not found")
+    body = re.sub(r"/\*.*?\*/", "", m.group(1), flags=re.S)
+    # unescape each literal BEFORE concatenating, as C does (translation phase 5, then 6):
+    # "\0" "200" is NUL then "200", never the octal escape \020
+    lits = re.findall(r'"((?:[^"\\]|\\.)*)"', body)
+    parts = b"".join(x.encode().decode("unicode_escape").encode("latin-1") for x in lits).split(b"\0")
+    if parts[-1] != b"" or [tuple(parts[i:i + 2]) for i in range(0, len(parts) - 1, 2)] != HPACK_STATIC:
+        die("src/http/hpack.c: hpack_static does not match RFC 7541 Appendix A")
+
+
+def py_hint_enc(v, n, flags=0):
+    """RFC 7541 5.1, minimal."""
+    mx = (1 << n) - 1
+    if v < mx:
+        return bytes([flags | v])
+    out, v = [flags | mx], v - mx
+    while v >= 128:
+        out.append(v % 128 + 128)
+        v //= 128
+    return bytes(out + [v])
+
+
+def py_hint_dec(b, pos, n):
+    """-> (value, next pos), or None: truncated, above 2^32-1, or a sixth continuation octet."""
+    if pos >= len(b):
+        return None
+    mx = (1 << n) - 1
+    v, pos, m = b[pos] & mx, pos + 1, 0
+    if v < mx:
+        return v, pos
+    for _ in range(5):
+        if pos >= len(b):
+            return None
+        c, pos = b[pos], pos + 1
+        v, m = v + ((c & 0x7F) << m), m + 7
+        if v > 0xFFFFFFFF:
+            return None
+        if not c & 0x80:
+            return v, pos
+    return None
+
+
+def py_huff_enc(data):
+    acc = n = 0
+    for x in data:
+        c, ln = HPACK_HUFF[x]
+        acc, n = acc << ln | c, n + ln
+    pad = -n % 8
+    return (acc << pad | ((1 << pad) - 1)).to_bytes((n + pad) // 8, "big")
+
+
+def py_huff_dec(b):
+    """RFC 7541 5.2: None on EOS, padding > 7 bits, or padding that is not all ones."""
+    out, code, n = bytearray(), 0, 0
+    for byte in b:
+        for i in range(7, -1, -1):
+            code, n = code << 1 | (byte >> i) & 1, n + 1
+            s = HPACK_HUFF_DEC.get((n, code))
+            if s == 256:
+                return None
+            if s is not None:
+                out.append(s)
+                code = n = 0
+    if n > 7 or code != (1 << n) - 1:
+        return None
+    return bytes(out)
+
+
+class PyHpackDec:
+    """Reference decoder: the table is a newest-first list, not a ring."""
+
+    def __init__(self, limit):
+        self.limit, self.max, self.table = limit, min(limit, 4096), []
+        self.need_update, self.dead = limit < 4096, False
+
+    def copy(self):
+        d = PyHpackDec(self.limit)
+        d.max, d.table, d.need_update, d.dead = self.max, list(self.table), self.need_update, self.dead
+        return d
+
+    def size(self):
+        return sum(len(n) + len(v) + 32 for n, v in self.table)
+
+    def evict(self, room):
+        while self.table and self.size() > room:
+            self.table.pop()
+
+    def decode(self, blk, scratch=HPACK_SCRATCH, max_list=HPACK_MAX_LIST):
+        """-> (ok, fields delivered [(name, value, flags)], representation boundaries)."""
+        fields, bounds, pos, seen, total = [], [0], 0, False, 0
+        if self.dead:
+            return False, fields, bounds
+
+        def fail():
+            self.dead = True
+            return False, fields, bounds
+
+        def entry(i):
+            if 1 <= i <= 61:
+                return HPACK_STATIC[i - 1]
+            return self.table[i - 62] if 62 <= i < 62 + len(self.table) else None
+
+        def string(pos, cap):
+            r = py_hint_dec(blk, pos, 7)
+            if r is None or r[0] > len(blk) - r[1]:
+                return None
+            raw = blk[r[1]:r[1] + r[0]]
+            s = py_huff_dec(raw) if blk[pos] & 0x80 else raw
+            return None if s is None or len(s) > cap else (s, r[1] + r[0])
+
+        while pos < len(blk):
+            b = blk[pos]
+            if b & 0xE0 == 0x20:
+                r = py_hint_dec(blk, pos, 5)
+                if seen or r is None or r[0] > self.limit:
+                    return fail()
+                self.max, self.need_update, pos = r[0], False, r[1]
+                self.evict(self.max)
+                bounds.append(pos)
+                continue
+            if self.need_update:
+                return fail()
+            seen, ins, flags = True, False, 0
+            if b & 0x80:
+                r = py_hint_dec(blk, pos, 7)
+                e = entry(r[0]) if r else None
+                if e is None or len(e[0]) + len(e[1]) > scratch:
+                    return fail()
+                (name, value), pos = e, r[1]
+            else:
+                n, ins, flags = (6, True, 0) if b & 0x40 else (4, False, 1 if b & 0x10 else 0)
+                r = py_hint_dec(blk, pos, n)
+                if r is None:
+                    return fail()
+                if r[0]:
+                    e = entry(r[0])
+                    if e is None or len(e[0]) > scratch:
+                        return fail()
+                    name, pos = e[0], r[1]
+                else:
+                    s = string(r[1], scratch)
+                    if s is None:
+                        return fail()
+                    name, pos = s
+                s = string(pos, scratch - len(name))
+                if s is None:
+                    return fail()
+                value, pos = s
+            total += len(name) + len(value) + 32
+            if total > max_list:
+                return fail()
+            fields.append((name, value, flags))
+            if ins:
+                sz = len(name) + len(value) + 32
+                if sz > self.max:
+                    self.table = []
+                else:
+                    self.evict(self.max - sz)
+                    self.table.insert(0, (name, value))
+            bounds.append(pos)
+        if self.need_update:
+            return fail()
+        return True, fields, bounds
+
+
+def hp_fields(fields):
+    return b"".join(len(n).to_bytes(2, "big") + n + len(v).to_bytes(2, "big") + v + bytes([f])
+                    for n, v, f in fields)
+
+
+def hp_table(d):
+    return b"".join(len(n).to_bytes(2, "big") + n + len(v).to_bytes(2, "big") + v for n, v in d.table)
+
+
+def rfc7541_examples():
+    """Appendix C.1-C.6 as {section: text}."""
+    text = "\n".join(rfc_lines(fetch("rfc7541")))
+    text = text[text.index("\nAppendix C.  Examples"):]
+    heads = list(re.finditer(r"^(C\.\d\.\d)\.  .*$", text, re.M))
+    return {h.group(1): text[h.end():(heads[i + 1].start() if i + 1 < len(heads) else len(text))]
+            for i, h in enumerate(heads)}
+
+
+def rfc7541_wire(sec, key):
+    s = sec[key]
+    dump = s[s.index("Hex dump of encoded data:"):s.index("Decoding process:")]
+    return hexbytes("".join(ln.split("|")[0] for ln in dump.splitlines()[1:]))
+
+
+def rfc7541_list(sec, key):
+    s = sec[key]
+    out = []
+    for ln in s[s.index("Header list to encode:"):s.index("Hex dump of encoded data:")].splitlines()[1:]:
+        if ln.strip():
+            i = ln.index(": ", 4)
+            out.append((ln[3:i].encode(), ln[i + 2:].encode()))
+    return out
+
+
+def rfc7541_table(sec, key):
+    """[(entry size, entry text without whitespace)], Table size - the RFC wraps long entries."""
+    s = sec[key]
+    if "Dynamic table (after decoding): empty." in s:
+        return [], 0
+    t = s[s.index("Dynamic Table (after decoding):"):s.index("Decoded header list:")]
+    ents = re.findall(r"\[\s*\d+\] \(s =\s*(\d+)\) ((?:.|\n)*?)(?=\n\s*\[|\n\s*Table size)", t)
+    return ([(int(sz), re.sub(r"\s+", "", txt)) for sz, txt in ents],
+            int(re.search(r"Table size:\s*(\d+)", t).group(1)))
+
+
+def hpack_int_rows(sec):
+    """(hex, prefix bits, value, octets used, ok, note)"""
+    rows = []
+    for key in ("C.1.1", "C.1.2", "C.1.3"):
+        s = sec[key]
+        m = re.search(r"The value (?:I=)?(\d+) is to be encoded\s+(?:with a (\d)-bit prefix|starting at an\s+octet\s+boundary)", s)
+        if not m:
+            die(f"RFC 7541 {key}: value/prefix not found")
+        v, n = int(m.group(1)), int(m.group(2) or 8)
+        bits = re.findall(r"^\s+\|((?: [X01] \|){8})", s, re.M)
+        wire = bytes(int(b.replace("|", "").replace(" ", "").replace("X", "0"), 2) for b in bits)
+        if not wire or py_hint_enc(v, n) != wire or py_hint_dec(wire, 0, n) != (v, len(wire)):
+            die(f"RFC 7541 {key}: integer example does not round trip")
+        rows.append((wire.hex(), n, v, len(wire), 1, f"RFC 7541 {key}"))
+    for n in (4, 5, 6, 7):  # 5.1 boundaries for every prefix a representation uses
+        mx = (1 << n) - 1
+        for v in (mx - 1, mx, mx + 1, mx + 127, mx + 128):
+            w = py_hint_enc(v, n, 0xFF ^ mx)
+            rows.append((w.hex(), n, v, len(w), 1, f"5.1 N={n} v={v}, flag bits set"))
+    for n in range(1, 9):
+        w = py_hint_enc(0xFFFFFFFF, n)
+        rows.append((w.hex(), n, 0xFFFFFFFF, len(w), 1, f"5.1 2^32-1 N={n}"))
+        rows.append((py_hint_enc(1 << 32, n).hex(), n, 0, 0, 0, f"5.1 2^32 N={n} exceeds the limit"))
+        for k in range(len(w)):
+            rows.append((w[:k].hex(), n, 0, 0, 0, f"5.1 2^32-1 N={n} truncated to {k} octets"))
+    for n in (5, 7):
+        mx = (1 << n) - 1
+        rows.append((bytes([mx, 0x80, 0x80, 0x80, 0x80, 0x00]).hex(), n, mx, 6, 1,
+                     "5.1 five zero-valued continuation octets: legal"))
+        rows.append((bytes([mx, 0x80, 0x80, 0x80, 0x80, 0x80, 0x00]).hex(), n, 0, 0, 0,
+                     "5.1 a sixth continuation octet"))
+        rows.append((bytes([mx, 0xFF, 0xFF, 0xFF, 0xFF, 0x0F]).hex(), n, 0, 0, 0,
+                     "5.1 overflow in the fifth continuation octet"))
+        # 0x10 << 28 wraps a uint32 to 0: only a check BEFORE the shift catches it
+        rows.append((bytes([mx, 0x80, 0x80, 0x80, 0x80, 0x10]).hex(), n, 0, 0, 0,
+                     "5.1 fifth continuation octet 0x10: 2^32 + prefix, wraps if shifted first"))
+    for hx, n, v, used, ok, note in rows:
+        r = py_hint_dec(bytes.fromhex(hx), 0, n)
+        if (r == (v, used)) != bool(ok) or (not ok and r is not None):
+            die(f"HPACK integer row disagrees with the reference: {note}")
+    return rows
+
+
+def hpack_huff_rows():
+    """(encoded, decoded, ok, note)"""
+    every = bytes(range(256))
+    rows = [("", "", 1, "5.2 empty Huffman string"),
+            (py_huff_enc(every).hex(), every.hex(), 1, "Appendix B every symbol once")]
+    # Each symbol LAST, after k five-bit '0's: 5k mod 8 walks every residue, so every legal
+    # padding length 0..7 follows every symbol.
+    for s in range(256):
+        for k in range(8):
+            d = b"0" * k + bytes([s])
+            rows.append((py_huff_enc(d).hex(), d.hex(), 1, f"sym {s} after {k}x'0'"))
+    rnd = random.Random(7541)
+    for i in range(300):
+        pool = range(256) if i % 2 else b"abcdefghijklmnopqrstuvwxyz0123456789-_./:;=, "
+        d = bytes(rnd.choice(pool) for _ in range(rnd.randrange(0, 80)))
+        rows.append((py_huff_enc(d).hex(), d.hex(), 1, f"differential {i}"))
+    for s in (ord("a"), ord("0"), ord("/"), 0, 255):  # 5.2 padding rejects
+        e = py_huff_enc(bytes([s]))
+        rows.append(((e + b"\xff").hex(), "", 0, f"5.2 sym {s} then 8+ padding bits"))
+        for bit in range(-HPACK_HUFF[s][1] % 8):
+            # a flipped padding bit can complete a real 5- or 6-bit code; the reference decides
+            f = e[:-1] + bytes([e[-1] ^ (1 << bit)])
+            d = py_huff_dec(f)
+            rows.append((f.hex(), d.hex() if d is not None else "", 1 if d is not None else 0,
+                         f"5.2 sym {s}, padding bit {bit} is 0"))
+    rows.append(("ffffffff", "", 0, "5.2 EOS (30 ones) + 2 padding ones"))
+    rows.append(("1fffffffff", "", 0, "5.2 'a' then EOS"))
+    rows.append(("ff", "", 0, "5.2 lone 0xff: 8 padding bits"))
+    rows.append(("ffff", "", 0, "5.2 16 ones"))
+    for enc, dec, ok, note in rows:
+        r = py_huff_dec(bytes.fromhex(enc))
+        if (r is not None) != bool(ok) or (ok and r.hex() != dec):
+            die(f"HPACK Huffman row disagrees with the reference: {note}")
+    return rows
+
+
+def hpack_block_rows(sec):
+    """Decoder rows: (wire, fresh, limit, max_list, scratch, ok, fields, table, table_size, split,
+    note). fresh = start a new decoder of `limit`; split = the ok-prefix offsets (u16 each)."""
+    rows = []
+
+    def seq(limit, blocks, split=False, table=True):
+        d = PyHpackDec(limit)
+        for i, b in enumerate(blocks):
+            wire, note = b[0], b[1]
+            kw = b[2] if len(b) > 2 else {}
+            sc, ml = kw.get("scratch", HPACK_SCRATCH), kw.get("max_list", HPACK_MAX_LIST)
+            pre = d.copy()
+            ok, fields, bounds = d.decode(wire, sc, ml)
+            if "want" in kw and kw["want"] != ok:
+                die(f"HPACK {note}: expected {'accept' if kw['want'] else 'reject'}")
+            spl = ""
+            if split and ok:
+                good = [k for k in range(len(wire) + 1) if pre.copy().decode(wire[:k], sc, ml)[0]]
+                # RFC 9113 4.3.1: while an update is owed, the empty prefix is not a valid block
+                if good != (bounds[1:] if pre.need_update else bounds):
+                    die(f"HPACK {note}: prefix verdicts disagree with the boundaries")
+                spl = b"".join(k.to_bytes(2, "big") for k in good).hex()
+            rows.append((wire.hex(), 1 if i == 0 else 0, limit, ml, sc, 1 if ok else 0,
+                         hp_fields(fields).hex(), hp_table(d).hex() if ok and table else "",
+                         d.size() if ok else 0, spl, note))
+
+    def rfc_seq(limit, keys, lead=()):
+        blocks = list(lead) + [(rfc7541_wire(sec, k), f"RFC 7541 {k}") for k in keys]
+        d = PyHpackDec(limit)
+        for wire, note in blocks:
+            ok, fields, _ = d.decode(wire)
+            if not note.startswith("RFC 7541 "):
+                continue
+            key = note[9:]
+            want_t, want_sz = rfc7541_table(sec, key)
+            got_t = [(len(n) + len(v) + 32, re.sub(r"\s+", "", (n + b":" + v).decode())) for n, v in d.table]
+            if (not ok or [(n, v) for n, v, _ in fields] != rfc7541_list(sec, key)
+                    or got_t != want_t or d.size() != want_sz):
+                die(f"RFC 7541 {key}: the reference decoder disagrees with the RFC")
+        seq(limit, blocks, split=True)
+
+    for key in ("C.2.1", "C.2.2", "C.2.3", "C.2.4"):
+        rfc_seq(4096, [key])
+    rfc_seq(4096, ["C.3.1", "C.3.2", "C.3.3"])
+    rfc_seq(4096, ["C.4.1", "C.4.2", "C.4.3"])
+    # 256-octet table (C.5 / C.6) is OUR advertised limit, so RFC 9113 4.3.1 wants the first
+    # block to open with a size update - sent as a block of its own so C.5.1 stays byte-exact.
+    upd256 = (py_hint_enc(256, 5, 0x20), "RFC 9113 4.3.1 size update to 256")
+    rfc_seq(256, ["C.5.1", "C.5.2", "C.5.3"], [upd256])
+    rfc_seq(256, ["C.6.1", "C.6.2", "C.6.3"], [upd256])
+    nrfc = len(rows)
+
+    for name in sorted(k for k in SRC if k.startswith("hpack_")):  # one decoder per story
+        cases = json.loads(fetch(name))["cases"]
+        limit = max([4096] + [c.get("header_table_size") or 0 for c in cases])
+        d = PyHpackDec(limit)
+        blocks = []
+        for c in cases:
+            wire = bytes.fromhex(c["wire"])
+            ok, fields, _ = d.decode(wire)
+            want = [(k.encode(), v.encode()) for h in c["headers"] for k, v in h.items()]
+            if not ok or [(n, v) for n, v, _ in fields] != want:
+                die(f"{name} case {c['seqno']}: the reference decoder disagrees")
+            blocks.append((wire, f"{name} case {c['seqno']}"))
+        seq(limit, blocks, table=False)  # no entry dump (size only): keeps the .inc small
+    nstory = len(rows) - nrfc
+
+    def E(w, note, **kw):
+        return w, note, dict(kw, want=False)
+
+    def A(w, note, **kw):
+        return w, note, dict(kw, want=True)
+
+    def lit(s):
+        return py_hint_enc(len(s), 7) + s
+
+    auth = bytes.fromhex("410f") + b"www.example.com"  # C.3.1's insert, 57 octets
+    c21, c31 = rfc7541_wire(sec, "C.2.1"), rfc7541_wire(sec, "C.3.1")
+    # invalid: every one is BRISK_E_PROTO and leaves the decoder dead
+    seq(4096, [E(b"\x80", "6.1 index 0")])
+    seq(4096, [E(py_hint_enc(62, 7, 0x80), "2.3.3 index 62 on an empty table")])
+    seq(4096, [A(auth, "insert one"), A(py_hint_enc(62, 7, 0x80), "2.3.3 index 62 = newest"),
+               E(py_hint_enc(63, 7, 0x80), "2.3.3 index 61+count+1")])
+    for f, n in ((0x40, 6), (0x00, 4), (0x10, 4)):
+        seq(4096, [E(py_hint_enc(62, n, f) + lit(b"a"), f"6.2 name index 62 out of range, {f:#04x}")])
+    seq(4096, [E(bytes.fromhex("400a") + b"abc", "5.2 name length past the block")])
+    seq(4096, [E(bytes.fromhex("400161") + bytes.fromhex("05") + b"abc", "5.2 value length past the block")])
+    seq(4096, [E(bytes.fromhex("4081ff") + lit(b"a"), "5.2 Huffman name: 8 padding bits")])
+    seq(4096, [E(bytes.fromhex("000161") + bytes.fromhex("84ffffffff"), "5.2 Huffman value: EOS")])
+    seq(4096, [E(bytes.fromhex("000161") + bytes.fromhex("811e"), "5.2 Huffman value: 0 in padding")])
+    seq(4096, [E(bytes.fromhex("8220"), "6.3/4.2 size update after a field")])
+    seq(4096, [E(py_hint_enc(4097, 5, 0x20), "6.3 size update above the limit (limit+1)")])
+    seq(4096, [E(py_hint_enc(0xFFFFFFFF, 5, 0x20), "6.3 size update 2^32-1")])
+    seq(256, [E(b"\x82", "RFC 9113 4.3.1 limit < 4096: first block without a size update")])
+    seq(256, [E(b"", "RFC 9113 4.3.1 limit < 4096: empty first block")])
+    seq(256, [E(py_hint_enc(257, 5, 0x20), "RFC 9113 4.3.1 first update above the limit")])
+    seq(0, [E(b"\x82", "RFC 9113 4.3.1 limit 0: first block without a size update")])
+    seq(0, [A(b"\x20", "limit 0: update to 0"), A(bytes.fromhex("400161") + lit(b"b"), "limit 0: insert is dropped")])
+    seq(4096, [E(bytes.fromhex("ffffffffff0f"), "5.1 index overflows 2^32-1")])
+    seq(4096, [E(bytes.fromhex("ff808080808000"), "5.1 index: a sixth continuation octet")])
+    seq(4096, [E(b"\xff", "5.1 index truncated")])
+    seq(4096, [E(b"\x82\x40", "5.1 name index truncated at block end")])
+    seq(4096, [E(c21, "local limit: field one octet over scratch", scratch=22)])
+    seq(4096, [A(c21, "local limit: field exactly scratch", scratch=23)])
+    seq(4096, [E(b"\x82", "local limit: indexed field over scratch", scratch=9)])
+    seq(4096, [A(b"\x82", "local limit: indexed field exactly scratch", scratch=10)])
+    lsum = (7 + 3 + 32) + (7 + 4 + 32) + (5 + 1 + 32) + (10 + 15 + 32)
+    seq(4096, [E(c31, "RFC 9113 6.5.2 list one over max_list", max_list=lsum - 1)])
+    seq(4096, [A(c31, "RFC 9113 6.5.2 list exactly max_list", max_list=lsum)])
+    big = bytes.fromhex("40") + lit(b"x") + py_hint_enc(4000, 7) + b"a" * 4000
+    seq(4096, [A(big, "7.3 insert a 4033-octet entry"),
+               E(b"\xbe" * 100, "7.3 amplification: 1-octet references trip max_list", max_list=16384)])
+    seq(4096, [A(big, "insert 4033"),
+               A(b"\xbe\xbe\xbe", "three references, exactly max_list", max_list=3 * 4033)])
+    # valid edge cases
+    seq(4096, [A(auth, "insert one"),
+               A(b"\x20" + py_hint_enc(4096, 5, 0x20) + bytes.fromhex("40") + lit(b"a") + lit(b"b"),
+                 "4.2 two size updates (0 then 4096) at block start, then an insert")])
+    seq(4096, [A(auth, "insert one"),
+               A(py_hint_enc(100, 5, 0x20) + py_hint_enc(50, 5, 0x20), "4.3 updates 100 then 50 evict")])
+    seq(4096, [A(auth, "insert one"), A(b"\x20", "4.3 size update 0 empties the table")])
+    seq(4096, [A(auth, "insert one"),
+               A(py_hint_enc(64, 5, 0x20) + bytes.fromhex("40") + lit(b"x") + lit(b"y" * 40),
+                 "4.4 entry larger than max empties the table, not an error")])
+    seq(4096, [A(py_hint_enc(60, 5, 0x20) + auth, "max 60, insert 57"),
+               A(py_hint_enc(62, 6, 0x40) + lit(b"xyz"), "4.4 name from the entry this insert evicts")])
+    seq(4096, [A(auth + auth, "2.3.2 duplicate entries")])
+    seq(4096, [A(b"", "empty block")])
+    seq(4096, [A(bytes.fromhex("400000"), "empty name and value, incremental")])
+    seq(4096, [A(bytes.fromhex("000000"), "empty name and value, without indexing")])
+    seq(4096, [A(bytes.fromhex("000161") + b"\x80", "5.2 empty Huffman value")])
+    seq(4096, [A(bytes.fromhex("14") + lit(b"/abc"), "6.2.3 never indexed, static name :path")])
+    seq(256, [A(upd256[0], "size update to 256"),
+              A(bytes.fromhex("40") + lit(b"a") + lit(b"p" * 100), "insert 105 ring octets"),
+              A(bytes.fromhex("40") + lit(b"b") + lit(b"q" * 100), "evict, insert straddling the ring end"),
+              A(b"\xbe", "reference the straddling entry")])
+    print(f"  hpack: {nrfc} Appendix C blocks, {nstory} hpack-test-case cases, "
+          f"{len(rows) - nrfc - nstory} generated")
+    return rows
+
+
+HPACK_ENC_NONE = 0xFFFFFFFF  # "no enc_peer_max call" in an encoder row
+
+
+def py_hpack_encode(fields, pending):
+    """Our encoder policy: 6.1 on an exact static match unless sensitive, else 6.2.2 (6.2.3 if
+    sensitive) with the lowest static name index; H=0 always, never incremental indexing.
+    None = rejected by the RFC 9113 8.2.1 input checks."""
+    out = bytearray(b"\x20" if pending else b"")
+    for n, v, fl in fields:
+        if not n or any(c <= 0x20 or 0x41 <= c <= 0x5A or c >= 0x7F for c in n) or b":" in n[1:]:
+            return None
+        if any(c in (0, 0x0A, 0x0D) for c in v) or (v and (v[0] in (0x20, 0x09) or v[-1] in (0x20, 0x09))):
+            return None
+        exact = next((i + 1 for i, e in enumerate(HPACK_STATIC) if e == (n, v)), 0)
+        name = next((i + 1 for i, e in enumerate(HPACK_STATIC) if e[0] == n), 0)
+        if exact and not fl:
+            out += py_hint_enc(exact, 7, 0x80)
+            continue
+        out += py_hint_enc(name, 4, 0x10 if fl else 0)
+        if not name:
+            out += py_hint_enc(len(n), 7) + n
+        out += py_hint_enc(len(v), 7) + v
+    return bytes(out)
+
+
+def hpack_enc_rows(sec):
+    """(fields, peer_max, ok, out1, out2, note): enc_peer_max(peer_max), then encode twice."""
+    rows = []
+
+    def row(fields, note, peer=HPACK_ENC_NONE):
+        pending = peer != HPACK_ENC_NONE and peer < 4096
+        o1, o2 = py_hpack_encode(fields, pending), py_hpack_encode(fields, False)
+        if o1 is not None:
+            # 7.1: no incremental indexing, no Huffman - our reference decoder reads it back
+            # unchanged with the table still empty
+            d = PyHpackDec(4096)
+            ok, got, _ = d.decode(o1)
+            if not ok or got != [(n, v, 1 if f else 0) for n, v, f in fields] or d.table:
+                die(f"HPACK encoder row {note}: does not round trip")
+        rows.append((hp_fields(fields).hex(), peer, 1 if o1 is not None else 0,
+                     (o1 or b"").hex(), (o2 or b"").hex(), note))
+
+    for key, fl in (("C.2.2", 0), ("C.2.3", 1), ("C.2.4", 0)):
+        f = [(n, v, fl) for n, v in rfc7541_list(sec, key)]
+        if py_hpack_encode(f, False) != rfc7541_wire(sec, key):
+            die(f"RFC 7541 {key}: our encoder policy does not reproduce it")
+        row(f, f"RFC 7541 {key}")
+    row([(b":method", b"GET", 0), (b":scheme", b"https", 0), (b":path", b"/", 0),
+         (b":authority", b"a.example", 0)], "request: exact, exact, exact, name only")
+    row([(b":method", b"PUT", 0)], "name-only static match")
+    row([(b"x-device", b"gw-7", 0)], "literal name")
+    row([(b":method", b"GET", 1)], "sensitive with an exact static match stays 6.2.3")
+    row([(b"authorization", b"Bearer abc", 1)], "sensitive, static name 23 (4-bit prefix overflow)")
+    row([(b"cookie", b"a=b", 1)], "sensitive cookie")
+    row([(b":status", b"418", 0)], "name index 8 (< 15)")
+    row([(b"accept-charset", b"utf-8", 0)], "name index 15 (= 2^4-1)")
+    row([(b"accept-encoding", b"br", 0)], "name index 16 (> 2^4-1)")
+    for ln in (0, 14, 15, 126, 127, 128, 255):
+        row([(b"x-v", b"v" * ln, 0)], f"value length {ln}")
+    row([(b"x-" + b"n" * 124, b"1", 0)], "name length 126")
+    row([(b"x-" + b"n" * 125, b"1", 0)], "name length 127")
+    row([(b"a", b"", 0), (b":path", b"", 0)], "empty values")
+    for peer in (0, 100, 4095, 4096, 8192):
+        row([(b":method", b"GET", 0)], f"after enc_peer_max({peer})", peer)
+    for n, v, note in ((b"", b"x", "empty name"), (b"X-a", b"x", "uppercase in name"),
+                       (b"a b", b"x", "SP in name"), (b"a\x7f", b"x", "0x7f in name"),
+                       (b"a\x80", b"x", "0x80 in name"), (b"a:b", b"x", "':' not first"),
+                       (b"a", b"x\x00y", "NUL in value"), (b"a", b"x\ry", "CR in value"),
+                       (b"a", b"x\ny", "LF in value"), (b"a", b" x", "leading SP"),
+                       (b"a", b"x ", "trailing SP"), (b"a", b"\tx", "leading HTAB"),
+                       (b"a", b"x\t", "trailing HTAB")):
+        row([(n, v, 0)], f"RFC 9113 8.2.1: {note}", 0)
+    row([(b":method", b"GET", 0), (b"Bad", b"x", 0)], "RFC 9113 8.2.1: second field invalid", 0)
+    return rows
+
+
+def hpack_fuzz_seeds(blocks):
+    """fuzz/fuzz_hpack.c input: a selector byte (limit in bits 0-1, max_list in bits 2-3), then
+    [u16 length][block] ... through one decoder."""
+    seeds, cur = [], None
+    for r in blocks:
+        if r[1]:
+            if cur:
+                seeds.append(cur)
+            sel = {0: 0, 256: 1, 4096: 2}.get(r[2], 3) | (3 << 2)
+            cur = [bytes([sel]), r[10]]
+        w = bytes.fromhex(r[0])
+        cur[0] += len(w).to_bytes(2, "big") + w
+    seeds.append(cur)
+    return [(s[0].hex(), s[1]) for s in seeds if len(s[0]) <= 8192]
+
+
 def cesc(s):
     """A C string body. A row whose whole point is a non-ASCII octet (a U-label reference) is
     written out as escapes, so neither an editor nor -finput-charset can change what it tests;
@@ -6523,6 +7121,26 @@ def main():
     with open(OUT / "tls13_rec_fuzz.inc", "a", newline="\n") as fh:
         fh.write(f'static const char TLS13_REC_FUZZ_S_AP[] = "{rec_fuzz_key.hex()}";\n')
 
+    rfc7541_static()
+    huff_counts, huff_syms = rfc7541_huffman()
+    check_hpack_source_constants(huff_counts, huff_syms)
+    hsec = rfc7541_examples()
+    hblk = hpack_block_rows(hsec)
+    note = lambda r: f'"{cesc(r)}"'
+    emit("hpack.inc", "struct hpack_int_kat HPACK_INT_KAT", hpack_int_rows(hsec),
+         lambda r: f'{cstr(r[0])}, {r[1]}, {r[2]}u, {r[3]}, {r[4]}, {note(r[5])}')
+    emit("hpack.inc", "struct hpack_huff_kat HPACK_HUFF_KAT", hpack_huff_rows(),
+         lambda r: f'{cstr(r[0])}, {cstr(r[1])}, {r[2]}, {note(r[3])}', append=True)
+    emit("hpack.inc", "struct hpack_blk_kat HPACK_BLK_KAT", hblk,
+         lambda r: f'{cstr(r[0])}, {r[1]}, {r[2]}u, {r[3]}u, {r[4]}u, {r[5]}, {cstr(r[6])}, '
+                   f'{cstr(r[7])}, {r[8]}u, {cstr(r[9])}, {note(r[10])}', append=True)
+    emit("hpack.inc", "struct hpack_enc_kat HPACK_ENC_KAT", hpack_enc_rows(hsec),
+         lambda r: f'{cstr(r[0])}, 0x{r[1]:08x}u, {r[2]}, {cstr(r[3])}, {cstr(r[4])}, {note(r[5])}',
+         append=True)
+    # Seeds for fuzz/fuzz_hpack.c (tools/dev.py fuzz hpack), not included by any test.
+    emit("hpack_fuzz.inc", "struct hpack_fuzz_seed HPACK_FUZZ_SEED", hpack_fuzz_seeds(hblk),
+         lambda r: f'{cstr(r[0])}, {note(r[1])}')
+
     rows = "\n".join(f"| {k} | {u} | `{h}` |" for k, (u, h) in sorted(fetched.items()))
     (OUT / "SOURCES.md").write_text(
         "# Known-answer vector sources\n\n"
@@ -6700,6 +7318,18 @@ def main():
         "- The DER *string* and *time* types carry no content rule in this layer, so no vector\n"
         "  pins one: PrintableString's alphabet and UTCTime's digits are checked by the name and\n"
         "  time code of the next ROADMAP items, which is where a violation has a meaning.\n\n"
+        "- **HPACK (RFC 7541) has no Wycheproof or NIST CAVP suite** - none exists for header\n"
+        "  compression. `hpack.inc` is: RFC 7541 Appendix C.1-C.6 (integers, the four single\n"
+        "  representations, the request and response sequences with and without Huffman, the\n"
+        "  256-octet eviction runs), each checked against the RFC's own 'Dynamic Table (after\n"
+        "  decoding)' listing by an independent Python decoder; three stories from each of eight\n"
+        "  hpack-test-case encoders (commit-pinned rows above); and GENERATED rows - every\n"
+        "  invalid case (index 0 / out of range, bad integer, bad Huffman padding, EOS, size\n"
+        "  update mid-block / above the limit, RFC 9113 4.3.1, local scratch and max_list\n"
+        "  limits), the Huffman symbol/padding sweep and a seeded differential set. The static\n"
+        "  table and the Huffman code are parsed out of Appendices A and B, the code is asserted\n"
+        "  canonical, and both are compared to the tables compiled into src/http/.\n"
+        "  summerwind/h2spec's hpack group is left for M4 line 3 (interop).\n\n"
         "## x509-limbo skip tally\n\n"
         f"limbo.json carries {len(x509_limbo) + sum(x509_limbo_skipped.values())} testcases and this "
         f"library exercises {len(x509_limbo)} of them.\n"

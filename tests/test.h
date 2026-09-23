@@ -33,6 +33,7 @@ void tls13_hs_ct_run(void); /* its constant-time run, called from test_ct */
 void test_rand(void);       /* Linux only */
 void test_conn(void);       /* the public connection API, sans-I/O (src/tls/conn.c) */
 void test_sock(void);       /* Linux only: the blocking API over loopback TCP */
+void test_hpack(void);      /* HPACK (RFC 7541); a no-op stub when BRISK_ENABLE_H2 is 0 */
 
 /* test_conn.c -> test_sock.c: the P-256 fixture flow as a server byte stream */
 typedef struct {

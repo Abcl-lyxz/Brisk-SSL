@@ -88,8 +88,18 @@ Tick a box only when the work is green on **every** arch (`python tools/dev.py t
     Built on Linux with BRISK_BUILD_EXAMPLES; not yet run against a real AWS account.
 
 ## M4 HTTP/2
-- [ ] HPACK (static + literal encoder, decoder with table, Huffman decode shared with QPACK)
+- [x] HPACK (static + literal encoder, decoder with table, Huffman decode shared with QPACK)
+  - `src/http/hpack.c` + `src/http/huffman.c` behind `BRISK_ENABLE_H2` (DEFAULT/FULL, empty TUs
+    in TINY); `BRISK_H2_HEADER_TABLE_SIZE` (4096) sizes the caller-owned ring. Decoder: full
+    RFC 7541, sticky-dead on any error (RFC 9113 4.3), RFC 9113 4.3.1 size-update rule, local
+    scratch/max_list limits fail closed. Encoder: static index or literal without/never
+    indexing, never Huffman, never indexes (7.1). RFC 9113 8.2.1 receive-side field checks are
+    owed by line 2 (in the decode callback). Vectors: RFC 7541 App. C + hpack-test-case
+    (8 encoders) + generated invalid rows; fuzz target `hpack`.
 - [ ] Frames, streams, flow control, SETTINGS, PING, GOAWAY; `brisk_h2_*`
+  - The HPACK encoder checks RFC 9113 8.2.1 only: the request builder must refuse pseudo-headers
+    other than :method :scheme :authority :path :protocol (8.3). QPACK (M7) must prefix its
+    static helpers (qp_*) - hpack.c's generic names (insert, put_int, ...) clash when amalgamated.
 - [ ] Interop: nginx, h2o, nghttpd
 
 ## M5 TLS 1.2 client

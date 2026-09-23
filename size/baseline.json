@@ -1,6 +1,6 @@
 {
  "aarch64": {
-  "TOTAL flash": 72632,
+  "TOTAL flash": 77354,
   "TOTAL ram": 60,
   "aes_ct": 0,
   "aes_ct64": 2962,
@@ -14,6 +14,8 @@
   "gcm": 1636,
   "handshake": 14138,
   "hkdf": 1271,
+  "hpack": 4003,
+  "huffman": 719,
   "keyschedule": 1919,
   "linux_ca": 798,
   "linux_net": 2968,
@@ -29,7 +31,7 @@
   "x25519": 3928
  },
  "armv5": {
-  "TOTAL flash": 84514,
+  "TOTAL flash": 89540,
   "TOTAL ram": 32,
   "aes_ct": 2930,
   "aes_ct64": 0,
@@ -43,6 +45,8 @@
   "gcm": 1192,
   "handshake": 15684,
   "hkdf": 1095,
+  "hpack": 4207,
+  "huffman": 819,
   "keyschedule": 1723,
   "linux_ca": 742,
   "linux_net": 3148,
@@ -58,7 +62,7 @@
   "x25519": 7444
  },
  "armv7hf": {
-  "TOTAL flash": 57208,
+  "TOTAL flash": 60574,
   "TOTAL ram": 32,
   "aes_ct": 2056,
   "aes_ct64": 0,
@@ -72,6 +76,8 @@
   "gcm": 1502,
   "handshake": 9842,
   "hkdf": 729,
+  "hpack": 2787,
+  "huffman": 579,
   "keyschedule": 1145,
   "linux_ca": 544,
   "linux_net": 2084,
@@ -87,7 +93,7 @@
   "x25519": 5286
  },
  "i686": {
-  "TOTAL flash": 93467,
+  "TOTAL flash": 97713,
   "TOTAL ram": 32,
   "aes_ct": 3037,
   "aes_ct64": 0,
@@ -101,6 +107,8 @@
   "gcm": 2484,
   "handshake": 16295,
   "hkdf": 1212,
+  "hpack": 3471,
+  "huffman": 775,
   "keyschedule": 1776,
   "linux_ca": 732,
   "linux_net": 3230,
@@ -116,7 +124,7 @@
   "x25519": 9222
  },
  "mips": {
-  "TOTAL flash": 107512,
+  "TOTAL flash": 113272,
   "TOTAL ram": 32,
   "aes_ct": 3552,
   "aes_ct64": 0,
@@ -130,6 +138,8 @@
   "gcm": 1652,
   "handshake": 17996,
   "hkdf": 1736,
+  "hpack": 4920,
+  "huffman": 840,
   "keyschedule": 2700,
   "linux_ca": 1116,
   "linux_net": 4848,
@@ -145,7 +155,7 @@
   "x25519": 8888
  },
  "mips64": {
-  "TOTAL flash": 98200,
+  "TOTAL flash": 103988,
   "TOTAL ram": 60,
   "aes_ct": 0,
   "aes_ct64": 4440,
@@ -159,6 +169,8 @@
   "gcm": 2648,
   "handshake": 17728,
   "hkdf": 1684,
+  "hpack": 4928,
+  "huffman": 860,
   "keyschedule": 2548,
   "linux_ca": 1080,
   "linux_net": 4380,
@@ -174,7 +186,7 @@
   "x25519": 5916
  },
  "mipsel": {
-  "TOTAL flash": 107780,
+  "TOTAL flash": 113568,
   "TOTAL ram": 32,
   "aes_ct": 3560,
   "aes_ct64": 0,
@@ -188,6 +200,8 @@
   "gcm": 1676,
   "handshake": 18292,
   "hkdf": 1740,
+  "hpack": 4948,
+  "huffman": 840,
   "keyschedule": 2700,
   "linux_ca": 1116,
   "linux_net": 4848,
@@ -203,7 +217,7 @@
   "x25519": 8952
  },
  "ppc": {
-  "TOTAL flash": 88510,
+  "TOTAL flash": 93636,
   "TOTAL ram": 32,
   "aes_ct": 2838,
   "aes_ct64": 0,
@@ -217,6 +231,8 @@
   "gcm": 2300,
   "handshake": 15090,
   "hkdf": 1243,
+  "hpack": 4335,
+  "huffman": 791,
   "keyschedule": 1895,
   "linux_ca": 818,
   "linux_net": 3488,
@@ -232,7 +248,7 @@
   "x25519": 8364
  },
  "riscv64": {
-  "TOTAL flash": 61658,
+  "TOTAL flash": 65672,
   "TOTAL ram": 60,
   "aes_ct": 0,
   "aes_ct64": 3402,
@@ -246,6 +262,8 @@
   "gcm": 1672,
   "handshake": 11636,
   "hkdf": 1041,
+  "hpack": 3349,
+  "huffman": 665,
   "keyschedule": 1372,
   "linux_ca": 665,
   "linux_net": 2236,
@@ -261,7 +279,7 @@
   "x25519": 3854
  },
  "x86_64": {
-  "TOTAL flash": 76686,
+  "TOTAL flash": 81127,
   "TOTAL ram": 60,
   "aes_ct": 0,
   "aes_ct64": 4144,
@@ -275,6 +293,8 @@
   "gcm": 1884,
   "handshake": 14907,
   "hkdf": 1098,
+  "hpack": 3698,
+  "huffman": 743,
   "keyschedule": 1688,
   "linux_ca": 718,
   "linux_net": 2700,

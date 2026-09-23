@@ -45,6 +45,27 @@
  * SHA-256/384/512, HMAC and HKDF are always built: every TLS configuration needs them.
  */
 
+/* HTTP/2 (RFC 9113). An optional module the application calls explicitly over a TLS connection
+ * whose ALPN it chose - never switched on by the core. Today that is HPACK only (RFC 7541:
+ * src/http/hpack.c + src/http/huffman.c; M4 line 1); frames and brisk_h2_* follow. Off in TINY.
+ * Needs nothing else. With it off both files compile to empty translation units. */
+#ifndef BRISK_ENABLE_H2
+#    define BRISK_ENABLE_H2 (BRISK_PROFILE >= BRISK_PROFILE_DEFAULT)
+#endif
+
+/* The SETTINGS_HEADER_TABLE_SIZE this client advertises, in octets: the largest HPACK dynamic
+ * table the peer may make us keep, and exactly the ring memory the caller hands the decoder. A
+ * RAM knob. RFC 9113 4.3.1 makes 4096 the initial value, and a smaller one forces every peer to
+ * open its first header block with a table size update - RFC 9113 4.3.1 calls reducing it "not
+ * widely interoperable", so lower it only after testing against your servers. The 65535 cap lets
+ * the ring store entry lengths as 16 bits. No public struct size depends on it. */
+#ifndef BRISK_H2_HEADER_TABLE_SIZE
+#    define BRISK_H2_HEADER_TABLE_SIZE 4096
+#endif
+#if BRISK_H2_HEADER_TABLE_SIZE < 0 || BRISK_H2_HEADER_TABLE_SIZE > 65535
+#    error "BRISK_H2_HEADER_TABLE_SIZE must be 0..65535"
+#endif
+
 /* Client certificates (mTLS): ECDSA P-256 signing with a hedged RFC 6979 nonce, and the
  * brisk_sign_fn hook for a key held in a secure element. Off in TINY - a gateway that only
  * authenticates the server links neither. It is a knob rather than always-on because
@@ -79,7 +100,10 @@
  * to 1 for any other core whose MUL latency depends on the operands. AES-GCM stays offered on
  * every target either way; ChaCha20-Poly1305 is preferred where AES is slow in software. */
 #ifndef BRISK_GHASH_MULFREE
-#    if (defined(__arm__) && ((defined(__ARM_ARCH) && __ARM_ARCH < 6) ||                                                        defined(__ARM_ARCH_5TE__) || defined(__ARM_ARCH_5TEJ__) ||                                        defined(__ARM_ARCH_5T__) || defined(__ARM_ARCH_4T__))) ||                   (defined(__mips__) && !defined(__mips64))
+#    if (defined(__arm__) &&                                                                       \
+         ((defined(__ARM_ARCH) && __ARM_ARCH < 6) || defined(__ARM_ARCH_5TE__) ||                  \
+          defined(__ARM_ARCH_5TEJ__) || defined(__ARM_ARCH_5T__) || defined(__ARM_ARCH_4T__))) ||  \
+        (defined(__mips__) && !defined(__mips64))
 #        define BRISK_GHASH_MULFREE 1
 #    else
 #        define BRISK_GHASH_MULFREE 0
