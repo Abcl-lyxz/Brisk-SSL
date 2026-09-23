@@ -46,9 +46,9 @@
  */
 
 /* HTTP/2 (RFC 9113). An optional module the application calls explicitly over a TLS connection
- * whose ALPN it chose - never switched on by the core. Today that is HPACK only (RFC 7541:
- * src/http/hpack.c + src/http/huffman.c; M4 line 1); frames and brisk_h2_* follow. Off in TINY.
- * Needs nothing else. With it off both files compile to empty translation units. */
+ * whose ALPN it chose - never switched on by the core: HPACK (RFC 7541, src/http/hpack.c +
+ * huffman.c) and frames, streams, flow control and the brisk_h2_* API (src/http/h2.c). Off in
+ * TINY. Needs nothing else. With it off all three files compile to empty translation units. */
 #ifndef BRISK_ENABLE_H2
 #    define BRISK_ENABLE_H2 (BRISK_PROFILE >= BRISK_PROFILE_DEFAULT)
 #endif
@@ -64,6 +64,26 @@
 #endif
 #if BRISK_H2_HEADER_TABLE_SIZE < 0 || BRISK_H2_HEADER_TABLE_SIZE > 65535
 #    error "BRISK_H2_HEADER_TABLE_SIZE must be 0..65535"
+#endif
+
+/* HTTP/2 streams open at once (RFC 9113 5.1.2): each costs BRISK_H2_STREAM_WINDOW + 4096 octets
+ * of brisk_h2_size(). The server's SETTINGS_MAX_CONCURRENT_STREAMS may lower it further. */
+#ifndef BRISK_H2_MAX_STREAMS
+#    define BRISK_H2_MAX_STREAMS 4
+#endif
+#if BRISK_H2_MAX_STREAMS < 1 || BRISK_H2_MAX_STREAMS > 64
+#    error "BRISK_H2_MAX_STREAMS must be 1..64"
+#endif
+
+/* Per-stream HTTP/2 receive window in octets (our SETTINGS_INITIAL_WINDOW_SIZE, RFC 9113 6.9.2):
+ * the server may have this much response data in flight per stream, and it is exactly the
+ * buffer each stream owns, so nothing is ever dropped. Throughput per stream is about
+ * window / RTT (8192 at 50 ms = 1.3 Mbit/s); doubling it doubles both. A RAM knob. */
+#ifndef BRISK_H2_STREAM_WINDOW
+#    define BRISK_H2_STREAM_WINDOW 8192
+#endif
+#if BRISK_H2_STREAM_WINDOW < 1024 || BRISK_H2_STREAM_WINDOW > 1048576
+#    error "BRISK_H2_STREAM_WINDOW must be 1024..1048576"
 #endif
 
 /* Client certificates (mTLS): ECDSA P-256 signing with a hedged RFC 6979 nonce, and the

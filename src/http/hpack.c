@@ -460,29 +460,30 @@ static int put_str(uint8_t *out, size_t cap, size_t *pos, const uint8_t *s, size
     return 0;
 }
 
-/* RFC 9113 8.2.1: what a well-formed message may carry. Refused here rather than sent. */
-static int field_ok(const brisk__hpack_field *f)
+/* RFC 9113 8.2.1: what a well-formed message may carry. The encoder refuses the rest rather than
+ * sending it; h2.c applies the same rule to received fields. */
+int brisk__hpack_field_ok(const uint8_t *name, size_t nl, const uint8_t *value, size_t vl)
 {
     size_t i;
-    if (!f->name || f->name_len == 0 || (!f->value && f->value_len)) {
+    if (!name || nl == 0 || (!value && vl)) {
         return 0;
     }
-    for (i = 0; i < f->name_len; i++) {
-        uint8_t c = f->name[i];
+    for (i = 0; i < nl; i++) {
+        uint8_t c = name[i];
         /* "A field name MUST NOT contain characters in the ranges 0x00-0x20, 0x41-0x5a, or
          * 0x7f-0xff"; ':' only as the first octet, i.e. a pseudo-header (8.3) */
         if (c <= 0x20 || (c >= 0x41 && c <= 0x5a) || c >= 0x7f || (c == ':' && i > 0)) {
             return 0;
         }
     }
-    for (i = 0; i < f->value_len; i++) {
-        uint8_t c = f->value[i];
+    for (i = 0; i < vl; i++) {
+        uint8_t c = value[i];
         if (c == 0x00 || c == 0x0a || c == 0x0d) { /* "MUST NOT contain a zero value, LF or CR" */
             return 0;
         }
     }
-    if (f->value_len) { /* "MUST NOT start or end with an ASCII whitespace character" (SP, HTAB) */
-        uint8_t a = f->value[0], z = f->value[f->value_len - 1];
+    if (vl) { /* "MUST NOT start or end with an ASCII whitespace character" (SP, HTAB) */
+        uint8_t a = value[0], z = value[vl - 1];
         if (a == 0x20 || a == 0x09 || z == 0x20 || z == 0x09) {
             return 0;
         }
@@ -502,7 +503,7 @@ int brisk__hpack_encode(brisk__hpack_enc *e, const brisk__hpack_field *f, size_t
         return BRISK_E_ARG;
     }
     for (i = 0; i < n; i++) { /* validate everything first: a failed call emits nothing */
-        if (!field_ok(&f[i])) {
+        if (!brisk__hpack_field_ok(f[i].name, f[i].name_len, f[i].value, f[i].value_len)) {
             return BRISK_E_ARG;
         }
     }

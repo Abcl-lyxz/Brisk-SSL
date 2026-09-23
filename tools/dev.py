@@ -7,7 +7,7 @@
   python tools/dev.py size [--arch all|mipsel..] [--md] [--save] [--check]
                                                  per-module flash/RAM from the linker map (-Os, static)
   python tools/dev.py ct                         constant-time check: the ct suite under valgrind
-  python tools/dev.py fuzz [der|name|tls13_hs|tls13_rec|ticket|conn|hpack] [--seconds N]  libFuzzer over a parser, seeded from its .inc
+  python tools/dev.py fuzz [der|name|tls13_hs|tls13_rec|ticket|conn|hpack|h2] [--seconds N]  libFuzzer over a parser, seeded from its .inc
   python tools/dev.py interop                    brisk_get vs openssl s_server, nginx, Caddy (test PKI)
   python tools/dev.py badssl                     brisk_get vs badssl.com (needs internet)
   python tools/dev.py image                      (re)build the brisk-dev Docker image
@@ -246,7 +246,11 @@ FUZZ = {"der": ("fuzz/fuzz_der.c src/x509/der.c", "tests/kat/der.inc"),
         # HPACK (RFC 7541): block sequences through one decoder + Huffman + encoder round trip.
         # BRISK_ENABLE_H2 is on in the default profile, which is what this build uses.
         "hpack": ("fuzz/fuzz_hpack.c src/http/hpack.c src/http/huffman.c src/util.c",
-                  "tests/kat/hpack_fuzz.inc")}
+                  "tests/kat/hpack_fuzz.inc"),
+        # HTTP/2 frames + streams (RFC 9113): server byte streams through brisk__h2_feed, then the
+        # blocking calls over the same handle. Seeds are the h2.inc scenario streams.
+        "h2": ("fuzz/fuzz_h2.c src/http/h2.c src/http/hpack.c src/http/huffman.c src/util.c",
+               "tests/kat/h2_fuzz.inc")}
 
 
 def fuzz_corpus(inc, out):

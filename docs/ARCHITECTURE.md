@@ -65,6 +65,12 @@ brisk_pull(c, out, cap); brisk_feed(c, in, n, &used); brisk_app_read(c, buf, cap
 Status-returning calls (`int` + out-parameter), never a NULL-means-error pointer. TLS 1.2 adds
 no `versions` knob until M5 needs one.
 
+HTTP/2 (decided 2026-09-23): simple blocking API over an open brisk_conn whose ALPN is "h2" -
+`brisk_h2_open(c, mem, len, &h)`, `brisk_h2_request(...) -> stream`, `brisk_h2_response`,
+`brisk_h2_read`, `brisk_h2_stream_close`, `brisk_h2_close` (GOAWAY; the caller closes the TLS
+connection). Up to 4 concurrent streams (value knob `BRISK_H2_MAX_STREAMS`), caller memory
+sized by `brisk_h2_size()`. No push, no priority.
+
 ## Memory model
 - Core: caller-provided memory sized by `brisk_*_size()`; blocking API does one arena malloc
   per connection.

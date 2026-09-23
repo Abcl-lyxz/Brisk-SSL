@@ -2,6 +2,22 @@
  * tools/dev.py reads the resulting map file to report per-module flash/RAM. Never run in tests. */
 #include "brisk_int.h"
 
+#if BRISK_ENABLE_H2
+static int h2_rd(void *io, void *buf, size_t cap)
+{
+    (void)io;
+    (void)buf;
+    return (int)(cap & 1);
+}
+
+static int h2_wr(void *io, const void *buf, size_t len)
+{
+    (void)io;
+    (void)buf;
+    return (int)(len & 1);
+}
+#endif
+
 int main(int argc, char **argv)
 {
     uint8_t out[64];
@@ -236,6 +252,31 @@ int main(int argc, char **argv)
         brisk__hpack_enc_peer_max(&he, (uint32_t)argc);
         brisk__hpack_encode(&he, &hf, 1, out, sizeof out, &n);
         brisk__huff_decode(out, 8, scr, sizeof scr, &n);
+    }
+    {
+        /* HTTP/2: the arena is the probe's BSS; the transport is the blocking TLS stream */
+        static uint8_t h2mem[1 << 17];
+        brisk_h2 *h;
+        brisk_h2_stream *s;
+        size_t used;
+        int st;
+        if (brisk__h2_setup(h2mem, sizeof h2mem, "a.example", 9, h2_rd, h2_wr, NULL, &h) == 0) {
+            brisk__h2_feed(h, out, sizeof out, &used);
+            brisk__h2_pull(h, out, sizeof out);
+            brisk__h2_start(h);
+            if (brisk_h2_request(h, "GET", "/", NULL, 0, NULL, 0, &s) == 0) {
+                brisk_h2_response(s, &st, NULL, NULL);
+                brisk_h2_read(s, out, sizeof out);
+                brisk_h2_stream_close(s);
+            }
+            brisk_h2_close(h);
+        }
+        out[3] = (uint8_t)brisk_h2_size();
+#    ifdef __linux__
+        if (brisk_h2_open(NULL, h2mem, sizeof h2mem, &h) == 0) {
+            brisk_h2_close(h);
+        }
+#    endif
     }
 #endif
     return out[0] + (brisk_build_info()[0] == brisk_version()[0]) +

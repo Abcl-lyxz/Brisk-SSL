@@ -65,6 +65,7 @@ static const struct {
     {"rsa", test_rsa},       {"der", test_der},           {"x509", test_x509},
     {"ct", test_ct},         {"tls13_ks", test_tls13_ks}, {"tls13_hs", test_tls13_hs},
     {"tls13_rec", test_tls13_rec}, {"conn", test_conn}, {"hpack", test_hpack},
+    {"h2", test_h2},
 #ifdef __linux__
     {"rand", test_rand},     {"sock", test_sock},
 #endif

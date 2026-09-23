@@ -73,6 +73,7 @@ SRC = {
         "4096_sha512_mgf1_32", "4096_sha512_mgf1_64", "misc")},
     "x509_limbo": "https://raw.githubusercontent.com/C2SP/x509-limbo/main/limbo.json",
     "rfc7541": "https://www.rfc-editor.org/rfc/rfc7541.txt",
+    "rfc9113": "https://www.rfc-editor.org/rfc/rfc9113.txt",
     # http2jp/hpack-test-case, pinned by commit (never master): real captures from independent
     # encoders. The cache file is named after the SRC key (every story is called story_NN.json).
     **{f"hpack_{e.replace('-', '_')}_{s}": "https://raw.githubusercontent.com/http2jp/hpack-test-case/"
@@ -6810,6 +6811,977 @@ def emit(name, decl, rows, fmt, append=False):
     print(f"  {name}: {len(rows)} vectors")
 
 
+# ------------------------------------------------------------------------------------ HTTP/2
+# RFC 9113 has no byte-level test vectors. Every row below is a SCENARIO: a server byte stream,
+# the public-API calls the C test makes (with the results they must return), and the exact client
+# byte stream those calls must produce. Frames are built here by hand from RFC 9113 sect 4-6;
+# server header blocks come from PyHpackEnc (literal with incremental indexing + Huffman, so the
+# client's dynamic table is exercised across frames and streams) and are each read back by the
+# independent PyHpackDec; client blocks come from py_hpack_encode (the encoder policy the HPACK
+# rows already pin). When the Python `h2` package is installed, every row is also replayed through
+# an h2 client connection (generation-time only): rows the C code accepts must be accepted by h2,
+# rows it rejects must make h2 raise - a second, independent implementation of the same RFC.
+# Invalid rows mirror summerwind/h2spec's case list (sect 3.5, 4.1-4.3, 5.1-5.5, 6.1-6.10, 8.1)
+# and the 2019 / 2024 flood advisories (Netflix 2019-002, CERT VU#421644); nothing is copied.
+
+H2_W, H2_L, H2_TX, H2_MAXS = 8192, 4096, 4096, 4  # BRISK_H2_STREAM_WINDOW / MAX_LIST / TX / MAX_STREAMS
+H2_PREFACE = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n"
+H2E = {"ARG": -1, "PROTO": -4, "PEER": -5, "IO": -6, "RETRY": -9}
+(H2_NO_ERROR, H2_PROTOCOL, H2_INTERNAL, H2_FLOW, H2_SETTINGS_TIMEOUT, H2_STREAM_CLOSED,
+ H2_FRAME_SIZE, H2_REFUSED, H2_CANCEL, H2_COMPRESSION, H2_CONNECT, H2_CALM) = range(12)
+EH, ES, PAD, PRIO = 0x4, 0x1, 0x8, 0x20
+
+
+def h2fr(t, fl, sid, pl=b""):
+    """RFC 9113 4.1: 24-bit length, type, flags, R + 31-bit stream id."""
+    return len(pl).to_bytes(3, "big") + bytes([t, fl]) + sid.to_bytes(4, "big") + pl
+
+
+def h2set(*kv):
+    return b"".join(k.to_bytes(2, "big") + v.to_bytes(4, "big") for k, v in kv)
+
+
+def h2u32(v):
+    return v.to_bytes(4, "big")
+
+
+def h2_goaway(code, last=0):
+    return h2fr(7, 0, 0, h2u32(last) + h2u32(code))
+
+
+def h2_rst(sid, code):
+    return h2fr(3, 0, sid, h2u32(code))
+
+
+def h2_wu(sid, inc):
+    return h2fr(8, 0, sid, h2u32(inc))
+
+
+def h2_data(sid, data, fl=0, pad=None):
+    if pad is not None:
+        return h2fr(0, fl | PAD, sid, bytes([pad]) + data + bytes(pad))
+    return h2fr(0, fl, sid, data)
+
+
+def h2_ping(payload, ack=False):
+    return h2fr(6, 1 if ack else 0, 0, payload)
+
+
+H2_SACK = h2fr(4, 1, 0)
+H2_CLI0 = H2_PREFACE + h2fr(4, 0, 0, h2set((2, 0), (4, H2_W), (6, H2_L)))
+
+
+def check_rfc9113_preface():
+    """3.4: the client preface, byte for byte against the RFC text."""
+    text = "".join(rfc_lines(fetch("rfc9113")))
+    m = re.search(r"0x((?:[0-9a-f]{2}){24})", text.replace(" ", ""))
+    if not m or bytes.fromhex(m.group(1)) != H2_PREFACE:
+        die("RFC 9113 3.4: connection preface not found / does not match")
+
+
+class PyHpackEnc:
+    """A server-style encoder: exact matches indexed, everything else a literal WITH incremental
+    indexing (6.2.1) and Huffman strings - the representations our own encoder never emits."""
+
+    def __init__(self):
+        self.table, self.max = [], 4096
+
+    def size(self):
+        return sum(len(n) + len(v) + 32 for n, v in self.table)
+
+    def _s(self, x, huff):
+        if huff:
+            h = py_huff_enc(x)
+            return py_hint_enc(len(h), 7, 0x80) + h
+        return py_hint_enc(len(x), 7) + x
+
+    def block(self, fields, index=True, huff=True):
+        out = bytearray()
+        for n, v in fields:
+            exact = next((i + 1 for i, e in enumerate(HPACK_STATIC) if e == (n, v)), 0) or \
+                next((62 + i for i, e in enumerate(self.table) if e == (n, v)), 0)
+            if exact:
+                out += py_hint_enc(exact, 7, 0x80)
+                continue
+            ni = next((i + 1 for i, e in enumerate(HPACK_STATIC) if e[0] == n), 0) or \
+                next((62 + i for i, e in enumerate(self.table) if e[0] == n), 0)
+            out += py_hint_enc(ni, 6, 0x40) if index else py_hint_enc(ni, 4, 0)
+            if not ni:
+                out += self._s(n, huff)
+            out += self._s(v, huff)
+            if index:
+                sz = len(n) + len(v) + 32
+                if sz > self.max:
+                    self.table = []
+                else:
+                    while self.table and self.size() > self.max - sz:
+                        self.table.pop()
+                    self.table.insert(0, (n, v))
+        return bytes(out)
+
+
+def h2b(x):
+    return x if isinstance(x, bytes) else x.encode()
+
+
+def h2_fields_hex(fields):
+    return b"".join(len(h2b(n)).to_bytes(2, "big") + h2b(n) + len(h2b(v)).to_bytes(2, "big") + h2b(v)
+                    for n, v in fields).hex()
+
+
+SENSITIVE = (b"authorization", b"proxy-authorization", b"cookie", b"set-cookie")
+
+
+class H2Row:
+    """One scenario. Methods append to the server stream / client stream / script in call order;
+    the order of calls is the order the C code consumes frames (lazily, one at a time)."""
+
+    def __init__(self, note, auth="example.com"):
+        self.note, self.auth = note, h2b(auth)
+        self.srv, self.cli, self.ops = bytearray(), bytearray(H2_CLI0), []
+        self.enc, self.ref = PyHpackEnc(), PyHpackDec(4096)
+        self.pending, self.dead, self.sid = False, False, 1
+        self.p_win, self.cpend, self.pend, self.rwin = 65535, 0, {}, {}
+        self.timeline, self.lib = [], None  # lib: None = derive, or ("skip", reason)
+
+    # --- raw
+    def s(self, *frames):
+        b = b"".join(frames)
+        self.srv += b
+        self.timeline.append(("srv", b))
+
+    def c(self, *frames):
+        self.cli += b"".join(frames)
+
+    def op(self, letter, *fields):
+        self.ops.append(letter + ",".join(str(f) for f in fields))
+
+    # --- server header blocks
+    def blk(self, fields, index=True, huff=True, verify=True):
+        fields = [(h2b(n), h2b(v)) for n, v in fields]
+        b = self.enc.block(fields, index, huff)
+        if verify:
+            ok, got, _ = self.ref.decode(b, 4096, 4096)
+            if not ok or [(n, v) for n, v, _ in got] != fields:
+                die(f"h2 row {self.note}: PyHpackDec disagrees with PyHpackEnc")
+        return b
+
+    def hdrs(self, sid, fields, fl=EH | ES, **kw):
+        return h2fr(1, fl, sid, self.blk(fields, **kw))
+
+    # --- calls
+    def start(self, settings=(), rc=0):
+        self.s(h2fr(4, 0, 0, h2set(*settings)))
+        for k, v in settings:
+            if k == 1 and v < 4096:
+                self.pending = True
+            if k == 4:
+                self.p_win = v
+        if rc == 0:
+            self.c(H2_SACK)
+        self.op("O", rc)
+
+    def req(self, slot, method="GET", path="/", hdrs=(), body=b"", rc=0, tx=0, swin=None):
+        """Q; on success the client's HEADERS/CONTINUATION + DATA as far as the windows allow.
+        Returns (sid, off, txlen) so a blocked upload can be continued by hand."""
+        m, p = h2b(method), h2b(path)
+        hd = [(h2b(n), h2b(v)) for n, v in hdrs]
+        self.op("Q", slot, rc, m.hex(), p.hex(), h2_fields_hex(hd), body.hex())
+        if rc != 0:
+            return None
+        sid = self.sid
+        self.sid += 2
+        self.pend[sid], self.rwin[sid] = 0, H2_W
+        fields = [(b":method", m, 0), (b":scheme", b"https", 0), (b":authority", self.auth, 0),
+                  (b":path", p, 0)] + [(n, v, 1 if n in SENSITIVE else 0) for n, v in hd]
+        blk = py_hpack_encode(fields, self.pending)
+        if blk is None:
+            die(f"h2 row {self.note}: request fields rejected by py_hpack_encode")
+        self.pending = False
+        self.timeline.append(("req", sid, [(n, v) for n, v, _ in fields], body))
+        # 6.10: HEADERS then CONTINUATION, each filling the 4 KB tx queue, flushed when full
+        room, first, frames = H2_TX - tx - 9, True, []
+        while True:
+            chunk, blk = blk[:room], blk[room:]
+            t, fl = (1, 0 if body else ES) if first else (9, 0)
+            if not blk:
+                fl |= EH
+            frames.append(h2fr(t, fl, sid, chunk))
+            txlen = (tx if first else 0) + 9 + len(chunk)
+            first, room = False, H2_TX - 9
+            if not blk:
+                break
+        self.c(*frames)
+        swin = self.p_win if swin is None else swin
+        return (sid,) + self.send(sid, body, 0, txlen, swin)
+
+    def send(self, sid, body, off, txlen, swin, cwin=65535):
+        """DATA frames: min(rest, tx room - 9, stream window, connection window); flush on < 10."""
+        while off < len(body):
+            room = H2_TX - txlen
+            if room < 10:
+                txlen = 0
+                continue
+            k = min(len(body) - off, room - 9, swin, cwin, 16384)
+            if k <= 0:
+                break
+            self.c(h2_data(sid, body[off:off + k], ES if off + k == len(body) else 0))
+            off, txlen, swin = off + k, txlen + 9 + k, swin - k
+        return off, txlen
+
+    def resp(self, slot, status=200, fields=(), rc=0):
+        self.op("R", slot, rc, status, h2_fields_hex(fields))
+
+    def credit(self, sid, ended):
+        """6.9 our side: stream WINDOW_UPDATE at W/2 owed (not after END_STREAM), then conn."""
+        if sid is not None and self.pend[sid] >= H2_W // 2 and not ended:
+            self.c(h2_wu(sid, self.pend[sid]))
+            self.rwin[sid] += self.pend[sid]
+            self.pend[sid] = 0
+        if self.cpend >= H2_W // 2:
+            self.c(h2_wu(0, self.cpend))
+            self.cpend = 0
+
+    def body(self, slot, sid, frames, cap=4096, rc=0, send=True):
+        """Server DATA frames for one stream [(data, pad or None, es)] consumed by one D op with
+        read size cap: models the credit the reads return, frame by frame."""
+        got = b""
+        for data, pad, es in frames:
+            if send:
+                self.s(h2_data(sid, data, ES if es else 0, pad))
+            ln = len(data) + (pad + 1 if pad is not None else 0)
+            if ln > self.rwin[sid]:
+                die(f"h2 row {self.note}: DATA exceeds our stream window")
+            self.rwin[sid] -= ln
+            padn = ln - len(data)
+            self.pend[sid] += padn
+            self.cpend += padn
+            self.credit(sid, es)
+            for i in range(0, len(data), cap):
+                n = min(cap, len(data) - i)
+                self.pend[sid] += n
+                self.cpend += n
+                self.credit(sid, es)
+            got += data
+        self.op("D", slot, rc, cap, got.hex())
+
+    def read1(self, slot, rc, data=b"", cap=16):
+        self.op("d", slot, rc, cap, data.hex())
+
+    def close_s(self, slot, rst_sid=None, unread=0):
+        self.op("C", slot)
+        if rst_sid is not None:
+            self.c(h2_rst(rst_sid, H2_CANCEL))
+            self.timeline.append(("rst", rst_sid))
+        if unread:
+            self.cpend += unread
+            self.credit(None, True)
+
+    def conn_err(self, code):
+        self.c(h2_goaway(code))
+        self.dead = True
+
+    def close(self):
+        self.op("X")
+        if not self.dead:
+            self.c(h2_goaway(H2_NO_ERROR))
+
+    def rejects(self):
+        """Some call returned BRISK_E_PROTO: the C code refused something the server sent."""
+        for o in self.ops:
+            f = o[1:].split(",")
+            rc = f[0] if o[0] == "O" else (f[1] if len(f) > 1 else "0")
+            if rc == str(H2E["PROTO"]):
+                return True
+        return False
+
+    def row(self):
+        return (self.auth.decode(), bytes(self.srv).hex(), bytes(self.cli).hex(), " ".join(self.ops),
+                self.note)
+
+
+def h2_lib_check(rows):
+    """Generation-time cross-check with the python-hyper `h2` package when installed."""
+    try:
+        import h2.config
+        import h2.connection
+        import h2.exceptions  # noqa: F401
+        import h2.settings
+    except ImportError:
+        print("  h2: python `h2` package not installed - cross-check skipped")
+        return
+    # Where python-hyper h2 4.2 is looser (or stricter) than RFC 9113 - checked by hand against the
+    # RFC text; each row still runs, and a NEW disagreement anywhere else fails generation.
+    known = {
+        "6.8 GOAWAY last=1": "h2 closes the whole connection on GOAWAY; 6.8 lets streams <= last "
+                             "finish",
+        "ignored: PRIORITY": "hyperframe rejects the WINDOW_UPDATE R bit, 6.9 says ignore it",
+        "3.4 server preface": "h2 does not enforce 3.4 (first server frame = SETTINGS)",
+        "3.4 bad first SETTINGS: ENABLE_PUSH 1": "h2 accepts ENABLE_PUSH 1 from a server (6.5.2 MUST)",
+        "6.5.2 ENABLE_PUSH 1": "same",
+        "5.1 idle stream 5: RST_STREAM": "h2 ignores RST_STREAM on idle streams (6.4 MUST)",
+        "5.1.1 even stream 2: RST_STREAM": "same",
+        "CONTINUATION flood": "a local limit (VU#421644), not an RFC rule",
+        "control-frame flood": "a local limit (CVE-2019-9512 class), not an RFC rule",
+        "1xx flood": "a local limit (RFC 9113 10.5), not an RFC rule",
+        "6.9.1 DATA over the stream window": "h2 applies our INITIAL_WINDOW_SIZE only once ACKed",
+        "8.1.1 malformed response: :status": "h2 does not check the :status syntax (8.3.2)",
+        "8.1.1 malformed response: name with": "h2 does not check 8.2.1 name octets",
+        "8.1.1 malformed response: value with": "h2 does not check 8.2.1 value octets",
+        "8.1.1 malformed response: conflicting content-length": "h2 takes the last one",
+    }
+    bad, skipped = [], 0
+    for r in rows:
+        if r.lib is not None or any(r.note.startswith(k) for k in known):
+            skipped += 1
+            continue
+        conn = h2.connection.H2Connection(h2.config.H2Configuration(
+            client_side=True, header_encoding=None, validate_inbound_headers=True,
+            normalize_inbound_headers=False))
+        conn.initiate_connection()
+        conn.update_settings({h2.settings.SettingCodes.ENABLE_PUSH: 0,
+                              h2.settings.SettingCodes.MAX_HEADER_LIST_SIZE: 4096})
+        raised = None
+        try:
+            for ev in r.timeline:
+                if ev[0] == "srv":
+                    for e in conn.receive_data(bytes(ev[1])):
+                        if type(e).__name__ in ("StreamReset",) and getattr(e, "remote_reset", 1) == 0:
+                            raised = raised or "local-reset"
+                elif ev[0] == "req":
+                    try:
+                        conn.send_headers(ev[1], ev[2], end_stream=not ev[3])
+                    except Exception:  # noqa: BLE001 - h2 refused to send: not a server fault
+                        pass
+                elif ev[0] == "rst":
+                    try:
+                        conn.reset_stream(ev[1], H2_CANCEL)
+                    except Exception:  # noqa: BLE001
+                        pass
+                conn.data_to_send()
+        except Exception as e:  # noqa: BLE001 - any h2 error = h2 rejected the server stream
+            raised = type(e).__name__
+        if bool(raised) != r.rejects():
+            bad.append(f"{r.note}: brisk {'rejects' if r.rejects() else 'accepts'}, h2 "
+                       f"{'raised ' + str(raised) if raised else 'accepted'}")
+    for b in bad:
+        print("   h2 disagrees:", b)
+    if bad:
+        die(f"h2 cross-check: {len(bad)} rows disagree (mark them with a reason or fix)")
+    print(f"  h2: {len(rows) - skipped} rows agree with python-hyper h2, {skipped} known deviations")
+
+
+def h2_rows():
+    rows = []
+    OK200 = [(":status", "200"), ("content-type", "text/plain")]
+
+    def new(note, auth="example.com"):
+        r = H2Row(note, auth)
+        rows.append(r)
+        return r
+
+    def get1(note, **kw):
+        r = new(note, **kw)
+        r.start()
+        r.req(0)
+        return r
+
+    # ---- valid flows (RFC 9113 8.8 shapes) ------------------------------------------------
+    r = get1("8.8.1-style GET, 200 + one DATA with END_STREAM")
+    r.s(r.hdrs(1, OK200, EH))
+    r.resp(0, 200, [("content-type", "text/plain")])
+    r.body(0, 1, [(b"hello", None, True)])
+    r.close_s(0)
+    r.close()
+
+    for auth in ("device.example.com", "[::1]", "host:8443"):
+        r = get1(f"8.3.1 :authority {auth}", auth=auth)
+        r.s(r.hdrs(1, [(":status", "204")]))
+        r.resp(0, 204)
+        r.body(0, 1, [], send=False)
+        r.close_s(0)
+        r.close()
+
+    r = get1("DATA in pieces, zero-length DATA carries END_STREAM")
+    r.s(r.hdrs(1, OK200, EH))
+    r.resp(0, 200, [("content-type", "text/plain")])
+    r.body(0, 1, [(b"ab", None, False), (b"cde", None, False), (b"", None, True)])
+    r.close_s(0)
+    r.close()
+
+    r = get1("small read size: many reads per frame")
+    r.s(r.hdrs(1, OK200, EH))
+    r.resp(0, 200, [("content-type", "text/plain")])
+    r.body(0, 1, [(bytes(range(200)), None, False), (b"tail", None, True)], cap=7)
+    r.close_s(0)
+    r.close()
+
+    # 4.3 / 6.10: one field block over HEADERS + CONTINUATION, cut at every offset
+    base = [(":status", "200"), ("content-type", "application/json"), ("x-request-id", "a1b2c3d4"),
+            ("cache-control", "no-store")]
+    probe = PyHpackEnc().block([(h2b(n), h2b(v)) for n, v in base])
+    for cut in range(len(probe) + 1):
+        r = get1(f"4.3 field block split HEADERS|CONTINUATION at {cut}")
+        b = r.blk(base)
+        r.s(h2fr(1, ES, 1, b[:cut]), h2fr(9, EH, 1, b[cut:]))
+        r.resp(0, 200, base[1:])
+        r.body(0, 1, [], send=False)
+        r.close_s(0)
+        r.close()
+    for cuts in ((1, 2, 3), (0, 0, 0), (5, 9, 20)):
+        r = get1(f"4.3 HEADERS + 3 CONTINUATION, cuts {cuts}")
+        b = r.blk(base)
+        a, m, z = cuts
+        r.s(h2fr(1, 0, 1, b[:a]), h2fr(9, 0, 1, b[a:m]), h2fr(9, 0, 1, b[m:z]),
+            h2fr(9, EH, 1, b[z:]))
+        r.s(h2_data(1, b"{}", ES))
+        r.resp(0, 200, base[1:])
+        r.body(0, 1, [(b"{}", None, True)], send=False)
+        r.close_s(0)
+        r.close()
+
+    for pad in (0, 255):
+        r = get1(f"6.2 padded HEADERS (pad {pad}) + 6.1 padded DATA (pad {pad})")
+        b = r.blk(OK200)
+        r.s(h2fr(1, EH | PAD, 1, bytes([pad]) + b + bytes(pad)))
+        r.resp(0, 200, [("content-type", "text/plain")])
+        r.body(0, 1, [(b"padded", pad, False), (b"", pad, True)])
+        r.close_s(0)
+        r.close()
+
+    r = get1("6.2 HEADERS with PRIORITY flag + padding (content ignored, 5.3.2)")
+    b = r.blk(OK200)
+    r.s(h2fr(1, EH | ES | PAD | PRIO, 1, bytes([3]) + h2u32(0x80000003) + bytes([200]) + b + bytes(3)))
+    r.resp(0, 200, [("content-type", "text/plain")])
+    r.body(0, 1, [], send=False)
+    r.close_s(0)
+    r.close()
+
+    r = get1("8.1 interim 100 and 103 before the final response (discarded)")
+    r.s(r.hdrs(1, [(":status", "100")], EH), r.hdrs(1, [(":status", "103"), ("link", "</a.css>")], EH),
+        r.hdrs(1, OK200, EH))
+    r.resp(0, 200, [("content-type", "text/plain")])
+    r.body(0, 1, [(b"x", None, True)])
+    r.close_s(0)
+    r.close()
+
+    r = get1("8.1 trailers after DATA (validated, discarded)")
+    r.s(r.hdrs(1, OK200, EH), h2_data(1, b"body"), r.hdrs(1, [("grpc-status", "0")], EH | ES))
+    r.resp(0, 200, [("content-type", "text/plain")])
+    r.body(0, 1, [(b"body", None, False)], send=False)
+    r.close_s(0)
+    r.close()
+
+    r = new("8.1.1 HEAD: content-length without DATA")
+    r.start()
+    r.req(0, "HEAD", "/f")
+    r.s(r.hdrs(1, [(":status", "200"), ("content-length", "1234")]))
+    r.resp(0, 200, [("content-length", "1234")])
+    r.body(0, 1, [], send=False)
+    r.close_s(0)
+    r.close()
+
+    r = get1("8.1.1 204 with content-length")
+    r.s(r.hdrs(1, [(":status", "204"), ("content-length", "10")]))
+    r.resp(0, 204, [("content-length", "10")])
+    r.body(0, 1, [], send=False)
+    r.close_s(0)
+    r.close()
+
+    r = get1("8.1.1 content-length matches, identical duplicate allowed")
+    r.s(r.hdrs(1, [(":status", "200"), ("content-length", "3"), ("content-length", "3")], EH))
+    r.resp(0, 200, [("content-length", "3"), ("content-length", "3")])
+    r.body(0, 1, [(b"abc", None, True)])
+    r.close_s(0)
+    r.close()
+
+    # POST whose body is larger than the server's window: the client reads while blocked
+    r = new("6.9 POST body > peer INITIAL_WINDOW_SIZE: reads WINDOW_UPDATEs while blocked")
+    r.start([(4, 100)])
+    body = bytes((i * 7) & 0xff for i in range(250))
+    sid, off, txl = r.req(0, "POST", "/upload", [("content-type", "application/octet-stream")], body)
+    r.s(h2_ping(b"blocked!"), h2_wu(1, 100))
+    r.c(h2_ping(b"blocked!", True))
+    off, txl = r.send(1, body, off, 0, 100)
+    r.s(h2_wu(1, 100))
+    off, txl = r.send(1, body, off, 0, 100)
+    r.s(r.hdrs(1, [(":status", "201")]))
+    r.resp(0, 201)
+    r.body(0, 1, [], send=False)
+    r.close_s(0)
+    r.close()
+
+    r = new("POST with body_len 0: END_STREAM on HEADERS")
+    r.start()
+    r.req(0, "POST", "/empty")
+    r.s(r.hdrs(1, [(":status", "200")]))
+    r.resp(0, 200)
+    r.body(0, 1, [], send=False)
+    r.close_s(0)
+    r.close()
+
+    for mfs in (None, 16777215):
+        r = new(f"DATA framing of a 9000-byte body, peer MAX_FRAME_SIZE {mfs or 16384}")
+        r.start([(5, mfs)] if mfs else [])
+        r.req(0, "PUT", "/big", [("content-length", "9000")], bytes(i & 0xff for i in range(9000)))
+        r.s(r.hdrs(1, [(":status", "204")]))
+        r.resp(0, 204)
+        r.body(0, 1, [], send=False)
+        r.close_s(0)
+        r.close()
+
+    r = new("4.3.1 peer HEADER_TABLE_SIZE 0: first block opens with a size update 0x20")
+    r.start([(1, 0)])
+    r.req(0, "GET", "/one")
+    r.s(r.hdrs(1, [(":status", "200")]))
+    r.resp(0, 200)
+    r.body(0, 1, [], send=False)
+    r.close_s(0)
+    r.req(0, "GET", "/two")
+    r.s(r.hdrs(3, [(":status", "200")]))
+    r.resp(0, 200)
+    r.body(0, 3, [], send=False)
+    r.close_s(0)
+    r.close()
+
+    r = new("request builder: never-indexed credentials, te: trailers, user fields in order")
+    r.start()
+    r.req(0, "GET", "/api?q=1", [("authorization", "Bearer abc.def"), ("cookie", "a=b"),
+                                  ("te", "trailers"), ("user-agent", "brisk/0.1"),
+                                  ("accept", "*/*")])
+    r.s(r.hdrs(1, [(":status", "200")]))
+    r.resp(0, 200)
+    r.body(0, 1, [], send=False)
+    r.close_s(0)
+    r.close()
+
+    r = new("request builder: OPTIONS * and a custom token method")
+    r.start()
+    r.req(0, "OPTIONS", "*")
+    r.req(1, "PURGE", "/cache/x")
+    r.s(r.hdrs(1, [(":status", "204")]), r.hdrs(3, [(":status", "200")]))
+    r.resp(0, 204)
+    r.resp(1, 200)
+    r.close_s(0)
+    r.close_s(1)
+    r.close()
+
+    r = new("6.10 huge request header section: HEADERS + CONTINUATION, each <= tx")
+    r.start()
+    r.req(0, "GET", "/", [("x-big1", "a" * 3000), ("x-big2", "b" * 3000), ("x-big3", "c" * 3000)])
+    r.s(r.hdrs(1, [(":status", "200")]))
+    r.resp(0, 200)
+    r.close_s(0)
+    r.close()
+
+    # ---- request builder refusals (BRISK_E_ARG, nothing sent) -------------------------------
+    bad_req = [
+        ("uppercase name", "GET", "/", [("X-Up", "1")]), (":path in hdrs", "GET", "/", [(":path", "/x")]),
+        (":protocol in hdrs", "GET", "/", [(":protocol", "websocket")]),
+        (":authority in hdrs", "GET", "/", [(":authority", "x")]),
+        ("connection", "GET", "/", [("connection", "close")]),
+        ("transfer-encoding", "GET", "/", [("transfer-encoding", "chunked")]),
+        ("upgrade", "GET", "/", [("upgrade", "h2c")]), ("keep-alive", "GET", "/", [("keep-alive", "1")]),
+        ("proxy-connection", "GET", "/", [("proxy-connection", "x")]),
+        ("te: gzip", "GET", "/", [("te", "gzip")]), ("host", "GET", "/", [("host", "example.com")]),
+        ("CR in value", "GET", "/", [("x", "a\rb")]), ("LF in value", "GET", "/", [("x", "a\nb")]),
+("leading SP", "GET", "/", [("x", " a")]),
+        ("trailing HTAB", "GET", "/", [("x", "a\t")]), ("empty name", "GET", "/", [("", "a")]),
+        ("space in name", "GET", "/", [("a b", "1")]),
+        ("empty method", "", "/", []), ("CONNECT", "CONNECT", "/", []), ("method with SP", "G T", "/", []),
+        ("path without /", "GET", "index.html", []), ("empty path", "GET", "", []),
+        ("* with GET", "GET", "*", []), ("path with LF", "GET", "/a\nb", []),
+        ("content-length != body_len", "POST", "/", [("content-length", "5")]),
+        ("content-length not digits", "GET", "/", [("content-length", "0x0")]),
+        ("field over 4080 octets", "GET", "/", [("x-big", "v" * 4080)]),
+    ]
+    r = new("8.2 / 8.3 request builder refusals (BRISK_E_ARG)")
+    r.start()
+    for note, m, p, h in bad_req:
+        r.req(0, m, p, h, b"", rc=H2E["ARG"])
+    r.req(0, "POST", "/", [("content-length", "3")], b"abc")  # the builder still works after all that
+    r.s(r.hdrs(1, [(":status", "200")]))
+    r.resp(0, 200)
+    r.close_s(0)
+    r.close()
+
+    r = new("10.5.1 section larger than peer MAX_HEADER_LIST_SIZE (BRISK_E_ARG)")
+    r.start([(6, 200)])
+    # :method GET 42 + :scheme 44 + :authority 53 + :path 38 = 177 <= 200; + x-a 135 is over
+    r.req(0, "GET", "/", [("x-a", "b" * 100)], rc=H2E["ARG"])
+    r.req(0, "GET", "/")
+    r.s(r.hdrs(1, [(":status", "200")]))
+    r.resp(0, 200)
+    r.close_s(0)
+    r.close()
+
+    # ---- multiplexing ------------------------------------------------------------------------
+    r = new("5.1.2 four concurrent streams, interleaved; fields parked and replayed")
+    r.start()
+    for i in range(4):
+        r.req(i, "GET", f"/{i + 1}")
+    r.req(4, "GET", "/5", rc=H2E["ARG"])  # 5th: BRISK_H2_MAX_STREAMS
+    r.s(r.hdrs(1, [(":status", "200"), ("content-type", "a/1")], EH), r.hdrs(3, [(":status", "200")], EH),
+        h2_data(1, b"one-a"), r.hdrs(5, [(":status", "200"), ("x-s", "5"), ("content-type", "a/1")], EH),
+        h2_data(3, b"two", ES), h2_data(5, b"three", ES), h2_data(1, b"one-b", ES),
+        r.hdrs(7, [(":status", "404"), ("x-s", "5")]))
+    r.resp(2, 200, [("x-s", "5"), ("content-type", "a/1")])
+    r.body(2, 5, [(b"three", None, True)], send=False)
+    r.resp(0, 200, [("content-type", "a/1")])
+    r.body(0, 1, [(b"one-a", None, False), (b"one-b", None, True)], send=False)
+    r.resp(1, 200)
+    r.body(1, 3, [(b"two", None, True)], send=False)
+    r.resp(3, 404, [("x-s", "5")])
+    r.body(3, 7, [], send=False)
+    r.close_s(0)
+    r.read1(0, H2E["ARG"])  # stale handle
+    r.req(0, "GET", "/6")   # the freed slot, next id 9
+    r.s(r.hdrs(9, [(":status", "200")]))
+    r.resp(0, 200)
+    for i in range(4):
+        r.close_s(i)
+    r.close()
+
+    r = new("5.1.2 peer MAX_CONCURRENT_STREAMS 1")
+    r.start([(3, 1)])
+    r.req(0)
+    r.req(1, rc=H2E["ARG"])
+    r.s(r.hdrs(1, [(":status", "200")]))
+    r.resp(0, 200)
+    r.close_s(0)
+    r.req(1)
+    r.s(r.hdrs(3, [(":status", "200")]))
+    r.resp(1, 200)
+    r.close_s(1)
+    r.close()
+
+    r = new("6.9 receive credit: WINDOW_UPDATE per stream at W/2 consumed, and for the connection")
+    r.start()
+    r.req(0)
+    r.s(r.hdrs(1, [(":status", "200")], EH))
+    r.resp(0, 200)
+    r.body(0, 1, [(bytes([0x41 + i % 26 for i in range(4096)]), None, False),
+                  (bytes(4096), None, False), (bytes(range(256)) * 16, None, False),
+                  (b"z" * 100, 7, True)], cap=1000)
+    r.close_s(0)
+    r.close()
+
+    r = new("two streams share the connection window; reading one buffers the other")
+    r.start()
+    r.req(0, "GET", "/a")
+    r.req(1, "GET", "/b")
+    r.s(r.hdrs(1, [(":status", "200")], EH), r.hdrs(3, [(":status", "200")], EH))
+    r.s(h2_data(3, b"B" * 8192), h2_data(1, b"A" * 3000, ES))
+    r.resp(0, 200)
+    # reading stream 1 processes stream 3's 8192 (buffered) then stream 1's 3000
+    r.body(0, 1, [(b"A" * 3000, None, True)], send=False)
+    r.resp(1, 200)
+    r.rwin[3] -= 8192
+    r.pend[3] = 0
+    got = b""
+    for i in range(0, 8192, 4096):  # reads of 4096: stream 3 is not ended, credit both levels
+        r.pend[3] += 4096
+        r.cpend += 4096
+        r.credit(3, False)
+    r.op("D", 1, H2E["IO"], 4096, (b"B" * 8192).hex())  # then the transport ends
+    r.close_s(0)
+    r.close_s(1, rst_sid=3)
+    r.close()
+
+    # ---- peer termination --------------------------------------------------------------------
+    r = get1("8.7 RST_STREAM REFUSED_STREAM -> BRISK_E_RETRY")
+    r.s(h2_rst(1, H2_REFUSED))
+    r.resp(0, 0, rc=H2E["RETRY"])
+    r.close_s(0)
+    r.close()
+
+    r = get1("6.4 RST_STREAM CANCEL -> peer error")
+    r.s(h2_rst(1, H2_CANCEL))
+    r.resp(0, 0, rc=H2E["PEER"])
+    r.close_s(0)
+    r.close()
+
+    r = get1("6.4 RST_STREAM mid-body -> peer error from read")
+    r.s(r.hdrs(1, [(":status", "200")], EH), h2_data(1, b"part"), h2_rst(1, H2_INTERNAL))
+    r.resp(0, 200)
+    r.op("D", 0, H2E["PEER"], 4096, b"part".hex())
+    r.pend[1] += 4
+    r.cpend += 4
+    r.close_s(0)
+    r.close()
+
+    for twice in (False, True):
+        r = new("6.8 GOAWAY last=1: stream 3 retryable, stream 1 completes, no new streams"
+                + (" (after GOAWAY 2^31-1)" if twice else ""))
+        r.start()
+        r.req(0, "GET", "/a")
+        r.req(1, "GET", "/b")
+        if twice:
+            r.s(h2_goaway(H2_NO_ERROR, 0x7fffffff))
+        r.s(h2_goaway(H2_NO_ERROR, 1), r.hdrs(1, [(":status", "200")], EH), h2_data(1, b"ok", ES))
+        r.resp(1, 0, rc=H2E["RETRY"])
+        r.resp(0, 200)
+        r.body(0, 1, [(b"ok", None, True)], send=False)
+        r.req(2, rc=H2E["RETRY"])
+        r.close_s(0)
+        r.close_s(1)
+        r.close()
+
+    r = get1("6.8 GOAWAY with an error, then the TLS connection ends -> peer error")
+    r.s(r.hdrs(1, [(":status", "200")], EH), h2_goaway(H2_INTERNAL, 1))
+    r.resp(0, 200)
+    r.op("D", 0, H2E["PEER"], 4096, "")
+    r.close_s(0, rst_sid=1)
+    r.close()
+
+    r = new("8.1 complete response then RST_STREAM NO_ERROR stops the upload (not an error)")
+    r.start([(4, 0)])
+    sid, off, txl = r.req(0, "POST", "/big", [], b"never sent")
+    r.s(r.hdrs(1, [(":status", "413")], EH), h2_data(1, b"too big", ES), h2_rst(1, H2_NO_ERROR))
+    r.resp(0, 413)
+    r.body(0, 1, [(b"too big", None, True)], send=False)
+    r.close_s(0)
+    r.close()
+
+    r = get1("TLS close_notify mid-response -> BRISK_E_IO after the data")
+    r.s(r.hdrs(1, [(":status", "200")], EH), h2_data(1, b"par"))
+    r.resp(0, 200)
+    r.op("D", 0, H2E["IO"], 4096, b"par".hex())
+    r.pend[1] += 3
+    r.close_s(0, rst_sid=1)
+    r.close()
+
+    r = get1("TLS close_notify before the response -> BRISK_E_IO")
+    r.resp(0, 0, rc=H2E["IO"])
+    r.req(1, rc=H2E["IO"])
+    r.close_s(0, rst_sid=1)
+    r.close()
+
+    # ---- ignored input -------------------------------------------------------------------------
+    r = new("ignored: PRIORITY, unknown type 0xfa, unknown flags / settings, PING ACK, R bits")
+    r.start([(0x9, 1), (0xff, 7), (3, 100)])
+    r.req(0)
+    r.s(h2fr(2, 0, 1, h2u32(0) + bytes([16])), h2fr(2, 0, 5, h2u32(3) + bytes([1])),
+        h2fr(0xfa, 0xff, 0, b"unknown payload"), h2fr(0xfa, 0, 1, b""),
+        h2fr(4, 0, 0, h2set((0x9, 0), (0x8, 1))), h2_ping(b"\0" * 8, True),
+        h2_wu(0x80000000, 0x80000001), h2_wu(1, 0x80000005))
+    r.c(H2_SACK)
+    b = r.blk([(":status", "200"), ("server", "x")])
+    r.s(h2fr(1, EH | 0x40 | 0x80 | 0x02, 0x80000001, b))
+    r.s(h2fr(0, 0x02 | 0x40, 0x80000001, b"data"), h2fr(0, ES, 1, b""))
+    r.resp(0, 200, [("server", "x")])
+    r.body(0, 1, [(b"data", None, False), (b"", None, True)], send=False)
+    r.close_s(0)
+    r.close()
+
+    r = new("5.1 frames on a stream we reset: dropped, DATA credited to the connection")
+    r.start()
+    r.req(0, "GET", "/a")
+    r.close_s(0, rst_sid=1)
+    r.req(0, "GET", "/b")
+    r.s(r.hdrs(1, [(":status", "200"), ("x-dyn", "shared-entry")], EH), h2_data(1, bytes(5000)),
+        h2_rst(1, H2_CANCEL), h2_wu(1, 10))
+    r.cpend += 5000
+    r.credit(None, True)
+    r.s(r.hdrs(3, [(":status", "200"), ("x-dyn", "shared-entry")]))  # indexed from the dropped block
+    r.resp(0, 200, [("x-dyn", "shared-entry")])
+    r.close_s(0)
+    r.close()
+
+    r = new("unread data returned to the connection window on stream_close")
+    r.start()
+    r.req(0)
+    r.s(r.hdrs(1, [(":status", "200")], EH), h2_data(1, b"q" * 5000))
+    r.resp(0, 200)
+    r.read1(0, 4096, b"q" * 4096, 4096)
+    r.pend[1] += 4096
+    r.cpend += 4096
+    r.credit(1, False)
+    r.close_s(0, rst_sid=1, unread=904)
+    r.close()
+
+    r = get1("6.7 250 PINGs: every one ACKed in order (tx backpressure, nothing dropped)")
+    for i in range(250):
+        r.s(h2_ping(i.to_bytes(8, "big")))
+        r.c(h2_ping(i.to_bytes(8, "big"), True))
+    r.s(r.hdrs(1, [(":status", "200")]))
+    r.resp(0, 200)
+    r.close_s(0)
+    r.close()
+
+    # ---- connection errors ---------------------------------------------------------------------
+    def cerr(note, frames, code, settings=(), when="R", pre=()):
+        r = new(note)
+        if when == "O":
+            r.s(*frames)
+            r.op("O", H2E["PROTO"])
+            r.conn_err(code)
+            r.close()
+            return r
+        r.start(settings)
+        r.req(0)
+        r.s(*frames)
+        r.resp(0, 0, rc=H2E["PROTO"])
+        r.c(*pre)
+        r.conn_err(code)
+        r.req(1, rc=H2E["PROTO"])
+        r.close_s(0)
+        r.close()
+        return r
+
+    cerr("3.4 server preface is not SETTINGS", [h2_ping(bytes(8))], H2_PROTOCOL, when="O")
+    cerr("3.4 server preface is a SETTINGS ACK", [H2_SACK], H2_PROTOCOL, when="O")
+    cerr("3.4 bad first SETTINGS: ENABLE_PUSH 1", [h2fr(4, 0, 0, h2set((2, 1)))], H2_PROTOCOL, when="O")
+    cerr("4.2 frame length 16385", [h2fr(0xfa, 0, 0, bytes(16385))], H2_FRAME_SIZE)
+    cerr("4.2 DATA of 16385 on a stream", [h2_data(1, bytes(16385))], H2_FRAME_SIZE)
+    for t, name, pl in ((0, "DATA", b"x"), (1, "HEADERS", b"\x88"), (3, "RST_STREAM", h2u32(8)),
+                        (2, "PRIORITY", bytes(5)), (9, "CONTINUATION", b"")):
+        cerr(f"stream 0: {name}", [h2fr(t, EH, 0, pl)], H2_PROTOCOL)
+    for t, name, pl in ((4, "SETTINGS", b""), (6, "PING", bytes(8)), (7, "GOAWAY", bytes(8))):
+        cerr(f"stream 1: {name}", [h2fr(t, 0, 1, pl)], H2_PROTOCOL)
+    cerr("6.5 SETTINGS length 5", [h2fr(4, 0, 0, bytes(5))], H2_FRAME_SIZE)
+    cerr("6.5 SETTINGS ACK with length 6", [h2fr(4, 1, 0, h2set((3, 1)))], H2_FRAME_SIZE)
+    for v in (1, 2):
+        cerr(f"6.5.2 ENABLE_PUSH {v}", [h2fr(4, 0, 0, h2set((2, v)))], H2_PROTOCOL)
+    cerr("6.5.2 INITIAL_WINDOW_SIZE 2^31", [h2fr(4, 0, 0, h2set((4, 1 << 31)))], H2_FLOW)
+    for v in (16383, 1 << 24):
+        cerr(f"6.5.2 MAX_FRAME_SIZE {v}", [h2fr(4, 0, 0, h2set((5, v)))], H2_PROTOCOL)
+    cerr("6.7 PING length 7", [h2fr(6, 0, 0, bytes(7))], H2_FRAME_SIZE)
+    cerr("6.8 GOAWAY length 7", [h2fr(7, 0, 0, bytes(7))], H2_FRAME_SIZE)
+    cerr("6.9 WINDOW_UPDATE length 3", [h2fr(8, 0, 0, bytes(3))], H2_FRAME_SIZE)
+    cerr("6.9 WINDOW_UPDATE increment 0 on stream 0", [h2_wu(0, 0)], H2_PROTOCOL)
+    cerr("6.9.1 connection send window over 2^31-1", [h2_wu(0, 0x7fffffff - 65535 + 1)], H2_FLOW)
+    cerr("6.4 RST_STREAM length 3", [h2fr(3, 0, 1, bytes(3))], H2_FRAME_SIZE)
+    cerr("6.3 PRIORITY length 4", [h2fr(2, 0, 1, bytes(4))], H2_FRAME_SIZE)
+    for t, name, pl in ((0, "DATA", b"x"), (1, "HEADERS", b"\x88"), (3, "RST_STREAM", h2u32(8)),
+                        (8, "WINDOW_UPDATE", h2u32(1))):
+        cerr(f"5.1 idle stream 5: {name}", [h2fr(t, EH, 5, pl)], H2_PROTOCOL)
+        cerr(f"5.1.1 even stream 2: {name}", [h2fr(t, EH, 2, pl)], H2_PROTOCOL)
+    cerr("6.6 PUSH_PROMISE (push disabled)", [h2fr(5, EH, 1, h2u32(2) + b"\x82")], H2_PROTOCOL)
+    # The DATA comes before any response: that stream error (8.1) is judged at the frame header,
+    # the padding (a connection error) at the first payload octet - so a RST precedes the GOAWAY.
+    cerr("6.1 DATA padding = payload length", [h2fr(0, PAD, 1, bytes([5]) + bytes(4))], H2_PROTOCOL,
+         pre=[h2_rst(1, H2_PROTOCOL)])
+    cerr("6.1 DATA PADDED with length 0", [h2fr(0, PAD, 1, b"")], H2_FRAME_SIZE)
+    cerr("6.2 HEADERS padding = remaining length", [h2fr(1, EH | PAD, 1, bytes([2]) + b"\x88")], H2_PROTOCOL)
+    cerr("6.2 HEADERS PRIORITY flag, length 4", [h2fr(1, EH | PRIO, 1, bytes(4))], H2_FRAME_SIZE)
+    cerr("6.10 CONTINUATION without HEADERS", [h2fr(9, EH, 1, b"\x88")], H2_PROTOCOL)
+    cerr("6.10 CONTINUATION on another stream", [h2fr(1, 0, 1, b"\x88"), h2fr(9, EH, 3, b"")], H2_PROTOCOL)
+    cerr("6.2 other frame inside a field block", [h2fr(1, 0, 1, b"\x88"), h2_ping(bytes(8))], H2_PROTOCOL)
+    cerr("5.5 unknown frame inside a field block", [h2fr(1, 0, 1, b"\x88"), h2fr(0xfa, 0, 0, b"")],
+         H2_PROTOCOL)
+    cerr("4.3 field block over 4096 octets", [h2fr(1, 0, 1, bytes(4000)), h2fr(9, EH, 1, bytes(97))],
+         H2_COMPRESSION)
+    cerr("CONTINUATION flood: 33 empty CONTINUATIONs (VU#421644)",
+         [h2fr(1, 0, 1, b"\x88")] + [h2fr(9, 0, 1, b"")] * 33, H2_CALM)
+    cerr("control-frame flood: 1001 PING ACKs without progress (CVE-2019-9512 class)",
+         [h2_ping(bytes(8), True)] * 1001, H2_CALM)
+    cerr("1xx flood: more than 16 interim 103 blocks on a stream (10.5)",
+         [h2fr(1, EH, 1, b"103")] * 17, H2_CALM)
+    cerr("4.3 HPACK garbage -> COMPRESSION_ERROR", [h2fr(1, EH, 1, b"\xff\xff\xff\xff\xff\xff\x7f")],
+         H2_COMPRESSION)
+    cerr("4.3 HPACK index 0 -> COMPRESSION_ERROR", [h2fr(1, EH, 1, b"\x80")], H2_COMPRESSION)
+    cerr("6.9.2 INITIAL_WINDOW_SIZE change overflows an open stream's send window",
+         [h2_wu(1, 0x7fffffff - 65535), h2fr(4, 0, 0, h2set((4, 65536)))], H2_FLOW)
+
+    # ---- stream errors: RST_STREAM on that stream only, stream 3 still completes ----------------
+    def serr(note, frames_fn, code, when="R", rst=True, status=200, fields=(), extra=()):
+        r = new(note)
+        r.start()
+        r.req(0, "GET", "/a")
+        r.req(1, "GET", "/b")
+        frames_fn(r)
+        if when == "R":
+            r.resp(0, 0, rc=H2E["PROTO"])
+        else:
+            r.resp(0, status, list(fields))
+            r.op("D", 0, H2E["PROTO"], 4096, "")
+        if rst:
+            r.c(h2_rst(1, code))
+        r.c(*extra)
+        r.s(r.hdrs(3, [(":status", "200"), ("x-ok", "3")]))
+        r.resp(1, 200, [("x-ok", "3")])
+        r.body(1, 3, [], send=False)
+        r.close_s(0)
+        r.close_s(1)
+        r.close()
+        return r
+
+    def hb(fields, fl=EH | ES):
+        return lambda r: r.s(r.hdrs(1, fields, fl))
+
+    serr("6.9 WINDOW_UPDATE increment 0 on a stream", lambda r: r.s(h2_wu(1, 0)), H2_PROTOCOL)
+    serr("6.9.1 stream send window over 2^31-1", lambda r: r.s(h2_wu(1, 0x7fffffff - 65535 + 1)), H2_FLOW)
+
+    serr("6.9.1 DATA over the stream window -> FLOW_CONTROL_ERROR (credited to the connection)",
+         lambda r: r.s(r.hdrs(1, [(":status", "200")], EH), h2_data(1, bytes(8193))), H2_FLOW,
+         when="D", extra=[h2_wu(0, 8193)])
+    malformed = [
+        ("missing :status", [("content-type", "x")]), ("two :status", [(":status", "200"), (":status", "200")]),
+        (":status '20'", [(":status", "20")]), (":status '600'", [(":status", "600")]),
+        (":status '2x0'", [(":status", "2x0")]),
+        (":method in a response", [(":status", "200"), (":method", "GET")]),
+        ("pseudo after regular", [("server", "x"), (":status", "200")]),
+        ("uppercase name", [(":status", "200"), ("Server", "x")]),
+        ("name with ':'", [(":status", "200"), ("a:b", "x")]), ("name with SP", [(":status", "200"), ("a b", "x")]),
+        ("name with 0x7f", [(":status", "200"), ("a\x7f", "x")]),
+        ("value with CR", [(":status", "200"), ("x", "a\rb")]), ("value with LF", [(":status", "200"), ("x", "a\nb")]),
+        ("value with NUL", [(":status", "200"), ("x", "a\x00b")]), ("value with leading SP", [(":status", "200"), ("x", " a")]),
+        ("connection field", [(":status", "200"), ("connection", "close")]),
+        ("transfer-encoding field", [(":status", "200"), ("transfer-encoding", "chunked")]),
+        ("content-length '12a'", [(":status", "200"), ("content-length", "12a")]),
+        ("conflicting content-length", [(":status", "200"), ("content-length", "5"), ("content-length", "6")]),
+        ("empty content-length", [(":status", "200"), ("content-length", "")]),
+    ]
+    for note, f in malformed:
+        serr(f"8.1.1 malformed response: {note}", hb(f), H2_PROTOCOL)
+    serr("8.1 1xx with END_STREAM", hb([(":status", "100")]), H2_PROTOCOL)
+    # without END_STREAM, so only the 8.6 rule (no 101 in HTTP/2) can reject it
+    serr("8.1.1 malformed response: :status 101 (8.6)", hb([(":status", "101")], EH), H2_PROTOCOL)
+    serr("8.1 DATA before the response HEADERS", lambda r: r.s(h2_data(1, b"early")), H2_PROTOCOL)
+    serr("8.1 HEADERS without END_STREAM after the final response",
+         lambda r: r.s(r.hdrs(1, [(":status", "200")], EH), r.hdrs(1, [("x-t", "1")], EH)), H2_PROTOCOL,
+         when="D")
+    serr("8.1 pseudo-header in trailers",
+         lambda r: r.s(r.hdrs(1, [(":status", "200")], EH), r.hdrs(1, [(":status", "200")])), H2_PROTOCOL,
+         when="D")
+    serr("8.1.1 DATA beyond content-length",
+         lambda r: r.s(r.hdrs(1, [(":status", "200"), ("content-length", "3")], EH), h2_data(1, b"abcd", ES)),
+         H2_PROTOCOL, when="D", fields=[("content-length", "3")])
+    serr("8.1.1 DATA short of content-length at END_STREAM (read fails, not 0)",
+         lambda r: r.s(r.hdrs(1, [(":status", "200"), ("content-length", "5")], EH), h2_data(1, b"abc", ES)),
+         H2_PROTOCOL, when="D", rst=False, fields=[("content-length", "5")])
+
+    def half_closed(kind):
+        r = new(f"5.1 half-closed (remote): {kind} after END_STREAM -> STREAM_CLOSED")
+        r.start([(4, 0)])
+        r.op("Q", 0, H2E["PROTO"], b"POST".hex(), b"/".hex(), "", b"blocked".hex())
+        fields = [(b":method", b"POST", 0), (b":scheme", b"https", 0), (b":authority", r.auth, 0),
+                  (b":path", b"/", 0)]
+        r.c(h2fr(1, EH, 1, py_hpack_encode(fields, False)))
+        r.timeline.append(("req", 1, [(n, v) for n, v, _ in fields], b"blocked"))
+        r.sid = 3
+        r.s(r.hdrs(1, [(":status", "200")]))
+        r.s(h2_data(1, b"late", ES) if kind == "DATA" else r.hdrs(1, [("x", "1")]))
+        r.c(h2_rst(1, H2_STREAM_CLOSED))
+        r.lib = ("skip", "h2 cannot hold a blocked upload open")
+        r.req(0, "GET", "/next")
+        r.s(r.hdrs(3, [(":status", "200")]))
+        r.resp(0, 200)
+        r.close_s(0)
+        r.close()
+
+    half_closed("DATA")
+    half_closed("HEADERS")
+    return rows
+
+
+def h2_fuzz_seeds(rows):
+    """fuzz/fuzz_h2.c input: a selector byte (bits 0-1: split size), then the server stream."""
+    return [(bytes([i & 3]) + bytes.fromhex(r[1]), r[4]) for i, r in enumerate(rows)
+            if len(r[1]) // 2 <= 8000]
+
+
 def main():
     OUT.mkdir(parents=True, exist_ok=True)
     print("fetching + verifying official vectors ...")
@@ -7141,6 +8113,18 @@ def main():
     emit("hpack_fuzz.inc", "struct hpack_fuzz_seed HPACK_FUZZ_SEED", hpack_fuzz_seeds(hblk),
          lambda r: f'{cstr(r[0])}, {note(r[1])}')
 
+    check_rfc9113_preface()
+    h2r = h2_rows()
+    h2_lib_check(h2r)
+    h2rows = [r.row() for r in h2r]
+    emit("h2.inc", "struct h2_kat H2_KAT", h2rows,
+         lambda r: f'"{cesc(r[0])}", {cstr(r[1])}, {cstr(r[2])}, {cstr(r[3])}, {note(r[4])}')
+    with open(OUT / "h2.inc", "a", newline="\n") as fh:
+        fh.write(f"#define H2_KAT_W {H2_W}\n#define H2_KAT_MAX {H2_MAXS}\n"
+                 f"static const char H2_KAT_PREFACE[] = {cstr(H2_PREFACE.hex())};\n")
+    emit("h2_fuzz.inc", "struct h2_fuzz_seed H2_FUZZ_SEED", h2_fuzz_seeds(h2rows),
+         lambda r: f'{cstr(r[0].hex())}, {note(r[1])}')
+
     rows = "\n".join(f"| {k} | {u} | `{h}` |" for k, (u, h) in sorted(fetched.items()))
     (OUT / "SOURCES.md").write_text(
         "# Known-answer vector sources\n\n"
@@ -7330,6 +8314,15 @@ def main():
         "  table and the Huffman code are parsed out of Appendices A and B, the code is asserted\n"
         "  canonical, and both are compared to the tables compiled into src/http/.\n"
         "  summerwind/h2spec's hpack group is left for M4 line 3 (interop).\n\n"
+        "- **HTTP/2 (RFC 9113) has no byte-level test vectors** at all. `h2.inc` rows are\n"
+        "  scenarios generated here: a server byte stream built frame by frame from RFC 9113\n"
+        "  sect 4-6 (header blocks by an indexing + Huffman Python encoder, each read back by the\n"
+        "  independent Python HPACK decoder), the brisk_h2_* calls with their required results,\n"
+        "  and the exact client bytes. The 3.4 preface is checked against the RFC text. When the\n"
+        "  python-hyper `h2` package is installed, every row is replayed through an h2 client and\n"
+        "  must be accepted / rejected exactly as by brisk (generation time only). The invalid\n"
+        "  rows follow summerwind/h2spec's case list and the Netflix 2019-002 / CERT VU#421644\n"
+        "  flood classes; nothing is copied from either.\n\n"
         "## x509-limbo skip tally\n\n"
         f"limbo.json carries {len(x509_limbo) + sum(x509_limbo_skipped.values())} testcases and this "
         f"library exercises {len(x509_limbo)} of them.\n"

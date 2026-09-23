@@ -1992,6 +1992,7 @@ struct brisk_conn {
     uint16_t alpn_len;
     char host[256]; /* NUL-terminated copy of the caller's host */
     size_t host_len;
+    uint16_t port; /* brisk_connect's port (0 = unknown: sans-I/O / test fd) - the h2 :authority */
     int64_t now_ms; /* wall clock: ticket age / stamp; auth.now holds the same in seconds */
     int64_t ch1_ms; /* now_ms when CH1 was built: CH2 re-imports its PSK at that time (4.2.2) */
     /* blocking layer (src/os/linux_net.c) only; fd = -1 and the rest 0 for sans-I/O */
@@ -2091,6 +2092,84 @@ void brisk__hpack_enc_peer_max(brisk__hpack_enc *e, uint32_t v);
  * never Huffman-encodes (RFC 7541 7.1: no compression-oracle surface) - keep it that way. */
 int brisk__hpack_encode(brisk__hpack_enc *e, const brisk__hpack_field *f, size_t n, uint8_t *out,
                         size_t cap, size_t *out_len);
+/* RFC 9113 8.2.1: 1 if the field may appear in a well-formed message (name non-empty, no octet
+ * 0x00-0x20 / 0x41-0x5a / 0x7f-0xff, ':' only first; value without NUL / LF / CR and without
+ * leading or trailing SP / HTAB), else 0. Shared by the encoder and the h2 receive side. */
+int brisk__hpack_field_ok(const uint8_t *name, size_t nl, const uint8_t *value, size_t vl);
+
+/* ---- http/h2.c: HTTP/2 frames, streams, flow control (RFC 9113) -------------------------------
+ * A pure core (brisk__h2_feed / brisk__h2_pull: frames in, frames out, no I/O) under a thin
+ * blocking layer (the public brisk_h2_*) that moves bytes through the two transport callbacks:
+ * brisk_read / brisk_write in production (brisk_h2_open, os/linux_net.c), a fake in the tests. */
+#    define BRISK__H2_MAX_LIST 4096 /* our SETTINGS_MAX_HEADER_LIST_SIZE = block buffer = scratch */
+#    define BRISK__H2_TX       4096 /* outbound frames (control + HEADERS/CONTINUATION/DATA) */
+#    define BRISK__H2_RX       1024 /* staging for the transport's reads, fed frame by frame */
+
+/* Same contracts as brisk_read / brisk_write (io = the brisk_conn). */
+typedef int (*brisk__h2_rd_fn)(void *io, void *buf, size_t cap);
+typedef int (*brisk__h2_wr_fn)(void *io, const void *buf, size_t len);
+
+struct brisk_h2_stream {
+    struct brisk_h2 *h;
+    uint8_t *ring;          /* BRISK_H2_STREAM_WINDOW + BRISK__H2_MAX_LIST octets: the parked
+                             * response fields [u16 nl][u16 vl][name][value]..., then DATA */
+    uint32_t id;            /* 0 = free slot */
+    int err;                /* this stream's error (BRISK_E_*), 0 = none */
+    int32_t swin, rwin;     /* send window (6.9.1, may go negative 6.9.2) / receive window left */
+    uint32_t pend;          /* receive credit owed (consumed or padding), not yet WINDOW_UPDATEd */
+    uint32_t rhead, rlen;   /* ring: oldest byte, bytes in use */
+    uint32_t hdr, ready;    /* parked field bytes at the front; DATA bytes of completed frames */
+    uint64_t cl, got;       /* content-length (8.1.1) and DATA octets received */
+    uint16_t status;
+    uint8_t flags;          /* H2S_* in h2.c */
+    uint8_t n1xx;           /* interim (1xx) responses seen, capped (RFC 9113 10.5) */
+};
+
+struct brisk_h2 {
+    uint8_t *mem; /* the caller's whole arena (wiped by brisk_h2_close) */
+    size_t mem_len;
+    brisk__h2_rd_fn rd;
+    brisk__h2_wr_fn wr;
+    void *io;
+    brisk__hpack_dec dec;
+    brisk__hpack_enc enc;
+    uint8_t *blk, *scratch, *tx, *rx;
+    size_t blk_len, tx_len, rx_off, rx_len;
+    int err;                  /* sticky: connection error (GOAWAY sent) or failed write */
+    int eof;                  /* transport ended (brisk_read 0 / error): open streams fail */
+    int32_t cwin, crwin;      /* connection send / receive windows */
+    uint32_t cpend;           /* connection receive credit owed */
+    uint32_t next_id;         /* next client stream id (odd; > 2^31-1 = exhausted) */
+    uint32_t last_id;         /* lowest GOAWAY last_stream_id seen */
+    uint32_t p_conc, p_frame, p_list, p_win; /* the server's SETTINGS (6.5.2) */
+    uint32_t idle;            /* frames without progress in this call (flood guard) */
+    uint32_t f_len, f_pos, f_end, f_sid, f_dat; /* frame being parsed; f_dat = DATA ringed */
+    struct brisk_h2_stream *f_s; /* DATA target (NULL = discard) */
+    struct brisk_h2_stream *b_s; /* field block target (NULL = decode only) */
+    uint32_t b_sid, b_pre;
+    uint64_t b_cl;
+    uint16_t b_status, auth_len;
+    uint8_t fh[9], fh_n, f_type, f_flags, f_pfx, pad, pb[8], set_n;
+    uint8_t in_blk, b_es, b_cont, b_trailer, b_bad, b_seen, b_reg, b_park, b_has_cl;
+    uint8_t got_settings, goaway, goaway_err;
+    char auth[264];           /* :authority */
+    struct brisk_h2_stream s[BRISK_H2_MAX_STREAMS];
+};
+
+/* Lay the handle out in mem (any alignment, mem_len >= brisk_h2_size()) and queue the preface,
+ * our SETTINGS and (when needed) a connection WINDOW_UPDATE; no I/O. authority = the :authority
+ * value (1..255 octets, already bracketed / port-suffixed). BRISK_E_ARG on bad arguments. */
+int brisk__h2_setup(void *mem, size_t mem_len, const char *authority, size_t auth_len,
+                    brisk__h2_rd_fn rd, brisk__h2_wr_fn wr, void *io, brisk_h2 **out);
+/* Blocking: flush, then read and process frames until the server's SETTINGS (RFC 9113 3.4). */
+int brisk__h2_start(brisk_h2 *h);
+/* The pure core: consume server bytes in any split, at most ONE frame per call (so the blocking
+ * layer can stop exactly when its condition holds). *used < len: call again; *used == 0 with
+ * BRISK_OK = the tx queue is full, brisk__h2_pull first. BRISK_OK, or the sticky BRISK_E_PROTO
+ * (a GOAWAY is queued) / BRISK_E_ARG (internal fault). */
+int brisk__h2_feed(brisk_h2 *h, const uint8_t *in, size_t len, size_t *used);
+/* Queued outbound bytes, whole frames only, into out[0..cap); returns the count (0 = none). */
+size_t brisk__h2_pull(brisk_h2 *h, uint8_t *out, size_t cap);
 #endif /* BRISK_ENABLE_H2 */
 
 /* ---- os/linux_net.c (Linux builds only): clocks and TCP -------------------------------------- */

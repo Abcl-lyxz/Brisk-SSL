@@ -34,6 +34,7 @@ void test_rand(void);       /* Linux only */
 void test_conn(void);       /* the public connection API, sans-I/O (src/tls/conn.c) */
 void test_sock(void);       /* Linux only: the blocking API over loopback TCP */
 void test_hpack(void);      /* HPACK (RFC 7541); a no-op stub when BRISK_ENABLE_H2 is 0 */
+void test_h2(void);         /* HTTP/2 frames + brisk_h2_* (RFC 9113); same stub rule */
 
 /* test_conn.c -> test_sock.c: the P-256 fixture flow as a server byte stream */
 typedef struct {

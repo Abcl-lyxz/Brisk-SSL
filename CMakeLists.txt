@@ -38,6 +38,7 @@ add_library(brisk STATIC
     src/tls/conn.c        # the public connection (brisk_conn): sans-I/O glue over hs + record
     src/http/huffman.c    # HPACK/QPACK prefixed integer + Huffman decode (empty TU without H2)
     src/http/hpack.c      # HPACK (RFC 7541) decoder + encoder (empty TU without BRISK_ENABLE_H2)
+    src/http/h2.c         # HTTP/2 frames, streams, flow control, brisk_h2_* (same rule)
 )
 if(CMAKE_SYSTEM_NAME STREQUAL "Linux") # src/os/ is Linux-only; the mingw host skips it
     target_sources(brisk PRIVATE src/os/linux_rand.c src/os/linux_ca.c src/os/linux_net.c)
@@ -77,7 +78,7 @@ if(BRISK_BUILD_TESTS)
                                tests/test_rsa.c tests/test_der.c tests/test_x509.c
                                tests/test_ct.c tests/test_tls13_ks.c
                                tests/test_tls13_hs.c tests/test_tls13_rec.c tests/test_conn.c
-                               tests/test_hpack.c)
+                               tests/test_hpack.c tests/test_h2.c)
     set_target_properties(brisk_tests PROPERTIES C_STANDARD 99 C_EXTENSIONS OFF)
     target_link_libraries(brisk_tests PRIVATE brisk)
     target_include_directories(brisk_tests PRIVATE src tests)
@@ -119,6 +120,8 @@ if(BRISK_BUILD_TESTS)
     set_tests_properties(conn PROPERTIES TIMEOUT 900)
     add_test(NAME hpack COMMAND brisk_tests hpack)
     set_tests_properties(hpack PROPERTIES TIMEOUT 900)
+    add_test(NAME h2 COMMAND brisk_tests h2)
+    set_tests_properties(h2 PROPERTIES TIMEOUT 900)
     if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
         target_sources(brisk_tests PRIVATE tests/test_rand.c tests/test_sock.c)
         # fault injection for src/os/linux_rand.c (getrandom, /dev/random wait, kernel version)

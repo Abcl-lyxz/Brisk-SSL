@@ -96,10 +96,20 @@ Tick a box only when the work is green on **every** arch (`python tools/dev.py t
     indexing, never Huffman, never indexes (7.1). RFC 9113 8.2.1 receive-side field checks are
     owed by line 2 (in the decode callback). Vectors: RFC 7541 App. C + hpack-test-case
     (8 encoders) + generated invalid rows; fuzz target `hpack`.
-- [ ] Frames, streams, flow control, SETTINGS, PING, GOAWAY; `brisk_h2_*`
-  - The HPACK encoder checks RFC 9113 8.2.1 only: the request builder must refuse pseudo-headers
-    other than :method :scheme :authority :path :protocol (8.3). QPACK (M7) must prefix its
-    static helpers (qp_*) - hpack.c's generic names (insert, put_int, ...) clash when amalgamated.
+- [x] Frames, streams, flow control, SETTINGS, PING, GOAWAY; `brisk_h2_*`
+  - `src/http/h2.c`: pure core `brisk__h2_feed` (one frame per call) / `brisk__h2_pull` under a
+    thin blocking layer (`brisk_h2_open/request/response/read/stream_close/close`; open lives in
+    `src/os/linux_net.c`, everything else links on the mingw host). Caller memory
+    `brisk_h2_size()` (~66 KB default); knobs `BRISK_H2_MAX_STREAMS` (4) and
+    `BRISK_H2_STREAM_WINDOW` (8192, proposed - needs user sign-off). New `BRISK_E_RETRY` (8.7;
+    proposed). `brisk_conn.port` feeds `:authority`. Request builder refuses every ':' name,
+    uppercase, connection-specific fields, host, te != trailers (8.2/8.3). Flood guards:
+    32 CONTINUATION per block, 1000 frames without progress per call.
+  - Vectors: `h2.inc` scenario rows (kat.py, cross-checked against python-hyper h2 when
+    installed; 26 documented deviations), replayed at many splits + timeouts; fuzz target `h2`.
+  - QPACK (M7) must prefix its static helpers (qp_*) - hpack.c's generic names (insert,
+    put_int, ...) clash when amalgamated; h2.c uses h2_*.
+  - Before commit: rfc-auditor pass (not yet run).
 - [ ] Interop: nginx, h2o, nghttpd
 
 ## M5 TLS 1.2 client

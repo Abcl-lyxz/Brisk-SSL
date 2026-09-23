@@ -57,7 +57,10 @@ enum {
                               * internal_error may be transient, handshake_failure or
                               * bad_certificate are not. A close_notify or user_canceled that
                               * arrives BEFORE the handshake completed is reported here too
-                              * (never as a clean end of data: nothing was authenticated yet). */
+                              * (never as a clean end of data: nothing was authenticated yet).
+                              * brisk_h2_*: the HTTP/2 server reset the stream (RST_STREAM with a
+                              * code other than NO_ERROR / REFUSED_STREAM) or ended the connection
+                              * with a GOAWAY carrying an error code. */
     BRISK_E_IO = -6,         /* the network failed (blocking API only): DNS, socket or connect
                               * error, a send/recv error, the peer's TCP FIN before its
                               * close_notify (a truncation, RFC 9846 6.1 - never reported as a clean
@@ -69,9 +72,13 @@ enum {
                               * half-sent record may be on the wire, so the connection only
                               * accepts brisk_close, and later brisk_read / brisk_write calls
                               * return BRISK_E_IO. */
-    BRISK_E_WANT = -8        /* sans-I/O only, and not a failure: "feed me more bytes first" -
+    BRISK_E_WANT = -8,       /* sans-I/O only, and not a failure: "feed me more bytes first" -
                               * brisk_status while the handshake is still running, brisk_app_read
                               * when no application data has arrived yet. */
+    BRISK_E_RETRY = -9       /* HTTP/2 only: the server guaranteed it did NOT process this request
+                              * (RFC 9113 8.7: RST_STREAM REFUSED_STREAM, a stream above a GOAWAY's
+                              * last stream id, or a request made after a GOAWAY). Safe to retry on
+                              * a NEW connection, even a POST. */
 };
 
 /* Library version, e.g. "0.1.0-dev". */
@@ -366,6 +373,108 @@ BRISK_API int brisk_resumed(const brisk_conn *c);
  * brisk_conn_init is all zero again (bar bytes it held before init that alignment skipped) and
  * may be freed or reused. NULL-safe. Closes nothing. */
 BRISK_API void brisk_conn_wipe(brisk_conn *c);
+
+
+/* ------------------------------------------------------------------------------------------------
+ * HTTP/2 client (RFC 9113), BRISK_ENABLE_H2 (DEFAULT / FULL). Declared in every profile; a build
+ * without it simply has no brisk_h2_* symbols.
+ *
+ * An optional module you call explicitly over a connected brisk_conn whose ALPN you chose
+ * (cfg.alpn = "h2" or "h2,http/1.1") and the server selected: brisk_alpn() must say exactly "h2".
+ * Nothing switches protocols for you. Blocking, single-threaded, no malloc: all state lives in
+ * the brisk_h2_size() bytes you pass to brisk_h2_open. Typical use:
+ *   brisk_connect(&cfg, "api.example.com", 443, &c);
+ *   brisk_h2_open(c, mem, sizeof mem, &h);
+ *   brisk_h2_request(h, "GET", "/v1/status", hdrs, 1, NULL, 0, &s);
+ *   brisk_h2_response(s, &status, on_header, ctx);
+ *   while ((n = brisk_h2_read(s, buf, sizeof buf)) > 0) { ... }   (0 = complete, < 0 = error)
+ *   brisk_h2_stream_close(s); brisk_h2_close(h); brisk_close(c);
+ *
+ * Up to BRISK_H2_MAX_STREAMS requests (and never more than the server's
+ * SETTINGS_MAX_CONCURRENT_STREAMS) may be open at once; reading one stream buffers the others'
+ * headers and data (up to BRISK_H2_STREAM_WINDOW bytes each - the flow-control window this client
+ * advertises, so nothing is ever dropped). A slot is held until brisk_h2_stream_close.
+ *
+ * ERRORS. A connection-level protocol violation by the server sends GOAWAY and makes every later
+ * call on the handle and all its streams return BRISK_E_PROTO. A malformed response (RFC 9113
+ * 8.1.1: bad :status, uppercase or connection-specific fields, content-length that does not match
+ * the DATA...) resets only that stream: its calls return BRISK_E_PROTO, the others continue.
+ * BRISK_E_RETRY: see the error list. BRISK_E_PEER_ALERT: the server reset the stream or sent
+ * GOAWAY with an error. BRISK_E_IO: the TLS connection ended (close_notify or failure) before the
+ * stream completed. BRISK_E_TIMEOUT from brisk_h2_response / brisk_h2_read is harmless (call
+ * again); from brisk_h2_request it cancels that request (RST_STREAM). A failed write is final for
+ * the whole handle. BRISK_E_ARG is always a caller mistake (or a local limit named below).
+ *
+ * LIMITS (documented deviations): a response header section is limited to 4096 octets (our
+ * SETTINGS_MAX_HEADER_LIST_SIZE; a larger one is a connection error, COMPRESSION_ERROR); one
+ * request header field (name + value) must stay under 4080 octets; interim 1xx responses and
+ * trailers are validated and discarded; frames for a stream you already closed are ignored.
+ * Server push is disabled (SETTINGS_ENABLE_PUSH = 0), priority signals are ignored, CONNECT and
+ * extended CONNECT are not supported. brisk_h2_open is Linux-only (blocking brisk_conn).
+ */
+typedef struct brisk_h2 brisk_h2;               /* opaque, lives in the caller's memory */
+typedef struct brisk_h2_stream brisk_h2_stream; /* opaque, a slot inside that memory */
+
+typedef struct {
+    const char *name;  /* lowercase field name, NUL-terminated; no pseudo-headers (":...") */
+    const char *value; /* NUL-terminated; no CR / LF, no leading or trailing SP / HTAB */
+} brisk_h2_header;
+
+/* Called once per response header field (never for :status), synchronously from
+ * brisk_h2_response, in the order the server sent them. name / value are NUL-terminated copies
+ * valid only during the call. It must not call any brisk_h2_* function. */
+typedef void (*brisk_h2_header_fn)(void *ctx, const char *name, size_t name_len, const char *value,
+                                   size_t value_len);
+
+/* Bytes of memory brisk_h2_open needs (any alignment). About 66 KB with the defaults
+ * (4 streams x (8 KB window + 4 KB headers) + 17 KB of frame, HPACK and I/O buffers). */
+BRISK_API size_t brisk_h2_size(void);
+
+/* Start HTTP/2 on c (from brisk_connect, whose ALPN answer is "h2"): send the connection preface
+ * and our SETTINGS, then wait for the server's SETTINGS. mem[0..mem_len) must stay valid until
+ * brisk_h2_close. BRISK_OK and *out, else *out = NULL and: BRISK_E_ARG (NULL / short mem, a
+ * sans-I/O connection, ALPN not "h2"), brisk_read / brisk_write errors, BRISK_E_PROTO (the server
+ * preface is not a valid SETTINGS frame). The :authority of every request is the host c was
+ * opened with (IPv6 literals in brackets, ":port" appended when it is not 443). Linux only. */
+BRISK_API int brisk_h2_open(brisk_conn *c, void *mem, size_t mem_len, brisk_h2 **out);
+
+/* Send one request: :method = method (a token; CONNECT is refused), :scheme https, :authority,
+ * :path = path ("/..." or "*" for OPTIONS), then hdrs[0..n) in order, then body[0..body_len)
+ * with flow control (END_STREAM on the last frame; on the HEADERS when body_len is 0). Returns
+ * once everything is sent, reading server frames meanwhile when a flow-control window is shut.
+ * BRISK_OK and *out, else *out = NULL and:
+ *   BRISK_E_ARG   bad method / path / header (uppercase or invalid octets, any ":" name, "host",
+ *                 connection / keep-alive / proxy-connection / transfer-encoding / upgrade, "te"
+ *                 other than "trailers", content-length != body_len), a header section larger
+ *                 than the server's SETTINGS_MAX_HEADER_LIST_SIZE, all streams held (at most
+ *                 BRISK_H2_MAX_STREAMS and the server's limit - close one first), or stream ids
+ *                 exhausted (2^31: open a new connection);
+ *   BRISK_E_RETRY the server sent GOAWAY (or refused this stream): retry on a new connection;
+ *   others        as listed above.
+ * authorization / proxy-authorization / cookie / set-cookie are sent never-indexed (RFC 7541
+ * 7.1.3). The server may answer before the upload ends: a complete response followed by
+ * RST_STREAM NO_ERROR stops the upload and is still a success (RFC 9113 8.1). */
+BRISK_API int brisk_h2_request(brisk_h2 *h, const char *method, const char *path,
+                               const brisk_h2_header *hdrs, size_t n, const void *body,
+                               size_t body_len, brisk_h2_stream **out);
+
+/* Wait for the final response HEADERS of s (1xx interim responses are skipped): *status is the
+ * :status (200..599), each header field goes to fn(ctx, ...) (fn may be NULL). Once per stream;
+ * a second call is BRISK_E_ARG. BRISK_OK, or < 0 as described above. */
+BRISK_API int brisk_h2_response(brisk_h2_stream *s, int *status, brisk_h2_header_fn fn, void *ctx);
+
+/* Response content after brisk_h2_response: > 0 bytes (at most min(cap, INT_MAX)), 0 = the
+ * stream ended and matched any content-length, or < 0. BRISK_E_ARG before brisk_h2_response
+ * succeeded, for cap 0, or for a closed stream handle. Trailers are discarded. */
+BRISK_API int brisk_h2_read(brisk_h2_stream *s, void *buf, size_t cap);
+
+/* Release the stream's slot: RST_STREAM CANCEL when either direction is still open, unread data
+ * dropped (its flow-control credit returned). The handle is invalid afterwards. NULL-safe. */
+BRISK_API void brisk_h2_stream_close(brisk_h2_stream *s);
+
+/* Send GOAWAY (NO_ERROR, best effort) and wipe all of mem. Does NOT close the brisk_conn: call
+ * brisk_close yourself. Every stream handle becomes invalid. NULL-safe. */
+BRISK_API void brisk_h2_close(brisk_h2 *h);
 
 #ifdef __cplusplus
 }

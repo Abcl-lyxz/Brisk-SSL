@@ -362,6 +362,7 @@ static int net_connect(const brisk_cfg *cfg, const char *host, int fd, const uin
     c->fixed_now = (uint8_t)(now_ms >= 0);
     c->timeout_ms = cfg->timeout_ms != 0 ? cfg->timeout_ms : NET_TIMEOUT_DEFAULT;
     c->fd = fd;
+    c->port = port;
     if (fd < 0) {
         rc = net_open(host, port, c->timeout_ms, &c->fd, &deadline);
     } else {
@@ -486,6 +487,73 @@ void brisk_close(brisk_conn *c)
     }
     net_free(c);
 }
+
+#if BRISK_ENABLE_H2
+/* brisk_h2's transport: the blocking TLS stream (h2.c stays free of OS symbols). */
+static int net_h2_rd(void *io, void *buf, size_t cap)
+{
+    return brisk_read((brisk_conn *)io, buf, cap);
+}
+
+static int net_h2_wr(void *io, const void *buf, size_t len)
+{
+    return brisk_write((brisk_conn *)io, buf, len);
+}
+
+int brisk_h2_open(brisk_conn *c, void *mem, size_t mem_len, brisk_h2 **out)
+{
+    char auth[264];
+    const char *alpn;
+    size_t alen, n = 0;
+    uint16_t port;
+    brisk_h2 *h;
+    int rc;
+
+    if (out != NULL) {
+        *out = NULL;
+    }
+    if (c == NULL || mem == NULL || out == NULL || c->heap == NULL) {
+        return BRISK_E_ARG; /* a sans-I/O connection has no brisk_read to block in */
+    }
+    /* RFC 9113 3.2: h2 over TLS only where ALPN selected "h2" - no protocol switching here */
+    if (brisk_alpn(c, &alpn, &alen) != BRISK_OK || alen != 2 || memcmp(alpn, "h2", 2) != 0) {
+        return BRISK_E_ARG;
+    }
+    /* RFC 9113 8.3.1 / RFC 3986 3.2.2: :authority = host, an IPv6 literal in brackets, plus
+     * ":port" unless it is the https default */
+    if (memchr(c->host, ':', c->host_len) != NULL) {
+        auth[n++] = '[';
+    }
+    memcpy(auth + n, c->host, c->host_len);
+    n += c->host_len;
+    if (auth[0] == '[') {
+        auth[n++] = ']';
+    }
+    port = c->port;
+    if (port != 0 && port != 443) {
+        char d[5];
+        size_t k = 0;
+        do {
+            d[k++] = (char)('0' + port % 10);
+            port = (uint16_t)(port / 10);
+        } while (port != 0);
+        auth[n++] = ':';
+        while (k != 0) {
+            auth[n++] = d[--k];
+        }
+    }
+    rc = brisk__h2_setup(mem, mem_len, auth, n, net_h2_rd, net_h2_wr, c, &h);
+    if (rc == BRISK_OK) {
+        rc = brisk__h2_start(h);
+        if (rc != BRISK_OK) {
+            brisk_h2_close(h); /* GOAWAY best effort (a PROTOCOL_ERROR one is already queued) */
+            return rc;
+        }
+        *out = h;
+    }
+    return rc;
+}
+#endif
 
 #undef NET_TIMEOUT_DEFAULT
 #undef NET_CLOSE_WAIT
