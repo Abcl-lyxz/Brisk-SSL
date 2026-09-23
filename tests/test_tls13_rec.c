@@ -23,14 +23,37 @@ struct tls13_flow_kat {
     const char *priv2, *ch2, *cookie;
     const char *sh, *ee, *cr, *cert, *cv, *sf, *cf;
     const char *s_hs, *c_hs, *s_ap, *c_ap, *exp_ms, *res_ms, *tbs;
+    const char *psk;
+    unsigned psk_suite;
+    int resumed;
+    const char *alpn, *cchain, *ckey, *srand;
 };
 struct tls13_rfc_kat {
-    const char *hrr, *down1, *down0, *cv_th, *cv_content;
+    const char *hrr, *down1, *down0, *cv_th, *cv_content, *cv_client;
 };
 struct tls13_chw_kat {
     const char *random, *sid, *suites, *groups, *sigs, *sni;
     unsigned share_group;
     const char *share_pub, *cookie, *ch;
+    const char *alpn;
+    int psk_modes;
+    const char *identity;
+    unsigned obf_age;
+    int psk_len;
+};
+struct tls13_psk_kat {
+    const char *nst, *psk, *prefix, *binder_hash, *binder, *ch4, *early, *blob;
+    long long issued, now;
+    unsigned obf_age;
+    const char *ticket, *fresh;
+    unsigned lifetime, age_add;
+};
+struct tls13_mtls_kat {
+    const char *note, *chain, *key;
+    int ok;
+};
+struct tls13_der_kat {
+    const char *raw, *der, *note;
 };
 struct tls13_mut_kat {
     int flow, msg;
@@ -62,6 +85,7 @@ struct tls13_hsmsg_kat {
 #include "kat/tls13_trace.inc"
 #include "kat/tls13_mut.inc"
 #include "kat/tls13_record.inc"
+#include "kat/tls13_psk.inc"
 
 #define NREC   (sizeof TLS13_REC_KAT / sizeof TLS13_REC_KAT[0])
 #define NHS    (sizeof TLS13_HSMSG_KAT / sizeof TLS13_HSMSG_KAT[0])
@@ -497,6 +521,9 @@ static void conn_trace3(void)
         CHECKI(C.tk.nonce_len == n && memcmp(C.tk_nonce, pl, n) == 0, o);
         pl = dec(h->ticket, &n);
         CHECKI(C.tk.ticket_len == n && memcmp(C.tk_ticket, pl, n) == 0, o);
+        /* 4.7.1: the resumption PSK the callback saw is RFC 8448 sect 4's */
+        pl = dec(TLS13_PSK_KAT[0].psk, &n);
+        CHECKI(C.tk.psk_len == n && C.tk.suite == 0x1301 && memcmp(C.tk.psk, pl, n) == 0, o);
         /* application data, both ways */
         pl = dec(rrow("8448s3 client 2")->payload, &pl_len);
         CHECKI(brisk__tls13_conn_write(&C.c, pl, pl_len, &used, out2 + OFF[o], sizeof out2 - 8,
@@ -820,8 +847,7 @@ static void conn_alerts(void)
           brisk__tls13_conn_close(&C.c) == BRISK_OK);
     CHECK(brisk__tls13_conn_pull(&C.c, wire, sizeof wire) != 0 && C.c.close == 2);
     CHECK(feed_row("mut tag last") == BRISK_E_AUTH && C.c.alert == BRISK__ALERT_BAD_RECORD_MAC);
-    CHECK(brisk__tls13_conn_pull(&C.c, wire, sizeof wire) == 0 &&
-          all_zero(&C.c.wr, sizeof C.c.wr));
+    CHECK(brisk__tls13_conn_pull(&C.c, wire, sizeof wire) == 0 && all_zero(&C.c.wr, sizeof C.c.wr));
     /* ... and application data there too */
     CHECK(connect3(0) == 0);
     srv_key("8448s3 server 2");
@@ -1129,6 +1155,8 @@ static void conn_guards(void)
 
 void test_tls13_rec(void)
 {
+    (void)TLS13_MTLS_KAT; /* tls13_psk.inc is shared with test_tls13_hs.c */
+    (void)TLS13_DER_KAT;
     g_scratch_len = brisk__tls13_hs_scratch_size();
     g_scratch = (uint8_t *)malloc(g_scratch_len);
     g_in = (uint8_t *)malloc(CAP + 8);

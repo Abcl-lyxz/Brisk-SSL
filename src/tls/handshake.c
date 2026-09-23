@@ -38,9 +38,11 @@ enum {
     EXT_SERVER_NAME = 0,
     EXT_SUPPORTED_GROUPS = 10,
     EXT_SIGNATURE_ALGORITHMS = 13,
+    EXT_ALPN = 16,
     EXT_PADDING = 21,
     EXT_RECORD_SIZE_LIMIT = 28,
     EXT_SESSION_TICKET = 35,
+    EXT_PSK = 41,
     EXT_EARLY_DATA = 42,
     EXT_SUPPORTED_VERSIONS = 43,
     EXT_COOKIE = 44,
@@ -97,10 +99,13 @@ static const struct {
  * because the engine would otherwise accept a server answer it never checks. The RFC 8448
  * ClientHellos need session_ticket, renegotiation_info, psk_key_exchange_modes, padding and
  * record_size_limit; the server may echo only the last one (EE, range-checked and kept in
- * peer_rsl). ALPN stays out until its answer is checked against the offer (M3 line 3). */
+ * peer_rsl), ALPN (EE, checked against the offer) and pre_shared_key (SH, 4.3.11). early_data is
+ * never allowed: no 0-RTT (docs/ARCHITECTURE.md). */
 static const uint16_t CH_ALLOWED[] = {EXT_SERVER_NAME,
                                       EXT_SUPPORTED_GROUPS,
                                       EXT_SIGNATURE_ALGORITHMS,
+                                      EXT_ALPN,
+                                      EXT_PSK,
                                       EXT_PADDING,
                                       EXT_RECORD_SIZE_LIMIT,
                                       EXT_SESSION_TICKET,
@@ -285,6 +290,7 @@ static void hs_wipe_secrets(brisk__tls13_hs *hs)
     brisk__secure_zero(hs->c_hs, sizeof hs->c_hs);
     brisk__secure_zero(hs->s_hs, sizeof hs->s_hs);
     brisk__secure_zero(hs->ks.secret, sizeof hs->ks.secret);
+    brisk__secure_zero(hs->psk, sizeof hs->psk);
 }
 
 static int hs_fail(brisk__tls13_hs *hs, uint8_t alert)
@@ -292,6 +298,7 @@ static int hs_fail(brisk__tls13_hs *hs, uint8_t alert)
     hs_wipe_secrets(hs);
     brisk__secure_zero(hs->exp_ms, sizeof hs->exp_ms);
     brisk__secure_zero(hs->res_ms, sizeof hs->res_ms);
+    brisk__secure_zero(hs->out, BRISK__TLS13_OUT_MAX); /* the queued CH / client flight */
     hs->out_len = hs->out_off = hs->out_split = 0;
     hs->n_certs = 0;
     hs->state = BRISK__HS_FAILED;
@@ -309,17 +316,27 @@ static int hs_fail(brisk__tls13_hs *hs, uint8_t alert)
 
 /* Queue a message for pull() and add it to the transcript. Epochs only move forward, so the
  * queue is one INITIAL run [0, out_split) followed by one HANDSHAKE run [out_split, out_len). */
-static int hs_queue(brisk__tls13_hs *hs, unsigned epoch, const uint8_t *m, size_t n)
+static uint8_t *hs_reserve(brisk__tls13_hs *hs, unsigned epoch, size_t n)
 {
+    uint8_t *p = hs->out + hs->out_len;
     if (n > BRISK__TLS13_OUT_MAX - hs->out_len) {
-        return 0;
+        return NULL;
     }
-    memcpy(hs->out + hs->out_len, m, n);
     hs->out_len += n;
     if (epoch == BRISK__EPOCH_INITIAL) {
         hs->out_split = hs->out_len;
     }
-    th_add(hs, m, n);
+    return p;
+}
+
+static int hs_queue(brisk__tls13_hs *hs, unsigned epoch, const uint8_t *m, size_t n)
+{
+    uint8_t *p = hs_reserve(hs, epoch, n);
+    if (p == NULL) {
+        return 0;
+    }
+    memcpy(p, m, n);
+    th_add(hs, p, n);
     return 1;
 }
 
@@ -400,7 +417,7 @@ static int hs_on_sh(brisk__tls13_hs *hs, const uint8_t *m, size_t n)
     const uint8_t *b = m + 4, *ext, *d, *sid;
     size_t bl = n - 4, sid_len, ext_len, dl, i;
     uint16_t suite, group;
-    int is_hrr, rc;
+    int is_hrr, rc, psk;
     uint8_t alert;
 
     /* legacy_version(2) random(32) session_id<0..32> cipher_suite(2) compression(1)
@@ -470,10 +487,22 @@ static int hs_on_sh(brisk__tls13_hs *hs, const uint8_t *m, size_t n)
         return hs_on_hrr(hs, m, n, ext, ext_len, suite);
     }
 
+    /* 4.3.11: the server's pre_shared_key is exactly uint16 selected_identity (hs_ext_check
+     * already refused it unless the ClientHello offered one). It MUST be an identity we sent
+     * (one, index 0) under a suite of the PSK's hash; psk_dhe_ke is the only mode offered
+     * (4.3.9), so a selected PSK without key_share is illegal_parameter as well. */
+    psk = hs_ext_find(ext, ext_len, EXT_PSK, &d, &dl) == 1;
+    if (psk && dl != 2) {
+        return hs_fail(hs, BRISK__ALERT_DECODE_ERROR);
+    }
+    if (psk && (brisk__load_be16(d) != 0 || hs_alg(suite) != hs_alg(hs->psk_suite) ||
+                hs_ext_find(ext, ext_len, EXT_KEY_SHARE, &d, &dl) != 1)) {
+        return hs_fail(hs, BRISK__ALERT_ILLEGAL_PARAMETER);
+    }
     /* 4.3.8: exactly one KeyShareEntry, in the group of the client's share (which after an HRR
      * is the HRR's selected_group, enforced when CH2 was absorbed). */
     if (hs_ext_find(ext, ext_len, EXT_KEY_SHARE, &d, &dl) != 1) {
-        return hs_fail(hs, BRISK__ALERT_MISSING_EXTENSION); /* local: no PSK in this slice */
+        return hs_fail(hs, BRISK__ALERT_MISSING_EXTENSION); /* local: 9.2 names no alert */
     }
     if (dl < 4 || brisk__load_be16(d + 2) != dl - 4) {
         return hs_fail(hs, BRISK__ALERT_DECODE_ERROR);
@@ -499,7 +528,11 @@ static int hs_on_sh(brisk__tls13_hs *hs, const uint8_t *m, size_t n)
         brisk__secure_zero(dhe, sizeof dhe);
         return hs_fail(hs, BRISK__ALERT_ILLEGAL_PARAMETER);
     }
-    rc = brisk__tls_ks_init(&hs->ks, hs_alg(suite), NULL, 0);
+    /* 7.1: early_secret = HKDF-Extract(0, PSK) only when the PSK was selected; otherwise this is
+     * a full handshake and the certificate path runs. The PSK is dead either way. */
+    rc = brisk__tls_ks_init(&hs->ks, hs_alg(suite), psk ? hs->psk : NULL, psk ? hs->psk_len : 0u);
+    brisk__secure_zero(hs->psk, sizeof hs->psk);
+    hs->psk_ok = (uint8_t)psk;
     if (rc == BRISK_OK) {
         rc = brisk__tls_ks_derive_handshake(&hs->ks, dhe, sizeof dhe, th, hs->c_hs, hs->s_hs);
     }
@@ -518,7 +551,7 @@ static int hs_on_sh(brisk__tls13_hs *hs, const uint8_t *m, size_t n)
 static int hs_on_ee(brisk__tls13_hs *hs, const uint8_t *m, size_t n)
 {
     const uint8_t *b = m + 4, *p, *d, *tp = NULL;
-    size_t bl = n - 4, dl, tp_len = 0;
+    size_t bl = n - 4, dl, tp_len = 0, off;
     uint16_t t;
     uint8_t alert;
 
@@ -549,6 +582,26 @@ static int hs_on_ee(brisk__tls13_hs *hs, const uint8_t *m, size_t n)
             tp = d; /* RFC 9001 8.2; only offered, so only accepted, when cfg.quic is set */
             tp_len = dl;
         }
+        if (t == EXT_ALPN) {
+            /* RFC 7301 3.1: the answer is a ProtocolNameList of EXACTLY one non-empty name,
+             * filling the extension; it must be a name we offered - no alert is named for that,
+             * illegal_parameter is the local choice over TCP, and RFC 9001 8.1 makes it
+             * no_application_protocol over QUIC. */
+            if (dl < 4 || brisk__load_be16(d) != dl - 2 || d[2] == 0 || d[2] != dl - 3) {
+                return hs_fail(hs, BRISK__ALERT_DECODE_ERROR);
+            }
+            for (off = 0; off < hs->alpn_len; off += 1 + (size_t)hs->alpn[off]) {
+                if (hs->alpn[off] == d[2] && memcmp(hs->alpn + off + 1, d + 3, d[2]) == 0) {
+                    break;
+                }
+            }
+            if (off >= hs->alpn_len) {
+                return hs_fail(hs, hs->cfg.quic ? BRISK__ALERT_NO_APPLICATION_PROTOCOL
+                                                : BRISK__ALERT_ILLEGAL_PARAMETER);
+            }
+            hs->alpn_sel_off = (uint16_t)(off + 1);
+            hs->alpn_sel_len = d[2];
+        }
     }
     /* RFC 9001 8.2: EE without quic_transport_parameters over QUIC is missing_extension. The
      * value is handed over here, the only moment it is in memory; its contents are the QUIC
@@ -556,12 +609,18 @@ static int hs_on_ee(brisk__tls13_hs *hs, const uint8_t *m, size_t n)
     if (hs->cfg.quic && tp == NULL) {
         return hs_fail(hs, BRISK__ALERT_MISSING_EXTENSION);
     }
+    /* RFC 9001 8.1: over QUIC the server MUST select an application protocol */
+    if (hs->cfg.quic && hs->alpn_sel_len == 0) {
+        return hs_fail(hs, BRISK__ALERT_NO_APPLICATION_PROTOCOL);
+    }
     if (tp != NULL && hs->cfg.on_peer_tp != NULL &&
         hs->cfg.on_peer_tp(hs->cfg.tp_ctx, tp, tp_len) != 0) {
         return hs_fail(hs, BRISK__ALERT_INTERNAL_ERROR);
     }
     th_add(hs, m, n);
-    hs->state = BRISK__HS_WAIT_CERT_CR;
+    /* A.1: a PSK handshake has no Certificate/CertificateVerify, and 4.4.2 forbids a
+     * CertificateRequest in it - both are unexpected_message from WAIT_FIN. */
+    hs->state = hs->psk_ok ? BRISK__HS_WAIT_FIN : BRISK__HS_WAIT_CERT_CR;
     return BRISK_OK;
 }
 
@@ -594,6 +653,12 @@ static int hs_on_cr(brisk__tls13_hs *hs, const uint8_t *m, size_t n)
     /* 4.3.3: SignatureScheme supported_signature_algorithms<2..2^16-2> */
     if (dl < 4 || brisk__load_be16(d) != dl - 2 || (dl & 1) != 0) {
         return hs_fail(hs, BRISK__ALERT_DECODE_ERROR);
+    }
+    /* 4.5.2: our CertificateVerify scheme must be one the server listed. certificate_authorities,
+     * oid_filters and signature_algorithms_cert are parsed (hs_ext_check) but not acted on:
+     * there is one device chain, and 4.3.5 lets a client ignore filters it does not act on. */
+    for (el = 2; el < dl; el += 2) {
+        hs->cr_sig_ok |= (uint8_t)(brisk__load_be16(d + el) == 0x0403);
     }
     th_add(hs, m, n);
     hs->cr_seen = 1;
@@ -698,9 +763,91 @@ static int hs_on_cv(brisk__tls13_hs *hs, const uint8_t *m, size_t n)
     return BRISK_OK;
 }
 
-static int hs_on_fin(brisk__tls13_hs *hs, const uint8_t *m, size_t n)
+#if BRISK_ENABLE_MTLS
+/* The CertificateEntry list of the device chain (4.4.2): per certificate cert_data<1..2^24-1>
+ * and empty extensions (4.5.1: client entry extensions only answer CR extensions, and we answer
+ * none). Returns its length, written to out when non-NULL; 0 if the chain is not a sequence of
+ * DER TLVs (refused at hs_init, so never at handshake time). */
+static size_t hs_chain_entries(const uint8_t *chain, size_t len, uint8_t *out)
+{
+    brisk__der c;
+    const uint8_t *tlv;
+    size_t tl, n = 0;
+    brisk__der_init(&c, chain, len);
+    while (brisk__der_peek(&c) != -1) {
+        if (brisk__der_tlv(&c, &tlv, &tl) != BRISK_OK) {
+            return 0;
+        }
+        if (out != NULL) {
+            brisk__store_be24(out + n, (uint32_t)tl);
+            memcpy(out + n + 3, tlv, tl);
+            out[n + 3 + tl] = 0;
+            out[n + 4 + tl] = 0;
+        }
+        n += 3 + tl + 2;
+    }
+    return brisk__der_err(&c) == BRISK_OK ? n : 0;
+}
+#endif
+
+/* The answer to a CertificateRequest (RFC 9846 4.5.1, 4.5.2), queued at HANDSHAKE before the
+ * client Finished: the device chain and a CertificateVerify, or - no chain, or 0x0403 not in the
+ * CR's signature_algorithms - an empty Certificate and nothing else. The context echoes the CR's,
+ * which is empty in the main handshake. BRISK_OK or a local fault (internal_error). */
+static int hs_client_auth(brisk__tls13_hs *hs)
 {
     static const uint8_t EMPTY_CERT[8] = {HS_CERTIFICATE, 0, 0, 4, 0, 0, 0, 0};
+#if BRISK_ENABLE_MTLS
+    uint8_t th[BRISK_HASH_MAX_LEN], tbs[98 + BRISK_HASH_MAX_LEN], raw[64], cv[8 + 72], *q;
+    size_t n, tbs_len, sig_len = 0;
+    int rc;
+
+    if (hs->cfg.client_chain != NULL && hs->cr_sig_ok) {
+        n = hs_chain_entries(hs->cfg.client_chain, hs->cfg.client_chain_len, NULL);
+        q = n != 0 ? hs_reserve(hs, BRISK__EPOCH_HANDSHAKE, 8 + n) : NULL;
+        if (q == NULL) {
+            return BRISK_E_ARG; /* the ClientHello was never pulled: see hs_cfg.client_chain */
+        }
+        q[0] = HS_CERTIFICATE;
+        brisk__store_be24(q + 1, (uint32_t)(4 + n));
+        q[4] = 0;
+        brisk__store_be24(q + 5, (uint32_t)n);
+        hs_chain_entries(hs->cfg.client_chain, hs->cfg.client_chain_len, q + 8);
+        th_add(hs, q, 8 + n);
+        /* 4.5.2: ecdsa_secp256r1_sha256 over the client context string || TH(CH..Certificate) */
+        th_snap(hs, th);
+        tbs_len = brisk__tls13_cv_content(0, th, brisk_hash_len(hs_alg(hs->suite)), tbs);
+        if (hs->cfg.client_key != NULL) {
+            /* hedged RFC 6979 (3.6) with the caller's fresh k'; a BRISK_E_AUTH from the
+             * fault self-check is fatal, never retried (a glitched signature leaks d) */
+            brisk_sha256(tbs, tbs_len, th);
+            rc = brisk__p256_ecdsa_sign(raw, hs->cfg.client_key, th, 32, hs->cfg.sign_rand, 32);
+        } else {
+            rc = hs->cfg.sign(hs->cfg.sign_ctx, 0x0403, tbs, tbs_len, raw, sizeof raw, &sig_len);
+            if (rc == BRISK_OK && sig_len != sizeof raw) {
+                rc = BRISK_E_ARG;
+            }
+        }
+        BRISK__CT_PUBLIC(raw, sizeof raw); /* r || s goes on the wire */
+        if (rc == BRISK_OK) {
+            n = brisk__x509_ecdsa_der(raw, cv + 8);
+            cv[0] = HS_CERTIFICATE_VERIFY;
+            brisk__store_be24(cv + 1, (uint32_t)(4 + n));
+            brisk__store_be16(cv + 4, 0x0403);
+            brisk__store_be16(cv + 6, (uint32_t)n);
+            rc = hs_queue(hs, BRISK__EPOCH_HANDSHAKE, cv, 8 + n) ? BRISK_OK : BRISK_E_ARG;
+        }
+        brisk__secure_zero(raw, sizeof raw);
+        brisk__secure_zero(th, sizeof th);
+        return rc;
+    }
+#endif
+    return hs_queue(hs, BRISK__EPOCH_HANDSHAKE, EMPTY_CERT, sizeof EMPTY_CERT) ? BRISK_OK
+                                                                               : BRISK_E_ARG;
+}
+
+static int hs_on_fin(brisk__tls13_hs *hs, const uint8_t *m, size_t n)
+{
     uint8_t th[BRISK_HASH_MAX_LEN], mac[4 + BRISK_HASH_MAX_LEN];
     uint8_t c_ap[BRISK_HASH_MAX_LEN], s_ap[BRISK_HASH_MAX_LEN];
     brisk_hash_alg alg = hs_alg(hs->suite);
@@ -722,11 +869,10 @@ static int hs_on_fin(brisk__tls13_hs *hs, const uint8_t *m, size_t n)
     th_snap(hs, th); /* TH(CH..server Finished): the application secrets (7.1) */
     rc = brisk__tls_ks_derive_application(&hs->ks, th, c_ap, s_ap, hs->exp_ms);
 
-    /* Client flight (4.5, A.1): an empty Certificate if one was requested (4.5.1 - there is no
-     * client key in this slice), then Finished over TH(CH..SF[..Certificate]). */
-    if (rc == BRISK_OK && hs->cr_seen &&
-        !hs_queue(hs, BRISK__EPOCH_HANDSHAKE, EMPTY_CERT, sizeof EMPTY_CERT)) {
-        rc = BRISK_E_ARG;
+    /* Client flight (4.5, A.1): Certificate [+ CertificateVerify] iff one was requested, then
+     * Finished over TH(CH..SF[..Certificate[..CertificateVerify]]) (4.5.3). */
+    if (rc == BRISK_OK && hs->cr_seen) {
+        rc = hs_client_auth(hs);
     }
     if (rc == BRISK_OK) {
         th_snap(hs, th);
@@ -820,7 +966,20 @@ static int hs_on_nst(brisk__tls13_hs *hs, const uint8_t *m, size_t n)
     if (r < 0) {
         return hs_fail(hs, BRISK__ALERT_DECODE_ERROR);
     }
-    if (hs->cfg.on_ticket != NULL && hs->cfg.on_ticket(hs->cfg.ticket_ctx, &tk) != 0) {
+    if (hs->cfg.on_ticket == NULL) {
+        return BRISK_OK; /* 4.7.1: a client that does not resume silently ignores the ticket */
+    }
+    /* 4.7.1: PSK = HKDF-Expand-Label(resumption_master_secret, "resumption", ticket_nonce,
+     * HashLen), usable only under a suite of the same hash - hence the suite goes with it. */
+    tk.suite = hs->suite;
+    tk.psk_len = brisk_hash_len(hs_alg(hs->suite));
+    r = brisk__hkdf_expand_label(hs_alg(hs->suite), hs->res_ms, tk.psk_len, "resumption", tk.nonce,
+                                 tk.nonce_len, tk.psk, tk.psk_len);
+    if (r == BRISK_OK) {
+        r = hs->cfg.on_ticket(hs->cfg.ticket_ctx, &tk);
+    }
+    brisk__secure_zero(tk.psk, sizeof tk.psk);
+    if (r != 0) {
         return hs_fail(hs, BRISK__ALERT_INTERNAL_ERROR);
     }
     return BRISK_OK;
@@ -899,6 +1058,48 @@ size_t brisk__tls13_hs_scratch_size(void)
            BRISK__TLS13_OUT_MAX;
 }
 
+#if BRISK_ENABLE_MTLS
+/* The device chain, checked once as configuration (RFC 9846 4.5.1.2): every certificate parses,
+ * the leaf is P-256 and may sign (digitalSignature when keyUsage is present), the key is the
+ * leaf's, and the chain is within BRISK_TLS_MAX_CLIENT_CHAIN (the 2048-byte base of the output
+ * queue covers the 5 bytes per entry, CertificateVerify and Finished). */
+static int hs_client_cfg_ok(const brisk__tls13_hs_cfg *cfg)
+{
+    brisk__x509_cert x;
+    brisk__der c;
+    const uint8_t *tlv;
+    uint8_t pub[65];
+    size_t tl, n = hs_chain_entries(cfg->client_chain, cfg->client_chain_len, NULL);
+    int first = 1;
+
+    if ((cfg->client_key != NULL) == (cfg->sign != NULL) ||
+        (cfg->client_key != NULL && cfg->sign_rand == NULL) || n == 0 ||
+        cfg->client_chain_len > BRISK_TLS_MAX_CLIENT_CHAIN ||
+        n > BRISK__TLS13_OUT_MAX - (8 + 8 + 72 + 4 + BRISK_HASH_MAX_LEN)) {
+        return 0;
+    }
+    brisk__der_init(&c, cfg->client_chain, cfg->client_chain_len);
+    while (brisk__der_peek(&c) != -1) {
+        if (brisk__der_tlv(&c, &tlv, &tl) != BRISK_OK ||
+            brisk__x509_parse(&x, tlv, tl) != BRISK_OK) {
+            return 0;
+        }
+        if (first) {
+            first = 0;
+            if (x.key_alg != BRISK__X509_KEY_P256 || x.key_len != sizeof pub ||
+                (x.key_usage != 0 && !(x.key_usage & BRISK__X509_KU_DIGITAL_SIGNATURE))) {
+                return 0;
+            }
+            if (cfg->client_key != NULL && (brisk__p256_keygen(pub, cfg->client_key) != BRISK_OK ||
+                                            memcmp(pub, x.key, sizeof pub) != 0)) {
+                return 0; /* the point is public; only keygen touches d, in constant time */
+            }
+        }
+    }
+    return 1;
+}
+#endif
+
 int brisk__tls13_hs_init(brisk__tls13_hs *hs, const brisk__tls13_hs_cfg *cfg, uint8_t *scratch,
                          size_t scratch_len)
 {
@@ -906,6 +1107,15 @@ int brisk__tls13_hs_init(brisk__tls13_hs *hs, const brisk__tls13_hs_cfg *cfg, ui
     if (hs == NULL || cfg == NULL || cfg->auth == NULL || scratch == NULL ||
         scratch_len < brisk__tls13_hs_scratch_size()) {
         return BRISK_E_ARG; /* no path to CONNECTED without an authenticator */
+    }
+    if (cfg->client_chain != NULL || cfg->client_key != NULL || cfg->sign != NULL) {
+#if BRISK_ENABLE_MTLS
+        if (cfg->client_chain == NULL || !hs_client_cfg_ok(cfg)) {
+            return BRISK_E_ARG;
+        }
+#else
+        return BRISK_E_ARG; /* a build without BRISK_ENABLE_MTLS has no client certificate */
+#endif
     }
     memset(hs, 0, sizeof *hs);
     hs->cfg = *cfg;
@@ -931,10 +1141,11 @@ typedef struct {
     uint16_t ext[BRISK__TLS13_MAX_OFFER_EXT], suites[BRISK__TLS13_MAX_OFFER_SUITES];
     uint16_t groups[BRISK__TLS13_MAX_OFFER_GROUPS], sigs[BRISK__TLS13_MAX_OFFER_SIGS];
     size_t n_ext, n_suites, n_groups, n_sigs;
-    const uint8_t *cookie;
-    size_t cookie_len;
-    uint16_t rsl; /* our record_size_limit, 0 = not offered */
-    int tls13, share;
+    const uint8_t *cookie, *alpn;
+    size_t cookie_len, alpn_len;
+    size_t binder_len; /* 0 = no pre_shared_key; else the one binder's length, at the very end */
+    uint16_t rsl;      /* our record_size_limit, 0 = not offered */
+    int tls13, share, modes;
 } hs_offer;
 
 /* A uint16 list<2..> exactly filling `len` bytes at d (after its own length prefix of `pre`
@@ -1041,6 +1252,41 @@ static int hs_parse_ch(const uint8_t *ch, size_t ch_len, uint16_t share_group, i
             o->cookie = d + 2;
             o->cookie_len = dl - 2;
             break;
+        case EXT_ALPN:
+            /* RFC 7301 3.1: ProtocolNameList<2..2^16-1> of non-empty names, within our cap */
+            if (dl < 3 || brisk__load_be16(d) != dl - 2 || dl - 2 > BRISK__TLS13_ALPN_MAX) {
+                return 0;
+            }
+            for (k = 2; k < dl; k += 1 + (size_t)d[k]) {
+                if (d[k] == 0 || d[k] > dl - k - 1) {
+                    return 0;
+                }
+            }
+            o->alpn = d + 2;
+            o->alpn_len = dl - 2;
+            break;
+        case EXT_PSK_MODES:
+            if (dl != 2 || d[0] != 1 || d[1] != 1) {
+                return 0; /* 4.3.9: [psk_dhe_ke] only - psk_ke has no forward secrecy */
+            }
+            o->modes = 1;
+            break;
+        case EXT_PSK:
+            /* 4.3.11: the LAST extension, exactly one identity<1..> + age, exactly one binder
+             * (its length is checked against the PSK's HashLen by the caller) */
+            if (p != end || dl < 2 + 2 + 1 + 4 + 2 + 1) {
+                return 0;
+            }
+            k = brisk__load_be16(d);
+            if (k > dl - 2 - 3 || k < 7 || brisk__load_be16(d + 2) != k - 6) {
+                return 0;
+            }
+            if (brisk__load_be16(d + 2 + k) != dl - 4 - k || d[4 + k] != dl - 5 - k ||
+                d[4 + k] < 32) {
+                return 0;
+            }
+            o->binder_len = d[4 + k];
+            break;
         default:
             break;
         }
@@ -1048,15 +1294,37 @@ static int hs_parse_ch(const uint8_t *ch, size_t ch_len, uint16_t share_group, i
     /* supported_versions is REQUIRED; signature_algorithms for certificate authentication, and
      * supported_groups with key_share for (EC)DHE (RFC 9846 9.2). RFC 9001 8.2: over QUIC the
      * client MUST send quic_transport_parameters, and MUST NOT send it over TCP. */
+    /* 4.3.9: a PSK needs psk_key_exchange_modes. RFC 9001 8.1: over QUIC, ALPN is mandatory. */
     return o->tls13 && o->share && o->n_sigs && o->n_groups &&
            hs_in_list(o->groups, o->n_groups, share_group) &&
-           (quic != 0) == hs_in_list(o->ext, o->n_ext, EXT_QUIC_TP);
+           (quic != 0) == hs_in_list(o->ext, o->n_ext, EXT_QUIC_TP) &&
+           (o->binder_len == 0 || o->modes) && (!quic || o->alpn != NULL);
+}
+
+/* 4.3.11.2: the binder over Transcript-Hash(prefix || Truncate(ch)) in the PSK's hash, from a
+ * fresh context in CH1 and from a copy of the post-HRR transcript in CH2 (4.2.2); Truncate drops
+ * the binders list, whose length fields stay counted. */
+static int hs_binder(const brisk__tls13_hs *hs, const uint8_t *ch, size_t ch_len, uint8_t *out)
+{
+    brisk_hash_alg alg = hs_alg(hs->psk_suite);
+    uint8_t th[BRISK_HASH_MAX_LEN];
+    brisk_hash_ctx c;
+    if (hs->state == BRISK__HS_START) {
+        brisk__hash_init(&c, alg);
+    } else {
+        c = alg == BRISK_HASH_SHA384 ? hs->th384 : hs->th256;
+    }
+    brisk__hash_update(&c, alg, ch, ch_len - 3 - hs->psk_len);
+    brisk__hash_final(&c, alg, th);
+    return brisk__tls_psk_binder(alg, hs->psk, hs->psk_len, th, out);
 }
 
 int brisk__tls13_hs_client_hello(brisk__tls13_hs *hs, const uint8_t *ch, size_t ch_len,
                                  uint16_t share_group, const uint8_t *share_priv)
 {
+    uint8_t binder[BRISK_HASH_MAX_LEN], *q;
     hs_offer o;
+    size_t k;
     if (hs == NULL || ch == NULL || share_priv == NULL) {
         return BRISK_E_ARG;
     }
@@ -1086,6 +1354,32 @@ int brisk__tls13_hs_client_hello(brisk__tls13_hs *hs, const uint8_t *ch, size_t 
             return BRISK_E_ARG;
         }
     }
+    if (o.binder_len != 0) {
+        /* 4.3.11: only the PSK the engine was given (hs_set_psk; dropped when CH1 lacked it), a
+         * binder of its HashLen, and a suite of its hash on offer - after an HRR, the HRR's
+         * suite: one of another hash means CH2 MUST drop the PSK (4.2.2). */
+        if (hs->psk_len == 0 || o.binder_len != hs->psk_len) {
+            return BRISK_E_ARG;
+        }
+        for (k = 0; k < o.n_suites; k++) {
+            if (hs_alg(o.suites[k]) == hs_alg(hs->psk_suite)) {
+                break;
+            }
+        }
+        if (k == o.n_suites ||
+            (hs->state == BRISK__HS_WAIT_CH2 && hs_alg(hs->suite) != hs_alg(hs->psk_suite)) ||
+            hs_binder(hs, ch, ch_len, binder) != BRISK_OK) {
+            return BRISK_E_ARG;
+        }
+    } else {
+        brisk__secure_zero(hs->psk, sizeof hs->psk);
+        hs->psk_len = 0;
+    }
+    hs->psk_offered = (uint8_t)(o.binder_len != 0);
+    if (o.alpn_len != 0) {
+        memcpy(hs->alpn, o.alpn, o.alpn_len);
+    }
+    hs->alpn_len = (uint16_t)o.alpn_len;
     memcpy(hs->offered_ext, o.ext, sizeof o.ext);
     memcpy(hs->offered_suites, o.suites, sizeof o.suites);
     memcpy(hs->offered_groups, o.groups, sizeof o.groups);
@@ -1097,7 +1391,13 @@ int brisk__tls13_hs_client_hello(brisk__tls13_hs *hs, const uint8_t *ch, size_t 
     hs->n_sigs = (uint8_t)o.n_sigs;
     hs->share_group = share_group;
     memcpy(hs->priv, share_priv, sizeof hs->priv);
-    hs_queue(hs, BRISK__EPOCH_INITIAL, ch, ch_len); /* room was checked above */
+    q = hs_reserve(hs, BRISK__EPOCH_INITIAL, ch_len); /* room was checked above */
+    memcpy(q, ch, ch_len);
+    if (hs->psk_offered) { /* the binder goes into OUR copy; the caller's bytes stay const */
+        memcpy(q + ch_len - hs->psk_len, binder, hs->psk_len);
+        brisk__secure_zero(binder, sizeof binder);
+    }
+    th_add(hs, q, ch_len);
     hs->state = BRISK__HS_WAIT_SH;
     return BRISK_OK;
 }
@@ -1202,6 +1502,33 @@ int brisk__tls13_hs_exporter(const brisk__tls13_hs *hs, const char *label, const
     return brisk__tls_ks_exporter(hs_alg(hs->suite), hs->exp_ms, label, ctx, ctx_len, out, out_len);
 }
 
+int brisk__tls13_hs_set_psk(brisk__tls13_hs *hs, const brisk__tls13_psk *psk)
+{
+    if (hs == NULL || psk == NULL || hs->state != BRISK__HS_START || !hs_known_suite(psk->suite) ||
+        psk->psk_len != brisk_hash_len(hs_alg(psk->suite))) {
+        return BRISK_E_ARG;
+    }
+    memcpy(hs->psk, psk->psk, psk->psk_len);
+    hs->psk_len = psk->psk_len;
+    hs->psk_suite = psk->suite;
+    return BRISK_OK;
+}
+
+int brisk__tls13_hs_alpn(const brisk__tls13_hs *hs, const uint8_t **name, size_t *len)
+{
+    if (hs == NULL || name == NULL || len == NULL || hs->state != BRISK__HS_CONNECTED) {
+        return BRISK_E_ARG;
+    }
+    *name = hs->alpn_sel_len ? hs->alpn + hs->alpn_sel_off : NULL;
+    *len = hs->alpn_sel_len;
+    return BRISK_OK;
+}
+
+int brisk__tls13_hs_resumed(const brisk__tls13_hs *hs)
+{
+    return hs != NULL && hs->psk_ok;
+}
+
 void brisk__tls13_hs_wipe(brisk__tls13_hs *hs)
 {
     if (hs == NULL) {
@@ -1260,6 +1587,11 @@ static void w_close(hs_wr *w, size_t at, size_t width)
     if (!w->ok) {
         return;
     }
+    /* a length that does not fit its prefix fails closed, never truncates */
+    if ((width == 1 && len > 0xff) || (width == 2 && len > 0xffff) || len > 0xffffff) {
+        w->ok = 0;
+        return;
+    }
     if (width == 1) {
         w->b[at - 1] = (uint8_t)len;
     } else if (width == 2) {
@@ -1302,12 +1634,36 @@ int brisk__tls13_ch_write(const brisk__tls13_ch_params *p, uint8_t *out, size_t 
         (p->quic_tp_len != 0 && p->quic_tp == NULL)) {
         return BRISK_E_ARG;
     }
-    /* RFC 6066 3: HostName MUST NOT carry the trailing root dot (match_host strips it too). */
+    /* RFC 6066 3: HostName MUST NOT carry the trailing root dot (match_host strips it too), and
+     * is ASCII: printable, no space - an IDN arrives as A-labels. */
     sni_len = p->sni_len;
     if (sni_len != 0 && p->sni[sni_len - 1] == '.') {
         if (--sni_len == 0) {
             return BRISK_E_ARG;
         }
+    }
+    for (i = 0; i < sni_len; i++) {
+        if ((uint8_t)p->sni[i] < 0x21 || (uint8_t)p->sni[i] > 0x7e) {
+            return BRISK_E_ARG;
+        }
+    }
+    /* RFC 7301 3.1: ProtocolName<1..2^8-1> entries, none empty, none truncated; a local cap on
+     * the list. 4.3.9 + 4.3.11: a PSK needs psk_key_exchange_modes, one identity, a binder of
+     * the PSK's HashLen. */
+    if ((p->alpn_len != 0 && p->alpn == NULL) || p->alpn_len > BRISK__TLS13_ALPN_MAX) {
+        return BRISK_E_ARG;
+    }
+    for (i = 0; i < p->alpn_len; i += 1 + (size_t)p->alpn[i]) {
+        if (p->alpn[i] == 0 || p->alpn[i] > p->alpn_len - i - 1) {
+            return BRISK_E_ARG;
+        }
+    }
+    if (p->psk != NULL &&
+        (!p->psk_modes || p->psk->identity == NULL || p->psk->identity_len == 0 ||
+         /* 4.3.11: extension_data<0..2^16-1> also holds 2+2+4 list/age bytes and 2+1+HashLen of
+          * binders */
+         p->psk->identity_len > 0xffff - 11 - (size_t)p->psk->psk_len || (p->psk->psk_len != 32 && p->psk->psk_len != 48))) {
+        return BRISK_E_ARG;
     }
     suites = p->suites ? p->suites : DEF_SUITES;
     n_suites = p->suites ? p->n_suites : sizeof DEF_SUITES / sizeof DEF_SUITES[0];
@@ -1353,6 +1709,14 @@ int brisk__tls13_ch_write(const brisk__tls13_ch_params *p, uint8_t *out, size_t 
     }
     w_u16_list(&w, EXT_SUPPORTED_GROUPS, groups, n_groups);
     w_u16_list(&w, EXT_SIGNATURE_ALGORITHMS, sigs, n_sigs);
+    if (p->alpn_len != 0) { /* RFC 7301 3.1 */
+        w_u16(&w, EXT_ALPN);
+        a = w_open(&w, 2);
+        b = w_open(&w, 2);
+        w_put(&w, p->alpn, p->alpn_len);
+        w_close(&w, b, 2);
+        w_close(&w, a, 2);
+    }
     w_u16(&w, EXT_SUPPORTED_VERSIONS); /* 4.3.1: exactly TLS 1.3 */
     w_u16(&w, 3);
     w_u8(&w, 2);
@@ -1364,6 +1728,12 @@ int brisk__tls13_ch_write(const brisk__tls13_ch_params *p, uint8_t *out, size_t 
         w_put(&w, p->cookie, p->cookie_len);
         w_close(&w, b, 2);
         w_close(&w, a, 2);
+    }
+    if (p->psk_modes) { /* 4.3.9: [psk_dhe_ke] only, never psk_ke */
+        w_u16(&w, EXT_PSK_MODES);
+        w_u16(&w, 2);
+        w_u8(&w, 1);
+        w_u8(&w, 1);
     }
     w_u16(&w, EXT_KEY_SHARE);
     a = w_open(&w, 2);
@@ -1377,6 +1747,24 @@ int brisk__tls13_ch_write(const brisk__tls13_ch_params *p, uint8_t *out, size_t 
         w_u16(&w, EXT_QUIC_TP);
         a = w_open(&w, 2);
         w_put(&w, p->quic_tp, p->quic_tp_len);
+        w_close(&w, a, 2);
+    }
+    if (p->psk != NULL) {
+        /* 4.3.11: pre_shared_key MUST be the last extension. One PskIdentity {identity,
+         * obfuscated_ticket_age}, one binder of HashLen zeros that hs_client_hello fills. */
+        w_u16(&w, EXT_PSK);
+        a = w_open(&w, 2);
+        b = w_open(&w, 2);
+        w_u16(&w, (unsigned)p->psk->identity_len);
+        w_put(&w, p->psk->identity, p->psk->identity_len);
+        w_u16(&w, (unsigned)(p->psk->obf_age >> 16));
+        w_u16(&w, (unsigned)(p->psk->obf_age & 0xffff));
+        w_close(&w, b, 2);
+        w_u16(&w, 1u + p->psk->psk_len);
+        w_u8(&w, p->psk->psk_len);
+        for (i = 0; i < p->psk->psk_len; i++) {
+            w_u8(&w, 0);
+        }
         w_close(&w, a, 2);
     }
     w_close(&w, exts, 2);

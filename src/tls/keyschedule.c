@@ -209,3 +209,25 @@ void brisk__tls_ks_wipe(brisk__tls_ks *ks)
         ks->alg = 0;
     }
 }
+
+int brisk__tls_psk_binder(brisk_hash_alg alg, const uint8_t *psk, size_t psk_len,
+                          const uint8_t *th_trunc, uint8_t *out)
+{
+    /* RFC 9846 4.3.11.2 + 7.1:
+     *   early_secret = HKDF-Extract(0, PSK)
+     *   binder_key   = Derive-Secret(early_secret, "res binder", "")
+     *   binder       = HMAC(Expand-Label(binder_key, "finished", "", HashLen), th_trunc) */
+    brisk__tls_ks ks;
+    uint8_t bk[BRISK_HASH_MAX_LEN], eh[BRISK_HASH_MAX_LEN];
+    int rc = brisk__tls_ks_init(&ks, alg, psk, psk_len);
+    if (rc == BRISK_OK) {
+        empty_hash(alg, eh);
+        rc = derive_secret(alg, ks.secret, "res binder", eh, bk);
+    }
+    if (rc == BRISK_OK) {
+        rc = brisk__tls_finished_mac(alg, bk, th_trunc, out);
+    }
+    brisk__tls_ks_wipe(&ks);
+    brisk__secure_zero(bk, sizeof bk);
+    return rc;
+}

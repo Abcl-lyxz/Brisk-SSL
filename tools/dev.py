@@ -7,7 +7,7 @@
   python tools/dev.py size [--arch all|mipsel..] [--md] [--save] [--check]
                                                  per-module flash/RAM from the linker map (-Os, static)
   python tools/dev.py ct                         constant-time check: the ct suite under valgrind
-  python tools/dev.py fuzz [der|name|tls13_hs|tls13_rec] [--seconds N]  libFuzzer over a parser, seeded from its .inc
+  python tools/dev.py fuzz [der|name|tls13_hs|tls13_rec|ticket] [--seconds N]  libFuzzer over a parser, seeded from its .inc
   python tools/dev.py image                      (re)build the brisk-dev Docker image
 
 Docker builds live in the named volume `brisk-build` (fast, and never collide with host builds).
@@ -229,7 +229,10 @@ FUZZ = {"der": ("fuzz/fuzz_der.c src/x509/der.c", "tests/kat/der.inc"),
                       "src/crypto/gcm.c src/crypto/x25519.c src/crypto/p256.c src/crypto/p384.c "
                       "src/crypto/bn.c src/crypto/rsa.c src/x509/der.c src/x509/cert.c "
                       "src/x509/chain.c src/x509/name.c",
-                      "tests/kat/tls13_rec_fuzz.inc")}
+                      "tests/kat/tls13_rec_fuzz.inc"),
+        # The resumption ticket blob: the one parser of caller-stored bytes (src/tls/ticket.c).
+        "ticket": ("fuzz/fuzz_ticket.c src/tls/ticket.c src/util.c",
+                   "tests/kat/tls13_ticket_fuzz.inc")}
 
 
 def fuzz_corpus(inc, out):

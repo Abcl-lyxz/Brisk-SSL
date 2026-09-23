@@ -58,7 +58,7 @@ Tick a box only when the work is green on **every** arch (`python tools/dev.py t
     Open before line 4: the GHASH-timing decision for early-terminating multipliers (armv5, some
     MIPS32) now that GCM is on the wire; post-handshake messages still use the engine's
     reassembly scratch, so the line-4 arena must keep it alive (or skip NSTs that do not fit).
-- [ ] PSK resumption tickets (export/import blob), ALPN list, SNI, mTLS (ECDSA)
+- [x] PSK resumption tickets (export/import blob), ALPN list, SNI, mTLS (ECDSA)
 - [ ] `src/os/` sockets + public API `brisk_connect/read/write/close`, sans-I/O `brisk_feed/pull`
 - [ ] RFC 8448 trace test; Docker interop (nginx, Caddy, openssl s_server); badssl.com
 - [ ] Examples: AWS IoT HTTPS over raw TLS (ALPN x-amzn-http-ca), MQTT-over-TLS sketch

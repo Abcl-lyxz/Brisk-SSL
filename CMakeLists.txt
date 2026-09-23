@@ -33,6 +33,7 @@ add_library(brisk STATIC
     src/tls/keyschedule.c # TLS 1.3 key schedule (RFC 9846 sect 7.1) + Finished + exporter
     src/tls/handshake.c   # TLS 1.3 client handshake engine (RFC 9846 sect 4), sans-I/O
     src/tls/record.c      # TLS 1.3 record layer over TCP (RFC 9846 sect 5) + connection driver
+    src/tls/ticket.c      # the resumption ticket blob (RFC 9846 4.7.1): export / import
 )
 if(CMAKE_SYSTEM_NAME STREQUAL "Linux") # src/os/ is Linux-only; the mingw host skips it
     target_sources(brisk PRIVATE src/os/linux_rand.c src/os/linux_ca.c)

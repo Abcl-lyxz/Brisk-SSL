@@ -434,3 +434,33 @@ int brisk__x509_chain_verify(const brisk__x509_cert *certs, size_t n_certs, int6
         cur = depth == 0 ? &certs[0] : chosen[depth - 1];
     }
 }
+
+#if BRISK_ENABLE_MTLS
+/* One non-negative 32-byte big-endian value as a minimal DER INTEGER (X.690 8.3.2): leading zero
+ * octets go, and a 0x00 comes back when the top bit would read as a sign. r and s are public
+ * (they go on the wire), so branching on them is fine. */
+static size_t ecdsa_der_int(const uint8_t *v, uint8_t *out)
+{
+    size_t i = 0, pad;
+    while (i < 31 && v[i] == 0) {
+        i++;
+    }
+    pad = v[i] >> 7;
+    out[0] = BRISK__DER_INTEGER;
+    out[1] = (uint8_t)(32 - i + pad);
+    out[2] = 0;
+    memcpy(out + 2 + pad, v + i, 32 - i);
+    return 2 + pad + 32 - i;
+}
+
+size_t brisk__x509_ecdsa_der(const uint8_t raw[64], uint8_t out[72])
+{
+    /* ECDSA-Sig-Value ::= SEQUENCE { r INTEGER, s INTEGER } (RFC 5480 A.1): at most 2 + 2 * 35
+     * bytes, so the SEQUENCE length always fits the short form. */
+    size_t n = ecdsa_der_int(raw, out + 2);
+    n += ecdsa_der_int(raw + 32, out + 2 + n);
+    out[0] = BRISK__DER_SEQUENCE;
+    out[1] = (uint8_t)n;
+    return n + 2;
+}
+#endif

@@ -132,17 +132,17 @@ BRISK_API void brisk_hmac_final(brisk_hmac_ctx *c, uint8_t *out);
 BRISK_API int brisk_hmac(brisk_hash_alg alg, const void *key, size_t key_len, const void *data,
                          size_t len, uint8_t *out);
 
-#if BRISK_ENABLE_MTLS
 /* ------------------------------------------------------------------------------------------------
- * Client-certificate signing hook (mTLS).
+ * Client-certificate signing hook (mTLS, BRISK_ENABLE_MTLS).
  *
  * The library can sign with its own ECDSA P-256 key, but a device key is better off in a secure
  * element, a TPM or an HSM, where this process never sees it. Set this callback on the client
- * config (M3) and the handshake calls it once, for CertificateVerify.
+ * config (M3) and the handshake calls it once, for CertificateVerify, synchronously from inside
+ * the call that fed the server's Finished - a slow element blocks that call. Declared in every
+ * profile (a typedef costs nothing) so config structs keep one layout; a build without
+ * BRISK_ENABLE_MTLS refuses a client certificate at setup.
  */
-#    define BRISK_SIG_ECDSA_P256_LEN                                                               \
-        64 /* raw r || s; the DER wrap is the handshake layer's job                                \
-            */
+#define BRISK_SIG_ECDSA_P256_LEN 64 /* raw r || s; the DER wrap is the handshake layer's job */
 
 /*   ctx      opaque, passed through unchanged.
  *   scheme   a TLS SignatureScheme code point (RFC 9846 4.3.3). 0x0403 = ecdsa_secp256r1_sha256
@@ -158,7 +158,18 @@ BRISK_API int brisk_hmac(brisk_hash_alg alg, const void *key, size_t key_len, co
  * unsupported scheme, BRISK_E_AUTH if the element refused to sign). */
 typedef int (*brisk_sign_fn)(void *ctx, uint16_t scheme, const uint8_t *tbs, size_t tbs_len,
                              uint8_t *sig, size_t sig_cap, size_t *sig_len);
-#endif /* BRISK_ENABLE_MTLS */
+
+/* ------------------------------------------------------------------------------------------------
+ * Session resumption (RFC 9846 2.2, 4.7.1): a NewSessionTicket is exported as one opaque blob of
+ * at most BRISK_TICKET_MAX bytes, which the caller stores and hands back on the next connection
+ * to the same host. A fixed size, not a knob; a ticket that does not fit is simply not
+ * resumable (never an error for the connection).
+ *
+ * THE BLOB IS KEY MATERIAL: it holds the resumption PSK, and anyone who has it can resume as
+ * this client until it expires (at most 7 days, RFC 9846 4.7.1). Store it like a private key and
+ * delete it once it has been offered - a ticket is single-use (RFC 9846 C.4).
+ */
+#define BRISK_TICKET_MAX 2048
 
 #ifdef __cplusplus
 }

@@ -4829,19 +4829,34 @@ def t_ch_parse(msg):
     return {"sid": b[35:35 + sl], "suites": suites, "exts": t_exts_parse(b[i + 2:])}
 
 
-def t_ch(random, sid, suites, groups, sigs, share_group, share_pub, sni=b"", cookie=b""):
+def t_alpn(names):
+    """RFC 7301 3.1 ProtocolName entries without the outer uint16: the brisk__tls13_ch_params form."""
+    return b"".join(t_v8(n) for n in names)
+
+
+def t_ch(random, sid, suites, groups, sigs, share_group, share_pub, sni=b"", cookie=b"", alpn=b"",
+         modes=False, psk=None):
     """The ClientHello brisk__tls13_ch_write produces, field for field and in the same extension
     order (RFC 9846 4.2.2), so the C builder is byte-compared against this, not only
-    round-tripped through its own parser."""
+    round-tripped through its own parser. psk = (identity, obfuscated_ticket_age, HashLen): the
+    pre_shared_key extension goes LAST (4.3.11) with a binder of HashLen zero bytes, which
+    t_binder_fill (and the C engine) replace."""
     exts = []
     if sni:
         exts.append((0, t_v16(b"\x00" + t_v16(sni))))  # RFC 6066 3: host_name(0)
     exts.append((10, t_v16(b"".join(t_u16(g) for g in groups))))
     exts.append((13, t_v16(b"".join(t_u16(s) for s in sigs))))
+    if alpn:
+        exts.append((16, t_v16(alpn)))  # RFC 7301 3.1
     exts.append((43, t_v8(t_u16(0x0304))))
     if cookie:
         exts.append((44, t_v16(cookie)))
+    if modes:
+        exts.append((45, t_v8(b"\x01")))  # RFC 9846 4.3.9: [psk_dhe_ke] only
     exts.append((51, t_v16(t_u16(share_group) + t_v16(share_pub))))
+    if psk:
+        ident, age, hl = psk
+        exts.append((41, t_v16(t_v16(ident) + age.to_bytes(4, "big")) + t_v16(t_v8(bytes(hl)))))
     return t_msg(1, t_u16(0x0303) + random + t_v8(sid)
                  + t_v16(b"".join(t_u16(s) for s in suites)) + b"\x01\x00" + t_exts_build(exts))
 
@@ -4860,27 +4875,48 @@ def t_cv_content(th):
     return b" " * 64 + b"TLS 1.3, server CertificateVerify\x00" + th  # RFC 9846 4.5.2
 
 
-def t_flow(bits, dhe, pre, sh, ee, cr, cert, cv):
+def t_binder(bits, psk, th):
+    """RFC 9846 4.3.11.2 + 7.1: a PskBinderEntry is a Finished MAC (4.5.3) under
+    binder_key = Derive-Secret(HKDF-Extract(0, PSK), "res binder", "")."""
+    hl, H = bits // 8, HASH[bits]
+    early = py_hkdf_extract(bits, bytes(hl), psk)
+    bk = py_expand_label(bits, early, b"res binder", H(b"").digest(), hl)
+    return hmac.new(py_expand_label(bits, bk, b"finished", b"", hl), th, H).digest()
+
+
+def t_binder_fill(bits, psk, prefix, ch):
+    """ch (one binder of HashLen, last) with its binder computed over Transcript-Hash(prefix ||
+    Truncate(ch)), Truncate dropping the binders list (2 + 1 + HashLen bytes)."""
+    hl = bits // 8
+    th = HASH[bits](b"".join(prefix) + ch[:-(3 + hl)]).digest()
+    return ch[:-hl] + t_binder(bits, psk, th)
+
+
+def t_flow(bits, dhe, pre, sh, ee, cr, cert, cv, psk=None, client=None):
     """The RFC 9846 7.1 key schedule, both Finished MACs (4.5.3) and the client flight of one
-    handshake, from nothing but its messages. `pre` is [CH], or [message_hash, HRR, CH2]."""
+    handshake, from nothing but its messages. `pre` is [CH], or [message_hash, HRR, CH2].
+    psk: the resumption PSK the ServerHello selected (no Certificate/CertificateVerify then).
+    client(msgs): the client's Certificate [+ CertificateVerify] answering `cr`, given the
+    transcript up to the server Finished; None answers with an empty Certificate."""
     hl, H = bits // 8, HASH[bits]
     zeros, empty = bytes(hl), H(b"").digest()
-    early = py_hkdf_extract(bits, zeros, zeros)
+    early = py_hkdf_extract(bits, zeros, psk or zeros)
     hs = py_hkdf_extract(bits, py_expand_label(bits, early, b"derived", empty, hl), dhe)
     t_sh = pre + [sh]
     th_sh = t_th(bits, t_sh)
     c_hs = py_expand_label(bits, hs, b"c hs traffic", th_sh, hl)
     s_hs = py_expand_label(bits, hs, b"s hs traffic", th_sh, hl)
     ms = py_hkdf_extract(bits, py_expand_label(bits, hs, b"derived", empty, hl), zeros)
-    t_cert = t_sh + [ee] + ([cr] if cr else []) + [cert]
-    tbs = t_cv_content(t_th(bits, t_cert))
-    t_cv = t_cert + [cv]
+    t_cert = t_sh + [ee] + ([cr] if cr else []) + ([cert] if cert else [])
+    tbs = t_cv_content(t_th(bits, t_cert)) if cert else b""
+    t_cv = t_cert + ([cv] if cv else [])
     sf = hmac.new(py_expand_label(bits, s_hs, b"finished", b"", hl), t_th(bits, t_cv), H).digest()
     t_sf = t_cv + [t_msg(20, sf)]
     th_sf = t_th(bits, t_sf)
-    # A CertificateRequest is answered with an empty Certificate (RFC 9846 4.5.1): this slice
-    # has no client key, and the client Finished then covers that message too.
-    flight = [t_msg(11, b"\x00" + t_v24(b""))] if cr else []
+    # A CertificateRequest is answered with the device chain + CertificateVerify, or with an
+    # empty Certificate when no suitable key is configured (RFC 9846 4.5.1); the client Finished
+    # covers whatever was sent.
+    flight = (client(t_sf) if client else [t_msg(11, b"\x00" + t_v24(b""))]) if cr else []
     cf = hmac.new(py_expand_label(bits, c_hs, b"finished", b"", hl), t_th(bits, t_sf + flight),
                   H).digest()
     t_cf = t_sf + flight + [t_msg(20, cf)]
@@ -4905,12 +4941,14 @@ def t_suite_bits(sh):
 
 
 def t_row(note, fl, *, ch1, priv1, g1, sh, ee, cert, cv, root=b"", host="", now=0, flags=0,
-          alert=0, hrr=b"", ch2=b"", priv2=b"", g2=0, cr=b"", cookie=b""):
+          alert=0, hrr=b"", ch2=b"", priv2=b"", g2=0, cr=b"", cookie=b"", psk=b"", psk_suite=0,
+          resumed=0, alpn="", cchain=b"", ckey=b"", srand=b""):
     return (note, root.hex(), host, now, flags, alert, g1, priv1.hex(), ch1.hex(), hrr.hex(), g2,
             priv2.hex(), ch2.hex(), cookie.hex(), sh.hex(), ee.hex(), cr.hex(), cert.hex(), cv.hex(),
             fl["sf"].hex(), fl["cf"].hex(), fl["s_hs"].hex(),
             fl["c_hs"].hex(), fl["s_ap"].hex(), fl["c_ap"].hex(), fl["exp"].hex(), fl["res"].hex(),
-            fl["tbs"].hex())
+            fl["tbs"].hex(), psk.hex(), psk_suite, resumed, alpn, cchain.hex(), ckey.hex(),
+            srand.hex())
 
 
 def rfc9846_constants():
@@ -4931,7 +4969,12 @@ def rfc9846_constants():
     if cv != t_cv_content(b"\x01" * 32):
         die("RFC 9846 4.5.2: the worked CertificateVerify content does not match the rule")
     RFC9846.update(hrr=hrr, down1=down[0], down0=down[1])
-    return [(hrr.hex(), down[0].hex(), down[1].hex(), (b"\x01" * 32).hex(), cv.hex())]
+    # The client-context variant of the same worked example (4.5.2's formula): generated.
+    cv_client = cv.replace(b"server CertificateVerify", b"client CertificateVerify")
+    if cv_client == cv:
+        die("RFC 9846 4.5.2: the server context string was not found")
+    return [(hrr.hex(), down[0].hex(), down[1].hex(), (b"\x01" * 32).hex(), cv.hex(),
+             cv_client.hex())]
 
 
 def tls13_traces():
@@ -5088,12 +5131,12 @@ def tls13_fixture():
     print(f"  tls13 fixture: {len(rows)} synthetic flows")
     chw = [(seed(b"client random").hex(), sid.hex(), "".join(f"{v:04x}" for v in TLS13_SUITES),
             "".join(f"{v:04x}" for v in TLS13_GROUPS), "".join(f"{v:04x}" for v in TLS13_SIGS),
-            "device.example.com", 0x001d, c_pub.hex(), "", ch.hex())]
+            "device.example.com", 0x001d, c_pub.hex(), "", ch.hex(), "", 0, "", 0, 0)]
     p256 = py_p256_keygen(int.from_bytes(seed(b"client p256"), "big"))[0]
     cookie = seed(b"cookie") * 3
     chw.append(("00" * 32, "", "1301", "001d0017", "04030804", "", 0x0017, p256.hex(), cookie.hex(),
                 t_ch(bytes(32), b"", [0x1301], [0x001d, 0x0017], [0x0403, 0x0804], 0x0017, p256,
-                     b"", cookie).hex()))
+                     b"", cookie).hex(), "", 0, "", 0, 0))
     return rows, chw
 
 
@@ -5349,6 +5392,319 @@ def tls13_cv_vectors():
     print(f"  tls13 CertificateVerify: {len(rows)} Wycheproof rows over {len(keys)} keys, "
           f"{sum(r[4] for r in rows)} valid")
     return keys, rows
+
+
+# ------------------------------------------ TLS 1.3 resumption, ALPN, mTLS (M3 line 3, RFC 9846 4.3.11)
+TLS13_ALPN = [b"mqtt", b"x-amzn-mqtt-ca"]
+TICKET_MAX = 2048  # must match BRISK_TICKET_MAX in include/brisk.h
+
+
+def t_ticket_blob(suite, issued_ms, lifetime, age_add, psk, sni, ticket):
+    """Ticket blob v1 (src/tls/ticket.c): ver | suite | issued_ms(int64) | lifetime | age_add |
+    psk_len psk | sni_len sni | ticket_len ticket, big-endian, byte-addressed."""
+    return (b"\x01" + t_u16(suite) + (issued_ms & (2**64 - 1)).to_bytes(8, "big")
+            + lifetime.to_bytes(4, "big") + age_add.to_bytes(4, "big") + t_v8(psk) + t_v8(sni)
+            + t_v16(ticket))
+
+
+def tls13_psk(parts):
+    """RFC 8448 sect 4 (resumed handshake) and the flows M3 line 3 adds on top of sect 3/6.
+
+    Official, checked here byte for byte: sect 3's NewSessionTicket turned into the sect 4 PSK
+    (RFC 9846 4.7.1), the sect 4 binder over 'ClientHello prefix' (4.3.11.2), the early secret,
+    and the whole sect 4 cascade (handshake/application secrets, server Finished) re-derived from
+    the official messages with that PSK. The sect 4 ClientHello carries early_data, which this
+    client never sends, so every flow the C engine replays is GENERATED with the same cascade:
+    the sect 4 PSK, keys and server messages under a ClientHello from brisk__tls13_ch_write's
+    layout (no early_data), a PSK + HRR, a declined PSK, and sect 6's CertificateRequest answered
+    by a P-256 device key."""
+    s3, s5, s6, s7 = parts
+    secs = {}
+    for b in rfc8448_blocks():
+        secs.setdefault(b["_sec"], []).append(b)
+
+    def blk(sec, side, head):
+        for b in secs[sec]:
+            if b["_side"] == side and b["_h"].startswith(head) and b["_f"]:
+                return {k: hexbytes(v) for k, v in b["_f"].items()}
+        die(f"RFC 8448 sect {sec}: no {side} block '{head}'")
+
+    # sect 3: the NewSessionTicket and the PSK it yields (RFC 9846 4.7.1)
+    ks3 = t_ext(t_hello_parse(s3["sh"])["exts"], 51)
+    fl3 = t_flow(256, t_dhe(0x001d, s3["priv1"], ks3[4:]), [s3["ch1"]], s3["sh"], s3["ee"], b"",
+                 s3["cert"], s3["cv"])
+    nst = t_body(s3["nst"], 4)
+    lifetime, age_add = int.from_bytes(nst[:4], "big"), int.from_bytes(nst[4:8], "big")
+    nonce = nst[9:9 + nst[8]]
+    i = 9 + nst[8]
+    ticket = nst[i + 2:i + 2 + int.from_bytes(nst[i:i + 2], "big")]
+    psk = py_expand_label(256, fl3["res"], b"resumption", nonce, 32)
+    if blk(3, "server", "generate resumption secret")["expanded"] != psk:
+        die("RFC 8448 sect 3: resumption PSK mismatch")
+    early4 = blk(4, "client", 'extract secret "early"')
+    if early4["IKM"] != psk or py_hkdf_extract(256, bytes(32), psk) != early4["secret"]:
+        die("RFC 8448 sect 4: the early secret is not HKDF-Extract(0, sect 3's PSK)")
+    # sect 4: the binder (4.3.11.2) over Truncate(CH)
+    b4 = blk(4, "client", "calculate PSK binder")
+    ch4 = blk(4, "client", "send handshake record")["payload"]
+    prefix = b4["ClientHello prefix"]
+    if ch4[:len(prefix)] != prefix or len(ch4) != len(prefix) + 3 + 32:
+        die("RFC 8448 sect 4: the ClientHello prefix is not Truncate(ClientHello)")
+    if HASH[256](prefix).digest() != b4["binder hash"]:
+        die("RFC 8448 sect 4: binder hash mismatch")
+    binder = t_binder(256, psk, b4["binder hash"])
+    if binder != b4["finished"] or ch4[-32:] != binder or t_binder_fill(256, psk, [], ch4) != ch4:
+        die("RFC 8448 sect 4: PSK binder mismatch")
+    c4 = t_ch_parse(ch4)
+    if t_ext(c4["exts"], 42) is None:
+        die("RFC 8448 sect 4: expected early_data in the ClientHello (the negative row)")
+    pe = t_ext(c4["exts"], 41)
+    il = int.from_bytes(pe[2:4], "big")
+    if pe[4:4 + il] != ticket:
+        die("RFC 8448 sect 4: the PSK identity is not sect 3's ticket")
+    obf = int.from_bytes(pe[4 + il:8 + il], "big")
+    # sect 4: the cascade with the PSK, from the official messages
+    sh4 = blk(4, "server", "construct a ServerHello")["ServerHello"]
+    ee4 = blk(4, "server", "construct an EncryptedExtensions")["EncryptedExtensions"]
+    ck = blk(4, "client", "create an ephemeral x25519")
+    s_pub4 = t_ext(t_hello_parse(sh4)["exts"], 51)[4:]
+    dhe4 = py_x25519(ck["private key"], s_pub4)
+    fl4 = t_flow(256, dhe4, [ch4], sh4, ee4, b"", b"", b"", psk=psk)
+    if fl4["sf"] != blk(4, "server", "construct a Finished")["Finished"]:
+        die("RFC 8448 sect 4: server Finished mismatch")
+    for name, k in (("c hs traffic", "c_hs"), ("s hs traffic", "s_hs"), ("c ap traffic", "c_ap"),
+                    ("s ap traffic", "s_ap"), ("exp master", "exp")):
+        if blk(4, "server", f'derive secret "tls13 {name}"')["expanded"] != fl4[k]:
+            die(f"RFC 8448 sect 4: {name} mismatch")
+
+    # Generated flows on the sect 4 keys, ClientHello in brisk__tls13_ch_write's layout.
+    seed = lambda tag: hashlib.sha256(b"brisk tls13 psk " + tag).digest()
+    rnd = t_body(ch4, 1)[2:34]
+    c_priv, c_pub = ck["private key"], ck["public key"]
+    alpn = t_alpn(TLS13_ALPN)
+    ee_alpn = t_msg(8, t_exts_build([(0, b""), (16, t_v16(t_v8(b"mqtt")))]))
+    ee_plain = t_msg(8, t_exts_build([(0, b"")]))
+
+    def ch_of(group, pub, prefix, age, with_psk=True):
+        ch = t_ch(rnd, b"", TLS13_SUITES, TLS13_GROUPS, TLS13_SIGS, group, pub, b"server",
+                  alpn=alpn, modes=True, psk=(ticket, age, 32) if with_psk else None)
+        return t_binder_fill(256, psk, prefix, ch) if with_psk else ch
+
+    def sh_of(suite, group, pub, sel=True):
+        exts = ([(41, t_u16(0))] if sel else []) + [(51, t_u16(group) + t_v16(pub)),
+                                                    (43, t_u16(0x0304))]
+        return t_msg(2, t_u16(0x0303) + seed(b"server random") + t_v8(b"") + t_u16(suite)
+                     + b"\x00" + t_exts_build(exts))
+
+    rows, chw = [], []
+    ch1 = ch_of(0x001d, c_pub, [], obf)
+    chw.append((rnd.hex(), "", "".join(f"{v:04x}" for v in TLS13_SUITES),
+                "".join(f"{v:04x}" for v in TLS13_GROUPS), "".join(f"{v:04x}" for v in TLS13_SIGS),
+                "server", 0x001d, c_pub.hex(), "",
+                t_ch(rnd, b"", TLS13_SUITES, TLS13_GROUPS, TLS13_SIGS, 0x001d, c_pub, b"server",
+                     alpn=alpn, modes=True, psk=(ticket, obf, 32)).hex(),
+                alpn.hex(), 1, ticket.hex(), obf, 32))
+    chw.append((rnd.hex(), "", "1301", "001d", "0403", "", 0x001d, c_pub.hex(), "",
+                t_ch(rnd, b"", [0x1301], [0x001d], [0x0403], 0x001d, c_pub, alpn=alpn).hex(),
+                alpn.hex(), 0, "", 0, 0))
+    common = dict(psk=psk, psk_suite=0x1301, alpn="")
+    # 1. resumed: the official sect 4 ServerHello (pre_shared_key 0 + x25519, psk_dhe_ke)
+    fl = t_flow(256, dhe4, [ch1], sh4, ee_alpn, b"", b"", b"", psk=psk)
+    rows.append(t_row("RFC 8448 sect 4 minus 0-RTT: resumed, psk_dhe_ke, ALPN mqtt", fl, ch1=ch1,
+                      priv1=c_priv, g1=0x001d, sh=sh4, ee=ee_alpn, cert=b"", cv=b"",
+                      **dict(common, resumed=1, alpn="mqtt")))
+    fresh = py_expand_label(256, fl["res"], b"resumption", nonce, 32)
+    # 2. declined: a full handshake (sect 3's certificate) under the same ClientHello
+    sh = sh_of(0x1301, 0x001d, s_pub4, sel=False)
+    fl = t_flow(256, dhe4, [ch1], sh, ee_plain, b"", s3["cert"], s3["cv"])
+    rows.append(t_row("PSK offered, declined: full handshake, no ALPN answer", fl, ch1=ch1,
+                      priv1=c_priv, g1=0x001d, sh=sh, ee=ee_plain, cert=s3["cert"], cv=s3["cv"],
+                      **common))
+    # 3 + 4. PSK + HelloRetryRequest (4.3.11.2 + 4.2.2): same hash, then SHA-384
+    c_d = int.from_bytes(seed(b"client p256"), "big")
+    s_d = int.from_bytes(seed(b"server p256"), "big")
+    c_p256, s_p256 = py_p256_keygen(c_d)[0], py_p256_keygen(s_d)[0]
+    dhe_p = py_p256_ecdh(c_d, s_p256)
+
+    def hrr_of(suite):
+        return t_msg(2, t_u16(0x0303) + RFC9846["hrr"] + t_v8(b"") + t_u16(suite) + b"\x00"
+                     + t_exts_build([(43, t_u16(0x0304)), (51, t_u16(0x0017))]))
+
+    hrr = hrr_of(0x1301)
+    mh = t_message_hash(256, ch1)
+    ch2 = ch_of(0x0017, c_p256, [mh, hrr], (obf + 1500) & 0xffffffff)
+    sh = sh_of(0x1301, 0x0017, s_p256)
+    fl = t_flow(256, dhe_p, [mh, hrr, ch2], sh, ee_alpn, b"", b"", b"", psk=psk)
+    rows.append(t_row("PSK + HRR (same hash): CH2 binder over message_hash(CH1) || HRR || "
+                      "Truncate(CH2)", fl, ch1=ch1, priv1=c_priv, g1=0x001d, hrr=hrr, ch2=ch2,
+                      priv2=c_d.to_bytes(32, "big"), g2=0x0017, sh=sh, ee=ee_alpn, cert=b"", cv=b"",
+                      **dict(common, resumed=1, alpn="mqtt")))
+    hrr384 = hrr_of(0x1302)
+    ch2n = ch_of(0x0017, c_p256, [], 0, with_psk=False)
+    sh = sh_of(0x1302, 0x0017, s_p256, sel=False)
+    fl = t_flow(384, dhe_p, [t_message_hash(384, ch1), hrr384, ch2n], sh, ee_plain, b"",
+                s3["cert"], s3["cv"])
+    rows.append(t_row("PSK + HRR to SHA-384: the PSK is dropped from CH2, full handshake", fl,
+                      ch1=ch1, priv1=c_priv, g1=0x001d, hrr=hrr384, ch2=ch2n,
+                      priv2=c_d.to_bytes(32, "big"), g2=0x0017, sh=sh, ee=ee_plain,
+                      cert=s3["cert"], cv=s3["cv"], **common))
+
+    # 5 + 6. mTLS: sect 6's CertificateRequest answered with a P-256 device chain
+    ca = ec_issuer(P256, 0x7153E020, 256)
+    dev_d = 0x7153E021
+    dev = ec_issuer(P256, dev_d, 256)
+    ca_c = chain_cert("Brisk Device CA", "Brisk Device CA", ca, ca,
+                      exts=[x_bc(True), x_ku(KU_BIT_KEY_CERT_SIGN)])
+
+    def dev_leaf(key=dev, ku=KU_BIT_DIGITAL_SIGNATURE):
+        return chain_cert("Brisk Device CA", "device-0001", ca, key,
+                          exts=[x_bc(False), x_ku(ku),
+                                x_ext("2.5.29.37", False, x_seq(x_oid("1.3.6.1.5.5.7.3.2")))])
+
+    leaf_c = dev_leaf()
+    chain = [leaf_c, ca_c]
+    srand = hashlib.sha256(b"brisk tls13 sign_rand").digest()
+    dev_pub = py_p256_keygen(dev_d)[0]
+
+    # The IIoT shape the old 2 KB output queue refused: a P-256 leaf issued by an RSA CA, sent
+    # with that CA and its RSA root, each carrying CRL/AIA URLs. It must stay above the old
+    # 1908-byte cap and within BRISK_TLS_MAX_CLIENT_CHAIN's default (4096).
+    rsa_k = rsa_issuer(256)
+    urls = "http://pki.device.example/brisk-rsa-issuing-ca"
+
+    def pki_exts(is_ca, ku):
+        return [x_bc(is_ca), x_ku(ku),
+                x_ext("2.5.29.31", False, x_seq(x_seq(x_ctx(0, x_ctx(0, der_tlv(
+                    0x86, (urls + ".crl").encode())))))),
+                x_ext("1.3.6.1.5.5.7.1.1", False, x_seq(
+                    x_seq(x_oid("1.3.6.1.5.5.7.48.2"), der_tlv(0x86, (urls + ".crt").encode())),
+                    x_seq(x_oid("1.3.6.1.5.5.7.48.1"),
+                          der_tlv(0x86, b"http://ocsp.device.example")))),
+                x_ext("2.5.29.32", False, x_seq(x_seq(x_oid("2.23.140.1.2.1"))))]
+
+    rsa_chain = [chain_cert("Brisk RSA Issuing CA", "device-0001", rsa_k, dev,
+                            exts=pki_exts(False, KU_BIT_DIGITAL_SIGNATURE)),
+                 chain_cert("Brisk RSA Root CA", "Brisk RSA Issuing CA", rsa_k, rsa_k,
+                            exts=pki_exts(True, KU_BIT_KEY_CERT_SIGN)),
+                 chain_cert("Brisk RSA Root CA", "Brisk RSA Root CA", rsa_k, rsa_k,
+                            exts=[x_bc(True), x_ku(KU_BIT_KEY_CERT_SIGN)])]
+    rsa_len = len(b"".join(rsa_chain))
+    if not 1908 < rsa_len <= 4096:
+        die(f"mTLS: the RSA-issued device chain is {rsa_len} bytes, want 1909..4096")
+
+    def client(msgs, chain=chain):
+        cert = t_msg(11, b"\x00" + t_v24(b"".join(t_v24(c) + t_v16(b"") for c in chain)))
+        tbs = (b" " * 64 + b"TLS 1.3, client CertificateVerify\x00"
+               + t_th(256, msgs + [cert]))  # RFC 9846 4.5.2, client context
+        h = hashlib.sha256(tbs).digest()
+        r, s_ = py_p256_sign(dev_d, h, 256, srand)
+        raw = r.to_bytes(32, "big") + s_.to_bytes(32, "big")
+        if py_p256_verify(dev_pub, h, raw) != P256_OK:
+            die("mTLS: the client CertificateVerify does not verify")
+        return [cert, t_msg(15, t_u16(0x0403) + t_v16(x_seq(x_int(r), x_int(s_))))]
+
+    ks6 = t_ext(t_hello_parse(s6["sh"])["exts"], 51)
+    dhe6 = t_dhe(s6["g1"], s6["priv1"], ks6[4:])
+    mt = dict(cchain=b"".join(chain), ckey=dev_d.to_bytes(32, "big"), srand=srand)
+    fl = t_flow(256, dhe6, [s6["ch1"]], s6["sh"], s6["ee"], s6["cr"], s6["cert"], s6["cv"],
+                client=client)
+    rows.append(t_row("RFC 8448 sect 6 shape: CertificateRequest answered by a P-256 device key",
+                      fl, ch1=s6["ch1"], priv1=s6["priv1"], g1=s6["g1"], sh=s6["sh"], ee=s6["ee"],
+                      cr=s6["cr"], cert=s6["cert"], cv=s6["cv"], **mt))
+    mt_rsa = dict(mt, cchain=b"".join(rsa_chain))
+    fl = t_flow(256, dhe6, [s6["ch1"]], s6["sh"], s6["ee"], s6["cr"], s6["cert"], s6["cv"],
+                client=lambda msgs: client(msgs, rsa_chain))
+    rows.append(t_row(f"RFC 9846 4.4.2: a {rsa_len}-byte device chain (P-256 leaf, RSA issuing "
+                      "CA + root) in the client flight", fl, ch1=s6["ch1"], priv1=s6["priv1"],
+                      g1=s6["g1"], sh=s6["sh"], ee=s6["ee"], cr=s6["cr"], cert=s6["cert"],
+                      cv=s6["cv"], **mt_rsa))
+    cr_rsa = t_msg(13, b"\x00" + t_exts_build([(13, t_v16(t_u16(0x0804) + t_u16(0x0401)))]))
+    fl = t_flow(256, dhe6, [s6["ch1"]], s6["sh"], s6["ee"], cr_rsa, s6["cert"], s6["cv"])
+    rows.append(t_row("RFC 9846 4.5.1: CR without ecdsa_secp256r1_sha256 -> empty Certificate", fl,
+                      ch1=s6["ch1"], priv1=s6["priv1"], g1=s6["g1"], sh=s6["sh"], ee=s6["ee"],
+                      cr=cr_rsa, cert=s6["cert"], cv=s6["cv"], **mt))
+
+    # hs_init's device-chain checks (RFC 9846 4.5.1.2): (note, chain, key, ok)
+    p384 = ec_issuer(P384, 0x7153E022, 384)
+    mtls = [("device chain leaf + CA, matching key", b"".join(chain), dev_d, 1),
+            ("leaf alone", leaf_c, dev_d, 1),
+            ("leaf + RSA issuing CA + RSA root, over 1908 bytes", b"".join(rsa_chain), dev_d, 1),
+            ("key does not match the leaf", b"".join(chain), dev_d + 1, 0),
+            ("RSA leaf (RSA is verify only)", dev_leaf(key=rsa_issuer(256)), dev_d, 0),
+            ("P-384 leaf (verify only)", dev_leaf(key=p384), dev_d, 0),
+            ("keyUsage without digitalSignature", dev_leaf(ku=4), dev_d, 0),
+            ("garbage DER", b"\x30\x03\x02\x01\x01", dev_d, 0),
+            ("a stray byte after the leaf", leaf_c + b"\x00", dev_d, 0)]
+    mtls = [(n, c.hex(), d.to_bytes(32, "big").hex(), ok) for n, c, d, ok in mtls]
+
+    # SH / EE / flight negatives on the resumed and HRR flows (alert, section)
+    muts = []  # (flow offset in rows, message name, bytes, alert, note)
+    hs4 = t_hello_parse(sh4)
+    rest = [e for e in hs4["exts"] if e[0] != 41]
+    for sel, alert, why in ((t_u16(1), "illegal_parameter",
+                             "4.3.11: selected_identity not offered"),
+                            (b"\x00", "decode_error", "4.3.11: selected_identity truncated"),
+                            (b"\x00\x00\x00", "decode_error", "4.3.11: trailing byte")):
+        muts.append((0, "sh", t_hello_build(hs4, exts=[[41, sel]] + rest), alert,
+                     f"RFC 9846 {why}"))
+    muts.append((0, "sh", t_hello_build(hs4, suite=t_u16(0x1302)), "illegal_parameter",
+                 "RFC 9846 4.3.11: PSK selected under a suite of another hash"))
+    muts.append((0, "sh", t_hello_build(hs4, exts=[e for e in hs4["exts"] if e[0] != 51]),
+                 "illegal_parameter", "RFC 9846 4.3.11: PSK selected without key_share "
+                 "(psk_dhe_ke only)"))
+    for name, m, why in (("sf", s6["cr"], "CertificateRequest"),
+                         ("sf", s3["cert"], "Certificate")):
+        muts.append((0, name, m, "unexpected_message",
+                     f"RFC 9846 4.4.2 / A.1: a {why} in a PSK handshake"))
+    fb = t_body(bytes.fromhex(rows[0][19]), 20)
+    muts.append((0, "sf", t_msg(20, fb[:-1] + bytes([fb[-1] ^ 1])), "decrypt_error",
+                 "RFC 9846 4.5.3: flipped server Finished in a PSK handshake"))
+    muts.append((0, "ee", t_msg(8, t_exts_build([(0, b""), (16, t_v16(t_v8(b"h2")))])),
+                 "illegal_parameter", "RFC 7301 3.1: ALPN answer not in the offer (TCP, local)"))
+    hh = t_hello_parse(hrr)
+    muts.append((2, "hrr", t_hello_build(hh, exts=hh["exts"] + [[41, t_u16(0)]]),
+                 "illegal_parameter", "RFC 9846 4.3 Table 1: pre_shared_key in a "
+                 "HelloRetryRequest"))
+
+    blob_issued = 1758600000000
+    blob = t_ticket_blob(0x1301, blob_issued, lifetime, age_add, psk, b"server", ticket)
+    one = (s3["nst"].hex(), psk.hex(), prefix.hex(), b4["binder hash"].hex(), binder.hex(),
+           ch4.hex(), early4["secret"].hex(), blob.hex(), blob_issued, blob_issued + 5000,
+           (5000 + age_add) & 0xffffffff, ticket.hex(), fresh.hex(), lifetime, age_add)
+    print(f"  tls13 psk: sect 4 binder/early/cascade verified, {len(rows)} flows, {len(muts)} "
+          f"mutations, {len(mtls)} device chains")
+    return rows, chw, muts, mtls, [one]
+
+
+def tls13_ecdsa_der():
+    """brisk__x509_ecdsa_der, the CertificateVerify encoder: every 'valid' Wycheproof
+    ecdsa_secp256r1_sha256_test.json signature must come back byte for byte from its r || s
+    (the minimal DER of X.690 8.3.2 is unique), plus generated edge cases."""
+    n = P256["n"]
+    seen, rows = set(), []
+    for g in json.loads(fetch("wp_p256_ecdsa_der"))["testGroups"]:
+        for t in g["tests"]:
+            sig = bytes.fromhex(t["sig"])
+            if t["result"] != "valid" or sig in seen:
+                continue
+            raw = t_ecdsa_der(sig, 32)
+            if raw is None:
+                die(f"wycheproof tcId {t['tcId']}: a valid signature does not parse")
+            r, s_ = int.from_bytes(raw[:32], "big"), int.from_bytes(raw[32:], "big")
+            if x_seq(x_int(r), x_int(s_)) != sig:
+                die(f"wycheproof tcId {t['tcId']}: a valid signature is not minimal DER")
+            seen.add(sig)
+            rows.append((raw.hex(), sig.hex(), f"wycheproof tcId {t['tcId']}"))
+    for r, s_, note in ((1, 1, "r = s = 1"), (1 << 255, n - 1, "r top bit set, s = n - 1"),
+                        (n - 1, n - 2, "both 33-byte INTEGERs: the 72-byte maximum"),
+                        (0x7f, 0x80, "one-byte r, s needing a 0x00 pad"),
+                        (1 << 200, 0xff << 100, "leading zero octets stripped")):
+        der = x_seq(x_int(r), x_int(s_))
+        rows.append(((r.to_bytes(32, "big") + s_.to_bytes(32, "big")).hex(), der.hex(), note))
+    if max(len(r[1]) for r in rows) != 144:
+        die("ecdsa der: no 72-byte row")
+    print(f"  tls13 ecdsa DER encoder: {len(rows)} rows")
+    return rows
 
 
 # ---------------------------------------------------------------- TLS 1.3 record layer (RFC 9846 5)
@@ -5841,6 +6197,15 @@ def main():
     tls13_fx, tls13_chw = tls13_fixture()
     tls13_mut = t_mutations(tls13_parts)
     tls13_cv_keys, tls13_cv = tls13_cv_vectors()
+    tls13_pskf, psk_chw, psk_muts, tls13_mtls, tls13_psk1 = tls13_psk(tls13_parts)
+    tls13_chw += psk_chw
+    base = len(tls13_flows) + len(tls13_fx)
+    for off, name, msg, alert, note in psk_muts:
+        r = tls13_pskf[off]
+        names = [n for n, i in (("hrr", 9), ("sh", 14), ("ee", 15), ("cr", 16), ("cert", 17),
+                                ("cv", 18), ("sf", 19)) if r[i]]
+        tls13_mut.append((base + off, names.index(name), msg.hex(), ALERT[alert], note))
+    tls13_der = tls13_ecdsa_der()
     rec_rows, rec_nonces, rec_hsmsg, rec_seeds, rec_fuzz_key = tls13_records()
 
     emit("sha2.inc", "struct hash_kat SHA2_KAT", cavp + dhash, lambda r: f"{r[0]}, {cstr(r[1])}, {cstr(r[2])}")
@@ -5954,20 +6319,34 @@ def main():
                                      + ["NULL"] * (PIN_MAX - len(r[2]))) + "}, "
                    + f'{r[3]}, {r[4]}LL, "{r[5]}"')
 
-    emit("tls13_trace.inc", "struct tls13_flow_kat TLS13_FLOW_KAT", tls13_flows + tls13_fx,
+    emit("tls13_trace.inc", "struct tls13_flow_kat TLS13_FLOW_KAT", tls13_flows + tls13_fx + tls13_pskf,
          lambda r: f'"{cesc(r[0])}", {cstr(r[1])}, "{r[2]}", {r[3]}LL, {r[4]}, {r[5]}, '
                    f'0x{r[6]:04x}u, {cstr(r[7])}, {cstr(r[8])}, {cstr(r[9])}, 0x{r[10]:04x}u, '
-                   + ", ".join(cstr(x) for x in r[11:]))
+                   + ", ".join(cstr(x) for x in r[11:29])
+                   + f', 0x{r[29]:04x}u, {r[30]}, "{r[31]}", {cstr(r[32])}, {cstr(r[33])}, '
+                   f'{cstr(r[34])}')
     emit("tls13_trace.inc", "struct tls13_rfc_kat TLS13_RFC_KAT", tls13_rfc,
          lambda r: ", ".join(cstr(x) for x in r), append=True)
     emit("tls13_trace.inc", "struct tls13_chw_kat TLS13_CHW_KAT", tls13_chw,
          lambda r: ", ".join(cstr(x) for x in r[:5]) + f', "{r[5]}", 0x{r[6]:04x}u, '
-                   + ", ".join(cstr(x) for x in r[7:]), append=True)
+                   + ", ".join(cstr(x) for x in r[7:11]) + f", {r[11]}, {cstr(r[12])}, "
+                   f"{r[13]}u, {r[14]}", append=True)
+    emit("tls13_psk.inc", "struct tls13_psk_kat TLS13_PSK_KAT", tls13_psk1,
+         lambda r: ", ".join(cstr(x) for x in r[:8]) + f", {r[8]}LL, {r[9]}LL, {r[10]}u, "
+                   f"{cstr(r[11])}, {cstr(r[12])}, {r[13]}u, {r[14]}u")
+    emit("tls13_psk.inc", "struct tls13_mtls_kat TLS13_MTLS_KAT", tls13_mtls,
+         lambda r: f'"{r[0]}", {cstr(r[1])}, {cstr(r[2])}, {r[3]}', append=True)
+    emit("tls13_psk.inc", "struct tls13_der_kat TLS13_DER_KAT", tls13_der,
+         lambda r: f'{cstr(r[0])}, {cstr(r[1])}, "{r[2]}"', append=True)
+    # Seeds for fuzz/fuzz_ticket.c (tools/dev.py fuzz ticket): the one ticket blob.
+    emit("tls13_ticket_fuzz.inc", "struct tls13_fuzz_seed TLS13_TICKET_FUZZ_SEED",
+         [(tls13_psk1[0][7], "RFC 8448 sect 3 ticket, v1 blob")],
+         lambda r: f'{cstr(r[0])}, "{r[1]}"')
     # Seeds for fuzz/fuzz_tls13_hs.c (tools/dev.py fuzz tls13_hs), not included by any test:
     # [ServerHello length] ServerHello || the HANDSHAKE flight, the harness's input format. The
     # sect 3 flight passes that harness's ServerHello checks, so the fuzzer starts deep.
     seeds = []
-    for r in tls13_flows + tls13_fx:
+    for r in tls13_flows + tls13_fx + tls13_pskf:
         sh = bytes.fromhex(r[9] or r[14])
         rest = b"".join(bytes.fromhex(x) for x in r[15:20])
         if len(sh) < 256:
@@ -6056,10 +6435,27 @@ def main():
         "  2^384-1 on each side). The DER siblings of both files are out of scope here for the\n"
         "  same reason the P-256 one is; the SHA-384 one is used by `tls13_cv.inc`.\n"
         "- TLS 1.3 handshake (`tls13_*.inc`): NIST CAVP has no handshake vectors, and the RFC 9001\n"
-        "  A.2/A.3 QUIC Initial ClientHello/ServerHello belong to M6. RFC 8448 sect 4 (0-RTT\n"
-        "  resumption) is out of this slice: no PSK, no 0-RTT. Sect 6's client flight uses an RSA\n"
-        "  client key this library cannot produce, so from there on the values are ours, computed\n"
-        "  by the same Python cascade that reproduces sections 3, 5 and 7 byte for byte.\n"
+        "  A.2/A.3 QUIC Initial ClientHello/ServerHello belong to M6. Sect 6's client flight uses\n"
+        "  an RSA client key this library cannot produce, so from there on the values are ours,\n"
+        "  computed by the same Python cascade that reproduces sections 3, 5 and 7 byte for byte;\n"
+        "  the ECDSA P-256 device-key flight (`tls13_trace.inc`, sect 6 shape) is generated the\n"
+        "  same way with a fixture certificate and a fixed hedging input, and its CertificateVerify\n"
+        "  is re-verified in Python and in C.\n"
+        "- TLS 1.3 resumption (`tls13_psk.inc`, the PSK rows of `tls13_trace.inc`). OFFICIAL, from\n"
+        "  RFC 8448: sect 3's NewSessionTicket and the PSK it yields, sect 4's binder over the\n"
+        "  'ClientHello prefix', the binder hash, the early secret, and the sect 4 handshake /\n"
+        "  application secrets and server Finished, all re-derived here from the official\n"
+        "  messages. NOT usable, because they are 0-RTT specific: `c e traffic`, EndOfEarlyData,\n"
+        "  sect 4's client Finished and its res master; sect 4's ClientHello itself carries\n"
+        "  early_data, so the engine must refuse it (a negative row). GENERATED by the same\n"
+        "  cascade: the resumed flow with a ClientHello in `brisk__tls13_ch_write`'s layout (no\n"
+        "  early_data), a declined PSK, PSK + HelloRetryRequest (the binder over\n"
+        "  message_hash(CH1) || HRR || Truncate(CH2) - no official vector exists), and the ticket\n"
+        "  blob. No Wycheproof or NIST suite exists for PSK binders, ticket blobs or ALPN; RFC 7301\n"
+        "  and RFC 6066 publish no vectors, so the ALPN/SNI encoding rows are generated and\n"
+        "  tlsfuzzer's test-alpn-negotiation.py / test-sni-*.py served as a case catalogue only.\n"
+        "  The ECDSA-Sig-Value ENCODER round-trips every 'valid' row of\n"
+        "  `ecdsa_secp256r1_sha256_test.json`.\n"
         "- TLS 1.3 record layer (`tls13_record.inc`): Wycheproof has NO TLS record-layer suite and\n"
         "  NIST CAVP has no TLS 1.3 record set. The AEADs underneath are covered by M1\n"
         "  (`aes_gcm.inc`, `chacha20_poly1305.inc`, valid and invalid tags). The official rows are\n"

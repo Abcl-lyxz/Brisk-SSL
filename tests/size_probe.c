@@ -145,7 +145,7 @@ int main(int argc, char **argv)
     }
     {
         /* the handshake engine; its scratch is the probe's own BSS, not the library's RAM */
-        static uint8_t scratch[4 + BRISK_TLS_MAX_HS_MSG + 8192];
+        static uint8_t scratch[4 + BRISK_TLS_MAX_HS_MSG + 8192 + BRISK_TLS_MAX_CLIENT_CHAIN];
         static brisk__tls13_hs hs;
         brisk__tls13_auth_x509_ctx ax = {"a.example", 9, NULL, 0};
         brisk__tls13_hs_cfg cfg = {NULL, NULL, brisk__tls13_auth_x509, &ax, 0, NULL, NULL,
@@ -164,6 +164,17 @@ int main(int argc, char **argv)
         brisk__tls13_hs_feed(&hs, 0, out, n);
         brisk__tls13_hs_pull(&hs, &e, out, sizeof out);
         brisk__tls13_hs_exporter(&hs, "e", out, 1, out, 32);
+        {
+            /* resumption (ticket blob + PSK offer) and the ALPN answer */
+            static brisk__tls13_psk psk;
+            static brisk__tls13_ticket tk;
+            const uint8_t *name;
+            brisk__tls13_ticket_import(out, sizeof out, "a", 1, 5, &psk);
+            brisk__tls13_ticket_export(&tk, 5, "a", 1, out, sizeof out, &n);
+            brisk__tls13_hs_set_psk(&hs, &psk);
+            brisk__tls13_hs_alpn(&hs, &name, &n);
+            out[1] = (uint8_t)brisk__tls13_hs_resumed(&hs);
+        }
         {
             /* the record layer + connection driver over the same engine */
             static uint8_t rec_in[BRISK__TLS_REC_IN_MAX];

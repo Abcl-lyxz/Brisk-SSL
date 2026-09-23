@@ -1414,6 +1414,13 @@ int brisk__tls_ks_exporter(brisk_hash_alg alg, const uint8_t *exporter_ms, const
 /* Wipe every secret in ks. Safe on NULL. */
 void brisk__tls_ks_wipe(brisk__tls_ks *ks);
 
+/* PSK binder (RFC 9846 4.3.11.2 + 7.1): binder_key = Derive-Secret(HKDF-Extract(0, psk),
+ * "res binder", ""), then a Finished MAC (4.5.3) with binder_key as BaseKey over `th_trunc`, the
+ * HashLen-byte Transcript-Hash(... || Truncate(ClientHello)). `out` gets HashLen bytes. The early
+ * secret, binder_key and finished_key are wiped before return. BRISK_E_ARG on an unknown alg. */
+int brisk__tls_psk_binder(brisk_hash_alg alg, const uint8_t *psk, size_t psk_len,
+                          const uint8_t *th_trunc, uint8_t *out);
+
 /* ---- tls/handshake.c: TLS 1.3 client handshake engine (RFC 9846 sect 4), sans-I/O -----------
  *
  * One engine for TCP and QUIC: it deals in HANDSHAKE MESSAGES tagged with an epoch (the RFC 9001
@@ -1426,8 +1433,24 @@ void brisk__tls_ks_wipe(brisk__tls_ks *ks);
  * FLOW (RFC 9846 sect 4.1, Appendix A.1). START -> [hs_client_hello] -> WAIT_SH -> WAIT_EE ->
  * WAIT_CERT_CR -> [WAIT_CERT] -> WAIT_CV -> WAIT_FIN -> CONNECTED. A HelloRetryRequest turns
  * WAIT_SH into WAIT_CH2 once; the caller then builds CH2 from hs->hrr_group / hs->cookie and
- * absorbs it with hs_client_hello again. Anything out of order is unexpected_message. The PSK
- * branch (WAIT_EE -> WAIT_FIN) is not in this slice.
+ * absorbs it with hs_client_hello again. Anything out of order is unexpected_message. When the
+ * ServerHello selected the offered PSK (hs_set_psk), WAIT_EE goes to WAIT_FIN (A.1): no
+ * certificate is sent or checked on a resumed connection, so the ONLY binding to the original
+ * server is the ticket's SNI match and its 7-day cap (ticket.c); SPKI pins are not re-checked.
+ *
+ * PSK (RFC 9846 4.3.11): resumption only, psk_dhe_ke only, never 0-RTT. The caller builds the
+ * ClientHello with brisk__tls13_ch_write (binder = HashLen zeros); hs_client_hello computes the
+ * binder over Truncate(CH) (after an HRR: message_hash(CH1) || HRR || Truncate(CH2)), writes it
+ * into ITS queued copy and the transcript - the caller's bytes stay const. The PSK is wiped once
+ * the ServerHello is processed, selected or not; a declined PSK is a full handshake.
+ *
+ * ALPN (RFC 7301): the offer is read from the ClientHello; EE must answer with exactly one name
+ * from it (else decode_error / illegal_parameter, over QUIC no_application_protocol - RFC 9001
+ * 8.1, which also makes ALPN mandatory there). hs_alpn reports the answer, len 0 for none.
+ *
+ * mTLS (RFC 9846 4.5.1-4.5.2): a CertificateRequest is answered with cfg.client_chain and a
+ * CertificateVerify (ecdsa_secp256r1_sha256, signed with cfg.client_key or cfg.sign) when the
+ * request lists 0x0403, else with an empty Certificate.
  *
  * FAILURE is sticky: the first violation sets hs->alert (RFC 9846 6.2 AlertDescription), wipes
  * every secret, drops queued output and returns BRISK_E_AUTH (a certificate or signature
@@ -1468,16 +1491,36 @@ enum {
     BRISK__ALERT_INTERNAL_ERROR = 80,
     BRISK__ALERT_USER_CANCELED = 90,
     BRISK__ALERT_MISSING_EXTENSION = 109,
-    BRISK__ALERT_UNSUPPORTED_EXTENSION = 110
+    BRISK__ALERT_UNSUPPORTED_EXTENSION = 110,
+    BRISK__ALERT_CERTIFICATE_REQUIRED = 116,   /* 4.5.1.3 / 6.2: only ever received */
+    BRISK__ALERT_NO_APPLICATION_PROTOCOL = 120 /* RFC 7301 3.2; RFC 9001 8.1 over QUIC */
 };
+
+/* Local cap on the encoded ALPN ProtocolNameList body we offer (RFC 7301 3.1 allows 2^16-1). */
+#define BRISK__TLS13_ALPN_MAX 256
+
+/* One resumption PSK, from brisk__tls13_ticket_import (RFC 9846 4.3.11). */
+typedef struct {
+    const uint8_t *identity; /* the ticket; points into the caller's blob */
+    size_t identity_len;
+    uint8_t psk[BRISK_HASH_MAX_LEN]; /* SECRET */
+    uint8_t psk_len;                 /* 32 or 48 = HashLen of `suite` */
+    uint16_t suite;
+    uint32_t obf_age; /* 4.3.11.1: (age_ms + ticket_age_add) mod 2^32, from import's now_ms */
+} brisk__tls13_psk;
 
 /* The HRR cookie is copied into CH2 (RFC 9846 4.3.2). The RFC allows 2^16-1 bytes; 256 is a
  * LOCAL limit that keeps the context small, and a bigger cookie fails with illegal_parameter.
  * Raise it (and make it a knob) if interop finds a stateless server that needs more. */
 #define BRISK__TLS13_COOKIE_MAX 256
 /* Room for a queued ClientHello pair and the client flight. brisk__tls13_ch_write output is
- * ~350 bytes with SNI and a P-256 share; a CH that does not fit is BRISK_E_ARG at absorb. */
-#define BRISK__TLS13_OUT_MAX 2048
+ * ~350 bytes with SNI and a P-256 share; a CH that does not fit is BRISK_E_ARG at absorb. With
+ * mTLS the flight carries the device chain too (BRISK_TLS_MAX_CLIENT_CHAIN on top). */
+#if BRISK_ENABLE_MTLS
+#    define BRISK__TLS13_OUT_MAX (2048 + BRISK_TLS_MAX_CLIENT_CHAIN)
+#else
+#    define BRISK__TLS13_OUT_MAX 2048
+#endif
 
 /* Traffic secret hand-off: called synchronously from hs_feed, in the order s_hs(recv),
  * c_hs(send) after the ServerHello and s_ap(recv), c_ap(send) after the server Finished.
@@ -1555,11 +1598,23 @@ typedef struct {
     const uint8_t *quic_tp; /* QUIC only: encoded transport parameters (RFC 9001 8.2); NULL over
                                TCP, where the extension MUST NOT be sent */
     size_t quic_tp_len;
+    /* RFC 7301 3.1 ProtocolName entries (u8 length + name each), WITHOUT the outer uint16;
+     * NULL/0 = no ALPN. Empty names, a truncated entry or more than BRISK__TLS13_ALPN_MAX
+     * bytes are BRISK_E_ARG. Over QUIC it is mandatory (RFC 9001 8.1, checked at absorb). */
+    const uint8_t *alpn;
+    size_t alpn_len;
+    uint8_t psk_modes; /* 1 = psk_key_exchange_modes [psk_dhe_ke] (4.3.9); needed with psk */
+    /* NULL = no pre_shared_key. Else one identity + obf_age, and a binder of psk_len zero bytes
+     * that hs_client_hello fills (4.3.11). The extension is written LAST, as 4.3.11 demands. */
+    const brisk__tls13_psk *psk;
 } brisk__tls13_ch_params;
 
 /* Serialise a ClientHello handshake message, header included. Extension order: server_name,
- * supported_groups, signature_algorithms, supported_versions, cookie, key_share,
- * quic_transport_parameters.
+ * supported_groups, signature_algorithms, ALPN, supported_versions, cookie,
+ * psk_key_exchange_modes, key_share, quic_transport_parameters, pre_shared_key. The SNI must be
+ * printable ASCII (0x21..0x7e; IDNs as A-labels) and at most 255 bytes; one trailing dot is
+ * dropped. The same caller string MUST be the RFC 9525 reference host (auth ctx) and the ticket
+ * SNI - brisk_connect wires all three from its `host`.
  * BRISK_E_ARG, with *out_len 0, on bad parameters or when cap is too small. */
 int brisk__tls13_ch_write(const brisk__tls13_ch_params *p, uint8_t *out, size_t cap,
                           size_t *out_len);
@@ -1572,11 +1627,16 @@ typedef int (*brisk__tls13_tp_fn)(void *ctx, const uint8_t *tp, size_t len);
 /* A NewSessionTicket (RFC 9846 4.7.1), strictly parsed. nonce and ticket point into the engine's
  * scratch and die with the call. lifetime is passed through as sent (a value above 604800 is
  * not fatal; whoever stores the ticket MUST NOT use it beyond 7 days). max_early_data is 0
- * when the early_data extension is absent. */
+ * when the early_data extension is absent. psk = HKDF-Expand-Label(resumption_master_secret,
+ * "resumption", ticket_nonce, HashLen) of the connection's suite: SECRET, and wiped as soon as
+ * the callback returns - export it (brisk__tls13_ticket_export) inside the callback. */
 typedef struct {
     uint32_t lifetime, age_add, max_early_data;
     const uint8_t *nonce, *ticket;
     size_t nonce_len, ticket_len;
+    uint8_t psk[BRISK_HASH_MAX_LEN];
+    size_t psk_len;
+    uint16_t suite;
 } brisk__tls13_ticket;
 /* Non-zero return = internal_error (BRISK_E_ARG). */
 typedef int (*brisk__tls13_ticket_fn)(void *ctx, const brisk__tls13_ticket *t);
@@ -1594,6 +1654,24 @@ typedef struct {
     void *tp_ctx;
     brisk__tls13_ticket_fn on_ticket; /* may be NULL: tickets are silently ignored */
     void *ticket_ctx;
+    /* mTLS (RFC 9846 4.5.1, 4.5.2). Same layout in every profile; a chain with
+     * BRISK_ENABLE_MTLS == 0 is BRISK_E_ARG at init. hs_init checks, as configuration bugs
+     * (BRISK_E_ARG): exactly one of client_key / sign; sign_rand with client_key; every DER
+     * certificate parses; the leaf is P-256 with digitalSignature when keyUsage is present
+     * (4.5.1.2); keygen(client_key) is the leaf's point; client_chain_len is at most
+     * BRISK_TLS_MAX_CLIENT_CHAIN, so the Certificate + CertificateVerify + Finished fit an
+     * empty output queue (BRISK__TLS13_OUT_MAX) - it is empty in practice,
+     * because the ClientHello is pulled before the server can answer it; if it is not, the
+     * flight fails with internal_error, never truncated. Buffers are not copied: they must
+     * outlive the handshake. */
+    const uint8_t *client_chain; /* concatenated DER certificates, leaf first; NULL = none */
+    size_t client_chain_len;
+    const uint8_t *client_key; /* 32-byte P-256 d (SECRET), or NULL when `sign` is used */
+    const uint8_t *sign_rand;  /* 32 fresh bytes of brisk__os_random per handshake: the hedged
+                                  RFC 6979 3.6 k'. Reuse is safe (6979 stays deterministic on
+                                  the rest), only weaker against faults. */
+    brisk_sign_fn sign;        /* e.g. a secure element; must return a raw 64-byte r || s */
+    void *sign_ctx;
 } brisk__tls13_hs_cfg;
 
 enum {
@@ -1635,6 +1713,15 @@ typedef struct {
     uint16_t own_rsl;  /* ours, from the ClientHello; 0 = not offered */
     uint8_t n_ext, n_suites, n_groups, n_sigs, session_id_len;
     uint8_t hrr_seen, cr_seen, state, alert, in_epoch;
+    /* resumption (4.3.11): the PSK from hs_set_psk (wiped at the ServerHello), whether the last
+     * ClientHello carried it, whether the ServerHello selected it */
+    uint8_t psk[BRISK_HASH_MAX_LEN];
+    uint8_t psk_len, psk_offered, psk_ok, cr_sig_ok; /* cr_sig_ok: the CR lists 0x0403 */
+    uint16_t psk_suite;
+    /* ALPN (RFC 7301): the offered ProtocolNameList body, and the server's pick inside it */
+    uint8_t alpn[BRISK__TLS13_ALPN_MAX];
+    uint16_t alpn_len, alpn_sel_off;
+    uint8_t alpn_sel_len;
     /* KeyUpdate received in CONNECTED (RFC 9846 4.7.3), for the record layer, which clears it:
      * bit0 rotate the receive key after this record, bit1 the peer set update_requested */
     uint8_t ku;
@@ -1672,6 +1759,38 @@ int brisk__tls13_hs_feed(brisk__tls13_hs *hs, unsigned epoch, const uint8_t *in,
 /* Drain queued output of ONE epoch per call into out[0..cap). Returns the byte count, 0 when
  * nothing is queued (always 0 once FAILED). *epoch is set when the count is non-zero. */
 size_t brisk__tls13_hs_pull(brisk__tls13_hs *hs, unsigned *epoch, uint8_t *out, size_t cap);
+
+/* Before hs_client_hello when the ClientHello carries pre_shared_key (START only). psk_len must
+ * be the HashLen of a known suite. The PSK is copied (identity/obf_age are ch_write's business)
+ * and wiped at the ServerHello, by hs_fail and by hs_wipe. BRISK_E_ARG otherwise. */
+int brisk__tls13_hs_set_psk(brisk__tls13_hs *hs, const brisk__tls13_psk *psk);
+
+/* After CONNECTED: the ALPN name the server selected (points into hs), *len 0 = none. BRISK_E_ARG
+ * before CONNECTED. Whether "none" is acceptable is the caller's call (no protocol switching). */
+int brisk__tls13_hs_alpn(const brisk__tls13_hs *hs, const uint8_t **name, size_t *len);
+
+/* 1 if the ServerHello accepted the PSK: no certificate was checked on this connection. */
+int brisk__tls13_hs_resumed(const brisk__tls13_hs *hs);
+
+/* ---- tls/ticket.c: the resumption ticket blob, the ONE parser of caller-stored bytes -------------
+ * Blob v1, big-endian, byte-addressed (portable across archs): ver(1)=1 | suite(2) |
+ * issued_ms(8, int64) | lifetime(4) | age_add(4) | psk_len(1) psk | sni_len(1) sni |
+ * ticket_len(2) ticket, nothing after. KEY MATERIAL (the PSK). ALPN is per connection (RFC 7301
+ * 3.1) and is not stored. The SNI stored and compared is the caller's host with one trailing dot
+ * dropped, compared ASCII case-insensitively: 4.7.1 only lets a ticket be used for a server
+ * the original certificate was valid for, and an exact host match is the cheap way to meet it.
+ * Both return BRISK_OK or BRISK_E_ARG, and wipe out[0..cap) / *out on failure.
+ *
+ * export: lifetime 0 (discard, 4.7.1), a psk_len that is not the suite's HashLen, an empty
+ * ticket, an SNI over 255 bytes, or a blob over min(cap, BRISK_TICKET_MAX) are refused.
+ * import: anything malformed, an unknown suite, an SNI mismatch, now_ms < issued_ms (the clock
+ * went back) or an age >= min(lifetime, 604800) s (4.7.1, 4.3.11.1) is refused, which just
+ * means a full handshake. out->identity points into `blob`. Import does not consume: the caller
+ * deletes the blob once it has been offered (C.4, clients SHOULD NOT reuse a ticket). */
+int brisk__tls13_ticket_export(const brisk__tls13_ticket *t, int64_t now_ms, const char *sni,
+                               size_t sni_len, uint8_t *out, size_t cap, size_t *out_len);
+int brisk__tls13_ticket_import(const uint8_t *blob, size_t len, const char *sni, size_t sni_len,
+                               int64_t now_ms, brisk__tls13_psk *out);
 
 /* RFC 9846 7.5 exporter; CONNECTED only (BRISK_E_ARG otherwise). */
 int brisk__tls13_hs_exporter(const brisk__tls13_hs *hs, const char *label, const uint8_t *ctx,
@@ -1817,5 +1936,12 @@ void brisk__tls13_conn_wipe(brisk__tls13_conn *c);
  * 2 * flen bytes. BRISK_E_ARG on any encoding error, negative or over-wide integer, trailing
  * byte. Shared by certificate signatures and the CertificateVerify. */
 int brisk__x509_ecdsa_raw(const uint8_t *sig, size_t sig_len, size_t flen, uint8_t *out);
+
+#if BRISK_ENABLE_MTLS
+/* x509/chain.c: the inverse for P-256 - r || s as a minimal DER ECDSA-Sig-Value (X.690 8.3.2:
+ * leading zero octets stripped, 0x00 prepended when the top bit is set). Returns the length,
+ * 8..72. The client CertificateVerify's encoder (RFC 9846 4.3.3). */
+size_t brisk__x509_ecdsa_der(const uint8_t raw[64], uint8_t out[72]);
+#endif
 
 #endif /* BRISK_INT_H */
