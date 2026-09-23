@@ -98,6 +98,7 @@ static void ct_aes_gcm(void)
     memcpy(h, secret16, 16);
     memset(block, 0, sizeof block);
     brisk__ghash(block, h, plain, sizeof plain);
+    brisk__ghash_mulfree(block, h, plain, sizeof plain);
 }
 
 /* X25519: the scalar is the private key, the peer's u-coordinate is public (it came over the

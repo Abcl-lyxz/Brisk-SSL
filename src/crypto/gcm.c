@@ -6,9 +6,11 @@
  * a kept bit, and the high half comes from the bit-reversed operands (rev(x) * rev(y) =
  * rev(x * y)). One variant is compiled per target, selected like aes_ct.c / aes_ct64.c:
  * ctmul64 (64x64->64 multiplies) where pointers are 64-bit, ctmul32 (32x32->32 multiplies only)
- * elsewhere, so 32-bit targets never need a widening multiply or __muldi3. Caveat: CPUs with an
- * early-terminating multiplier (ARM7/ARM9 = armv5, some MIPS32 4K cores) are not guaranteed
- * constant time; see docs/ARCHITECTURE.md.
+ * elsewhere, so 32-bit targets never need a widening multiply or __muldi3. CPUs with an
+ * early-terminating multiplier (ARM7/ARM9 = armv5, some MIPS32 4K cores) would leak H through
+ * the multiply latency, so there BRISK_GHASH_MULFREE (brisk_config.h) swaps in
+ * brisk__ghash_mulfree: shifts and masked XORs only, about 4x slower. It is compiled on every
+ * target so the tests run it everywhere; --gc-sections drops it from images that do not use it.
  *
  * SPDX-License-Identifier: Apache-2.0 AND MIT
  *
@@ -56,7 +58,53 @@ static const uint8_t *next_block(const uint8_t **data, size_t *len, uint8_t tmp[
     return tmp;
 }
 
-#if BRISK__AES_CT64
+/* SP 800-38D 6.3 Algorithm 1, bit by bit: Z ^= V & -x_i; V = (V >> 1) ^ (R & -lsb(V)). Only
+ * shifts, ANDs and XORs on 32-bit words (w[0] = bytes 0..3), so the timing cannot depend on H or
+ * the data even where MUL is variable time. */
+void brisk__ghash_mulfree(uint8_t y[16], const uint8_t h[16], const uint8_t *data, size_t len)
+{
+    struct {
+        uint32_t x[4], z[4], v[4];
+        uint8_t tmp[16];
+    } s;
+    int i, j;
+    for (i = 0; i < 4; i++) {
+        s.x[i] = brisk__load_be32(y + 4 * i);
+    }
+    while (len > 0) {
+        const uint8_t *src = next_block(&data, &len, s.tmp);
+        for (i = 0; i < 4; i++) {
+            s.x[i] ^= brisk__load_be32(src + 4 * i);
+            s.v[i] = brisk__load_be32(h + 4 * i);
+            s.z[i] = 0;
+        }
+        for (i = 0; i < 128; i++) {
+            uint32_t xm = 0u - ((s.x[i >> 5] >> (31 - (i & 31))) & 1u);
+            uint32_t vm = 0u - (s.v[3] & 1u);
+            for (j = 0; j < 4; j++) {
+                s.z[j] ^= s.v[j] & xm;
+            }
+            s.v[3] = (s.v[3] >> 1) | (s.v[2] << 31);
+            s.v[2] = (s.v[2] >> 1) | (s.v[1] << 31);
+            s.v[1] = (s.v[1] >> 1) | (s.v[0] << 31);
+            s.v[0] = (s.v[0] >> 1) ^ (0xE1000000u & vm); /* R = 11100001 || 0^120 */
+        }
+        memcpy(s.x, s.z, sizeof s.x);
+    }
+    for (i = 0; i < 4; i++) {
+        brisk__store_be32(y + 4 * i, s.x[i]);
+    }
+    brisk__secure_zero(&s, sizeof s);
+}
+
+#if BRISK_GHASH_MULFREE
+
+void brisk__ghash(uint8_t y[16], const uint8_t h[16], const uint8_t *data, size_t len)
+{
+    brisk__ghash_mulfree(y, h, data, len);
+}
+
+#elif BRISK__AES_CT64
 
 /* Carry-less 64x64 multiply, low 64 bits: 4-bit holes keep every carry out of the kept bits. */
 static uint64_t bmul64(uint64_t x, uint64_t y)
@@ -270,7 +318,7 @@ void brisk__ghash(uint8_t y[16], const uint8_t h[16], const uint8_t *data, size_
     brisk__secure_zero(&s, sizeof s);
 }
 
-#endif /* BRISK__AES_CT64 */
+#endif /* BRISK_GHASH_MULFREE / BRISK__AES_CT64 */
 
 /* ---- AES-GCM (SP 800-38D 7.1 / 7.2) ---- */
 /* SP 800-38D 5.2.1.1: len(P) <= 2^39 - 256 bits = 2^36 - 32 bytes (2^32 - 2 counter blocks; one

@@ -212,6 +212,8 @@ void brisk__aes_ctr32(const brisk__aes_key *k, const uint8_t cb[16], const uint8
  * y = (y ^ X) * H in GF(2^128). Constant time (ctmul32 on 32-bit, ctmul64 on 64-bit targets,
  * from BearSSL). len may be 0 (data may then be NULL). */
 void brisk__ghash(uint8_t y[16], const uint8_t h[16], const uint8_t *data, size_t len);
+/* the multiply-free GHASH behind BRISK_GHASH_MULFREE; always built so every arch tests it */
+void brisk__ghash_mulfree(uint8_t y[16], const uint8_t h[16], const uint8_t *data, size_t len);
 
 typedef struct {
     brisk__aes_key aes; /* 248 B on every arch */
@@ -1825,8 +1827,8 @@ void brisk__tls13_hs_wipe(brisk__tls13_hs *hs);
  * successful open branches on the authenticated plaintext, which is declassified there: it is
  * the peer's message, handed to the caller anyway, and its padding length is not a key.
  *
- * GCM on the wire: the ARCHITECTURE decision on GHASH timing for early-terminating multipliers
- * (armv5, some MIPS32) is still open and due before the public API (M3 line 4).
+ * GCM on the wire: armv5 and 32-bit MIPS use the multiply-free GHASH (BRISK_GHASH_MULFREE), so
+ * an early-terminating multiplier cannot leak H there.
  */
 #define BRISK__TLS_REC_HDR    5
 #define BRISK__TLS_MAX_PLAIN  16384u              /* 2^14, 5.1 */

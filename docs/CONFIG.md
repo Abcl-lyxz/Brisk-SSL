@@ -20,6 +20,7 @@ that says how to fix it. Knobs are added as their milestone lands.
 |---|---|---|---|
 | (always built) SHA-256/384/512, HMAC, HKDF | on | - | see table below |
 | `BRISK_ENABLE_MTLS` — client certificates: ECDSA P-256 signing (hedged RFC 6979) and the `brisk_sign_fn` hook | DEFAULT and FULL | SHA-2, HMAC, P-256 (all already built) | 818 (armv7hf) … 1776 (mips); 1309 on x86_64 |
+| `BRISK_GHASH_MULFREE` — GHASH with shifts and masked XORs only (SP 800-38D Algorithm 1), for CPUs whose integer multiply finishes early on small operands and would leak the GCM key H through timing. About 4x slower GHASH; AES-GCM stays offered. | on for armv4/armv5 and 32-bit MIPS, off elsewhere (auto) | - | saves 1116 (armv5), 1068 (mips/mipsel); force it to 1 on any other core with a variable-latency MUL |
 | `BRISK_ENABLE_P384` — ECDSA **P-384 signature verification** (`ecdsa_secp384r1_sha384`). Verify only: no P-384 keygen, ECDH or signing exists. | DEFAULT and FULL | `src/crypto/bn.c` (already built for RSA) | 2671 (armv7hf) … 5092 (mips/mipsel); 3775 on x86_64 |
 
 `BRISK_ENABLE_P384` is a knob, unlike P-256 and RSA, because RFC 9846 9.1 makes only

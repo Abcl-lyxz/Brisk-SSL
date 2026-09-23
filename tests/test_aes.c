@@ -303,9 +303,12 @@ static int gcm_open_fails(const brisk__gcm_key *k, const uint8_t *iv, const uint
     return ok;
 }
 
+typedef void (*ghash_fn)(uint8_t y[16], const uint8_t h[16], const uint8_t *data, size_t len);
+
 /* ghash_kat + split_ghash + unaligned: one call, then split at every 16-byte
- * boundary with 0-length calls in between; y and data at offsets 0..3. */
-static void test_ghash(void)
+ * boundary with 0-length calls in between; y and data at offsets 0..3. Run for the build's
+ * brisk__ghash and for the multiply-free one, so BRISK_GHASH_MULFREE is covered on every arch. */
+static void test_ghash_with(ghash_fn ghash)
 {
     size_t i, off, b;
     for (i = 0; i < N(GHASH_KAT); i++) {
@@ -318,17 +321,23 @@ static void test_ghash(void)
             memcpy(wy + off, y0, 16);
             memcpy(wh + off, h, 16);
             memcpy(GWI + off, GP, n);
-            brisk__ghash(wy + off, wh + off, opt(GWI + off, n, off), n);
+            ghash(wy + off, wh + off, opt(GWI + off, n, off), n);
             CHECKI(memcmp(wy + off, want, 16) == 0, i);
         }
         for (b = 0; b <= n; b += 16) {
             memcpy(wy, y0, 16);
-            brisk__ghash(wy, h, GP, b);
-            brisk__ghash(wy, h, GP + b, 0);
-            brisk__ghash(wy, h, GP + b, n - b);
+            ghash(wy, h, GP, b);
+            ghash(wy, h, GP + b, 0);
+            ghash(wy, h, GP + b, n - b);
             CHECKI(memcmp(wy, want, 16) == 0, i);
         }
     }
+}
+
+static void test_ghash(void)
+{
+    test_ghash_with(brisk__ghash);
+    test_ghash_with(brisk__ghash_mulfree);
 }
 
 /* kat_cavp + kat_wycheproof + differential + unaligned: seal/open, out of place

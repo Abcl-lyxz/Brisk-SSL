@@ -71,6 +71,21 @@
 #    define BRISK_ENABLE_P384 (BRISK_PROFILE >= BRISK_PROFILE_DEFAULT)
 #endif
 
+/* GHASH without multiply instructions (src/crypto/gcm.c). The default GHASH is constant time
+ * only if the CPU's integer multiply is: ARM7/ARM9 (armv5) and some MIPS32 cores (4K family)
+ * finish early on small operands, which would leak the GCM hash key H through timing. 1 = use
+ * shifts and masked XORs only (about 4x slower GHASH, a few hundred bytes smaller); 0 = the
+ * multiply-based one. Undefined = on for armv4/armv5 and 32-bit MIPS, off elsewhere. Force it
+ * to 1 for any other core whose MUL latency depends on the operands. AES-GCM stays offered on
+ * every target either way; ChaCha20-Poly1305 is preferred where AES is slow in software. */
+#ifndef BRISK_GHASH_MULFREE
+#    if (defined(__arm__) && ((defined(__ARM_ARCH) && __ARM_ARCH < 6) ||                                                        defined(__ARM_ARCH_5TE__) || defined(__ARM_ARCH_5TEJ__) ||                                        defined(__ARM_ARCH_5T__) || defined(__ARM_ARCH_4T__))) ||                   (defined(__mips__) && !defined(__mips64))
+#        define BRISK_GHASH_MULFREE 1
+#    else
+#        define BRISK_GHASH_MULFREE 0
+#    endif
+#endif
+
 /* Largest RSA modulus accepted when verifying a certificate signature, in bits. The project's
  * first VALUE knob - every other one is a tri-state boolean - and it is a STACK lever, not a
  * flash one: it sizes BRISK__BN_MAX_LIMBS, hence both the i31 scratch inside src/crypto/rsa.c and

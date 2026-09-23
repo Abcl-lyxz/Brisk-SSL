@@ -55,8 +55,8 @@ Tick a box only when the work is green on **every** arch (`python tools/dev.py t
     line 3). ALPN in EE is accepted unchecked until line 3.
 - [x] Record layer (TCP), KeyUpdate, alerts, close_notify
   - `src/tls/record.c`: `brisk__tls_rec_seal/open` + the sans-I/O `brisk__tls13_conn` driver.
-    Open before line 4: the GHASH-timing decision for early-terminating multipliers (armv5, some
-    MIPS32) now that GCM is on the wire; post-handshake messages still use the engine's
+    GHASH timing on early-terminating multipliers: `BRISK_GHASH_MULFREE` (auto on for armv5 and
+    32-bit MIPS) swaps in a shift + masked-XOR GHASH. Post-handshake messages still use the engine's
     reassembly scratch, so the line-4 arena must keep it alive (or skip NSTs that do not fit).
 - [x] PSK resumption tickets (export/import blob), ALPN list, SNI, mTLS (ECDSA)
 - [ ] `src/os/` sockets + public API `brisk_connect/read/write/close`, sans-I/O `brisk_feed/pull`
