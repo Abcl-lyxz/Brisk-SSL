@@ -35,6 +35,7 @@ SRC = {
     "rfc4231": "https://www.rfc-editor.org/rfc/rfc4231.txt",
     "rfc5869": "https://www.rfc-editor.org/rfc/rfc5869.txt",
     "rfc8448": "https://www.rfc-editor.org/rfc/rfc8448.txt",
+    "rfc9846": "https://www.rfc-editor.org/rfc/rfc9846.txt",
     "rfc9001": "https://www.rfc-editor.org/rfc/rfc9001.txt",
     "rfc8439": "https://www.rfc-editor.org/rfc/rfc8439.txt",
     "rfc7748": "https://www.rfc-editor.org/rfc/rfc7748.txt",
@@ -56,6 +57,7 @@ SRC = {
     "wp_p256_ecdh": f"{WP}ecdh_secp256r1_ecpoint_test.json",
     "wp_p256_ecdsa": f"{WP}ecdsa_secp256r1_sha256_p1363_test.json",
     "wp_p256_ecdsa_der": f"{WP}ecdsa_secp256r1_sha256_test.json",
+    "tls13_wp_p384_ecdsa_der": f"{WP}ecdsa_secp384r1_sha384_test.json",  # not wp_p384_*: der_wycheproof and x509_real_spkis scan that prefix
     "wp_p384_ecdsa_sha384": f"{WP}ecdsa_secp384r1_sha384_p1363_test.json",
     "wp_p384_ecdsa_sha512": f"{WP}ecdsa_secp384r1_sha512_p1363_test.json",
     "rfc8017": "https://www.rfc-editor.org/rfc/rfc8017.txt",
@@ -462,11 +464,14 @@ def wycheproof_hkdf():
 # ---------------------------------------------------------------- TLS 1.3 key schedule: RFC 8448 + RFC 9001
 def rfc8448_blocks():
     """The RFC 8448 traces as ordered {_side, _h, _f} blocks ("{client}  <header>:" + hex fields)."""
-    blocks, cur, field = [], None, None
+    blocks, cur, field, sec = [], None, None, 0
     for ln in rfc_lines(fetch("rfc8448")):
+        m = re.match(r"^(\d+)\.  \S", ln)  # a section heading (column 0; the TOC is indented)
+        if m:
+            sec = int(m.group(1))
         m = re.match(r"^\s*\{(client|server)\}\s+(.*)$", ln)
         if m:
-            cur = {"_side": m.group(1), "_h": m.group(2), "_f": {}}
+            cur = {"_side": m.group(1), "_h": m.group(2), "_f": {}, "_sec": sec}
             blocks.append(cur)
             field = None
             continue
@@ -482,6 +487,8 @@ def rfc8448_blocks():
             cur["_f"]["salt"] = ""
             field = None
             continue
+        if not ln.strip():
+            continue  # a page break leaves blank lines inside a long hex dump (the Certificate)
         m = re.match(r"^\s+((?:[0-9a-f]{2} ?)+)$", ln)
         if m and field:
             cur["_f"][field] += " " + m.group(1)
@@ -4724,6 +4731,626 @@ def x509_ip_vectors():
     return rows
 
 
+# ---------------------------------------------------------------- TLS 1.3 handshake engine (M3)
+# Everything tests/test_tls13_hs.c replays: the RFC 8448 traces as message flows with every secret
+# re-derived here, a synthetic ECDSA/RSA-PSS server for the production auth path (the RFC 8448
+# server key is RSA-1024 and chains to nothing), a mutation table whose alerts each cite the RFC
+# 9846 section that fixes them, and Wycheproof signatures and key shares routed through the
+# CertificateVerify and key_share code.
+ALERT = {"unexpected_message": 10, "handshake_failure": 40, "bad_certificate": 42,
+         "unsupported_certificate": 43, "illegal_parameter": 47, "unknown_ca": 48,
+         "decode_error": 50, "decrypt_error": 51, "protocol_version": 70, "internal_error": 80,
+         "missing_extension": 109, "unsupported_extension": 110}
+TLS13_F_TIME = 1  # the verdict depends on BRISK_X509_TIME_POLICY (INSECURE_NO_TIME connects)
+# The offer brisk__tls13_ch_write makes by default in a build with BRISK_ENABLE_P384 (the C test
+# passes these lists explicitly, so the byte comparison holds in every profile).
+TLS13_SUITES = [0x1303, 0x1301, 0x1302]
+TLS13_GROUPS = [0x001d, 0x0017]
+TLS13_SIGS = [0x0403, 0x0503, 0x0804, 0x0805, 0x0806, 0x0401, 0x0501, 0x0601]
+RFC9846 = {}
+
+
+def t_u16(v):
+    return v.to_bytes(2, "big")
+
+
+def t_v8(b):
+    return bytes([len(b)]) + b
+
+
+def t_v16(b):
+    return len(b).to_bytes(2, "big") + b
+
+
+def t_v24(b):
+    return len(b).to_bytes(3, "big") + b
+
+
+def t_msg(typ, body):
+    """A handshake message: msg_type(1) || uint24 length || body (RFC 9846 4)."""
+    return bytes([typ]) + t_v24(body)
+
+
+def t_body(msg, typ):
+    if not msg or msg[0] != typ or int.from_bytes(msg[1:4], "big") != len(msg) - 4:
+        die(f"tls13: not a well-formed handshake message of type {typ}")
+    return msg[4:]
+
+
+def t_exts_parse(b):
+    out, i = [], 0
+    while i + 4 <= len(b):
+        t, n = int.from_bytes(b[i:i + 2], "big"), int.from_bytes(b[i + 2:i + 4], "big")
+        out.append([t, b[i + 4:i + 4 + n]])
+        i += 4 + n
+    if i != len(b):
+        die("tls13: malformed extension block in a trace message")
+    return out
+
+
+def t_exts_build(exts):
+    return t_v16(b"".join(t_u16(t) + t_v16(d) for t, d in exts))
+
+
+def t_ext(exts, t):
+    return next((d for tt, d in exts if tt == t), None)
+
+
+def t_hello_parse(msg):
+    """ServerHello / HelloRetryRequest (RFC 9846 4.2.3) as a dict that t_hello_build inverts."""
+    b = t_body(msg, 2)
+    sl = b[34]
+    i = 35 + sl
+    el = int.from_bytes(b[i + 3:i + 5], "big")
+    if i + 5 + el != len(b):
+        die("tls13: trailing bytes after a ServerHello")
+    return {"ver": b[:2], "random": b[2:34], "sid": b[35:i], "suite": b[i:i + 2], "comp": b[i + 2],
+            "exts": t_exts_parse(b[i + 5:])}
+
+
+def t_hello_build(h, **kw):
+    h = dict(h, **kw)
+    ext = b"" if h["exts"] is None else t_exts_build(h["exts"])  # None: no extensions field
+    return t_msg(2, h["ver"] + h["random"] + t_v8(h["sid"]) + h["suite"] + bytes([h["comp"]])
+                 + ext)
+
+
+def t_ch_parse(msg):
+    b = t_body(msg, 1)
+    sl = b[34]
+    i = 35 + sl
+    cl = int.from_bytes(b[i:i + 2], "big")
+    suites = b[i + 2:i + 2 + cl]
+    i += 2 + cl
+    i += 1 + b[i]
+    el = int.from_bytes(b[i:i + 2], "big")
+    if i + 2 + el != len(b):
+        die("tls13: trailing bytes after a ClientHello")
+    return {"sid": b[35:35 + sl], "suites": suites, "exts": t_exts_parse(b[i + 2:])}
+
+
+def t_ch(random, sid, suites, groups, sigs, share_group, share_pub, sni=b"", cookie=b""):
+    """The ClientHello brisk__tls13_ch_write produces, field for field and in the same extension
+    order (RFC 9846 4.2.2), so the C builder is byte-compared against this, not only
+    round-tripped through its own parser."""
+    exts = []
+    if sni:
+        exts.append((0, t_v16(b"\x00" + t_v16(sni))))  # RFC 6066 3: host_name(0)
+    exts.append((10, t_v16(b"".join(t_u16(g) for g in groups))))
+    exts.append((13, t_v16(b"".join(t_u16(s) for s in sigs))))
+    exts.append((43, t_v8(t_u16(0x0304))))
+    if cookie:
+        exts.append((44, t_v16(cookie)))
+    exts.append((51, t_v16(t_u16(share_group) + t_v16(share_pub))))
+    return t_msg(1, t_u16(0x0303) + random + t_v8(sid)
+                 + t_v16(b"".join(t_u16(s) for s in suites)) + b"\x01\x00" + t_exts_build(exts))
+
+
+def t_th(bits, msgs):
+    """Transcript-Hash(M1 || ... || Mn), RFC 9846 4.1."""
+    return HASH[bits](b"".join(msgs)).digest()
+
+
+def t_message_hash(bits, ch1):
+    """The synthetic message_hash(254) that replaces ClientHello1 after an HRR (RFC 9846 4.1)."""
+    return t_msg(254, HASH[bits](ch1).digest())
+
+
+def t_cv_content(th):
+    return b" " * 64 + b"TLS 1.3, server CertificateVerify\x00" + th  # RFC 9846 4.5.2
+
+
+def t_flow(bits, dhe, pre, sh, ee, cr, cert, cv):
+    """The RFC 9846 7.1 key schedule, both Finished MACs (4.5.3) and the client flight of one
+    handshake, from nothing but its messages. `pre` is [CH], or [message_hash, HRR, CH2]."""
+    hl, H = bits // 8, HASH[bits]
+    zeros, empty = bytes(hl), H(b"").digest()
+    early = py_hkdf_extract(bits, zeros, zeros)
+    hs = py_hkdf_extract(bits, py_expand_label(bits, early, b"derived", empty, hl), dhe)
+    t_sh = pre + [sh]
+    th_sh = t_th(bits, t_sh)
+    c_hs = py_expand_label(bits, hs, b"c hs traffic", th_sh, hl)
+    s_hs = py_expand_label(bits, hs, b"s hs traffic", th_sh, hl)
+    ms = py_hkdf_extract(bits, py_expand_label(bits, hs, b"derived", empty, hl), zeros)
+    t_cert = t_sh + [ee] + ([cr] if cr else []) + [cert]
+    tbs = t_cv_content(t_th(bits, t_cert))
+    t_cv = t_cert + [cv]
+    sf = hmac.new(py_expand_label(bits, s_hs, b"finished", b"", hl), t_th(bits, t_cv), H).digest()
+    t_sf = t_cv + [t_msg(20, sf)]
+    th_sf = t_th(bits, t_sf)
+    # A CertificateRequest is answered with an empty Certificate (RFC 9846 4.5.1): this slice
+    # has no client key, and the client Finished then covers that message too.
+    flight = [t_msg(11, b"\x00" + t_v24(b""))] if cr else []
+    cf = hmac.new(py_expand_label(bits, c_hs, b"finished", b"", hl), t_th(bits, t_sf + flight),
+                  H).digest()
+    t_cf = t_sf + flight + [t_msg(20, cf)]
+    return {"c_hs": c_hs, "s_hs": s_hs, "tbs": tbs, "sf": t_msg(20, sf),
+            "cf": b"".join(flight) + t_msg(20, cf), "th_sh": th_sh, "th_sf": th_sf,
+            "th_cf": t_th(bits, t_cf),
+            "c_ap": py_expand_label(bits, ms, b"c ap traffic", th_sf, hl),
+            "s_ap": py_expand_label(bits, ms, b"s ap traffic", th_sf, hl),
+            "exp": py_expand_label(bits, ms, b"exp master", th_sf, hl),
+            "res": py_expand_label(bits, ms, b"res master", t_th(bits, t_cf), hl)}
+
+
+def t_dhe(group, priv, share):
+    if group == 0x001d:
+        z = py_x25519(priv, share)
+        return None if z == bytes(32) else z
+    return py_p256_ecdh(int.from_bytes(priv, "big"), share)
+
+
+def t_suite_bits(sh):
+    return 384 if t_hello_parse(sh)["suite"] == b"\x13\x02" else 256
+
+
+def t_row(note, fl, *, ch1, priv1, g1, sh, ee, cert, cv, root=b"", host="", now=0, flags=0,
+          alert=0, hrr=b"", ch2=b"", priv2=b"", g2=0, cr=b"", cookie=b""):
+    return (note, root.hex(), host, now, flags, alert, g1, priv1.hex(), ch1.hex(), hrr.hex(), g2,
+            priv2.hex(), ch2.hex(), cookie.hex(), sh.hex(), ee.hex(), cr.hex(), cert.hex(), cv.hex(),
+            fl["sf"].hex(), fl["cf"].hex(), fl["s_hs"].hex(),
+            fl["c_hs"].hex(), fl["s_ap"].hex(), fl["c_ap"].hex(), fl["exp"].hex(), fl["res"].hex(),
+            fl["tbs"].hex())
+
+
+def rfc9846_constants():
+    """RFC 9846 4.2.3 (the HRR random and both DOWNGRD sentinels) and 4.5.2 (the worked
+    CertificateVerify content), parsed out of the RFC text, never typed."""
+    text = "\n".join(rfc_lines(fetch("rfc9846")))
+    s423 = text[text.index("\n4.2.3.  Server Hello\n"):text.index("\n4.2.4.  Hello Retry Request\n")]
+    i = s423.index('SHA-256 of "HelloRetryRequest":')
+    hrr = hexbytes(s423[i + 31:s423.index("Upon receiving", i)])
+    if hrr != hashlib.sha256(b"HelloRetryRequest").digest():
+        die("RFC 9846 4.2.3: the HRR random is not SHA-256(\"HelloRetryRequest\")")
+    down = [hexbytes(m) for m in re.findall(r"bytes:\s*\n((?:\s*[0-9A-F]{2})+)\s*\n", s423)]
+    if down != [b"DOWNGRD\x01", b"DOWNGRD\x00"]:
+        die(f"RFC 9846 4.2.3: DOWNGRD sentinels parsed as {down}")
+    s452 = text[text.index("\n4.5.2.  Certificate Verify\n"):text.index("\n4.5.3.  Finished\n")]
+    i = s452.index("CertificateVerify would be:")
+    cv = hexbytes(s452[i + 27:s452.index("On the sender side", i)])
+    if cv != t_cv_content(b"\x01" * 32):
+        die("RFC 9846 4.5.2: the worked CertificateVerify content does not match the rule")
+    RFC9846.update(hrr=hrr, down1=down[0], down0=down[1])
+    return [(hrr.hex(), down[0].hex(), down[1].hex(), (b"\x01" * 32).hex(), cv.hex())]
+
+
+def tls13_traces():
+    """RFC 8448 sections 3, 5, 6 and 7 as flows, every secret and both Finished MACs re-derived
+    from the messages alone and compared against what the trace printed."""
+    secs = {}
+    for b in rfc8448_blocks():
+        secs.setdefault(b["_sec"], []).append(b)
+    ks_src = (ROOT / "tests" / "test_tls13_ks.c").read_text()
+    rows, parts = [], []
+    for sec, note in ((3, "RFC 8448 sect 3: simple 1-RTT"),
+                      (5, "RFC 8448 sect 5: HelloRetryRequest, x25519 -> secp256r1"),
+                      (6, "RFC 8448 sect 6: CertificateRequest answered with an empty Certificate"),
+                      (7, "RFC 8448 sect 7: compatibility mode, 32-byte session id")):
+        msgs, keys, want = {"client": [], "server": []}, [], {}
+        for b in secs[sec]:
+            f = {k: hexbytes(v) for k, v in b["_f"].items()}
+            m = re.match(r"construct an? (\w+) handshake message", b["_h"])
+            if m:
+                msgs[b["_side"]].append((m.group(1), f[m.group(1)]))
+            m = re.match(r"create an ephemeral (x25519|P-256) key pair", b["_h"])
+            if m and b["_side"] == "client":
+                keys.append((0x001d if m.group(1) == "x25519" else 0x0017, f["private key"]))
+            m = re.match(r'derive secret "tls13 (c hs traffic|s hs traffic|c ap traffic|'
+                         r's ap traffic|exp master|res master)"', b["_h"])
+            if m and "expanded" in f:
+                want.setdefault(m.group(1), (f["expanded"], f["hash"]))
+        one = lambda side, name: next((v for n, v in msgs[side] if n == name), b"")
+        chs = [v for n, v in msgs["client"] if n == "ClientHello"]
+        shs = [v for n, v in msgs["server"] if n == "ServerHello"]
+        hrr, sh = (shs[0] if len(shs) == 2 else b""), shs[-1]
+        ee, cr, cert, cv, sf = (one("server", n) for n in (
+            "EncryptedExtensions", "CertificateRequest", "Certificate", "CertificateVerify",
+            "Finished"))
+        if len(chs) != (2 if hrr else 1) or len(keys) != len(chs) or not (ee and cert and cv and sf):
+            die(f"RFC 8448 sect {sec}: unexpected message set")
+        cookie = b""
+        if hrr:
+            h = t_hello_parse(hrr)
+            if h["random"] != RFC9846["hrr"]:
+                die("RFC 8448 sect 5: the HRR random is not the RFC 9846 4.2.3 constant")
+            c = t_ext(h["exts"], 44)
+            if c is None or t_ext(t_ch_parse(chs[1])["exts"], 44) != c:
+                die("RFC 8448 sect 5: CH2 does not echo the HRR cookie")
+            cookie = c[2:]
+        bits = t_suite_bits(sh)
+        ks = t_ext(t_hello_parse(sh)["exts"], 51)
+        g = int.from_bytes(ks[:2], "big")
+        if keys[-1][0] != g:
+            die(f"RFC 8448 sect {sec}: the server share is not in the client's last group")
+        pre = [t_message_hash(bits, chs[0]), hrr, chs[1]] if hrr else [chs[0]]
+        fl = t_flow(bits, t_dhe(g, keys[-1][1], ks[4:]), pre, sh, ee, cr, cert, cv)
+        if fl["sf"] != sf:
+            die(f"RFC 8448 sect {sec}: server Finished mismatch")
+        for name, k in (("c hs traffic", "c_hs"), ("s hs traffic", "s_hs"),
+                        ("c ap traffic", "c_ap"), ("s ap traffic", "s_ap"), ("exp master", "exp")):
+            if want[name][0] != fl[k]:
+                die(f"RFC 8448 sect {sec}: {name} mismatch")
+        if want["c hs traffic"][1] != fl["th_sh"] or want["c ap traffic"][1] != fl["th_sf"]:
+            die(f"RFC 8448 sect {sec}: transcript hash mismatch")
+        if sec == 6:
+            # The trace's client answers with an RSA certificate this library cannot produce,
+            # so from the client flight on the values are ours, computed by the same cascade.
+            if not cr or one("client", "Finished") == fl["cf"][-36:]:
+                die("RFC 8448 sect 6: expected a CertificateRequest and a diverging flight")
+        elif fl["cf"] != one("client", "Finished") or want["res master"] != (fl["res"], fl["th_cf"]):
+            die(f"RFC 8448 sect {sec}: client Finished / res master mismatch")
+        if sec == 3:
+            for name, v in (("TH_CH_SH", fl["th_sh"]), ("TH_CH_SF", fl["th_sf"]),
+                            ("TH_CH_CF", fl["th_cf"])):
+                m = re.search(name + r' = "([0-9a-f]{64})"', ks_src)
+                if not m or m.group(1) != v.hex():
+                    die(f"RFC 8448 sect 3: {name} disagrees with tests/test_tls13_ks.c")
+        kw = dict(ch1=chs[0], priv1=keys[0][1], g1=keys[0][0], sh=sh, ee=ee, cr=cr, cert=cert,
+                  cv=cv)
+        if hrr:
+            kw.update(hrr=hrr, ch2=chs[1], priv2=keys[1][1], g2=keys[1][0], cookie=cookie)
+        rows.append(t_row(note, fl, **kw))
+        parts.append(dict(kw, sf=sf, nst=one("server", "NewSessionTicket")))
+    print(f"  tls13 traces: {len(rows)} RFC 8448 flows re-derived")
+    return rows, parts
+
+
+def tls13_fixture():
+    """A P-256 root, a leaf for device.example.com, and whole server flights signed with them:
+    the only end-to-end run of brisk__tls13_auth_x509, because the RFC 8448 server key is
+    RSA-1024 and chains to nothing. The ECDSA nonces are the chain fixtures' (see py_ec_sign)."""
+    root = ec_issuer(P256, 0x7153E001, 256)
+    leaf = ec_issuer(P256, 0x7153E002, 256)
+    rogue = ec_issuer(P256, 0x7153E003, 256)
+    rsa_leaf = rsa_issuer(256, pss_salt=32)
+    ca_ext = [x_bc(True), x_ku(KU_BIT_KEY_CERT_SIGN)]
+
+    def leaf_cert(host="device.example.com", ku=KU_BIT_DIGITAL_SIGNATURE,
+                  eku="1.3.6.1.5.5.7.3.1", key=leaf, **kw):
+        exts = [x_bc(False), x_ku(ku), x_ext("2.5.29.17", False, x_seq(gn_dns(host))),
+                x_ext("2.5.29.37", False, x_seq(x_oid(eku)))]
+        return chain_cert("Brisk TLS Root", "device.example.com", root, key, exts=exts, **kw)
+
+    root_c = chain_cert("Brisk TLS Root", "Brisk TLS Root", root, root, exts=ca_ext)
+    rogue_c = chain_cert("Brisk TLS Root", "Brisk TLS Root", rogue, rogue, exts=ca_ext)
+    seed = lambda tag: hashlib.sha256(b"brisk tls13 fixture " + tag).digest()
+    c_priv, s_priv, sid = seed(b"client x25519"), seed(b"server x25519"), seed(b"session id")
+    c_pub, s_pub = py_x25519(c_priv, X25519_BASE), py_x25519(s_priv, X25519_BASE)
+    ch = t_ch(seed(b"client random"), sid, TLS13_SUITES, TLS13_GROUPS, TLS13_SIGS, 0x001d, c_pub,
+              b"device.example.com")
+    rows = []
+
+    def flight(note, alert, cert_der=None, anchor=root_c, scheme=0x0403, signer=leaf,
+               wrong_th=False, mangle=None, suite=0x1301, flags=0):
+        cert_der = cert_der or leaf_cert()
+        sh = t_msg(2, t_u16(0x0303) + seed(b"server random") + t_v8(sid) + t_u16(suite) + b"\x00"
+                   + t_exts_build([(43, t_u16(0x0304)), (51, t_u16(0x001d) + t_v16(s_pub))]))
+        ee = t_msg(8, t_exts_build([(0, b"")]))  # an empty server_name: RFC 6066 3
+        cert = t_msg(11, b"\x00" + t_v24(t_v24(cert_der) + t_v16(b"")))
+        bits = 384 if suite == 0x1302 else 256
+        th = t_th(bits, [ch, sh, ee, cert])
+        sig = signer["sign"](t_cv_content(bytes(bits // 8) if wrong_th else th))
+        if mangle:
+            sig = mangle(sig)
+        cv = t_msg(15, t_u16(scheme) + t_v16(sig))
+        fl = t_flow(bits, py_x25519(c_priv, s_pub), [ch], sh, ee, b"", cert, cv)
+        rows.append(t_row(note, fl, ch1=ch, priv1=c_priv, g1=0x001d, sh=sh, ee=ee, cert=cert,
+                          cv=cv, root=anchor, host="device.example.com", now=CHAIN_NOW,
+                          flags=flags, alert=ALERT[alert] if alert else 0))
+
+    flight("fixture: P-256 leaf, ecdsa_secp256r1_sha256, TLS_AES_128_GCM_SHA256", None)
+    flight("fixture: TLS_AES_256_GCM_SHA384 (SHA-384 transcript)", None, suite=0x1302)
+    flight("fixture: TLS_CHACHA20_POLY1305_SHA256", None, suite=0x1303)
+    flight("fixture: RSA-2049 leaf, rsa_pss_rsae_sha256 (sLen = hLen)", None,
+           cert_der=leaf_cert(key=rsa_leaf), scheme=0x0804, signer=rsa_leaf)
+    flight("RFC 9525 6.3: the leaf names another host -> bad_certificate", "bad_certificate",
+           cert_der=leaf_cert(host="other.example.com"))
+    flight("RFC 9846 4.5.1.2: keyUsage without digitalSignature -> unsupported_certificate",
+           "unsupported_certificate", cert_der=leaf_cert(ku=4))
+    flight("RFC 5280 4.2.1.12: EKU clientAuth only -> unsupported_certificate",
+           "unsupported_certificate", cert_der=leaf_cert(eku="1.3.6.1.5.5.7.3.2"))
+    flight("RFC 5280 6.1.3: expired leaf -> bad_certificate", "bad_certificate",
+           cert_der=leaf_cert(naf="270101000000Z"), flags=TLS13_F_TIME)
+    flight("RFC 5280 6.1: the anchor shares the root's Name but not its key -> bad_certificate",
+           "bad_certificate", anchor=rogue_c)
+    flight("RFC 9846 4.5.2: CertificateVerify signed over the wrong transcript -> decrypt_error",
+           "decrypt_error", wrong_th=True)
+    flight("RFC 9846 4.5.2: one flipped signature bit -> decrypt_error", "decrypt_error",
+           mangle=lambda s: s[:-1] + bytes([s[-1] ^ 1]))
+    flight("RFC 9846 4.5.2: BER length in the ECDSA-Sig-Value -> decode_error", "decode_error",
+           mangle=lambda s: b"\x30\x81" + s[1:])
+    flight("RFC 9846 4.3.3: ecdsa_secp384r1_sha384 with a P-256 key -> illegal_parameter",
+           "illegal_parameter", scheme=0x0503)
+    flight("RFC 9846 4.3.3: rsa_pss_rsae_sha256 with a P-256 key -> illegal_parameter",
+           "illegal_parameter", scheme=0x0804)
+    flight("RFC 9846 4.3.3: rsa_pkcs1_sha256 is never valid in CertificateVerify",
+           "illegal_parameter", scheme=0x0401)
+    print(f"  tls13 fixture: {len(rows)} synthetic flows")
+    chw = [(seed(b"client random").hex(), sid.hex(), "".join(f"{v:04x}" for v in TLS13_SUITES),
+            "".join(f"{v:04x}" for v in TLS13_GROUPS), "".join(f"{v:04x}" for v in TLS13_SIGS),
+            "device.example.com", 0x001d, c_pub.hex(), "", ch.hex())]
+    p256 = py_p256_keygen(int.from_bytes(seed(b"client p256"), "big"))[0]
+    cookie = seed(b"cookie") * 3
+    chw.append(("00" * 32, "", "1301", "001d0017", "04030804", "", 0x0017, p256.hex(), cookie.hex(),
+                t_ch(bytes(32), b"", [0x1301], [0x001d, 0x0017], [0x0403, 0x0804], 0x0017, p256,
+                     b"", cookie).hex()))
+    return rows, chw
+
+
+def t_mutations(parts):
+    """Single-fault variants of the RFC 8448 messages. Each row names the message it replaces
+    (by position in that flow's server flight) and the alert, with the section that fixes it.
+    A row whose alert is not an RFC MUST says 'local' and why."""
+    rows = []
+    names = {}
+    for fi, p in enumerate(parts):
+        names[fi] = [n for n in ("hrr", "sh", "ee", "cr", "cert", "cv", "sf") if p.get(n)]
+
+    def row(fi, name, msg, alert, note):
+        rows.append((fi, names[fi].index(name), msg.hex(), ALERT[alert], note))
+
+    s3, s5, s6, s7 = parts
+    sh = t_hello_parse(s3["sh"])
+    ks = t_ext(sh["exts"], 51)
+    sv = [43, t_u16(0x0304)]
+    no_sv = [e for e in sh["exts"] if e[0] != 43]
+    row(0, "sh", t_hello_build(sh, ver=t_u16(0x0304)), "protocol_version",
+        "RFC 9846 4.2.3: legacy_version must be 0x0303")
+    row(0, "sh", t_hello_build(sh, sid=b"\x5a" * 32), "illegal_parameter",
+        "RFC 9846 4.2.3: legacy_session_id_echo differs from what was sent")
+    row(0, "sh", t_hello_build(sh, suite=t_u16(0x1304)), "illegal_parameter",
+        "RFC 9846 4.2.3: cipher suite not offered")
+    row(0, "sh", t_hello_build(sh, comp=1), "illegal_parameter",
+        "RFC 9846 4.2.3: legacy_compression_method != 0")
+    row(0, "sh", t_hello_build(sh, exts=no_sv + [[43, t_u16(0x0303)]]), "illegal_parameter",
+        "RFC 9846 4.3.1: selected_version below TLS 1.3")
+    row(0, "sh", t_hello_build(sh, exts=no_sv + [[43, b"\x03"]]), "decode_error",
+        "RFC 9846 4.3: supported_versions truncated")
+    row(0, "sh", t_hello_build(sh, exts=no_sv + [[43, b"\x03\x04\x00"]]), "decode_error",
+        "RFC 9846 4.3: trailing byte inside supported_versions")
+    for tail, tag in ((RFC9846["down1"], "01"), (RFC9846["down0"], "00")):
+        row(0, "sh", t_hello_build(sh, exts=no_sv, random=sh["random"][:24] + tail),
+            "illegal_parameter", f"RFC 9846 4.2.3: no supported_versions and DOWNGRD{tag}")
+    row(0, "sh", t_hello_build(sh, exts=no_sv), "protocol_version",
+        "RFC 9846 4.3.1: a TLS 1.2 ServerHello (local: TLS 1.2 is M5)")
+    row(0, "sh", t_hello_build(sh, exts=None, random=sh["random"][:24] + RFC9846["down1"]),
+        "illegal_parameter", "RFC 9846 4.2.3: extension-less ServerHello (RFC 5246 7.4.1.3) "
+        "with DOWNGRD01")
+    row(0, "sh", t_hello_build(sh, exts=None), "protocol_version",
+        "RFC 9846 4.3.1: extension-less TLS 1.2 ServerHello (local: TLS 1.2 is M5)")
+    row(0, "sh", t_msg(2, t_body(t_hello_build(sh, exts=None), 2) + bytes(1)), "decode_error",
+        "RFC 9846 4: one stray byte where the extensions length belongs")
+    row(0, "sh", t_hello_build(sh, exts=sh["exts"] + [[51, ks]]), "illegal_parameter",
+        "RFC 9846 4.3: duplicate key_share (local alert; the RFC names none)")
+    row(0, "sh", t_hello_build(sh, exts=sh["exts"] + [[41, t_u16(0)]]), "unsupported_extension",
+        "RFC 9846 4.3: unsolicited pre_shared_key")
+    row(0, "sh", t_hello_build(sh, exts=sh["exts"] + [[0, b""]]), "illegal_parameter",
+        "RFC 9846 4.3: server_name offered but not allowed in a ServerHello")
+    no_ks = [e for e in sh["exts"] if e[0] != 51]
+    p256_pub = t_ext(t_hello_parse(s5["sh"])["exts"], 51)[4:]
+    row(0, "sh", t_hello_build(sh, exts=no_ks + [[51, t_u16(0x0017) + t_v16(p256_pub)]]),
+        "illegal_parameter", "RFC 9846 4.3.8: share in a group the client sent no share for")
+    for n in (31, 33):
+        kx = (ks[4:] + b"\x00")[:n]
+        row(0, "sh", t_hello_build(sh, exts=no_ks + [[51, t_u16(0x001d) + t_v16(kx)]]),
+            "illegal_parameter", f"RFC 9846 4.3.8.2: x25519 key_exchange of {n} bytes (local)")
+    row(0, "sh", t_hello_build(sh, exts=no_ks + [[51, ks + b"\x00"]]), "decode_error",
+        "RFC 9846 4.3: trailing byte inside key_share")
+    row(0, "sh", t_hello_build(sh, exts=no_ks), "missing_extension",
+        "RFC 9846 9.2: no key_share and no PSK (local alert)")
+    body = t_body(s3["sh"], 2)
+    row(0, "sh", t_msg(2, body[:-1]), "decode_error", "RFC 9846 4: ServerHello one byte short")
+    row(0, "sh", t_msg(2, body + b"\x00"), "decode_error", "RFC 9846 4: ServerHello trailing byte")
+    ee = t_exts_parse(t_body(s3["ee"], 8)[2:])
+    row(0, "ee", t_msg(8, t_exts_build(ee + [[51, ks]])), "illegal_parameter",
+        "RFC 9846 4.4.1: key_share in EncryptedExtensions")
+    row(0, "ee", t_msg(8, t_exts_build(ee + [[42, b""]])), "unsupported_extension",
+        "RFC 9846 4.3: early_data was never offered")
+    row(0, "ee", t_msg(8, t_exts_build(ee + [[43, t_u16(0x0304)]])), "illegal_parameter",
+        "RFC 9846 4.4.1: supported_versions in EncryptedExtensions")
+    row(0, "ee", t_msg(8, t_exts_build([e for e in ee if e[0] != 0] + [[0, b"\x00"]])),
+        "decode_error", "RFC 6066 3: a non-empty server_name answer")
+    row(0, "ee", t_msg(8, t_exts_build(ee) + b"\x00"), "decode_error",
+        "RFC 9846 4: trailing byte after the extension block")
+    row(0, "ee", t_msg(8, t_exts_build(ee + [[10, t_ext(ee, 10)]])), "illegal_parameter",
+        "RFC 9846 4.3: duplicate supported_groups (local alert)")
+    cb = t_body(s3["cert"], 11)
+    entries = cb[4:]
+    row(0, "cert", t_msg(11, b"\x01\x00" + cb[1:]), "illegal_parameter",
+        "RFC 9846 4.5.1: non-empty certificate_request_context")
+    row(0, "cert", t_msg(11, b"\x00" + t_v24(b"")), "decode_error",
+        "RFC 9846 4.5.1.3: empty certificate_list")
+    der_len = int.from_bytes(entries[:3], "big")
+    one_ext = entries[:3 + der_len] + t_v16(t_u16(5) + t_v16(b"\x01\x00\x00\x00\x00"))
+    row(0, "cert", t_msg(11, b"\x00" + t_v24(one_ext)), "unsupported_extension",
+        "RFC 9846 4.5.1: CertificateEntry extension that was never requested")
+    row(0, "cert", t_msg(11, b"\x00" + t_v24(t_v24(b"") + t_v16(b""))), "decode_error",
+        "RFC 9846 4.5.1: cert_data<1..2^24-1> is empty")
+    row(0, "cert", t_msg(11, b"\x00" + t_v24(t_v24(b"\x30\x03\x02\x01\x01") + t_v16(b""))),
+        "bad_certificate", "RFC 9846 4.5.1.3: a certificate that does not parse (local alert)")
+    cvb = t_body(s3["cv"], 15)
+    for scheme, why in ((0x0401, "rsa_pkcs1_sha256 is certificates-only (4.3.3)"),
+                        (0x0203, "ecdsa_sha1 (4.3.3: SHA-1 MUST NOT be used)"),
+                        (0x0807, "ed25519 was never offered (4.5.2)")):
+        row(0, "cv", t_msg(15, t_u16(scheme) + cvb[2:]), "illegal_parameter",
+            f"RFC 9846 {why}")
+    row(0, "cv", t_msg(15, cvb[:-1]), "decode_error", "RFC 9846 4.5.2: signature length mismatch")
+    fb = t_body(s3["sf"], 20)
+    row(0, "sf", t_msg(20, fb[:-1] + bytes([fb[-1] ^ 1])), "decrypt_error",
+        "RFC 9846 4.5.3: one flipped bit in verify_data")
+    row(0, "sf", t_msg(20, fb[:-1]), "decode_error", "RFC 9846 4.5.3: verify_data of HashLen-1")
+    row(0, "sf", t_msg(20, fb + b"\x00"), "decode_error", "RFC 9846 4.5.3: verify_data of HashLen+1")
+    for at, msg, why in (("sh", s3["ee"], "EncryptedExtensions before ServerHello"),
+                         ("cert", s3["cv"], "CertificateVerify before Certificate"),
+                         ("cv", s3["sf"], "Finished before CertificateVerify"),
+                         ("ee", s3["ch1"], "a ClientHello from the server"),
+                         ("ee", s3["sh"], "a second ServerHello"),
+                         ("sh", s3["nst"], "NewSessionTicket during the handshake"),
+                         ("ee", t_msg(0x63, b""), "an unknown message type")):
+        row(0, at, msg, "unexpected_message", f"RFC 9846 4 / A.1: {why}")
+    # sect 7: the 32-byte session id echo (compatibility mode, Appendix E.4)
+    h7 = t_hello_parse(s7["sh"])
+    row(3, "sh", t_hello_build(h7, sid=h7["sid"][:-1] + bytes([h7["sid"][-1] ^ 1])),
+        "illegal_parameter", "RFC 9846 4.2.3: one flipped byte in a 32-byte session id echo")
+    # sect 5: HelloRetryRequest
+    hr = t_hello_parse(s5["hrr"])
+    base = [e for e in hr["exts"] if e[0] not in (51, 44)]
+    row(1, "hrr", t_hello_build(hr, exts=base), "illegal_parameter",
+        "RFC 9846 4.2.4: an HRR that would not change the ClientHello")
+    row(1, "sh", s5["hrr"], "unexpected_message", "RFC 9846 4.2.4: a second HelloRetryRequest")
+    kept = [e for e in hr["exts"] if e[0] != 51]
+    row(1, "hrr", t_hello_build(hr, exts=kept + [[51, t_u16(0x001d)]]), "illegal_parameter",
+        "RFC 9846 4.3.8: selected_group already had a share in ClientHello1")
+    row(1, "hrr", t_hello_build(hr, exts=kept + [[51, t_u16(0x001e)]]), "illegal_parameter",
+        "RFC 9846 4.3.8: selected_group not in supported_groups")
+    no_cookie = [e for e in hr["exts"] if e[0] != 44]
+    row(1, "hrr", t_hello_build(hr, exts=no_cookie + [[44, t_v16(b"\x42" * 257)]]),
+        "illegal_parameter", "RFC 9846 4.3.2: cookie over BRISK__TLS13_COOKIE_MAX (local limit)")
+    row(1, "hrr", t_hello_build(hr, exts=no_cookie + [[44, t_v16(b"")]]), "decode_error",
+        "RFC 9846 4.3.2: cookie<1..2^16-1> is empty")
+    row(1, "hrr", t_hello_build(hr, exts=hr["exts"] + [[42, b""]]), "unsupported_extension",
+        "RFC 9846 4.2.4: an HRR extension other than cookie that was never offered")
+    row(1, "hrr", t_hello_build(hr, suite=t_u16(0x1304)), "illegal_parameter",
+        "RFC 9846 4.2.4: HRR cipher suite not offered")
+    row(1, "hrr", t_hello_build(hr, ver=t_u16(0x0304)), "protocol_version",
+        "RFC 9846 4.2.4: HRR legacy_version must be 0x0303")
+    row(1, "hrr", t_hello_build(hr, exts=[e for e in hr["exts"] if e[0] != 43]), "protocol_version",
+        "RFC 9846 4.2.4: HRR without supported_versions (local: read as TLS 1.2)")
+    h5 = t_hello_parse(s5["sh"])
+    no_ks5 = [e for e in h5["exts"] if e[0] != 51]
+    row(1, "sh", t_hello_build(h5, exts=no_ks5 + [[51, t_u16(0x001d) + t_v16(ks[4:])]]),
+        "illegal_parameter", "RFC 9846 4.3.8: ServerHello group differs from the HRR's")
+    row(1, "sh", t_hello_build(h5, suite=t_u16(0x1303)), "illegal_parameter",
+        "RFC 9846 4.2.4: ServerHello suite differs from the HRR's")
+    # sect 6: CertificateRequest
+    crb = t_body(s6["cr"], 13)
+    crx = t_exts_parse(crb[3:])
+    row(2, "cr", t_msg(13, b"\x01\x00" + crb[1:]), "illegal_parameter",
+        "RFC 9846 4.4.2: non-empty certificate_request_context")
+    row(2, "cr", t_msg(13, b"\x00" + t_exts_build([e for e in crx if e[0] != 13])),
+        "missing_extension", "RFC 9846 4.4.2: no signature_algorithms")
+    row(2, "cr", t_msg(13, b"\x00" + t_exts_build(crx + [[51, ks]])), "illegal_parameter",
+        "RFC 9846 4.3: key_share in a CertificateRequest")
+    row(2, "cr", t_msg(13, b"\x00" + t_exts_build(crx + [[13, t_ext(crx, 13)]])),
+        "illegal_parameter", "RFC 9846 4.3: duplicate signature_algorithms (local alert)")
+    row(2, "cr", t_msg(13, b"\x00" + t_exts_build([e for e in crx if e[0] != 13]
+                                                   + [[13, t_v16(b"\x04\x03\x08")]])),
+        "decode_error", "RFC 9846 4.3.3: odd-length signature_algorithms")
+    # Wycheproof x25519 small-order points spliced into the sect 3 ServerHello (RFC 9846 7.4.2:
+    # an all-zero shared secret MUST abort), and invalid P-256 points into sect 5 (4.3.8.2).
+    priv = parts[0]["priv1"]
+    seen = set()
+    for g in json.loads(fetch("wp_x25519"))["testGroups"]:
+        for t in g["tests"]:
+            u = bytes.fromhex(t["public"])
+            if u in seen or py_x25519(priv, u) != bytes(32):
+                continue
+            seen.add(u)
+            row(0, "sh", t_hello_build(sh, exts=no_ks + [[51, t_u16(0x001d) + t_v16(u)]]),
+                "illegal_parameter", f"RFC 9846 7.4.2: Wycheproof x25519 tcId {t['tcId']}")
+    n_x = len(seen)
+    d5 = int.from_bytes(parts[1]["priv2"], "big")
+    seen = set()
+    for g in json.loads(fetch("wp_p256_ecdh"))["testGroups"]:
+        for t in g["tests"]:
+            pt = bytes.fromhex(t["public"])
+            if pt in seen or t["result"] == "valid" or py_p256_ecdh(d5, pt) is not None:
+                continue
+            seen.add(pt)
+            row(1, "sh", t_hello_build(h5, exts=no_ks5 + [[51, t_u16(0x0017) + t_v16(pt)]]),
+                "illegal_parameter", f"RFC 9846 4.3.8.2: Wycheproof ecpoint tcId {t['tcId']}")
+    if n_x < 10 or len(seen) < 10:
+        die(f"tls13 mutations: only {n_x} x25519 and {len(seen)} P-256 invalid shares")
+    print(f"  tls13 mutations: {len(rows)} rows ({n_x} x25519, {len(seen)} P-256 shares)")
+    return rows
+
+
+def t_ecdsa_der(sig, flen):
+    """r || s out of a strict DER ECDSA-Sig-Value (RFC 5480 A.1), or None."""
+    if not py_der_walk(sig):
+        return None
+    h = py_der_hdr(sig, 0, len(sig))
+    if h is None or h[0] != 0x30 or h[2] != len(sig):
+        return None
+    i, out = h[1], b""
+    for _ in range(2):
+        v = py_der_hdr(sig, i, h[2])
+        if v is None or v[0] != 0x02:
+            return None
+        c = sig[v[1]:v[2]]
+        if c[0] & 0x80:
+            return None
+        c = c.lstrip(b"\x00") or b"\x00"
+        if len(c) > flen:
+            return None
+        out += c.rjust(flen, b"\x00")
+        i = v[2]
+    return out if i == h[2] else None
+
+
+def tls13_cv_vectors():
+    """Wycheproof signatures through brisk__tls13_cv_verify: ECDSA as the DER ECDSA-Sig-Value a
+    CertificateVerify carries (4.3.3), RSA-PSS as rsa_pss_rsae_* with sLen fixed to hLen. The
+    verdict is recomputed here from the value, and must agree with upstream's 'valid'."""
+    keys, rows = [], []
+    for src, scheme, flen, alg, verify, ok in (
+            ("wp_p256_ecdsa_der", 0x0403, 32, 2, py_p256_verify, P256_OK),
+            ("tls13_wp_p384_ecdsa_der", 0x0503, 48, 3, py_p384_verify, P384_OK)):
+        for g in json.loads(fetch(src))["testGroups"]:
+            pub = bytes.fromhex(g["publicKey"]["uncompressed"])
+            keys.append((alg, pub.hex()))
+            for t in g["tests"]:
+                msg, sig = bytes.fromhex(t["msg"]), bytes.fromhex(t["sig"])
+                raw = t_ecdsa_der(sig, flen)
+                good = raw is not None and verify(pub, HASH[flen * 8](msg).digest(), raw) == ok
+                if good != (t["result"] == "valid"):
+                    die(f"{src} tcId {t['tcId']}: we say {good}, upstream says {t['result']}")
+                rows.append((len(keys) - 1, scheme, msg.hex(), sig.hex(), int(good)))
+    for src, scheme, bits in (("wp_rsa_pss_2048_sha256_mgf1_32", 0x0804, 256),
+                              ("wp_rsa_pss_3072_sha256_mgf1_32", 0x0804, 256),
+                              ("wp_rsa_pss_2048_sha384_mgf1_48", 0x0805, 384),
+                              ("wp_rsa_pss_4096_sha512_mgf1_64", 0x0806, 512),
+                              ("wp_rsa_pss_2048_sha256_mgf1_0", 0x0804, 256)):
+        for g in json.loads(fetch(src))["testGroups"]:
+            if g["sha"] != f"SHA-{bits}" or g.get("mgfSha") != g["sha"]:
+                continue
+            n = int(g["publicKey"]["modulus"], 16)
+            e = int(g["publicKey"]["publicExponent"], 16)
+            keys.append((1, x_seq(x_int(n), x_int(e)).hex()))
+            for t in g["tests"]:
+                msg, sig = bytes.fromhex(t["msg"]), bytes.fromhex(t["sig"])
+                good = py_pss_verify(n, e, bits, bits // 8, HASH[bits](msg).digest(), sig) == RSA_OK
+                if int(g["sLen"]) == bits // 8:
+                    if good != (t["result"] == "valid"):
+                        die(f"{src} tcId {t['tcId']}: we say {good}, upstream says {t['result']}")
+                # Other sLen files: the verdict is ours alone. A row upstream signed with sLen = hLen
+                # (tcId 69 of mgf1_0 is one) verifies here, which is what a TLS peer must see.
+                rows.append((len(keys) - 1, scheme, msg.hex(), sig.hex(), int(good)))
+    print(f"  tls13 CertificateVerify: {len(rows)} Wycheproof rows over {len(keys)} keys, "
+          f"{sum(r[4] for r in rows)} valid")
+    return keys, rows
+
+
 def cesc(s):
     """A C string body. A row whose whole point is a non-ASCII octet (a U-label reference) is
     written out as escapes, so neither an editor nor -finput-charset can change what it tests;
@@ -4761,10 +5388,13 @@ def cstr(hx, width=96):
     return " ".join(f'"{hx[i:i + width]}"' for i in range(0, len(hx), width))
 
 
-def emit(name, decl, rows, fmt):
+def emit(name, decl, rows, fmt, append=False):
     body = ",\n".join("    {" + fmt(r) + "}" for r in rows)
-    text = (f"/* generated by tools/kat.py - do not edit; sources in tests/kat/SOURCES.md */\n"
-            f"static const {decl}[] = {{\n{body}\n}};\n")
+    text = f"static const {decl}[] = {{\n{body}\n}};\n"
+    if append:  # a second array in the same file
+        text = (OUT / name).read_text() + text
+    else:
+        text = "/* generated by tools/kat.py - do not edit; sources in tests/kat/SOURCES.md */\n" + text
     (OUT / name).write_text(text, newline="\n")
     print(f"  {name}: {len(rows)} vectors")
 
@@ -4878,6 +5508,11 @@ def main():
     x509_stores = x509_store_vectors()
     x509_pins = x509_pin_vectors()
     x509_limbo, x509_limbo_skipped = x509_limbo_vectors()
+    tls13_rfc = rfc9846_constants()
+    tls13_flows, tls13_parts = tls13_traces()
+    tls13_fx, tls13_chw = tls13_fixture()
+    tls13_mut = t_mutations(tls13_parts)
+    tls13_cv_keys, tls13_cv = tls13_cv_vectors()
 
     emit("sha2.inc", "struct hash_kat SHA2_KAT", cavp + dhash, lambda r: f"{r[0]}, {cstr(r[1])}, {cstr(r[2])}")
     emit("sha2_monte.inc", "struct monte_kat SHA2_MONTE", monte,
@@ -4990,6 +5625,33 @@ def main():
                                      + ["NULL"] * (PIN_MAX - len(r[2]))) + "}, "
                    + f'{r[3]}, {r[4]}LL, "{r[5]}"')
 
+    emit("tls13_trace.inc", "struct tls13_flow_kat TLS13_FLOW_KAT", tls13_flows + tls13_fx,
+         lambda r: f'"{cesc(r[0])}", {cstr(r[1])}, "{r[2]}", {r[3]}LL, {r[4]}, {r[5]}, '
+                   f'0x{r[6]:04x}u, {cstr(r[7])}, {cstr(r[8])}, {cstr(r[9])}, 0x{r[10]:04x}u, '
+                   + ", ".join(cstr(x) for x in r[11:]))
+    emit("tls13_trace.inc", "struct tls13_rfc_kat TLS13_RFC_KAT", tls13_rfc,
+         lambda r: ", ".join(cstr(x) for x in r), append=True)
+    emit("tls13_trace.inc", "struct tls13_chw_kat TLS13_CHW_KAT", tls13_chw,
+         lambda r: ", ".join(cstr(x) for x in r[:5]) + f', "{r[5]}", 0x{r[6]:04x}u, '
+                   + ", ".join(cstr(x) for x in r[7:]), append=True)
+    # Seeds for fuzz/fuzz_tls13_hs.c (tools/dev.py fuzz tls13_hs), not included by any test:
+    # [ServerHello length] ServerHello || the HANDSHAKE flight, the harness's input format. The
+    # sect 3 flight passes that harness's ServerHello checks, so the fuzzer starts deep.
+    seeds = []
+    for r in tls13_flows + tls13_fx:
+        sh = bytes.fromhex(r[9] or r[14])
+        rest = b"".join(bytes.fromhex(x) for x in r[15:20])
+        if len(sh) < 256:
+            seeds.append(((bytes([len(sh)]) + sh + rest).hex(), r[0]))
+    emit("tls13_fuzz.inc", "struct tls13_fuzz_seed TLS13_FUZZ_SEED", seeds,
+         lambda r: f'{cstr(r[0])}, "{cesc(r[1])}"')
+    emit("tls13_mut.inc", "struct tls13_mut_kat TLS13_MUT_KAT", tls13_mut,
+         lambda r: f'{r[0]}, {r[1]}, {cstr(r[2])}, {r[3]}, "{cesc(r[4])}"')
+    emit("tls13_cv.inc", "struct tls13_cv_key TLS13_CV_KEY", tls13_cv_keys,
+         lambda r: f"{r[0]}, {cstr(r[1])}")
+    emit("tls13_cv.inc", "struct tls13_cv_kat TLS13_CV_KAT", tls13_cv,
+         lambda r: f"{r[0]}, 0x{r[1]:04x}u, {cstr(r[2])}, {cstr(r[3])}, {r[4]}", append=True)
+
     rows = "\n".join(f"| {k} | {u} | `{h}` |" for k, (u, h) in sorted(fetched.items()))
     (OUT / "SOURCES.md").write_text(
         "# Known-answer vector sources\n\n"
@@ -5001,7 +5663,9 @@ def main():
         "- `ecdsa_secp256r1_sha256_test.json` (the DER-encoded Wycheproof sibling of\n"
         "  `ecdsa_secp256r1_sha256_p1363_test.json`). `brisk__p256_ecdsa_verify` takes a fixed\n"
         "  64-byte r||s, so that suite's extra invalid cases are all ASN.1 encoding errors and\n"
-        "  belong to the M2 DER parser, not here. Not forgotten - out of scope by design.\n"
+        "  belong to the M2 DER parser, not here. Not forgotten - out of scope by design. (M3 does\n"
+        "  use it, together with the P-384 `ecdsa_secp384r1_sha384_test.json`, through the\n"
+        "  CertificateVerify path in `tests/kat/tls13_cv.inc`, where the DER unwrap belongs.)\n"
         "- CAVP `PKV.rsp` [P-256]: 4 of the 12 rows are \"Q_x or Q_y out of range\" with a 33-byte\n"
         "  coordinate, which the 65-byte encoding of RFC 9846 4.3.8.2 cannot express. The in-range\n"
         "  half of that check is pinned by generated `x == p` / `y == p` / `coord == 2^256-1` rows.\n"
@@ -5045,8 +5709,13 @@ def main():
         "  \"invalid\". `brisk__p384_ecdsa_verify` takes a fixed `uint8_t[96]`, so the width is\n"
         "  settled by the caller that unwraps the DER ECDSA-Sig-Value. Their substance - r or s\n"
         "  outside [1, n-1] - is pinned at the right width by generated edge rows (0, n, n+1,\n"
-        "  2^384-1 on each side). The DER siblings of both files are out of scope for the same\n"
-        "  reason the P-256 one is.\n"
+        "  2^384-1 on each side). The DER siblings of both files are out of scope here for the\n"
+        "  same reason the P-256 one is; the SHA-384 one is used by `tls13_cv.inc`.\n"
+        "- TLS 1.3 handshake (`tls13_*.inc`): NIST CAVP has no handshake vectors, and the RFC 9001\n"
+        "  A.2/A.3 QUIC Initial ClientHello/ServerHello belong to M6. RFC 8448 sect 4 (0-RTT\n"
+        "  resumption) is out of this slice: no PSK, no 0-RTT. Sect 6's client flight uses an RSA\n"
+        "  client key this library cannot produce, so from there on the values are ours, computed\n"
+        "  by the same Python cascade that reproduces sections 3, 5 and 7 byte for byte.\n"
         "- There is no P-384 *keygen*, *ECDH* or *signing* vector set here, and there never will\n"
         "  be: docs/ARCHITECTURE.md locks P-384 to verify only, so `KAS_ECC_CDH` `[P-384]`,\n"
         "  `KeyPair.rsp` `[P-384]`, `SigGen.txt` `[P-384]` and `ecdh_secp384r1_*` are all out of\n"

@@ -36,6 +36,29 @@ static inline void brisk__store_be64(uint8_t *p, uint64_t v)
     brisk__store_be32(p + 4, (uint32_t)v);
 }
 
+static inline uint32_t brisk__load_be16(const uint8_t *p)
+{
+    return ((uint32_t)p[0] << 8) | p[1];
+}
+
+static inline uint32_t brisk__load_be24(const uint8_t *p)
+{
+    return ((uint32_t)p[0] << 16) | ((uint32_t)p[1] << 8) | p[2];
+}
+
+static inline void brisk__store_be16(uint8_t *p, uint32_t v)
+{
+    p[0] = (uint8_t)(v >> 8);
+    p[1] = (uint8_t)v;
+}
+
+static inline void brisk__store_be24(uint8_t *p, uint32_t v)
+{
+    p[0] = (uint8_t)(v >> 16);
+    p[1] = (uint8_t)(v >> 8);
+    p[2] = (uint8_t)v;
+}
+
 static inline uint32_t brisk__load_le32(const uint8_t *p)
 {
     return (uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
@@ -1390,5 +1413,250 @@ int brisk__tls_ks_exporter(brisk_hash_alg alg, const uint8_t *exporter_ms, const
 
 /* Wipe every secret in ks. Safe on NULL. */
 void brisk__tls_ks_wipe(brisk__tls_ks *ks);
+
+/* ---- tls/handshake.c: TLS 1.3 client handshake engine (RFC 9846 sect 4), sans-I/O -----------
+ *
+ * One engine for TCP and QUIC: it deals in HANDSHAKE MESSAGES tagged with an epoch (the RFC 9001
+ * 4.1.3 encryption levels), never in records or packets, and it exports traffic SECRETS through
+ * a callback, never keys - the record layer or QUIC derives key/iv/hp itself (picotls model).
+ * No syscalls, no clock, no malloc: the caller supplies the ClientHello bytes (built with
+ * brisk__tls13_ch_write from brisk__os_random output), the ECDHE private key, `now` for the
+ * certificate check, and one scratch buffer.
+ *
+ * FLOW (RFC 9846 sect 4.1, Appendix A.1). START -> [hs_client_hello] -> WAIT_SH -> WAIT_EE ->
+ * WAIT_CERT_CR -> [WAIT_CERT] -> WAIT_CV -> WAIT_FIN -> CONNECTED. A HelloRetryRequest turns
+ * WAIT_SH into WAIT_CH2 once; the caller then builds CH2 from hs->hrr_group / hs->cookie and
+ * absorbs it with hs_client_hello again. Anything out of order is unexpected_message. The PSK
+ * branch (WAIT_EE -> WAIT_FIN) is not in this slice.
+ *
+ * FAILURE is sticky: the first violation sets hs->alert (RFC 9846 6.2 AlertDescription), wipes
+ * every secret, drops queued output and returns BRISK_E_AUTH (a certificate or signature
+ * failure: alerts 42, 43, 48, 51), BRISK_E_ARG (internal_error, 80: a local fault - on_secret
+ * or on_peer_tp refused, or the authenticator rejected its own ctx or reference host) or
+ * BRISK_E_PROTO (everything else: the peer broke the protocol); every later call returns
+ * the same code. There is no best-effort continuation anywhere.
+ *
+ * KNOWN GAP (M3 line 2/3): post-handshake messages (NewSessionTicket, KeyUpdate) are not
+ * handled yet, so handshake bytes fed in CONNECTED are unexpected_message.
+ *
+ * STACK: hs_feed is 512 B (-fstack-usage, gcc -Os, x86_64 host) and calls the authenticator
+ * from inside it, so the deepest chain is hs_feed -> brisk__tls13_auth_x509 (128) ->
+ * brisk__x509_chain_verify's RSA-4096 subtree (the chain.c block: 4240 on x86_64 gcc 14), about
+ * 4.9 KB. The certificate array lives in the scratch buffer, never on the stack.
+ */
+/* Epochs = RFC 9001 4.1.3 encryption levels. 1 (0-RTT) is reserved and never used: no 0-RTT. */
+enum { BRISK__EPOCH_INITIAL = 0, BRISK__EPOCH_HANDSHAKE = 2, BRISK__EPOCH_APP = 3 };
+
+/* RFC 9846 6.2 AlertDescription values the engine emits. */
+enum {
+    BRISK__ALERT_UNEXPECTED_MESSAGE = 10,
+    BRISK__ALERT_HANDSHAKE_FAILURE = 40,
+    BRISK__ALERT_BAD_CERTIFICATE = 42,
+    BRISK__ALERT_UNSUPPORTED_CERTIFICATE = 43,
+    BRISK__ALERT_ILLEGAL_PARAMETER = 47,
+    BRISK__ALERT_UNKNOWN_CA = 48,
+    BRISK__ALERT_DECODE_ERROR = 50,
+    BRISK__ALERT_DECRYPT_ERROR = 51,
+    BRISK__ALERT_PROTOCOL_VERSION = 70,
+    BRISK__ALERT_INTERNAL_ERROR = 80,
+    BRISK__ALERT_MISSING_EXTENSION = 109,
+    BRISK__ALERT_UNSUPPORTED_EXTENSION = 110
+};
+
+/* The HRR cookie is copied into CH2 (RFC 9846 4.3.2). The RFC allows 2^16-1 bytes; 256 is a
+ * LOCAL limit that keeps the context small, and a bigger cookie fails with illegal_parameter.
+ * Raise it (and make it a knob) if interop finds a stateless server that needs more. */
+#define BRISK__TLS13_COOKIE_MAX 256
+/* Room for a queued ClientHello pair and the client flight. brisk__tls13_ch_write output is
+ * ~350 bytes with SNI and a P-256 share; a CH that does not fit is BRISK_E_ARG at absorb. */
+#define BRISK__TLS13_OUT_MAX 2048
+
+/* Traffic secret hand-off: called synchronously from hs_feed, in the order s_hs(recv),
+ * c_hs(send) after the ServerHello and s_ap(recv), c_ap(send) after the server Finished.
+ * `len` is HashLen. A non-zero return aborts the handshake with internal_error. The c_ap send
+ * secret protects only what the caller sends AFTER the bytes hs_pull tagged HANDSHAKE. */
+typedef int (*brisk__tls13_secret_fn)(void *ctx, unsigned epoch, int is_send, uint16_t suite,
+                                      const uint8_t *secret, size_t len);
+
+/* Peer authentication: the server's certificates (certs[0] is the end entity), the signature
+ * scheme and signature of its CertificateVerify, and `tbs`, the FULL RFC 9846 4.5.2 signed
+ * content (not a digest). REQUIRED: a NULL auth is BRISK_E_ARG at init, never a silent skip.
+ * Production always passes brisk__tls13_auth_x509; only the RFC 8448 trace test, whose server
+ * key is RSA-1024 with no anchor, passes its own. Return BRISK_OK or a negative code with *alert
+ * set; an *alert left at 0 becomes decrypt_error for BRISK_E_AUTH and bad_certificate
+ * otherwise. The certificate structs point into the engine's scratch and die with the call. */
+typedef int (*brisk__tls13_auth_fn)(void *ctx, const brisk__x509_cert *certs, size_t n_certs,
+                                    uint16_t scheme, const uint8_t *tbs, size_t tbs_len,
+                                    const uint8_t *sig, size_t sig_len, uint8_t *alert);
+
+typedef struct {
+    const char *host; /* RFC 9525 reference identity, host_len bytes, not NUL-terminated */
+    size_t host_len;
+    const brisk__x509_trust *trust;
+    int64_t now; /* seconds since the epoch, widened; never time_t */
+} brisk__tls13_auth_x509_ctx;
+
+/* The production brisk__tls13_auth_fn (ctx = brisk__tls13_auth_x509_ctx). In this order: the
+ * scheme fits the leaf key (illegal_parameter, before any bignum work),
+ * brisk__x509_chain_verify (bad_certificate - one alert for every chain failure, because chain.c
+ * deliberately reports one code; its BRISK_E_ARG "cannot verify this pairing" is
+ * unsupported_certificate), brisk__x509_match_host (bad_certificate), the leaf's keyUsage has
+ * digitalSignature when present (RFC 9846 4.5.1.2) and its EKU includes serverAuth or
+ * anyExtendedKeyUsage when present (RFC 5280 4.2.1.12) - chain.c checks neither -
+ * (unsupported_certificate), then the signature through brisk__tls13_cv_verify. */
+int brisk__tls13_auth_x509(void *ctx, const brisk__x509_cert *certs, size_t n_certs,
+                           uint16_t scheme, const uint8_t *tbs, size_t tbs_len, const uint8_t *sig,
+                           size_t sig_len, uint8_t *alert);
+
+/* The CertificateVerify signature alone (RFC 9846 4.5.2) against `leaf`'s key. Schemes: 0x0403
+ * (P-256 key), 0x0503 (P-384 key, BRISK_ENABLE_P384), 0x0804/0805/0806 rsa_pss_rsae with
+ * sLen = hLen, NEVER a parsed saltLength (RFC 9846 4.3.3). Anything else, or a key of the
+ * wrong type, is illegal_parameter before any bignum work. ECDSA signatures are the DER
+ * ECDSA-Sig-Value, strictly (decode_error otherwise). A signature that does not verify is
+ * decrypt_error; malformed key material is bad_certificate.
+ * BRISK_OK, or BRISK_E_AUTH / BRISK_E_ARG with *alert set. */
+int brisk__tls13_cv_verify(const brisk__x509_cert *leaf, uint16_t scheme, const uint8_t *tbs,
+                           size_t tbs_len, const uint8_t *sig, size_t sig_len, uint8_t *alert);
+
+/* RFC 9846 4.5.2 signed content: 64 x 0x20 || "TLS 1.3, server CertificateVerify" (or client)
+ * || 0x00 || th. `out` needs 98 + hl bytes. Returns the length. */
+size_t brisk__tls13_cv_content(int is_server, const uint8_t *th, size_t hl, uint8_t *out);
+
+/* ClientHello parameters (RFC 9846 4.2.2). NULL lists take the library's offer, which is the
+ * security-relevant default: suites 0x1303, 0x1301, 0x1302 (ChaCha20 first: this library has no
+ * AES instructions); groups x25519, secp256r1; signature schemes 0x0403, 0x0503 (with
+ * BRISK_ENABLE_P384), 0x0804-0x0806, then 0x0401/0x0501/0x0601 for certificates only. Never
+ * SHA-1, never rsa_pss_pss (no RSASSA-PSS key type in x509), never a group without ECDHE. */
+typedef struct {
+    const uint8_t *random; /* 32 bytes from brisk__os_random */
+    const uint8_t *session_id;
+    size_t session_id_len; /* 32 over TCP (Appendix E.4), 0 over QUIC (RFC 9001 8.4) */
+    const uint16_t *suites;
+    size_t n_suites;
+    const uint16_t *groups;
+    size_t n_groups;
+    uint16_t share_group; /* exactly one KeyShareEntry, and its group must be in `groups` */
+    const uint8_t *share_pub;
+    size_t share_pub_len; /* 32 (x25519) or 65 (secp256r1) */
+    const uint16_t *sig_schemes;
+    size_t n_sig_schemes;
+    const char *sni; /* NULL/0 = omit; an IP literal is omitted too (RFC 6066 3) */
+    size_t sni_len;
+    const uint8_t *cookie; /* from the HRR (RFC 9846 4.3.2); NULL on CH1 */
+    size_t cookie_len;
+    const uint8_t *quic_tp; /* QUIC only: encoded transport parameters (RFC 9001 8.2); NULL over
+                               TCP, where the extension MUST NOT be sent */
+    size_t quic_tp_len;
+} brisk__tls13_ch_params;
+
+/* Serialise a ClientHello handshake message, header included. Extension order: server_name,
+ * supported_groups, signature_algorithms, supported_versions, cookie, key_share,
+ * quic_transport_parameters.
+ * BRISK_E_ARG, with *out_len 0, on bad parameters or when cap is too small. */
+int brisk__tls13_ch_write(const brisk__tls13_ch_params *p, uint8_t *out, size_t cap,
+                          size_t *out_len);
+
+/* The server's quic_transport_parameters extension_data (RFC 9001 8.2), called from hs_feed
+ * while the EncryptedExtensions is processed, before CONNECTED; the bytes die with the call.
+ * A non-zero return aborts the handshake with internal_error (BRISK_E_ARG). */
+typedef int (*brisk__tls13_tp_fn)(void *ctx, const uint8_t *tp, size_t len);
+
+typedef struct {
+    brisk__tls13_secret_fn on_secret; /* may be NULL (nothing exported) */
+    void *secret_ctx;
+    brisk__tls13_auth_fn auth; /* REQUIRED */
+    void *auth_ctx;
+    /* RFC 9001 8.4: the ClientHello session id MUST be empty. 8.2: the ClientHello MUST carry
+     * quic_transport_parameters when set and MUST NOT otherwise (BRISK_E_ARG at absorb), and an
+     * EE without it is missing_extension. */
+    uint8_t quic;
+    brisk__tls13_tp_fn on_peer_tp; /* QUIC: may be NULL (the parameters are dropped) */
+    void *tp_ctx;
+} brisk__tls13_hs_cfg;
+
+enum {
+    BRISK__HS_START,
+    BRISK__HS_WAIT_SH,
+    BRISK__HS_WAIT_CH2,
+    BRISK__HS_WAIT_EE,
+    BRISK__HS_WAIT_CERT_CR,
+    BRISK__HS_WAIT_CERT,
+    BRISK__HS_WAIT_CV,
+    BRISK__HS_WAIT_FIN,
+    BRISK__HS_CONNECTED,
+    BRISK__HS_FAILED
+};
+
+/* The offer, parsed from the ClientHello bytes the engine absorbed - what was sent is the only
+ * source of truth for "did the client offer this" (RFC 9846 4.3 unsolicited extensions). */
+#define BRISK__TLS13_MAX_OFFER_EXT    16
+#define BRISK__TLS13_MAX_OFFER_SUITES 8
+#define BRISK__TLS13_MAX_OFFER_GROUPS 16
+#define BRISK__TLS13_MAX_OFFER_SIGS   24
+
+typedef struct {
+    brisk__tls13_hs_cfg cfg;
+    brisk_hash_ctx th256, th384; /* transcript; both until the suite is known (RFC 9846 4.1) */
+    brisk__tls_ks ks;
+    uint8_t c_hs[BRISK_HASH_MAX_LEN], s_hs[BRISK_HASH_MAX_LEN]; /* wiped after the Finished pair */
+    uint8_t exp_ms[BRISK_HASH_MAX_LEN], res_ms[BRISK_HASH_MAX_LEN];
+    uint8_t priv[32]; /* ECDHE private key, wiped right after the shared secret */
+    uint8_t session_id[32];
+    uint8_t cookie[BRISK__TLS13_COOKIE_MAX];
+    uint16_t offered_ext[BRISK__TLS13_MAX_OFFER_EXT];
+    uint16_t offered_suites[BRISK__TLS13_MAX_OFFER_SUITES];
+    uint16_t offered_groups[BRISK__TLS13_MAX_OFFER_GROUPS];
+    uint16_t offered_sigs[BRISK__TLS13_MAX_OFFER_SIGS];
+    uint16_t cookie_len;
+    uint16_t share_group, suite, hrr_group; /* suite is 0 until the SH/HRR picks one */
+    uint16_t peer_rsl; /* server's record_size_limit (RFC 8449 4) from EE; 0 = none sent */
+    uint8_t n_ext, n_suites, n_groups, n_sigs, session_id_len;
+    uint8_t hrr_seen, cr_seen, state, alert, in_epoch;
+    int err; /* the sticky return code once FAILED */
+    /* scratch carve-up: [message reassembly | certificate array | output queue] */
+    uint8_t *scratch, *in, *out;
+    brisk__x509_cert *certs;
+    size_t scratch_len, in_cap, in_base, in_len, n_certs, out_len, out_off, out_split;
+} brisk__tls13_hs;
+
+/* Scratch bytes hs_init needs: BRISK_TLS_MAX_HS_MSG + 4 for the largest message (the
+ * Certificate, kept while the CertificateVerify is reassembled after it, because the parsed
+ * certificates point into it), a CertificateVerify, BRISK__X509_MAX_CHAIN certificate structs
+ * (sizeof-based, aligned in place), and BRISK__TLS13_OUT_MAX of output queue. */
+size_t brisk__tls13_hs_scratch_size(void);
+
+/* BRISK_E_ARG if cfg or cfg->auth is NULL or scratch is too small. */
+int brisk__tls13_hs_init(brisk__tls13_hs *hs, const brisk__tls13_hs_cfg *cfg, uint8_t *scratch,
+                         size_t scratch_len);
+
+/* Absorb a ClientHello exactly as it goes on the wire (CH1 in START, CH2 in WAIT_CH2), queue it
+ * at INITIAL, learn the offer from the bytes, and take the 32-byte private key of its single key
+ * share. The bytes must be well formed, offer TLS 1.3 and only suites/groups the engine can
+ * finish, carry exactly one share, no PSK/early_data, and - for CH2 - the HRR's group and
+ * cookie (RFC 9846 4.2.2). BRISK_E_ARG (nothing changed) otherwise: a caller bug. */
+int brisk__tls13_hs_client_hello(brisk__tls13_hs *hs, const uint8_t *ch, size_t ch_len,
+                                 uint16_t share_group, const uint8_t *share_priv);
+
+/* Feed handshake bytes received at `epoch`, in any split. BRISK_OK (maybe waiting for more),
+ * else BRISK_E_PROTO / BRISK_E_AUTH with hs->alert set. Bytes at an epoch other than the current
+ * receive epoch, or left over in the same call after the message that ends an epoch (the
+ * ServerHello, the server Finished) are unexpected_message (RFC 9846 5.1). */
+int brisk__tls13_hs_feed(brisk__tls13_hs *hs, unsigned epoch, const uint8_t *in, size_t len);
+
+/* Drain queued output of ONE epoch per call into out[0..cap). Returns the byte count, 0 when
+ * nothing is queued (always 0 once FAILED). *epoch is set when the count is non-zero. */
+size_t brisk__tls13_hs_pull(brisk__tls13_hs *hs, unsigned *epoch, uint8_t *out, size_t cap);
+
+/* RFC 9846 7.5 exporter; CONNECTED only (BRISK_E_ARG otherwise). */
+int brisk__tls13_hs_exporter(const brisk__tls13_hs *hs, const char *label, const uint8_t *ctx,
+                             size_t ctx_len, uint8_t *out, size_t out_len);
+
+/* Wipe everything: secrets, key, transcript, and the whole scratch buffer. Safe on NULL. */
+void brisk__tls13_hs_wipe(brisk__tls13_hs *hs);
+
+/* x509/chain.c: an ECDSA-Sig-Value (strict DER, RFC 5480 A.1) as the fixed-width r || s of
+ * 2 * flen bytes. BRISK_E_ARG on any encoding error, negative or over-wide integer, trailing
+ * byte. Shared by certificate signatures and the CertificateVerify. */
+int brisk__x509_ecdsa_raw(const uint8_t *sig, size_t sig_len, size_t flen, uint8_t *out);
 
 #endif /* BRISK_INT_H */

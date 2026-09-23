@@ -175,4 +175,17 @@
 #    error "BRISK_X509_TIME_FLOOR must be a Unix timestamp in SECONDS, e.g. $(date -u +%s)"
 #endif
 
+/* Largest handshake message the TLS 1.3 engine buffers, in bytes of body. In practice that is
+ * the server's Certificate message, which is reassembled whole because the certificates are
+ * parsed in place. 12 KB holds a leaf plus two intermediates even at RSA-4096; a longer chain
+ * fails the handshake closed (illegal_parameter - a local limit, not an RFC one). A RAM knob:
+ * the engine's scratch buffer is this plus about 3 KB (brisk__tls13_hs_scratch_size). No public
+ * struct size depends on it. */
+#ifndef BRISK_TLS_MAX_HS_MSG
+#    define BRISK_TLS_MAX_HS_MSG 12288
+#endif
+#if BRISK_TLS_MAX_HS_MSG < 4096 || BRISK_TLS_MAX_HS_MSG > 65536
+#    error "BRISK_TLS_MAX_HS_MSG must be 4096..65536"
+#endif
+
 #endif /* BRISK_CONFIG_H */

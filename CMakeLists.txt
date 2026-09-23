@@ -31,6 +31,7 @@ add_library(brisk STATIC
     src/x509/name.c       # RFC 9525 service identity: host name / IP against the SAN
     src/x509/bundle.c     # PEM certificates out of a byte stream, sans-I/O
     src/tls/keyschedule.c # TLS 1.3 key schedule (RFC 9846 sect 7.1) + Finished + exporter
+    src/tls/handshake.c   # TLS 1.3 client handshake engine (RFC 9846 sect 4), sans-I/O
 )
 if(CMAKE_SYSTEM_NAME STREQUAL "Linux") # src/os/ is Linux-only; the mingw host skips it
     target_sources(brisk PRIVATE src/os/linux_rand.c src/os/linux_ca.c)
@@ -68,7 +69,8 @@ if(BRISK_BUILD_TESTS)
     add_executable(brisk_tests tests/test_main.c tests/test_hash.c tests/test_aead.c tests/test_aes.c
                                tests/test_x25519.c tests/test_p256.c tests/test_p384.c
                                tests/test_rsa.c tests/test_der.c tests/test_x509.c
-                               tests/test_ct.c tests/test_tls13_ks.c)
+                               tests/test_ct.c tests/test_tls13_ks.c
+                               tests/test_tls13_hs.c)
     set_target_properties(brisk_tests PROPERTIES C_STANDARD 99 C_EXTENSIONS OFF)
     target_link_libraries(brisk_tests PRIVATE brisk)
     target_include_directories(brisk_tests PRIVATE src tests)
@@ -102,6 +104,8 @@ if(BRISK_BUILD_TESTS)
     set_tests_properties(ct PROPERTIES TIMEOUT 900)
     add_test(NAME tls13_ks COMMAND brisk_tests tls13_ks)
     set_tests_properties(tls13_ks PROPERTIES TIMEOUT 900)
+    add_test(NAME tls13_hs COMMAND brisk_tests tls13_hs)
+    set_tests_properties(tls13_hs PROPERTIES TIMEOUT 900)
     if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
         target_sources(brisk_tests PRIVATE tests/test_rand.c)
         # fault injection for src/os/linux_rand.c (getrandom, /dev/random wait, kernel version)

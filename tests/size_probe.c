@@ -143,6 +143,29 @@ int main(int argc, char **argv)
         brisk__tls_ks_exporter(alg, out, "exp", out, 8, out, 32);
         brisk__tls_ks_wipe(&ks);
     }
+    {
+        /* the handshake engine; its scratch is the probe's own BSS, not the library's RAM */
+        static uint8_t scratch[4 + BRISK_TLS_MAX_HS_MSG + 8192];
+        static brisk__tls13_hs hs;
+        brisk__tls13_auth_x509_ctx ax = {"a.example", 9, NULL, 0};
+        brisk__tls13_hs_cfg cfg = {NULL, NULL, brisk__tls13_auth_x509, &ax, 0, NULL, NULL};
+        brisk__tls13_ch_params p;
+        size_t n;
+        unsigned e;
+        memset(&p, 0, sizeof p);
+        p.random = out;
+        p.share_group = 0x001d;
+        p.share_pub = out;
+        p.share_pub_len = 32;
+        brisk__tls13_ch_write(&p, out, sizeof out, &n);
+        brisk__tls13_hs_init(&hs, &cfg, scratch, sizeof scratch);
+        brisk__tls13_hs_client_hello(&hs, out, n, 0x001d, out);
+        brisk__tls13_hs_feed(&hs, 0, out, n);
+        brisk__tls13_hs_pull(&hs, &e, out, sizeof out);
+        brisk__tls13_hs_exporter(&hs, "e", out, 1, out, 32);
+        brisk__tls13_hs_wipe(&hs);
+        (void)brisk__tls13_hs_scratch_size();
+    }
     return out[0] + (brisk_build_info()[0] == brisk_version()[0]) +
            brisk__ct_memeq(out, out + 1, 8);
 }

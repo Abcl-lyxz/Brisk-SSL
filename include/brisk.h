@@ -39,12 +39,17 @@ extern "C" {
  */
 enum {
     BRISK_OK = 0,
-    BRISK_E_ARG = -1, /* invalid argument: unknown algorithm, length out of range, ... */
-    BRISK_E_RNG = -2, /* kernel randomness unavailable; seccomp filters must allow getrandom */
-    BRISK_E_AUTH =
-        -3 /* a cryptographic check failed on data the peer sent: AEAD authentication
-            * (TLS bad_record_mac; no plaintext released), or a signature that does not
-            * verify (TLS decrypt_error). Never a caller mistake - that is BRISK_E_ARG. */
+    BRISK_E_ARG = -1,  /* invalid argument: unknown algorithm, length out of range, ... */
+    BRISK_E_RNG = -2,  /* kernel randomness unavailable; seccomp filters must allow getrandom */
+    BRISK_E_AUTH = -3, /* a cryptographic check failed on data the peer sent: AEAD authentication
+                        * (TLS bad_record_mac; no plaintext released), a signature that does not
+                        * verify (TLS decrypt_error), or a certificate that is not acceptable. Never
+                        * a caller mistake - that is BRISK_E_ARG. */
+    BRISK_E_PROTO = -4 /* the peer violated the TLS protocol: a message out of order, a bad
+                        * length, a field or extension the RFC forbids. The connection is dead and
+                        * the fatal alert has been chosen; retrying the same peer will not help.
+                        * Never a caller mistake (BRISK_E_ARG) or a failed check on the peer's
+                        * credentials (BRISK_E_AUTH). */
 };
 
 /* Library version, e.g. "0.1.0-dev". */

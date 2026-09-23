@@ -304,4 +304,5 @@ void test_ct(void)
 #endif
     ct_bn_rsa();
     ct_memeq();
+    tls13_hs_ct_run(); /* the handshake engine over RFC 8448 sect 3, ECDHE key secret */
 }

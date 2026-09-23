@@ -24,8 +24,10 @@ void test_p384(void); /* the suite is a no-op stub when BRISK_ENABLE_P384 is 0 *
 void test_rsa(void);
 void test_der(void);
 void test_x509(void);
-void test_ct(void);       /* constant-time smoke run; the real check is `dev.py ct` */
-void test_tls13_ks(void); /* TLS 1.3 key schedule (RFC 9846 sect 7.1) + Finished + exporter */
-void test_rand(void);     /* Linux only */
+void test_ct(void);         /* constant-time smoke run; the real check is `dev.py ct` */
+void test_tls13_ks(void);   /* TLS 1.3 key schedule (RFC 9846 sect 7.1) + Finished + exporter */
+void test_tls13_hs(void);   /* TLS 1.3 handshake engine (RFC 9846 sect 4) */
+void tls13_hs_ct_run(void); /* its constant-time run, called from test_ct */
+void test_rand(void);       /* Linux only */
 
 #endif

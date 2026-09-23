@@ -17,7 +17,7 @@
  * the certificate-wide brisk__der_walk never saw - it sits inside the signatureValue BIT
  * STRING, which is a leaf to the walk - so the strict cursor runs over it here, trailing bytes
  * and all. */
-static int ecdsa_raw(const uint8_t *sig, size_t sig_len, size_t flen, uint8_t *out)
+int brisk__x509_ecdsa_raw(const uint8_t *sig, size_t sig_len, size_t flen, uint8_t *out)
 {
     brisk__der c, body;
     const uint8_t *r = NULL, *s = NULL;
@@ -123,7 +123,7 @@ int brisk__x509_signed_by(const brisk__x509_cert *child, const brisk__x509_cert 
         if (issuer->key_len != 2 * flen + 1) {
             return BRISK_E_AUTH;
         }
-        rc = ecdsa_raw(child->sig, child->sig_len, flen, raw);
+        rc = brisk__x509_ecdsa_raw(child->sig, child->sig_len, flen, raw);
         if (rc != BRISK_OK) {
             return rc;
         }

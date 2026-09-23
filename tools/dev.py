@@ -7,7 +7,7 @@
   python tools/dev.py size [--arch all|mipsel..] [--md] [--save] [--check]
                                                  per-module flash/RAM from the linker map (-Os, static)
   python tools/dev.py ct                         constant-time check: the ct suite under valgrind
-  python tools/dev.py fuzz [der|name] [--seconds N]  libFuzzer over a parser, seeded from its .inc
+  python tools/dev.py fuzz [der|name|tls13_hs] [--seconds N]  libFuzzer over a parser, seeded from its .inc
   python tools/dev.py image                      (re)build the brisk-dev Docker image
 
 Docker builds live in the named volume `brisk-build` (fast, and never collide with host builds).
@@ -215,7 +215,13 @@ def cmd_size(archs, md, save, check, jobs):
 # into files beats keeping the same bytes in the tree twice.
 FUZZ = {"der": ("fuzz/fuzz_der.c src/x509/der.c", "tests/kat/der.inc"),
         "name": ("fuzz/fuzz_name.c src/x509/name.c src/x509/der.c",
-                 "tests/kat/x509_name.inc")}
+                 "tests/kat/x509_name.inc"),
+        # The engine links most of the library; its seeds are whole server flights (kat.py).
+        "tls13_hs": ("fuzz/fuzz_tls13_hs.c src/tls/handshake.c src/tls/keyschedule.c src/util.c "
+                     "src/crypto/sha2.c src/crypto/hkdf.c src/crypto/x25519.c src/crypto/p256.c "
+                     "src/crypto/p384.c src/crypto/bn.c src/crypto/rsa.c src/x509/der.c "
+                     "src/x509/cert.c src/x509/chain.c src/x509/name.c",
+                     "tests/kat/tls13_fuzz.inc")}
 
 
 def fuzz_corpus(inc, out):
@@ -235,7 +241,7 @@ def cmd_fuzz(target, seconds):
     exe = f"build/fuzz_{target}"
     # -fno-sanitize-recover: a UBSan finding must abort so libFuzzer records it as a crash.
     build = ["clang", "-g", "-O1", "-std=c99", "-fsanitize=fuzzer,address,undefined",
-             "-fno-sanitize-recover=all", "-Iinclude", "-Isrc", *sources.split(), "-o", exe]
+             "-fno-sanitize-recover=all", "-Iinclude", "-Isrc", "-Ivendor", *sources.split(), "-o", exe]
     rc, out = run(docker_cmd(build), True)
     if rc:
         print(out)

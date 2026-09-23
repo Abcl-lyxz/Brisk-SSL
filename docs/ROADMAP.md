@@ -47,7 +47,13 @@ Tick a box only when the work is green on **every** arch (`python tools/dev.py t
 - [x] x509-limbo suite
 
 ## M3 TLS 1.3 client
-- [ ] Handshake engine (messages + epochs, exports secrets), HRR, key schedule
+- [x] Handshake engine (messages + epochs, exports secrets), HRR, key schedule
+  - Engine landed (`src/tls/handshake.c`): CH/SH/HRR/EE/CR/Certificate/CertificateVerify/
+    Finished, epochs, secrets out, `brisk__tls13_auth_x509`. **Known gap until line 2/3:** handshake
+    bytes in CONNECTED (NewSessionTicket, KeyUpdate) are `unexpected_message`, and real servers
+    send a NewSessionTicket right after their Finished - the record layer must not ship without
+    NST/KeyUpdate handling. CertificateRequest is answered with an empty Certificate (mTLS is
+    line 3). ALPN in EE is accepted unchecked until line 3.
 - [ ] Record layer (TCP), KeyUpdate, alerts, close_notify
 - [ ] PSK resumption tickets (export/import blob), ALPN list, SNI, mTLS (ECDSA)
 - [ ] `src/os/` sockets + public API `brisk_connect/read/write/close`, sans-I/O `brisk_feed/pull`

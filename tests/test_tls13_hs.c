@@ -1,0 +1,1192 @@
+/* test_tls13_hs.c - the TLS 1.3 handshake engine (src/tls/handshake.c, RFC 9846 sect 4).
+ *
+ * Everything replayed here comes from tools/kat.py: the RFC 8448 sect 3/5/6/7 traces (every
+ * secret re-derived in Python from the messages alone), a synthetic P-256 / RSA-PSS server for
+ * the production authenticator, a mutation table whose alert column cites the RFC 9846 section,
+ * and Wycheproof signatures and key shares. Nothing below types a vector by hand.
+ *
+ * The RFC 8448 server key is RSA-1024 and chains to nothing, so those flows run with a stub
+ * authenticator that checks the CertificateVerify content it is handed and says yes; the
+ * synthetic flows run with brisk__tls13_auth_x509, which is what production uses. */
+#include <stdlib.h>
+#include <string.h>
+
+#include "brisk_int.h"
+#include "test.h"
+
+struct tls13_flow_kat {
+    const char *note, *root, *host;
+    long long now;
+    int flags, alert;
+    unsigned g1;
+    const char *priv1, *ch1, *hrr;
+    unsigned g2;
+    const char *priv2, *ch2, *cookie;
+    const char *sh, *ee, *cr, *cert, *cv, *sf, *cf;
+    const char *s_hs, *c_hs, *s_ap, *c_ap, *exp_ms, *res_ms, *tbs;
+};
+struct tls13_rfc_kat {
+    const char *hrr, *down1, *down0, *cv_th, *cv_content;
+};
+struct tls13_chw_kat {
+    const char *random, *sid, *suites, *groups, *sigs, *sni;
+    unsigned share_group;
+    const char *share_pub, *cookie, *ch;
+};
+struct tls13_mut_kat {
+    int flow, msg;
+    const char *bytes;
+    int alert;
+    const char *note;
+};
+struct tls13_cv_key {
+    unsigned alg;
+    const char *key;
+};
+struct tls13_cv_kat {
+    int key;
+    unsigned scheme;
+    const char *msg, *sig;
+    int ok;
+};
+#include "kat/tls13_trace.inc"
+#include "kat/tls13_mut.inc"
+#include "kat/tls13_cv.inc"
+
+#define NFLOW  (sizeof TLS13_FLOW_KAT / sizeof TLS13_FLOW_KAT[0])
+#define F_TIME 1 /* the verdict depends on BRISK_X509_TIME_POLICY */
+
+/* ---------------------------------------------------------------- hex arena ---------------- */
+static uint8_t arena[1 << 18];
+static size_t arena_used;
+
+static const uint8_t *dec(const char *h, size_t *n)
+{
+    size_t len = strlen(h) / 2;
+    uint8_t *p = arena + arena_used;
+    if (len > sizeof arena - arena_used) {
+        exit(2);
+    }
+    *n = t_unhex(h, p, len);
+    arena_used += len;
+    return p;
+}
+
+/* ---------------------------------------------------------------- one flow, decoded -------- */
+typedef struct {
+    const struct tls13_flow_kat *k;
+    const uint8_t *m[7], *priv1, *ch1, *priv2, *ch2, *cookie, *root, *cf, *sec[6], *tbs;
+    size_t n_m[7], count, sh_at, ch1_len, ch2_len, cookie_len, root_len, cf_len, hl, tbs_len;
+} flow;
+
+static void flow_load(flow *f, const struct tls13_flow_kat *k)
+{
+    const char *msgs[7];
+    size_t i, n;
+    memset(f, 0, sizeof *f);
+    arena_used = 0;
+    f->k = k;
+    msgs[0] = k->hrr;
+    msgs[1] = k->sh;
+    msgs[2] = k->ee;
+    msgs[3] = k->cr;
+    msgs[4] = k->cert;
+    msgs[5] = k->cv;
+    msgs[6] = k->sf;
+    for (i = 0; i < 7; i++) {
+        if (*msgs[i]) {
+            f->m[f->count] = dec(msgs[i], &f->n_m[f->count]);
+            f->count++;
+        }
+    }
+    f->sh_at = *k->hrr ? 1 : 0;
+    f->priv1 = dec(k->priv1, &n);
+    f->ch1 = dec(k->ch1, &f->ch1_len);
+    f->priv2 = dec(k->priv2, &n);
+    f->ch2 = dec(k->ch2, &f->ch2_len);
+    f->cookie = dec(k->cookie, &f->cookie_len);
+    f->root = dec(k->root, &f->root_len);
+    f->cf = dec(k->cf, &f->cf_len);
+    f->sec[0] = dec(k->s_hs, &f->hl);
+    f->sec[1] = dec(k->c_hs, &n);
+    f->sec[2] = dec(k->s_ap, &n);
+    f->sec[3] = dec(k->c_ap, &n);
+    f->sec[4] = dec(k->exp_ms, &n);
+    f->sec[5] = dec(k->res_ms, &n);
+    f->tbs = dec(k->tbs, &f->tbs_len);
+}
+
+/* ---------------------------------------------------------------- callbacks ---------------- */
+typedef struct {
+    uint8_t sec[4][BRISK_HASH_MAX_LEN];
+    size_t len[4];
+    unsigned epoch[4];
+    int send[4], count;
+} capture;
+
+static int on_secret(void *ctx, unsigned epoch, int is_send, uint16_t suite, const uint8_t *s,
+                     size_t len)
+{
+    capture *c = (capture *)ctx;
+    (void)suite;
+    if (c->count >= 4 || len > BRISK_HASH_MAX_LEN) {
+        return 1;
+    }
+    memcpy(c->sec[c->count], s, len);
+    c->len[c->count] = len;
+    c->epoch[c->count] = epoch;
+    c->send[c->count] = is_send;
+    c->count++;
+    return 0;
+}
+
+typedef struct {
+    const uint8_t *want;
+    size_t want_len;
+    int calls, tbs_ok;
+} stub;
+
+/* The RFC 8448 authenticator: checks the 4.5.2 content it is given against the one kat.py
+ * rebuilt from the trace messages, then accepts. Production never gets here. */
+static int stub_auth(void *ctx, const brisk__x509_cert *certs, size_t n_certs, uint16_t scheme,
+                     const uint8_t *tbs, size_t tbs_len, const uint8_t *sig, size_t sig_len,
+                     uint8_t *alert)
+{
+    stub *s = (stub *)ctx;
+    (void)scheme;
+    (void)sig;
+    (void)sig_len;
+    (void)alert;
+    s->calls++;
+    s->tbs_ok = n_certs >= 1 && certs[0].raw != NULL && tbs_len == s->want_len &&
+                memcmp(tbs, s->want, tbs_len) == 0;
+    return BRISK_OK;
+}
+
+typedef struct {
+    const uint8_t *der;
+    size_t len;
+} anchor;
+
+static int anchor_fn(void *ctx, const uint8_t *dn, size_t dn_len, size_t index,
+                     brisk__x509_cert *out)
+{
+    const anchor *a = (const anchor *)ctx;
+    (void)dn;
+    (void)dn_len;
+    return index == 0 ? brisk__x509_parse(out, a->der, a->len) : BRISK_E_ARG;
+}
+
+/* ---------------------------------------------------------------- the runner --------------- */
+enum { FEED_MSG, FEED_BYTES, FEED_FLIGHT, FEED_CUT };
+
+typedef struct {
+    brisk__tls13_hs hs;
+    capture cap;
+    stub st;
+    anchor an;
+    brisk__x509_trust trust;
+    brisk__tls13_auth_x509_ctx ax;
+    uint8_t init[2048], hsk[512];
+    size_t init_len, hsk_len;
+} run;
+
+static uint8_t *g_scratch;
+static size_t g_scratch_len;
+static uint8_t feedbuf[4 + BRISK_TLS_MAX_HS_MSG + 1024];
+
+static void drain(run *r, size_t off)
+{
+    uint8_t tmp[700 + 8];
+    unsigned e = 99;
+    size_t n;
+    /* a 700-byte cap: a queued ClientHello pair comes out in several pieces */
+    while ((n = brisk__tls13_hs_pull(&r->hs, &e, tmp + off, 700)) != 0) {
+        if (e == BRISK__EPOCH_INITIAL && n <= sizeof r->init - r->init_len) {
+            memcpy(r->init + r->init_len, tmp + off, n);
+            r->init_len += n;
+        } else if (e == BRISK__EPOCH_HANDSHAKE && n <= sizeof r->hsk - r->hsk_len) {
+            memcpy(r->hsk + r->hsk_len, tmp + off, n);
+            r->hsk_len += n;
+        } else {
+            CHECK(0 && "pull: unexpected epoch or overflow");
+            return;
+        }
+    }
+}
+
+static int feed(run *r, unsigned epoch, const uint8_t *m, size_t n, int mode, size_t cut,
+                size_t off)
+{
+    uint8_t *p = feedbuf + off;
+    size_t i;
+    int rc;
+    if (n > sizeof feedbuf - off) {
+        exit(2);
+    }
+    memcpy(p, m, n);
+    if (mode == FEED_BYTES) {
+        for (i = 0; i < n; i++) {
+            rc = brisk__tls13_hs_feed(&r->hs, epoch, p + i, 1);
+            if (rc != BRISK_OK) {
+                return rc;
+            }
+        }
+        return BRISK_OK;
+    }
+    if (mode == FEED_CUT && cut != 0 && cut < n && (m[0] == 2 || m[0] == 11)) {
+        rc = brisk__tls13_hs_feed(&r->hs, epoch, p, cut);
+        return rc != BRISK_OK ? rc : brisk__tls13_hs_feed(&r->hs, epoch, p + cut, n - cut);
+    }
+    return brisk__tls13_hs_feed(&r->hs, epoch, p, n);
+}
+
+/* Replay one flow, message `ov_idx` replaced by ov (ov_idx < 0: none). 0 when every step was
+ * accepted; the engine's error code otherwise; 97..99 for a harness-level refusal. */
+static int run_flow(run *r, const flow *f, int ov_idx, const uint8_t *ov, size_t ov_len, int mode,
+                    size_t cut, size_t off)
+{
+    static uint8_t flight[4 * (4 + BRISK_TLS_MAX_HS_MSG)];
+    brisk__tls13_hs_cfg cfg;
+    size_t i, j, n, fl;
+    const uint8_t *m;
+    int rc;
+
+    memset(r, 0, sizeof *r);
+    memset(&cfg, 0, sizeof cfg);
+    cfg.on_secret = on_secret;
+    cfg.secret_ctx = &r->cap;
+    if (f->root_len != 0) {
+        r->an.der = f->root;
+        r->an.len = f->root_len;
+        r->trust.find_anchor = anchor_fn;
+        r->trust.anchor_ctx = &r->an;
+        r->ax.host = f->k->host;
+        r->ax.host_len = strlen(f->k->host);
+        r->ax.trust = &r->trust;
+        r->ax.now = (int64_t)f->k->now;
+        cfg.auth = brisk__tls13_auth_x509;
+        cfg.auth_ctx = &r->ax;
+    } else {
+        r->st.want = f->tbs;
+        r->st.want_len = f->tbs_len;
+        cfg.auth = stub_auth;
+        cfg.auth_ctx = &r->st;
+    }
+    if (brisk__tls13_hs_init(&r->hs, &cfg, g_scratch + (off & 7), g_scratch_len - 8) != BRISK_OK ||
+        brisk__tls13_hs_client_hello(&r->hs, f->ch1, f->ch1_len, (uint16_t)f->k->g1, f->priv1) !=
+            BRISK_OK) {
+        return 99;
+    }
+    drain(r, off & 1);
+    for (i = 0; i < f->count; i++) {
+        unsigned epoch = i <= f->sh_at ? BRISK__EPOCH_INITIAL : BRISK__EPOCH_HANDSHAKE;
+        m = (int)i == ov_idx ? ov : f->m[i];
+        n = (int)i == ov_idx ? ov_len : f->n_m[i];
+        if (mode == FEED_FLIGHT && epoch == BRISK__EPOCH_HANDSHAKE) {
+            for (fl = 0, j = i; j < f->count; j++) {
+                const uint8_t *mj = (int)j == ov_idx ? ov : f->m[j];
+                size_t nj = (int)j == ov_idx ? ov_len : f->n_m[j];
+                memcpy(flight + fl, mj, nj);
+                fl += nj;
+            }
+            rc = brisk__tls13_hs_feed(&r->hs, epoch, flight, fl);
+            i = f->count;
+        } else {
+            rc = feed(r, epoch, m, n, mode, cut, off);
+        }
+        if (rc != BRISK_OK) {
+            return rc;
+        }
+        if (i == 0 && f->sh_at == 1) { /* after the HelloRetryRequest */
+            if (r->hs.state != BRISK__HS_WAIT_CH2 ||
+                brisk__tls13_hs_client_hello(&r->hs, f->ch2, f->ch2_len, (uint16_t)f->k->g2,
+                                             f->priv2) != BRISK_OK) {
+                return 98;
+            }
+            drain(r, off & 1);
+        }
+    }
+    drain(r, off & 1);
+    return BRISK_OK;
+}
+
+static int all_zero(const uint8_t *p, size_t n)
+{
+    size_t i;
+    uint8_t acc = 0;
+    for (i = 0; i < n; i++) {
+        acc |= p[i];
+    }
+    return acc == 0;
+}
+
+static int secrets_wiped(const brisk__tls13_hs *hs)
+{
+    return all_zero(hs->priv, sizeof hs->priv) && all_zero(hs->c_hs, sizeof hs->c_hs) &&
+           all_zero(hs->s_hs, sizeof hs->s_hs) && all_zero(hs->ks.secret, sizeof hs->ks.secret);
+}
+
+/* Everything a completed flow must have produced, byte for byte. */
+static void check_connected(const run *r, const flow *f, int rc, long idx)
+{
+    static const unsigned EP[4] = {BRISK__EPOCH_HANDSHAKE, BRISK__EPOCH_HANDSHAKE, BRISK__EPOCH_APP,
+                                   BRISK__EPOCH_APP};
+    int i;
+    CHECKI(rc == BRISK_OK && r->hs.state == BRISK__HS_CONNECTED, idx);
+    if (rc != BRISK_OK) {
+        return;
+    }
+    CHECKI(r->cap.count == 4, idx);
+    for (i = 0; i < 4 && i < r->cap.count; i++) {
+        /* order: s_hs recv, c_hs send, s_ap recv, c_ap send (RFC 9846 7.3) */
+        CHECKI(r->cap.epoch[i] == EP[i] && r->cap.send[i] == (i & 1), idx);
+        CHECKI(r->cap.len[i] == f->hl && memcmp(r->cap.sec[i], f->sec[i], f->hl) == 0, idx);
+    }
+    CHECKI(memcmp(r->hs.exp_ms, f->sec[4], f->hl) == 0, idx);
+    CHECKI(memcmp(r->hs.res_ms, f->sec[5], f->hl) == 0, idx);
+    CHECKI(r->hsk_len == f->cf_len && memcmp(r->hsk, f->cf, f->cf_len) == 0, idx);
+    CHECKI(r->init_len == f->ch1_len + f->ch2_len && memcmp(r->init, f->ch1, f->ch1_len) == 0 &&
+               memcmp(r->init + f->ch1_len, f->ch2, f->ch2_len) == 0,
+           idx);
+    CHECKI(secrets_wiped(&r->hs), idx);
+    if (f->root_len == 0) {
+        CHECKI(r->st.calls == 1 && r->st.tbs_ok, idx);
+    }
+}
+
+static int flow_expect(const struct tls13_flow_kat *k)
+{
+#if BRISK_X509_TIME_POLICY == BRISK_X509_TIME_POLICY_INSECURE_NO_TIME
+    if (k->flags & F_TIME) {
+        return 0;
+    }
+#endif
+    return k->alert;
+}
+
+/* ---------------------------------------------------------------- suites ------------------- */
+static run R; /* ~1.5 KB of engine state plus buffers; static keeps it off the qemu stack */
+
+static void hs_flows(void)
+{
+    static const int modes[] = {FEED_MSG, FEED_BYTES, FEED_FLIGHT};
+    flow f;
+    size_t i, mi, cut, maxcut;
+    int rc;
+
+    for (i = 0; i < NFLOW; i++) {
+        flow_load(&f, &TLS13_FLOW_KAT[i]);
+        if (TLS13_FLOW_KAT[i].alert != 0 || flow_expect(&TLS13_FLOW_KAT[i]) != 0) {
+            continue; /* the negative fixture rows run in hs_fixture_negative */
+        }
+        for (mi = 0; mi < sizeof modes / sizeof modes[0]; mi++) {
+            rc = run_flow(&R, &f, -1, NULL, 0, modes[mi], 0, 0);
+            check_connected(&R, &f, rc, (long)(i * 10 + mi));
+        }
+        /* unaligned: every message fed from buf+1 and buf+3, pulled into out+1 */
+        rc = run_flow(&R, &f, -1, NULL, 0, FEED_MSG, 0, 1);
+        check_connected(&R, &f, rc, (long)i);
+        rc = run_flow(&R, &f, -1, NULL, 0, FEED_MSG, 0, 3);
+        check_connected(&R, &f, rc, (long)i);
+    }
+    /* RFC 8448 sect 3: the ServerHello and the Certificate cut at every possible point. */
+    flow_load(&f, &TLS13_FLOW_KAT[0]);
+    maxcut = f.n_m[0] > f.n_m[2] ? f.n_m[0] : f.n_m[2];
+    for (cut = 1; cut < maxcut; cut++) {
+        rc = run_flow(&R, &f, -1, NULL, 0, FEED_CUT, cut, 0);
+        check_connected(&R, &f, rc, (long)cut);
+    }
+}
+
+static void hs_trace_specifics(void)
+{
+    flow f;
+    size_t n;
+    const uint8_t *hrr_random;
+    int rc;
+
+    /* sect 5: after the HRR the engine waits for CH2 and says how to build it */
+    flow_load(&f, &TLS13_FLOW_KAT[1]);
+    hrr_random = dec(TLS13_RFC_KAT[0].hrr, &n);
+    CHECK(f.n_m[0] > 38 && memcmp(f.m[0] + 6, hrr_random, 32) == 0); /* RFC 9846 4.2.3 value */
+    {
+        brisk__tls13_hs_cfg cfg;
+        memset(&cfg, 0, sizeof cfg);
+        memset(&R, 0, sizeof R);
+        cfg.auth = stub_auth;
+        cfg.auth_ctx = &R.st;
+        CHECK(brisk__tls13_hs_init(&R.hs, &cfg, g_scratch, g_scratch_len) == BRISK_OK);
+        CHECK(brisk__tls13_hs_client_hello(&R.hs, f.ch1, f.ch1_len, (uint16_t)f.k->g1, f.priv1) ==
+              BRISK_OK);
+        CHECK(brisk__tls13_hs_feed(&R.hs, BRISK__EPOCH_INITIAL, f.m[0], f.n_m[0]) == BRISK_OK);
+        CHECK(R.hs.state == BRISK__HS_WAIT_CH2 && R.hs.hrr_group == 0x0017);
+        CHECK(R.hs.cookie_len == f.cookie_len && memcmp(R.hs.cookie, f.cookie, f.cookie_len) == 0);
+        CHECK(all_zero(R.hs.priv, sizeof R.hs.priv)); /* CH1's share is dead */
+        /* CH2 must carry the HRR's group: the sect 5 CH1 (x25519, no cookie) is refused */
+        CHECK(brisk__tls13_hs_client_hello(&R.hs, f.ch1, f.ch1_len, (uint16_t)f.k->g1, f.priv1) ==
+              BRISK_E_ARG);
+        /* and nothing may arrive from the server before CH2 */
+        CHECK(brisk__tls13_hs_feed(&R.hs, BRISK__EPOCH_INITIAL, f.m[1], 4) == BRISK_E_PROTO &&
+              R.hs.alert == BRISK__ALERT_UNEXPECTED_MESSAGE);
+    }
+    /* sect 6: the CertificateRequest is answered with an empty Certificate, then Finished */
+    flow_load(&f, &TLS13_FLOW_KAT[2]);
+    rc = run_flow(&R, &f, -1, NULL, 0, FEED_MSG, 0, 0);
+    CHECK(rc == BRISK_OK && R.hs.cr_seen);
+    CHECK(R.hsk_len > 8 && memcmp(R.hsk, "\x0b\x00\x00\x04\x00\x00\x00\x00", 8) == 0 &&
+          R.hsk[8] == 0x14);
+    /* sect 7: a 32-byte session id and its echo */
+    flow_load(&f, &TLS13_FLOW_KAT[3]);
+    rc = run_flow(&R, &f, -1, NULL, 0, FEED_MSG, 0, 0);
+    CHECK(rc == BRISK_OK && R.hs.session_id_len == 32);
+    /* RFC 8449 4: sect 3's EE record_size_limit (0x4001) is kept; a value below 64 is
+     * illegal_parameter */
+    flow_load(&f, &TLS13_FLOW_KAT[0]);
+    rc = run_flow(&R, &f, -1, NULL, 0, FEED_MSG, 0, 0);
+    CHECK(rc == BRISK_OK && R.hs.peer_rsl == 0x4001);
+    {
+        static uint8_t ee[256];
+        size_t k;
+        CHECK(f.n_m[1] <= sizeof ee && f.m[1][0] == 0x08);
+        memcpy(ee, f.m[1], f.n_m[1]);
+        for (k = 4; k + 6 <= f.n_m[1] && memcmp(ee + k, "\x00\x1c\x00\x02", 4) != 0; k++) {
+        }
+        CHECK(k + 6 <= f.n_m[1]);
+        ee[k + 4] = 0;
+        ee[k + 5] = 63;
+        rc = run_flow(&R, &f, 1, ee, f.n_m[1], FEED_MSG, 0, 0);
+        CHECK(rc == BRISK_E_PROTO && R.hs.alert == BRISK__ALERT_ILLEGAL_PARAMETER);
+    }
+}
+
+static void hs_fixture_negative(void)
+{
+    flow f;
+    size_t i;
+    int rc, want;
+    for (i = 0; i < NFLOW; i++) {
+        if (TLS13_FLOW_KAT[i].alert == 0) {
+            continue;
+        }
+        flow_load(&f, &TLS13_FLOW_KAT[i]);
+        want = flow_expect(&TLS13_FLOW_KAT[i]);
+        rc = run_flow(&R, &f, -1, NULL, 0, FEED_MSG, 0, 0);
+        if (want == 0) {
+            check_connected(&R, &f, rc, (long)i);
+            continue;
+        }
+        CHECKI(rc != BRISK_OK && R.hs.state == BRISK__HS_FAILED && R.hs.alert == want, i);
+        CHECKI(rc == (want == BRISK__ALERT_DECRYPT_ERROR || want == BRISK__ALERT_BAD_CERTIFICATE ||
+                              want == BRISK__ALERT_UNSUPPORTED_CERTIFICATE
+                          ? BRISK_E_AUTH
+                          : BRISK_E_PROTO),
+               i);
+        CHECKI(secrets_wiped(&R.hs), i);
+    }
+}
+
+static void hs_mutations(void)
+{
+    flow f;
+    size_t i, n;
+    const uint8_t *ov;
+    unsigned e;
+    uint8_t one = 0x16;
+    int rc;
+    for (i = 0; i < sizeof TLS13_MUT_KAT / sizeof TLS13_MUT_KAT[0]; i++) {
+        const struct tls13_mut_kat *k = &TLS13_MUT_KAT[i];
+        flow_load(&f, &TLS13_FLOW_KAT[k->flow]);
+        ov = dec(k->bytes, &n);
+        rc = run_flow(&R, &f, k->msg, ov, n, FEED_MSG, 0, 0);
+        CHECKI(rc != BRISK_OK && R.hs.state == BRISK__HS_FAILED && R.hs.alert == k->alert, i);
+        /* sticky: every later call gives the same answer, nothing is emitted */
+        CHECKI(brisk__tls13_hs_feed(&R.hs, BRISK__EPOCH_HANDSHAKE, &one, 1) == rc, i);
+        CHECKI(brisk__tls13_hs_client_hello(&R.hs, f.ch1, f.ch1_len, (uint16_t)f.k->g1, f.priv1) ==
+                   rc,
+               i);
+        CHECKI(brisk__tls13_hs_pull(&R.hs, &e, R.init, sizeof R.init) == 0, i);
+        CHECKI(secrets_wiped(&R.hs), i);
+    }
+}
+
+/* RFC 9846 5.1: messages never straddle a key change, and each epoch is fed where it belongs. */
+static void hs_epochs(void)
+{
+    flow f;
+    brisk__tls13_hs_cfg cfg;
+    uint8_t buf[2048], extra = 0x08;
+    unsigned e;
+    size_t n, i;
+    flow_load(&f, &TLS13_FLOW_KAT[0]); /* m: SH EE CERT CV SF */
+    memset(&cfg, 0, sizeof cfg);
+    cfg.auth = stub_auth;
+    cfg.auth_ctx = &R.st;
+
+    for (i = 0; i < 4; i++) {
+        memset(&R, 0, sizeof R);
+        CHECK(brisk__tls13_hs_init(&R.hs, &cfg, g_scratch, g_scratch_len) == BRISK_OK);
+        CHECK(brisk__tls13_hs_client_hello(&R.hs, f.ch1, f.ch1_len, 0x001d, f.priv1) == BRISK_OK);
+        if (i == 0) { /* ServerHello at HANDSHAKE */
+            CHECKI(brisk__tls13_hs_feed(&R.hs, BRISK__EPOCH_HANDSHAKE, f.m[0], f.n_m[0]) ==
+                       BRISK_E_PROTO,
+                   i);
+        } else if (i == 1) { /* EncryptedExtensions at INITIAL */
+            CHECKI(brisk__tls13_hs_feed(&R.hs, BRISK__EPOCH_INITIAL, f.m[0], f.n_m[0]) == BRISK_OK,
+                   i);
+            CHECKI(brisk__tls13_hs_feed(&R.hs, BRISK__EPOCH_INITIAL, f.m[1], f.n_m[1]) ==
+                       BRISK_E_PROTO,
+                   i);
+        } else if (i == 2) { /* SH + EE in one INITIAL feed */
+            memcpy(buf, f.m[0], f.n_m[0]);
+            memcpy(buf + f.n_m[0], f.m[1], f.n_m[1]);
+            CHECKI(brisk__tls13_hs_feed(&R.hs, BRISK__EPOCH_INITIAL, buf, f.n_m[0] + f.n_m[1]) ==
+                       BRISK_E_PROTO,
+                   i);
+        } else { /* bytes after the server Finished in the same HANDSHAKE feed */
+            CHECKI(brisk__tls13_hs_feed(&R.hs, BRISK__EPOCH_INITIAL, f.m[0], f.n_m[0]) == BRISK_OK,
+                   i);
+            for (n = 1; n < 4; n++) {
+                CHECKI(brisk__tls13_hs_feed(&R.hs, BRISK__EPOCH_HANDSHAKE, f.m[n], f.n_m[n]) ==
+                           BRISK_OK,
+                       i);
+            }
+            memcpy(buf, f.m[4], f.n_m[4]);
+            buf[f.n_m[4]] = extra;
+            CHECKI(brisk__tls13_hs_feed(&R.hs, BRISK__EPOCH_HANDSHAKE, buf, f.n_m[4] + 1) ==
+                       BRISK_E_PROTO,
+                   i);
+        }
+        CHECKI(R.hs.alert == BRISK__ALERT_UNEXPECTED_MESSAGE, i);
+    }
+
+    /* pull(): the ClientHello and the client Finished are queued together and come out one
+     * epoch per call, never mixed. */
+    memset(&R, 0, sizeof R);
+    CHECK(brisk__tls13_hs_init(&R.hs, &cfg, g_scratch, g_scratch_len) == BRISK_OK);
+    CHECK(brisk__tls13_hs_client_hello(&R.hs, f.ch1, f.ch1_len, 0x001d, f.priv1) == BRISK_OK);
+    CHECK(brisk__tls13_hs_feed(&R.hs, BRISK__EPOCH_INITIAL, f.m[0], f.n_m[0]) == BRISK_OK);
+    for (n = 1; n < 5; n++) {
+        CHECK(brisk__tls13_hs_feed(&R.hs, BRISK__EPOCH_HANDSHAKE, f.m[n], f.n_m[n]) == BRISK_OK);
+    }
+    CHECK(R.hs.state == BRISK__HS_CONNECTED);
+    n = brisk__tls13_hs_pull(&R.hs, &e, buf, sizeof buf);
+    CHECK(n == f.ch1_len && e == BRISK__EPOCH_INITIAL && memcmp(buf, f.ch1, n) == 0);
+    n = brisk__tls13_hs_pull(&R.hs, &e, buf, sizeof buf);
+    CHECK(n == f.cf_len && e == BRISK__EPOCH_HANDSHAKE && memcmp(buf, f.cf, n) == 0);
+    CHECK(brisk__tls13_hs_pull(&R.hs, &e, buf, sizeof buf) == 0);
+    /* KNOWN GAP (M3 line 2/3): post-handshake messages are not handled yet */
+    CHECK(brisk__tls13_hs_feed(&R.hs, BRISK__EPOCH_APP, &extra, 1) == BRISK_E_PROTO &&
+          R.hs.alert == BRISK__ALERT_UNEXPECTED_MESSAGE);
+}
+
+static void hs_limits(void)
+{
+    flow f;
+    brisk__tls13_hs_cfg cfg;
+    static uint8_t big[4 + 4 + 10 * 1024];
+    size_t i, n, der_len, pos;
+    uint8_t hdr[4];
+
+    flow_load(&f, &TLS13_FLOW_KAT[0]);
+    memset(&cfg, 0, sizeof cfg);
+    cfg.auth = stub_auth;
+    cfg.auth_ctx = &R.st;
+    for (i = 0; i < 3; i++) {
+        memset(&R, 0, sizeof R);
+        CHECK(brisk__tls13_hs_init(&R.hs, &cfg, g_scratch, g_scratch_len) == BRISK_OK);
+        CHECK(brisk__tls13_hs_client_hello(&R.hs, f.ch1, f.ch1_len, 0x001d, f.priv1) == BRISK_OK);
+        CHECK(brisk__tls13_hs_feed(&R.hs, BRISK__EPOCH_INITIAL, f.m[0], f.n_m[0]) == BRISK_OK);
+        CHECK(brisk__tls13_hs_feed(&R.hs, BRISK__EPOCH_HANDSHAKE, f.m[1], f.n_m[1]) == BRISK_OK);
+        if (i < 2) {
+            /* one past BRISK_TLS_MAX_HS_MSG, and 0xFFFFFF: refused on the header alone, before a
+             * body byte is buffered and without any length arithmetic wrapping on 32 bits */
+            hdr[0] = 11;
+            brisk__store_be24(hdr + 1, i == 0 ? BRISK_TLS_MAX_HS_MSG + 1 : 0xFFFFFF);
+            CHECKI(brisk__tls13_hs_feed(&R.hs, BRISK__EPOCH_HANDSHAKE, hdr, 4) == BRISK_E_PROTO &&
+                       R.hs.alert == BRISK__ALERT_ILLEGAL_PARAMETER,
+                   i);
+            continue;
+        }
+        /* BRISK__X509_MAX_CHAIN + 1 copies of the trace certificate -> bad_certificate */
+        der_len = brisk__load_be24(f.m[2] + 8);
+        pos = 8;
+        for (n = 0; n <= BRISK__X509_MAX_CHAIN; n++) {
+            memcpy(big + pos, f.m[2] + 8, 3 + der_len + 2);
+            pos += 3 + der_len + 2;
+        }
+        big[0] = 11;
+        brisk__store_be24(big + 1, (uint32_t)(pos - 4));
+        big[4] = 0;
+        brisk__store_be24(big + 5, (uint32_t)(pos - 8));
+        CHECK(pos <= sizeof big);
+        CHECK(brisk__tls13_hs_feed(&R.hs, BRISK__EPOCH_HANDSHAKE, big, pos) == BRISK_E_AUTH &&
+              R.hs.alert == BRISK__ALERT_BAD_CERTIFICATE);
+    }
+    /* exactly BRISK__X509_MAX_CHAIN is still parsed (the trace cert is accepted by the parser,
+     * so the limit above is the only thing that failed) */
+    memset(&R, 0, sizeof R);
+    CHECK(brisk__tls13_hs_init(&R.hs, &cfg, g_scratch, g_scratch_len) == BRISK_OK);
+    CHECK(brisk__tls13_hs_client_hello(&R.hs, f.ch1, f.ch1_len, 0x001d, f.priv1) == BRISK_OK);
+    CHECK(brisk__tls13_hs_feed(&R.hs, BRISK__EPOCH_INITIAL, f.m[0], f.n_m[0]) == BRISK_OK);
+    CHECK(brisk__tls13_hs_feed(&R.hs, BRISK__EPOCH_HANDSHAKE, f.m[1], f.n_m[1]) == BRISK_OK);
+    der_len = brisk__load_be24(f.m[2] + 8);
+    pos -= 3 + der_len + 2;
+    brisk__store_be24(big + 1, (uint32_t)(pos - 4));
+    brisk__store_be24(big + 5, (uint32_t)(pos - 8));
+    CHECK(brisk__tls13_hs_feed(&R.hs, BRISK__EPOCH_HANDSHAKE, big, pos) == BRISK_OK &&
+          R.hs.state == BRISK__HS_WAIT_CV && R.hs.n_certs == BRISK__X509_MAX_CHAIN);
+    /* the certificates point into the kept Certificate message, and the CertificateVerify is
+     * reassembled after it rather than over it (hs_feed's in_base) */
+    CHECK(R.hs.in_base == pos && R.hs.certs[0].raw == R.hs.in + 11);
+}
+
+static void hs_cv(void)
+{
+    const struct tls13_rfc_kat *r = &TLS13_RFC_KAT[0];
+    uint8_t out[98 + BRISK_HASH_MAX_LEN], alert;
+    const uint8_t *th, *want, *msg, *sig;
+    brisk__x509_cert leaf;
+    size_t n, wn, i, mn, sn, checked = 0;
+    int rc;
+
+    arena_used = 0;
+    th = dec(r->cv_th, &n);
+    want = dec(r->cv_content, &wn);
+    CHECK(brisk__tls13_cv_content(1, th, n, out) == wn && memcmp(out, want, wn) == 0);
+    CHECK(brisk__tls13_cv_content(0, th, n, out) == wn &&
+          memcmp(out + 64, "TLS 1.3, client", 15) == 0);
+
+    for (i = 0; i < sizeof TLS13_CV_KAT / sizeof TLS13_CV_KAT[0]; i++) {
+        const struct tls13_cv_kat *k = &TLS13_CV_KAT[i];
+        const struct tls13_cv_key *key = &TLS13_CV_KEY[k->key];
+#if !BRISK_ENABLE_P384
+        if (key->alg == BRISK__X509_KEY_P384) {
+            continue;
+        }
+#endif
+        arena_used = 0;
+        memset(&leaf, 0, sizeof leaf);
+        leaf.key_alg = (uint8_t)key->alg;
+        leaf.key = dec(key->key, &leaf.key_len);
+        msg = dec(k->msg, &mn);
+        sig = dec(k->sig, &sn);
+        alert = 0;
+        rc = brisk__tls13_cv_verify(&leaf, (uint16_t)k->scheme, msg, mn, sig, sn, &alert);
+        CHECKI((rc == BRISK_OK) == (k->ok != 0), i);
+        CHECKI(rc == BRISK_OK
+                   ? alert == 0
+                   : (alert == BRISK__ALERT_DECRYPT_ERROR || alert == BRISK__ALERT_DECODE_ERROR),
+               i);
+        checked++;
+        /* the same key under a certificates-only or mismatched scheme: refused up front */
+        if (i % 97 == 0) {
+            alert = 0;
+            CHECKI(brisk__tls13_cv_verify(&leaf, 0x0401, msg, mn, sig, sn, &alert) == BRISK_E_ARG &&
+                       alert == BRISK__ALERT_ILLEGAL_PARAMETER,
+                   i);
+            alert = 0;
+            CHECKI(brisk__tls13_cv_verify(&leaf, key->alg == BRISK__X509_KEY_RSA ? 0x0403 : 0x0804,
+                                          msg, mn, sig, sn, &alert) == BRISK_E_ARG &&
+                       alert == BRISK__ALERT_ILLEGAL_PARAMETER,
+                   i);
+        }
+    }
+    CHECK(checked > 1000);
+}
+
+static void u16s(const char *hex, uint16_t *out, size_t *n)
+{
+    size_t i, len;
+    const uint8_t *b = dec(hex, &len);
+    for (i = 0; i < len / 2; i++) {
+        out[i] = (uint16_t)brisk__load_be16(b + 2 * i);
+    }
+    *n = len / 2;
+}
+
+static void hs_ch_write(void)
+{
+    uint16_t suites[8], groups[8], sigs[16];
+    uint8_t out[1024], priv[32];
+    brisk__tls13_ch_params p;
+    brisk__tls13_hs_cfg cfg;
+    size_t i, len, want_len, n;
+    const uint8_t *want;
+    int j;
+
+    memset(priv, 0x11, sizeof priv);
+    memset(&cfg, 0, sizeof cfg);
+    cfg.auth = stub_auth;
+    cfg.auth_ctx = &R.st;
+    for (i = 0; i < sizeof TLS13_CHW_KAT / sizeof TLS13_CHW_KAT[0]; i++) {
+        const struct tls13_chw_kat *k = &TLS13_CHW_KAT[i];
+        arena_used = 0;
+        memset(&p, 0, sizeof p);
+        p.random = dec(k->random, &n);
+        p.session_id = dec(k->sid, &p.session_id_len);
+        u16s(k->suites, suites, &p.n_suites);
+        u16s(k->groups, groups, &p.n_groups);
+        u16s(k->sigs, sigs, &p.n_sig_schemes);
+        p.suites = suites;
+        p.groups = groups;
+        p.sig_schemes = sigs;
+        p.share_group = (uint16_t)k->share_group;
+        p.share_pub = dec(k->share_pub, &p.share_pub_len);
+        p.sni = k->sni;
+        p.sni_len = strlen(k->sni);
+        p.cookie = dec(k->cookie, &p.cookie_len);
+        want = dec(k->ch, &want_len);
+        /* byte-exact against the Python builder in tools/kat.py */
+        CHECKI(brisk__tls13_ch_write(&p, out, sizeof out, &len) == BRISK_OK && len == want_len &&
+                   memcmp(out, want, len) == 0,
+               i);
+        /* every cap below the size fails without writing past it */
+        for (n = 0; n < want_len; n++) {
+            out[n] = 0xEE;
+            CHECKI(brisk__tls13_ch_write(&p, out, n, &len) == BRISK_E_ARG && len == 0 &&
+                       out[n] == 0xEE,
+                   n);
+        }
+        /* round trip: the engine learns exactly the offer the params describe */
+        memset(&R, 0, sizeof R);
+        CHECK(brisk__tls13_hs_init(&R.hs, &cfg, g_scratch, g_scratch_len) == BRISK_OK);
+        CHECK(brisk__tls13_ch_write(&p, out, sizeof out, &len) == BRISK_OK);
+        /* a cookie belongs only in CH2 (RFC 9846 4.3.2) */
+        CHECKI(brisk__tls13_hs_client_hello(&R.hs, out, len, p.share_group, priv) ==
+                   (p.cookie_len ? BRISK_E_ARG : BRISK_OK),
+               i);
+        if (p.cookie_len) {
+            continue;
+        }
+        CHECKI(R.hs.n_suites == p.n_suites && R.hs.n_groups == p.n_groups &&
+                   R.hs.n_sigs == p.n_sig_schemes && R.hs.session_id_len == p.session_id_len,
+               i);
+        for (j = 0; j < (int)p.n_sig_schemes; j++) {
+            CHECKI(R.hs.offered_sigs[j] == sigs[j], j);
+        }
+        CHECKI(R.hs.share_group == p.share_group && memcmp(R.hs.priv, priv, 32) == 0, i);
+    }
+
+    /* RFC 6066 3: an IP literal is never sent as server_name */
+    arena_used = 0;
+    {
+        const struct tls13_chw_kat *k = &TLS13_CHW_KAT[0];
+        uint8_t a[1024];
+        size_t alen;
+        memset(&p, 0, sizeof p);
+        p.random = dec(k->random, &n);
+        p.share_group = 0x001d;
+        p.share_pub = priv;
+        p.share_pub_len = 32;
+        p.sni = "192.0.2.1";
+        p.sni_len = 9;
+        CHECK(brisk__tls13_ch_write(&p, a, sizeof a, &alen) == BRISK_OK);
+        p.sni = NULL;
+        p.sni_len = 0;
+        CHECK(brisk__tls13_ch_write(&p, out, sizeof out, &len) == BRISK_OK);
+        CHECK(alen == len && memcmp(a, out, len) == 0);
+        /* the defaults: TLS 1.3 only, an ECDHE group list, no SHA-1 anywhere */
+        memset(&R, 0, sizeof R);
+        cfg.quic = 1; /* RFC 9001 8.4: and this CH has an empty session id */
+        CHECK(brisk__tls13_hs_init(&R.hs, &cfg, g_scratch, g_scratch_len) == BRISK_OK);
+        /* RFC 9001 8.2: without quic_transport_parameters a QUIC CH is refused */
+        CHECK(brisk__tls13_hs_client_hello(&R.hs, out, len, 0x001d, priv) == BRISK_E_ARG);
+        p.quic_tp = (const uint8_t *)"\x0f\x00"; /* initial_source_connection_id, empty */
+        p.quic_tp_len = 2;
+        CHECK(brisk__tls13_ch_write(&p, out, sizeof out, &len) == BRISK_OK);
+        CHECK(len == alen + 6 && memcmp(out + len - 6, "\x00\x39\x00\x02\x0f\x00", 6) == 0);
+        CHECK(brisk__tls13_hs_client_hello(&R.hs, out, len, 0x001d, priv) == BRISK_OK);
+        CHECK(R.hs.n_suites == 3 && R.hs.offered_suites[0] == 0x1303 && R.hs.n_groups == 2);
+        for (j = 0; j < R.hs.n_sigs; j++) {
+            CHECKI((R.hs.offered_sigs[j] >> 8) != 0x02 && R.hs.offered_sigs[j] != 0x0809, j);
+        }
+        CHECK(R.hs.offered_sigs[0] == 0x0403);
+        /* a 32-byte session id over QUIC is refused */
+        memset(a, 0x42, 32);
+        p.session_id = a;
+        p.session_id_len = 32;
+        memset(&R, 0, sizeof R);
+        CHECK(brisk__tls13_hs_init(&R.hs, &cfg, g_scratch, g_scratch_len) == BRISK_OK);
+        CHECK(brisk__tls13_ch_write(&p, out, sizeof out, &len) == BRISK_OK);
+        CHECK(brisk__tls13_hs_client_hello(&R.hs, out, len, 0x001d, priv) == BRISK_E_ARG);
+        /* 8.2: and the same CH, with its session id, over TCP: MUST NOT carry the extension */
+        cfg.quic = 0;
+        memset(&R, 0, sizeof R);
+        CHECK(brisk__tls13_hs_init(&R.hs, &cfg, g_scratch, g_scratch_len) == BRISK_OK);
+        CHECK(brisk__tls13_hs_client_hello(&R.hs, out, len, 0x001d, priv) == BRISK_E_ARG);
+        p.quic_tp = NULL;
+        p.quic_tp_len = 0;
+        CHECK(brisk__tls13_ch_write(&p, out, sizeof out, &len) == BRISK_OK);
+        CHECK(brisk__tls13_hs_client_hello(&R.hs, out, len, 0x001d, priv) == BRISK_OK);
+        /* the share must be in supported_groups, and have its group's length */
+        p.groups = groups;
+        groups[0] = 0x0017;
+        p.n_groups = 1;
+        CHECK(brisk__tls13_ch_write(&p, out, sizeof out, &len) == BRISK_E_ARG);
+        /* 4.2.8: a group with no ECDHE here (secp384r1) cannot carry an empty share */
+        groups[0] = 0x0018;
+        p.share_group = 0x0018;
+        p.share_pub_len = 0;
+        CHECK(brisk__tls13_ch_write(&p, out, sizeof out, &len) == BRISK_E_ARG);
+        p.share_group = 0x001d;
+        p.groups = NULL;
+        p.share_pub_len = 31;
+        CHECK(brisk__tls13_ch_write(&p, out, sizeof out, &len) == BRISK_E_ARG);
+        /* absorbed with the wrong group for its share: refused */
+        p.share_pub_len = 32;
+        CHECK(brisk__tls13_ch_write(&p, out, sizeof out, &len) == BRISK_OK);
+        memset(&R, 0, sizeof R);
+        CHECK(brisk__tls13_hs_init(&R.hs, &cfg, g_scratch, g_scratch_len) == BRISK_OK);
+        CHECK(brisk__tls13_hs_client_hello(&R.hs, out, len, 0x0017, priv) == BRISK_E_ARG);
+        CHECK(brisk__tls13_hs_client_hello(&R.hs, out, len - 1, 0x001d, priv) == BRISK_E_ARG);
+        CHECK(R.hs.state == BRISK__HS_START);
+        /* RFC 6066 3: the trailing root dot is stripped from host_name; "." alone is refused */
+        p.session_id = NULL; /* it points into a, which is reused below */
+        p.session_id_len = 0;
+        p.sni = "device.example.com";
+        p.sni_len = 18;
+        CHECK(brisk__tls13_ch_write(&p, a, sizeof a, &alen) == BRISK_OK);
+        p.sni = "device.example.com.";
+        p.sni_len = 19;
+        CHECK(brisk__tls13_ch_write(&p, out, sizeof out, &len) == BRISK_OK);
+        CHECK(alen == len && memcmp(a, out, len) == 0);
+        p.sni = ".";
+        p.sni_len = 1;
+        CHECK(brisk__tls13_ch_write(&p, out, sizeof out, &len) == BRISK_E_ARG);
+        p.sni = NULL;
+        p.sni_len = 0;
+    }
+    /* A ClientHello whose only (so last) extension is a u16 list with empty or 1-byte data: the
+     * list prefix sits at or past the end of an exact-size heap buffer, so ASan flags any read
+     * of it before the length check. */
+    {
+        static const uint8_t tails[][5] = {{0x00, 0x0a, 0x00, 0x00},
+                                           {0x00, 0x2b, 0x00, 0x00},
+                                           {0x00, 0x0d, 0x00, 0x01, 0x00},
+                                           {0x00, 0x2b, 0x00, 0x01, 0x02}};
+        static const size_t tail_len[] = {4, 4, 5, 5};
+        size_t e, t, total;
+        uint8_t *m;
+        CHECK(brisk__tls13_ch_write(&p, out, sizeof out, &len) == BRISK_OK);
+        e = 4 + 35 + out[4 + 34];
+        e += 2 + brisk__load_be16(out + e) + 2; /* cipher_suites, compression: at ext length */
+        for (t = 0; t < 4; t++) {
+            total = e + 2 + tail_len[t];
+            m = (uint8_t *)malloc(total);
+            if (m == NULL) {
+                exit(2);
+            }
+            memcpy(m, out, e);
+            m[1] = (uint8_t)((total - 4) >> 16);
+            m[2] = (uint8_t)((total - 4) >> 8);
+            m[3] = (uint8_t)(total - 4);
+            m[e] = 0;
+            m[e + 1] = (uint8_t)tail_len[t];
+            memcpy(m + e + 2, tails[t], tail_len[t]);
+            memset(&R, 0, sizeof R);
+            CHECKI(brisk__tls13_hs_init(&R.hs, &cfg, g_scratch, g_scratch_len) == BRISK_OK, t);
+            CHECKI(brisk__tls13_hs_client_hello(&R.hs, m, total, 0x001d, priv) == BRISK_E_ARG, t);
+            CHECKI(R.hs.state == BRISK__HS_START, t);
+            free(m);
+        }
+    }
+    /* 4.2.8: absorbing a CH whose key share is {secp384r1, empty} is refused, or a matching
+     * empty server share would reach the ECDH with no point behind it */
+    {
+        size_t e, end, k;
+        groups[0] = 0x001d;
+        groups[1] = 0x0018;
+        p.groups = groups;
+        p.n_groups = 2;
+        CHECK(brisk__tls13_ch_write(&p, out, sizeof out, &len) == BRISK_OK);
+        e = 4 + 35 + out[4 + 34];
+        e += 2 + brisk__load_be16(out + e) + 2;
+        end = e + 2 + brisk__load_be16(out + e);
+        CHECK(end == len);
+        for (k = e + 2; k + 4 <= end && brisk__load_be16(out + k) != 0x0033;
+             k += 4 + brisk__load_be16(out + k + 2)) {
+        }
+        CHECK(k + 4 + 38 <= end && brisk__load_be16(out + k + 2) == 38);
+        memmove(out + k + 10, out + k + 42, end - (k + 42));
+        memcpy(out + k + 2, "\x00\x06\x00\x04\x00\x18\x00\x00", 8);
+        len -= 32;
+        brisk__store_be16(out + e, (uint32_t)(len - e - 2));
+        out[1] = (uint8_t)((len - 4) >> 16);
+        brisk__store_be16(out + 2, (uint32_t)(len - 4));
+        memset(&R, 0, sizeof R);
+        CHECK(brisk__tls13_hs_init(&R.hs, &cfg, g_scratch, g_scratch_len) == BRISK_OK);
+        CHECK(brisk__tls13_hs_client_hello(&R.hs, out, len, 0x0018, priv) == BRISK_E_ARG);
+        CHECK(R.hs.state == BRISK__HS_START);
+        p.groups = NULL;
+        p.n_groups = 0;
+    }
+}
+
+/* No path to CONNECTED without an authenticator: deleting the guard in hs_init must fail
+ * exactly this row. */
+static void hs_init_guard(void)
+{
+    brisk__tls13_hs_cfg cfg;
+    memset(&cfg, 0, sizeof cfg);
+    CHECK(brisk__tls13_hs_init(&R.hs, &cfg, g_scratch, g_scratch_len) == BRISK_E_ARG);
+    cfg.auth = stub_auth;
+    CHECK(brisk__tls13_hs_init(&R.hs, &cfg, g_scratch, brisk__tls13_hs_scratch_size() - 1) ==
+          BRISK_E_ARG);
+    CHECK(brisk__tls13_hs_init(&R.hs, NULL, g_scratch, g_scratch_len) == BRISK_E_ARG);
+}
+
+/* RFC 9001 8.2 through the engine: the sect 3 flow with
+ * quic_transport_parameters appended to CH1 (and to the EE where the row needs
+ * it). Each check stops at the EE, so the transcript change the new bytes cause
+ * never matters. */
+typedef struct {
+    uint8_t got[16];
+    size_t len;
+    int calls, rc;
+} tp_capture;
+
+static int on_tp(void *ctx, const uint8_t *tp, size_t len)
+{
+    tp_capture *c = (tp_capture *)ctx;
+    c->calls++;
+    c->len = len;
+    if (len <= sizeof c->got) {
+        memcpy(c->got, tp, len);
+    }
+    return c->rc;
+}
+
+/* m plus one extension {0x0039, v} appended to its extension block, whose
+ * length field sits at ext_at; the message header is fixed up. */
+static size_t add_tp(uint8_t *out, const uint8_t *m, size_t n, size_t ext_at, const uint8_t *v,
+                     size_t vl)
+{
+    memcpy(out, m, n);
+    memcpy(out + n, "\x00\x39\x00", 3);
+    out[n + 3] = (uint8_t)vl;
+    memcpy(out + n + 4, v, vl);
+    brisk__store_be16(out + ext_at, (uint32_t)(brisk__load_be16(out + ext_at) + 4 + vl));
+    n += 4 + vl;
+    out[1] = (uint8_t)((n - 4) >> 16);
+    brisk__store_be16(out + 2, (uint32_t)(n - 4));
+    return n;
+}
+
+static int tp_run(const flow *f, int quic, const uint8_t *ch, size_t ch_len, const uint8_t *ee,
+                  size_t ee_len, tp_capture *c)
+{
+    brisk__tls13_hs_cfg cfg;
+    int rc;
+    memset(&cfg, 0, sizeof cfg);
+    memset(&R, 0, sizeof R);
+    cfg.auth = stub_auth;
+    cfg.auth_ctx = &R.st;
+    cfg.quic = (uint8_t)quic;
+    cfg.on_peer_tp = on_tp;
+    cfg.tp_ctx = c;
+    if (brisk__tls13_hs_init(&R.hs, &cfg, g_scratch, g_scratch_len) != BRISK_OK) {
+        return 99;
+    }
+    rc = brisk__tls13_hs_client_hello(&R.hs, ch, ch_len, (uint16_t)f->k->g1, f->priv1);
+    if (rc != BRISK_OK) {
+        return rc;
+    }
+    if (brisk__tls13_hs_feed(&R.hs, BRISK__EPOCH_INITIAL, f->m[0], f->n_m[0]) != BRISK_OK) {
+        return 98;
+    }
+    return brisk__tls13_hs_feed(&R.hs, BRISK__EPOCH_HANDSHAKE, ee, ee_len);
+}
+
+static void hs_quic_tp(void)
+{
+    static const uint8_t TP[] = {0x0f, 0x04, 0xde, 0xad, 0xbe, 0xef};
+    static uint8_t ch[1024], ee[256];
+    flow f;
+    tp_capture c;
+    size_t ch_len, ee_len, e;
+    int rc;
+
+    flow_load(&f, &TLS13_FLOW_KAT[0]);
+    CHECK(f.sh_at == 0 && f.ch1[4 + 34] == 0 && f.m[1][0] == 0x08 && f.n_m[1] + 10 <= sizeof ee &&
+          f.ch1_len + 10 <= sizeof ch);
+    e = 4 + 35;
+    e += 2 + brisk__load_be16(f.ch1 + e) + 2; /* cipher_suites, compression: at ext length */
+    ch_len = add_tp(ch, f.ch1, f.ch1_len, e, TP, 2);
+    ee_len = add_tp(ee, f.m[1], f.n_m[1], 4, TP, sizeof TP);
+
+    /* QUIC, the server sends it: handed over once, byte-exact, before CONNECTED
+     */
+    memset(&c, 0, sizeof c);
+    rc = tp_run(&f, 1, ch, ch_len, ee, ee_len, &c);
+    CHECK(rc == BRISK_OK && R.hs.state == BRISK__HS_WAIT_CERT_CR && c.calls == 1 &&
+          c.len == sizeof TP && memcmp(c.got, TP, sizeof TP) == 0);
+    /* QUIC, the EE leaves it out: missing_extension (RFC 9001 8.2) */
+    memset(&c, 0, sizeof c);
+    rc = tp_run(&f, 1, ch, ch_len, f.m[1], f.n_m[1], &c);
+    CHECK(rc == BRISK_E_PROTO && R.hs.alert == BRISK__ALERT_MISSING_EXTENSION && c.calls == 0);
+    CHECK(secrets_wiped(&R.hs));
+    /* the caller refuses the parameters: a local verdict, internal_error,
+     * BRISK_E_ARG */
+    memset(&c, 0, sizeof c);
+    c.rc = 1;
+    rc = tp_run(&f, 1, ch, ch_len, ee, ee_len, &c);
+    CHECK(rc == BRISK_E_ARG && R.hs.alert == BRISK__ALERT_INTERNAL_ERROR && c.calls == 1);
+    /* QUIC without the extension in CH1, TCP with it: the caller's CH is refused
+     */
+    memset(&c, 0, sizeof c);
+    CHECK(tp_run(&f, 1, f.ch1, f.ch1_len, ee, ee_len, &c) == BRISK_E_ARG);
+    CHECK(tp_run(&f, 0, ch, ch_len, ee, ee_len, &c) == BRISK_E_ARG);
+    /* TCP, an unsolicited echo: unsupported_extension, never handed over */
+    rc = tp_run(&f, 0, f.ch1, f.ch1_len, ee, ee_len, &c);
+    CHECK(rc == BRISK_E_PROTO && R.hs.alert == BRISK__ALERT_UNSUPPORTED_EXTENSION && c.calls == 0);
+}
+
+/* internal_error is a local fault, never blamed on the peer (BRISK_E_ARG, not
+ * BRISK_E_PROTO): an on_secret refusal after the ServerHello, and the
+ * production authenticator with an unusable reference host or no ctx at all. */
+static int refuse_secret(void *ctx, unsigned epoch, int is_send, uint16_t suite, const uint8_t *s,
+                         size_t len)
+{
+    (void)ctx;
+    (void)epoch;
+    (void)is_send;
+    (void)suite;
+    (void)s;
+    (void)len;
+    return 1;
+}
+
+static void hs_local_faults(void)
+{
+    brisk__tls13_hs_cfg cfg;
+    flow f;
+    size_t i, m;
+    int rc, v;
+
+    flow_load(&f, &TLS13_FLOW_KAT[0]);
+    memset(&cfg, 0, sizeof cfg);
+    memset(&R, 0, sizeof R);
+    cfg.auth = stub_auth;
+    cfg.auth_ctx = &R.st;
+    cfg.on_secret = refuse_secret;
+    CHECK(brisk__tls13_hs_init(&R.hs, &cfg, g_scratch, g_scratch_len) == BRISK_OK);
+    CHECK(brisk__tls13_hs_client_hello(&R.hs, f.ch1, f.ch1_len, (uint16_t)f.k->g1, f.priv1) ==
+          BRISK_OK);
+    rc = brisk__tls13_hs_feed(&R.hs, BRISK__EPOCH_INITIAL, f.m[0], f.n_m[0]);
+    CHECK(rc == BRISK_E_ARG && R.hs.alert == BRISK__ALERT_INTERNAL_ERROR);
+    CHECK(secrets_wiped(&R.hs));
+
+    for (i = 0; i < NFLOW; i++) { /* the first accepted flow with a real chain */
+        if (TLS13_FLOW_KAT[i].alert == 0 && *TLS13_FLOW_KAT[i].root) {
+            break;
+        }
+    }
+    CHECK(i < NFLOW);
+    if (i == NFLOW) {
+        return;
+    }
+    flow_load(&f, &TLS13_FLOW_KAT[i]);
+    for (v = 0; v < 2; v++) {
+        memset(&cfg, 0, sizeof cfg);
+        memset(&R, 0, sizeof R);
+        R.an.der = f.root;
+        R.an.len = f.root_len;
+        R.trust.find_anchor = anchor_fn;
+        R.trust.anchor_ctx = &R.an;
+        R.ax.host = ""; /* RFC 9525: an empty reference identity is a caller bug */
+        R.ax.host_len = 0;
+        R.ax.trust = &R.trust;
+        R.ax.now = (int64_t)f.k->now;
+        cfg.auth = brisk__tls13_auth_x509;
+        cfg.auth_ctx = v == 0 ? &R.ax : NULL;
+        CHECKI(brisk__tls13_hs_init(&R.hs, &cfg, g_scratch, g_scratch_len) == BRISK_OK, v);
+        rc = brisk__tls13_hs_client_hello(&R.hs, f.ch1, f.ch1_len, (uint16_t)f.k->g1, f.priv1);
+        for (m = 0; rc == BRISK_OK && m < f.count; m++) {
+            rc = brisk__tls13_hs_feed(&R.hs,
+                                      m <= f.sh_at ? BRISK__EPOCH_INITIAL : BRISK__EPOCH_HANDSHAKE,
+                                      f.m[m], f.n_m[m]);
+        }
+        CHECKI(rc == BRISK_E_ARG && R.hs.alert == BRISK__ALERT_INTERNAL_ERROR, v);
+    }
+}
+static void hs_wipe_exporter(void)
+{
+    flow f;
+    uint8_t a[32], b[32];
+    int rc;
+    flow_load(&f, &TLS13_FLOW_KAT[0]);
+    rc = run_flow(&R, &f, -1, NULL, 0, FEED_MSG, 0, 0);
+    CHECK(rc == BRISK_OK);
+    CHECK(brisk__tls13_hs_exporter(&R.hs, "EXPORTER-brisk", (const uint8_t *)"ctx", 3, a, 32) ==
+          BRISK_OK);
+    CHECK(brisk__tls_ks_exporter(BRISK_HASH_SHA256, f.sec[4], "EXPORTER-brisk",
+                                 (const uint8_t *)"ctx", 3, b, 32) == BRISK_OK);
+    CHECK(memcmp(a, b, 32) == 0);
+    brisk__tls13_hs_wipe(&R.hs);
+    CHECK(all_zero((const uint8_t *)&R.hs, sizeof R.hs));
+    CHECK(all_zero(g_scratch, g_scratch_len - 8));
+    CHECK(brisk__tls13_hs_exporter(&R.hs, "x", NULL, 0, a, 32) == BRISK_E_ARG);
+    brisk__tls13_hs_wipe(NULL);
+}
+
+void test_tls13_hs(void)
+{
+    g_scratch_len = brisk__tls13_hs_scratch_size() + 8;
+    g_scratch = (uint8_t *)malloc(g_scratch_len);
+    if (g_scratch == NULL) {
+        exit(2);
+    }
+    hs_init_guard();
+    hs_flows();
+    hs_trace_specifics();
+    hs_fixture_negative();
+    hs_mutations();
+    hs_epochs();
+    hs_limits();
+    hs_cv();
+    hs_ch_write();
+    hs_quic_tp();
+    hs_local_faults();
+    hs_wipe_exporter();
+    free(g_scratch);
+    g_scratch = NULL;
+}
+
+/* The constant-time run for tests/test_ct.c: the RFC 8448 sect 3 handshake with the ECDHE
+ * private key marked secret, so `dev.py ct` reports any branch or index on it or on anything
+ * derived from it (the shared secret, every key-schedule stage, the Finished MACs). Nothing
+ * secret is compared here: the outputs are declassified only after the engine is done. */
+void tls13_hs_ct_run(void)
+{
+    flow f;
+    brisk__tls13_hs_cfg cfg;
+    uint8_t priv[32], *scratch;
+    size_t len = brisk__tls13_hs_scratch_size(), i;
+
+    scratch = (uint8_t *)malloc(len);
+    if (scratch == NULL) {
+        exit(2);
+    }
+    flow_load(&f, &TLS13_FLOW_KAT[0]);
+    memcpy(priv, f.priv1, sizeof priv);
+    BRISK__CT_SECRET(priv, sizeof priv);
+    memset(&cfg, 0, sizeof cfg);
+    memset(&R, 0, sizeof R);
+    R.st.want = f.tbs;
+    R.st.want_len = f.tbs_len;
+    cfg.auth = stub_auth;
+    cfg.auth_ctx = &R.st;
+    CHECK(brisk__tls13_hs_init(&R.hs, &cfg, scratch, len) == BRISK_OK);
+    CHECK(brisk__tls13_hs_client_hello(&R.hs, f.ch1, f.ch1_len, 0x001d, priv) == BRISK_OK);
+    CHECK(brisk__tls13_hs_feed(&R.hs, BRISK__EPOCH_INITIAL, f.m[0], f.n_m[0]) == BRISK_OK);
+    for (i = 1; i < f.count; i++) {
+        CHECK(brisk__tls13_hs_feed(&R.hs, BRISK__EPOCH_HANDSHAKE, f.m[i], f.n_m[i]) == BRISK_OK);
+    }
+    CHECK(R.hs.state == BRISK__HS_CONNECTED);
+    drain(&R, 0);
+    BRISK__CT_PUBLIC(R.hsk, sizeof R.hsk); /* the client Finished goes on the wire */
+    CHECK(R.hsk_len == f.cf_len && memcmp(R.hsk, f.cf, f.cf_len) == 0);
+    brisk__tls13_hs_wipe(&R.hs);
+    free(scratch);
+}
