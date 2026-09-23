@@ -23,11 +23,13 @@
 enum {
     HS_CLIENT_HELLO = 1,
     HS_SERVER_HELLO = 2,
+    HS_NEW_SESSION_TICKET = 4,
     HS_ENCRYPTED_EXTENSIONS = 8,
     HS_CERTIFICATE = 11,
     HS_CERTIFICATE_REQUEST = 13,
     HS_CERTIFICATE_VERIFY = 15,
     HS_FINISHED = 20,
+    HS_KEY_UPDATE = 24,
     HS_MESSAGE_HASH = 254
 };
 
@@ -39,6 +41,7 @@ enum {
     EXT_PADDING = 21,
     EXT_RECORD_SIZE_LIMIT = 28,
     EXT_SESSION_TICKET = 35,
+    EXT_EARLY_DATA = 42,
     EXT_SUPPORTED_VERSIONS = 43,
     EXT_COOKIE = 44,
     EXT_PSK_MODES = 45,
@@ -53,7 +56,7 @@ enum { GROUP_X25519 = 0x001d, GROUP_P256 = 0x0017 };
  * extension outside this table is one this client does not recognise: in a CertificateRequest
  * it is ignored (4.4.2), and in any other server message it can only be the echo of something
  * the ClientHello offered, which this engine refuses (see hs_client_hello's allow-list). */
-enum { IN_SH = 1, IN_HRR = 2, IN_EE = 4, IN_CR = 8, IN_CT = 16 };
+enum { IN_SH = 1, IN_HRR = 2, IN_EE = 4, IN_CR = 8, IN_CT = 16, IN_NST = 32 };
 static const struct {
     uint16_t type;
     uint8_t where;
@@ -72,7 +75,7 @@ static const struct {
                  {34, IN_CR | IN_CT},
                  {39, IN_EE},
                  {41, IN_SH},
-                 {42, IN_EE},
+                 {42, IN_EE | IN_NST},
                  {43, IN_SH | IN_HRR},
                  {44, IN_HRR},
                  {45, 0},
@@ -756,6 +759,90 @@ static int hs_on_fin(brisk__tls13_hs *hs, const uint8_t *m, size_t n)
     return BRISK_OK;
 }
 
+/* ------------------------------------------------------------------ post-handshake -------- */
+
+/* NewSessionTicket (RFC 9846 4.7.1): parsed strictly even when nobody wants it, then handed to
+ * cfg.on_ticket or silently ignored. Not part of the transcript. */
+static int hs_on_nst(brisk__tls13_hs *hs, const uint8_t *m, size_t n)
+{
+    const uint8_t *b = m + 4, *p, *end, *exts, *d, *d2;
+    size_t bl = n - 4, i, dl, dl2;
+    brisk__tls13_ticket tk;
+    uint16_t type;
+    int r;
+
+    memset(&tk, 0, sizeof tk);
+    /* ticket_lifetime(4) ticket_age_add(4) ticket_nonce<0..255> ticket<1..2^16-1>
+     * extensions<0..2^16-2>, every length checked against what remains before it is used */
+    if (bl < 9 || bl - 9 < (size_t)b[8] + 2) {
+        return hs_fail(hs, BRISK__ALERT_DECODE_ERROR);
+    }
+    tk.lifetime = brisk__load_be32(b);
+    tk.age_add = brisk__load_be32(b + 4);
+    tk.nonce_len = b[8];
+    tk.nonce = b + 9;
+    i = 9 + tk.nonce_len;
+    tk.ticket_len = brisk__load_be16(b + i);
+    if (tk.ticket_len == 0 || bl - i - 2 < tk.ticket_len + 2) {
+        return hs_fail(hs, BRISK__ALERT_DECODE_ERROR);
+    }
+    tk.ticket = b + i + 2;
+    i += 2 + tk.ticket_len;
+    if (brisk__load_be16(b + i) != bl - i - 2) {
+        return hs_fail(hs, BRISK__ALERT_DECODE_ERROR); /* short, or trailing bytes */
+    }
+    exts = p = b + i + 2;
+    end = b + bl;
+    while ((r = hs_ext_next(&p, end, &type, &d, &dl)) == 1) {
+        /* 4.3: at most one of each type, known or not (the prefix already parsed cleanly) */
+        if (hs_ext_find(exts, (size_t)(d - 4 - exts), type, &d2, &dl2) == 1) {
+            return hs_fail(hs, BRISK__ALERT_ILLEGAL_PARAMETER);
+        }
+        /* 4.3: a recognised extension not specified for NST (Table 1: only early_data) MUST
+         * abort with illegal_parameter; unrecognised ones are ignored. No "offered" rule: NST
+         * extensions are not responses. */
+        r = hs_ext_index(type);
+        if (r >= 0 && !(EXT_TABLE[r].where & IN_NST)) {
+            return hs_fail(hs, BRISK__ALERT_ILLEGAL_PARAMETER);
+        }
+        if (type == EXT_EARLY_DATA) { /* max_early_data_size */
+            if (dl != 4) {
+                return hs_fail(hs, BRISK__ALERT_DECODE_ERROR);
+            }
+            tk.max_early_data = brisk__load_be32(d);
+            /* RFC 9001 4.6.1: over QUIC any value but 0xffffffff is PROTOCOL_VIOLATION; the
+             * QUIC layer (M6) must map this alert to that error, not to CRYPTO_ERROR */
+            if (hs->cfg.quic && tk.max_early_data != 0xffffffffu) {
+                return hs_fail(hs, BRISK__ALERT_ILLEGAL_PARAMETER);
+            }
+        }
+    }
+    if (r < 0) {
+        return hs_fail(hs, BRISK__ALERT_DECODE_ERROR);
+    }
+    if (hs->cfg.on_ticket != NULL && hs->cfg.on_ticket(hs->cfg.ticket_ctx, &tk) != 0) {
+        return hs_fail(hs, BRISK__ALERT_INTERNAL_ERROR);
+    }
+    return BRISK_OK;
+}
+
+/* KeyUpdate (RFC 9846 4.7.3). The record layer rotates its receive key after the record that
+ * carried it (hs_feed refuses bytes after it in the same call) and answers update_requested. */
+static int hs_on_ku(brisk__tls13_hs *hs, const uint8_t *m, size_t n)
+{
+    if (hs->cfg.quic) {
+        return hs_fail(hs, BRISK__ALERT_UNEXPECTED_MESSAGE); /* RFC 9001 6: error 0x010a */
+    }
+    if (n != 5) {
+        return hs_fail(hs, BRISK__ALERT_DECODE_ERROR);
+    }
+    if (m[4] > 1) {
+        return hs_fail(hs, BRISK__ALERT_ILLEGAL_PARAMETER);
+    }
+    hs->ku |= (uint8_t)(1 | (m[4] << 1));
+    return BRISK_OK;
+}
+
 static int hs_dispatch(brisk__tls13_hs *hs, const uint8_t *m, size_t n)
 {
     switch (hs->state) {
@@ -787,6 +874,15 @@ static int hs_dispatch(brisk__tls13_hs *hs, const uint8_t *m, size_t n)
     case BRISK__HS_WAIT_FIN:
         if (m[0] == HS_FINISHED) {
             return hs_on_fin(hs, m, n);
+        }
+        break;
+    case BRISK__HS_CONNECTED:
+        /* 4.7: a CertificateRequest is unexpected too - post_handshake_auth is never offered */
+        if (m[0] == HS_NEW_SESSION_TICKET) {
+            return hs_on_nst(hs, m, n);
+        }
+        if (m[0] == HS_KEY_UPDATE) {
+            return hs_on_ku(hs, m, n);
         }
         break;
     default:
@@ -837,6 +933,7 @@ typedef struct {
     size_t n_ext, n_suites, n_groups, n_sigs;
     const uint8_t *cookie;
     size_t cookie_len;
+    uint16_t rsl; /* our record_size_limit, 0 = not offered */
     int tls13, share;
 } hs_offer;
 
@@ -930,6 +1027,13 @@ static int hs_parse_ch(const uint8_t *ch, size_t ch_len, uint16_t share_group, i
             }
             o->share = 1;
             break;
+        case EXT_RECORD_SIZE_LIMIT:
+            /* RFC 8449 4: a uint16, never below 64; kept so the record layer can enforce it */
+            if (dl != 2 || brisk__load_be16(d) < 64) {
+                return 0;
+            }
+            o->rsl = (uint16_t)brisk__load_be16(d);
+            break;
         case EXT_COOKIE:
             if (dl < 3 || brisk__load_be16(d) != dl - 2) {
                 return 0;
@@ -987,6 +1091,7 @@ int brisk__tls13_hs_client_hello(brisk__tls13_hs *hs, const uint8_t *ch, size_t 
     memcpy(hs->offered_groups, o.groups, sizeof o.groups);
     memcpy(hs->offered_sigs, o.sigs, sizeof o.sigs);
     hs->n_ext = (uint8_t)o.n_ext;
+    hs->own_rsl = o.rsl;
     hs->n_suites = (uint8_t)o.n_suites;
     hs->n_groups = (uint8_t)o.n_groups;
     hs->n_sigs = (uint8_t)o.n_sigs;
@@ -1013,9 +1118,8 @@ int brisk__tls13_hs_feed(brisk__tls13_hs *hs, unsigned epoch, const uint8_t *in,
         return BRISK_OK;
     }
     /* RFC 9846 5.1: messages MUST NOT span a key change, and nothing is expected before the
-     * ClientHello, between an HRR and CH2, or (in this slice) after the handshake. */
-    if (epoch != hs->in_epoch || hs->state == BRISK__HS_START || hs->state == BRISK__HS_WAIT_CH2 ||
-        hs->state == BRISK__HS_CONNECTED) {
+     * ClientHello or between an HRR and CH2. After the handshake the epoch is APP (4.7). */
+    if (epoch != hs->in_epoch || hs->state == BRISK__HS_START || hs->state == BRISK__HS_WAIT_CH2) {
         return hs_fail(hs, BRISK__ALERT_UNEXPECTED_MESSAGE);
     }
     while (len != 0) {
@@ -1052,8 +1156,11 @@ int brisk__tls13_hs_feed(brisk__tls13_hs *hs, unsigned epoch, const uint8_t *in,
         if (rc != BRISK_OK) {
             return rc;
         }
-        if (len != 0 && (hs->in_epoch != epoch || hs->state == BRISK__HS_WAIT_CH2)) {
-            return hs_fail(hs, BRISK__ALERT_UNEXPECTED_MESSAGE); /* 5.1: across a key change */
+        /* 5.1: nothing may follow a message that precedes a key change - SH, server Finished,
+         * KeyUpdate - in the same record, which is what one hs_feed call is over TCP */
+        if (len != 0 && (hs->in_epoch != epoch || hs->state == BRISK__HS_WAIT_CH2 ||
+                         (hs->state == BRISK__HS_CONNECTED && m[0] == HS_KEY_UPDATE))) {
+            return hs_fail(hs, BRISK__ALERT_UNEXPECTED_MESSAGE);
         }
     }
     return BRISK_OK;

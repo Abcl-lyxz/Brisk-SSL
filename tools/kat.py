@@ -5351,6 +5351,334 @@ def tls13_cv_vectors():
     return keys, rows
 
 
+# ---------------------------------------------------------------- TLS 1.3 record layer (RFC 9846 5)
+# Everything tests/test_tls13_rec.c replays. The RFC 8448 records are re-sealed here from their
+# payload under the trace's own keys and must match the printed "complete record" byte for byte.
+# No official record trace exists for ChaCha20-Poly1305 or AES-256-GCM/SHA-384, for KeyUpdate
+# ("traffic upd"), for padding or for the size limits, so those rows are generated with the same
+# Python AEADs that reproduce RFC 8439, SP 800-38D, Wycheproof and the RFC 8448 records.
+REC_CT = {"change_cipher_spec": 20, "alert": 21, "handshake": 22, "application_data": 23}
+REC_SUITE = {0x1301: (256, 16), 0x1302: (384, 32), 0x1303: (256, 32)}  # hash bits, key length
+REC_MAX_INNER = (1 << 14) + 1  # RFC 9846 5.4
+REC_MAX_CIPHER = (1 << 14) + 256  # RFC 9846 5.2
+REC_A_BAD_MAC, REC_A_OVERFLOW, REC_A_UNEXPECTED = 20, 22, 10
+
+
+def rec_keys(suite, secret):
+    """RFC 9846 7.3: key and iv from a traffic secret."""
+    bits, kl = REC_SUITE[suite]
+    return py_expand_label(bits, secret, b"key", b"", kl), py_expand_label(bits, secret, b"iv", b"", 12)
+
+
+def rec_nonce(iv, seq):
+    return bytes(a ^ b for a, b in zip(iv, seq.to_bytes(12, "big")))  # RFC 9846 5.3
+
+
+def rec_seal_raw(suite, key, iv, seq, inner):
+    """TLSCiphertext around an arbitrary TLSInnerPlaintext (RFC 9846 5.2): outer type 23, 0x0303,
+    AAD = the header as sent."""
+    hdr = bytes([23, 3, 3]) + (len(inner) + 16).to_bytes(2, "big")
+    seal = py_aead_seal if suite == 0x1303 else py_gcm_seal
+    ct, tag = seal(key, rec_nonce(iv, seq), hdr, inner)
+    return hdr + ct + tag
+
+
+def rec_seal(suite, key, iv, seq, typ, payload, pad=0):
+    return rec_seal_raw(suite, key, iv, seq, payload + bytes([typ]) + bytes(pad))
+
+
+def rec_row(name, suite, secret, seq, typ, payload, record, *, ver=0x0303, pad=0, alert=0, sec=0,
+            side=0, idx=0):
+    key, iv = rec_keys(suite, secret) if suite else (b"", b"")
+    return (name, sec, side, idx, suite, secret.hex(), key.hex(), iv.hex(), seq, typ, ver, pad,
+            payload.hex(), record.hex(), alert)
+
+
+def rec_rfc8448():
+    """Every record of RFC 8448 sections 3-7, keyed by who wrote it and under which traffic keys.
+    A '{side} derive write traffic keys for X' block switches that side's write keys (seq 0) even
+    when it prints no fields ('same as ...'): the key then comes from the peer's matching 'derive
+    read traffic keys' block. Section 6's client flight uses an RSA client key this library cannot
+    produce, but the record math does not care, so its records are kept too."""
+    secs, rows, keysets = {}, [], {}
+    for b in rfc8448_blocks():
+        secs.setdefault(b["_sec"], []).append(b)
+    other = {"client": "server", "server": "client"}
+    for sec in (3, 4, 5, 6, 7):
+        keys, phase, seq, idx = {}, {"client": None, "server": None}, {}, {"client": 0, "server": 0}
+        for b in secs[sec]:
+            f = {k: hexbytes(v) for k, v in b["_f"].items()}
+            side = b["_side"]
+            m = re.match(r"derive (write|read) traffic keys for "
+                         r"(early application data|handshake data|application data)", b["_h"])
+            if m:
+                writer = side if m.group(1) == "write" else other[side]
+                if "PRK" in f:
+                    k, iv = rec_keys(0x1301, f["PRK"])
+                    if (k, iv) != (f["key expanded"], f["iv expanded"]):
+                        die(f"RFC 8448 sect {sec}: {b['_h']} key/iv mismatch")
+                    if keys.get((writer, m.group(2)), (f["PRK"],))[0] != f["PRK"]:
+                        die(f"RFC 8448 sect {sec}: two secrets for {writer} {m.group(2)}")
+                    keys[(writer, m.group(2))] = (f["PRK"], k, iv)
+                if m.group(1) == "write":
+                    phase[side], seq[side] = m.group(2), 0
+                continue
+            m = re.match(r"send (handshake|application_data|alert|change_cipher_spec) record", b["_h"])
+            if not m:
+                continue
+            typ, payload, rec = REC_CT[m.group(1)], f["payload"], f["complete record"]
+            name = f"8448s{sec} {side} {idx[side]}"
+            sd = 1 if side == "server" else 0
+            if rec[0] != 23:  # unprotected (ClientHello, ServerHello, HRR, compat CCS)
+                if rec[0] != typ or int.from_bytes(rec[3:5], "big") != len(payload) or rec[5:] != payload:
+                    die(f"RFC 8448 {name}: bad plaintext record")
+                rows.append(rec_row(name, 0, b"", 0, typ, payload, rec, sec=sec, side=sd, idx=idx[side],
+                                    ver=int.from_bytes(rec[1:3], "big")))
+            else:
+                secret, k, iv = keys[(side, phase[side])]
+                if rec_seal(0x1301, k, iv, seq[side], typ, payload) != rec:
+                    die(f"RFC 8448 {name}: re-sealed record differs from the trace")
+                rows.append(rec_row(name, 0x1301, secret, seq[side], typ, payload, rec, sec=sec,
+                                    side=sd, idx=idx[side]))
+                seq[side] += 1
+            idx[side] += 1
+        keysets[sec] = keys
+    if len(rows) < 40 or sum(1 for r in rows if r[4]) < 25:
+        die(f"RFC 8448 records: parsed too few ({len(rows)})")
+    return rows, keysets
+
+
+def rec_hs(typ, body):
+    return bytes([typ]) + len(body).to_bytes(3, "big") + body
+
+
+def rec_nst(lifetime, age_add, nonce, ticket, exts):
+    """NewSessionTicket (RFC 9846 4.7.1) from its fields; exts = [(type, data)]."""
+    e = b"".join(t.to_bytes(2, "big") + len(d).to_bytes(2, "big") + d for t, d in exts)
+    return rec_hs(4, lifetime.to_bytes(4, "big") + age_add.to_bytes(4, "big") + t_v8(nonce)
+                  + len(ticket).to_bytes(2, "big") + ticket + len(e).to_bytes(2, "big") + e)
+
+
+# RFC 9846 4.2 Table 1: extension types defined for some message but not for NewSessionTicket
+# (early_data, 42, is the one NST extension). Unknown types (not in Table 1) are ignored.
+NST_RECOGNISED_NOT_ALLOWED = {0, 1, 5, 10, 13, 14, 15, 16, 18, 19, 20, 21, 27, 28, 34, 39, 41,
+                              43, 44, 45, 47, 48, 49, 50, 51, 52}
+
+
+def rec_nst_parse(msg):
+    """An independent strict reader of a NewSessionTicket (RFC 9846 4.7.1): the fields
+    (lifetime, age_add, nonce, ticket, max_early_data) or the alert number."""
+    if len(msg) < 4 or msg[0] != 4 or int.from_bytes(msg[1:4], "big") != len(msg) - 4:
+        die("NST row: bad handshake header")
+    b = msg[4:]
+    if len(b) < 9 or len(b) < 9 + b[8] + 2:
+        return 50
+    life, age, nonce = int.from_bytes(b[0:4], "big"), int.from_bytes(b[4:8], "big"), b[9:9 + b[8]]
+    i = 9 + b[8]
+    tl = int.from_bytes(b[i:i + 2], "big")
+    if tl == 0 or len(b) < i + 2 + tl + 2:  # ticket<1..2^16-1>
+        return 50
+    ticket, i = b[i + 2:i + 2 + tl], i + 2 + tl
+    if len(b) != i + 2 + int.from_bytes(b[i:i + 2], "big"):
+        return 50
+    e, i, seen, med = b[i + 2:], 0, set(), 0
+    while i < len(e):
+        if len(e) - i < 4 or int.from_bytes(e[i + 2:i + 4], "big") > len(e) - i - 4:
+            return 50
+        t, dl = int.from_bytes(e[i:i + 2], "big"), int.from_bytes(e[i + 2:i + 4], "big")
+        if t in seen:
+            return 47  # RFC 9846 4.3: at most one extension of each type
+        seen.add(t)
+        if t in NST_RECOGNISED_NOT_ALLOWED:
+            return 47  # RFC 9846 4.3: recognised, but Table 1 allows only early_data in NST
+        if t == 42:  # early_data carries max_early_data_size (4.7.1)
+            if dl != 4:
+                return 50
+            med = int.from_bytes(e[i + 4:i + 8], "big")
+        i += 4 + dl
+    return (life, age, nonce, ticket, med)
+
+
+def tls13_records():
+    """Rows for tests/test_tls13_rec.c: record seal/open, nonces, KeyUpdate chains, post-handshake
+    messages, and the seeds for fuzz/fuzz_tls13_rec.c."""
+    rows, keysets = rec_rfc8448()
+    n8448 = len(rows)
+    rnd = random.Random(20260923)
+
+    def seed(tag, n):
+        return (hashlib.sha384 if n > 32 else hashlib.sha256)(b"brisk tls13 record " + tag).digest()[:n]
+
+    # (a) the two suites no trace covers, plus AES-128-GCM through the same generator; seq values
+    # that catch a 32-bit truncation or a little-endian store of the 64-bit counter.
+    for suite in (0x1301, 0x1302, 0x1303):
+        sec = seed(b"suite %04x" % suite, REC_SUITE[suite][0] // 8)
+        k, iv = rec_keys(suite, sec)
+        for j, s in enumerate((0, 1, 0xFF, 0x100, 1 << 32, 1 << 63, (1 << 64) - 2)):
+            typ = (23, 22, 21)[j % 3]
+            n = 2 if typ == 21 else (1, 1, 2, 15, 16, 17, 100)[j]
+            pl = bytes(rnd.randrange(1, 256) for _ in range(n))
+            rows.append(rec_row(f"gen {suite:04x} seq {s}", suite, sec, s, typ, pl,
+                                rec_seal(suite, k, iv, s, typ, pl)))
+        # zero-length application data is legal (5.4) and delivers nothing
+        rows.append(rec_row(f"gen {suite:04x} empty app", suite, sec, 7, 23, b"",
+                            rec_seal(suite, k, iv, 7, 23, b"")))
+        # (c) padding, the largest content, the largest inner plaintext: all accepted
+        for name, pl, pad in (("pad 1", b"\x17" * 20, 1), ("pad 255", b"\x2a" * 20, 255),
+                              ("pad to limit", bytes(range(1, 101)), REC_MAX_INNER - 1 - 100),
+                              ("max content", bytes((i & 0xFF) | 1 for i in range(1 << 14)), 0),
+                              ("empty app pad to limit", b"", REC_MAX_INNER - 1)):
+            rows.append(rec_row(f"gen {suite:04x} {name}", suite, sec, 3, 23, pl,
+                                rec_seal(suite, k, iv, 3, 23, pl, pad), pad=pad))
+        # (c) inner plaintexts under a VALID tag that RFC 9846 5.4 still rejects
+        for name, inner, alert in (("inner too long", bytes(1 << 14) + b"\x17\x00", REC_A_OVERFLOW),
+                                   ("inner all zero", bytes(5), REC_A_UNEXPECTED),
+                                   ("inner empty", b"", REC_A_UNEXPECTED),
+                                   ("empty handshake", b"\x16", REC_A_UNEXPECTED),
+                                   ("empty alert", b"\x15\x00\x00", REC_A_UNEXPECTED),
+                                   ("inner ccs", b"\x01\x14", REC_A_UNEXPECTED),
+                                   ("inner type 24", b"\x01\x18", REC_A_UNEXPECTED),
+                                   ("inner type 99", b"\x01\x63\x00", REC_A_UNEXPECTED)):
+            rows.append(rec_row(f"gen {suite:04x} {name}", suite, sec, 5, 0, b"",
+                                rec_seal_raw(suite, k, iv, 5, inner), alert=alert))
+        # protected length below one tag (5.2): no AEAD call can succeed
+        for n in range(16):
+            rows.append(rec_row(f"gen {suite:04x} short {n}", suite, sec, 0, 0, b"",
+                                bytes([23, 3, 3, 0, n]) + bytes(rnd.randrange(256) for _ in range(n)),
+                                alert=REC_A_BAD_MAC))
+    s = keysets[3]
+    s_ap, _, siv = s[("server", "application data")]
+    s_hs = s[("server", "handshake data")][0]
+    c_ap = s[("client", "application data")][0]
+    rows.append(rec_row("gen overflow cipher", 0x1301, s_ap, 0, 0, b"",
+                        bytes([23, 3, 3]) + (REC_MAX_CIPHER + 1).to_bytes(2, "big")
+                        + bytes(REC_MAX_CIPHER + 1), alert=REC_A_OVERFLOW))
+    # unprotected (5.1): the 2^14 limit, zero-length handshake / alert, unknown types
+    for name, rec, typ, alert in (
+            ("plain max", bytes([22, 3, 3, 0x40, 0]) + bytes(1 << 14), 22, 0),
+            ("plain overflow", bytes([22, 3, 3, 0x40, 1]) + bytes((1 << 14) + 1), 0, REC_A_OVERFLOW),
+            ("plain empty handshake", bytes([22, 3, 3, 0, 0]), 0, REC_A_UNEXPECTED),
+            ("plain empty alert", bytes([21, 3, 3, 0, 0]), 0, REC_A_UNEXPECTED),
+            ("plain type 24", bytes([24, 3, 3, 0, 1, 1]), 0, REC_A_UNEXPECTED),
+            ("plain type 0", bytes([0, 3, 3, 0, 1, 1]), 0, REC_A_UNEXPECTED),
+            ("plain type 255", bytes([255, 3, 3, 0, 1, 1]), 0, REC_A_UNEXPECTED)):
+        rows.append(rec_row("gen " + name, 0, b"", 0, typ, b"" if alert else rec[5:], rec, alert=alert))
+    # (d) mutations of RFC 8448 sect 3's server application data record (s_ap, seq 1): one bit in
+    # the AAD (type, both version bytes), the ciphertext or the tag; a replay; a skipped seq; the
+    # wrong epoch's key. Every one is bad_record_mac and nothing else.
+    app = bytes.fromhex(next(r for r in rows if r[0] == "8448s3 server 3")[13])
+    for name, at in (("aad type", 0), ("aad version hi", 1), ("aad version lo", 2), ("ct first", 5),
+                     ("ct last", len(app) - 17), ("tag first", len(app) - 16), ("tag last", len(app) - 1)):
+        mut = bytearray(app)
+        mut[at] ^= 1
+        rows.append(rec_row(f"mut {name}", 0x1301, s_ap, 1, 0, b"", bytes(mut), alert=REC_A_BAD_MAC))
+    rows.append(rec_row("mut replay seq 2", 0x1301, s_ap, 2, 0, b"", app, alert=REC_A_BAD_MAC))
+    rows.append(rec_row("mut skip seq 0", 0x1301, s_ap, 0, 0, b"", app, alert=REC_A_BAD_MAC))
+    rows.append(rec_row("mut s_hs key", 0x1301, s_hs, 1, 0, b"", app, alert=REC_A_BAD_MAC))
+
+    # (b) KeyUpdate: application_traffic_secret_N+1 = Expand-Label(N, "traffic upd", "", HashLen)
+    # (RFC 9846 7.2), four generations from each sect 3 app secret, a SHA-384 and a ChaCha one.
+    # Each generation carries one sealed record so the rotated key is exercised, not just compared.
+    pl50 = bytes(range(50))
+    for label, suite, sec in (("s_ap", 0x1301, s_ap), ("c_ap", 0x1301, c_ap),
+                              ("384", 0x1302, seed(b"upd 384", 48)), ("chacha", 0x1303, seed(b"upd cc", 32))):
+        bits = REC_SUITE[suite][0]
+        for g in range(4):
+            k, iv = rec_keys(suite, sec)
+            rows.append(rec_row(f"upd {label} g{g}", suite, sec, 0, 23, pl50,
+                                rec_seal(suite, k, iv, 0, 23, pl50)))
+            sec = py_expand_label(bits, sec, b"traffic upd", b"", bits // 8)
+    # What the client must send, byte for byte: KeyUpdate(update_not_requested) under the OLD c_ap
+    # (4.7.3) then application data under c_ap_1 from seq 0; and around the 2^24 rekey point.
+    ku0 = rec_hs(24, b"\x00")
+    c_ap1 = py_expand_label(256, c_ap, b"traffic upd", b"", 32)
+    for name, secret, sq, typ, pl in (("drv c ku0 g0 seq 0", c_ap, 0, 22, ku0),
+                                      ("drv c app g1 seq 0", c_ap1, 0, 23, pl50),
+                                      ("drv c app g0 seq rekey-1", c_ap, (1 << 24) - 1, 23, pl50),
+                                      ("drv c ku0 g0 seq rekey", c_ap, 1 << 24, 22, ku0)):
+        k, iv = rec_keys(0x1301, secret)
+        rows.append(rec_row(name, 0x1301, secret, sq, typ, pl, rec_seal(0x1301, k, iv, sq, typ, pl)))
+    names = [r[0] for r in rows]
+    if len(set(names)) != len(names):
+        die("record rows: duplicate name")
+
+    # nonce builder: RFC 9001 A.5 (packet number 654360564 XOR iv = the printed nonce, a multi-byte
+    # XOR) plus generated sequence numbers against the sect 3 s_ap iv.
+    text = "\n".join(rfc_lines(fetch("rfc9001")))
+    a5 = text[text.rindex("\nA.5.  ChaCha20-Poly1305 Short Header Packet"):text.index("\nAppendix B.")]
+    q_secret = hexbytes(re.search(r"^\s+secret\b[^\n]*\n\s+=\s+([0-9a-f]+(?:\n\s+[0-9a-f]+)*)",
+                                  a5, re.M).group(1))
+    q_iv = py_expand_label(256, q_secret, b"quic iv", b"", 12)
+    pn = int(re.search(r"^\s+pn\s+=\s+(\d+)", a5, re.M).group(1))
+    q_nonce = bytes.fromhex(re.search(r"^\s+nonce\s+=\s+([0-9a-f]+)$", a5, re.M).group(1))
+    if rec_nonce(q_iv, pn) != q_nonce:
+        die("RFC 9001 A.5 nonce mismatch")
+    nonces = [(q_iv.hex(), pn, q_nonce.hex())]
+    for sq in (0, 1, 0xFF, 0x100, 1 << 32, 1 << 63, (1 << 64) - 1, 0x0102030405060708):
+        nonces.append((siv.hex(), sq, rec_nonce(siv, sq).hex()))
+
+    # post-handshake messages (RFC 9846 4.7): the sect 3 NewSessionTicket and its single-fault
+    # variants, KeyUpdate bodies, and messages that are never legal after the handshake.
+    nst = bytes.fromhex(next(r for r in rows if r[0] == "8448s3 server 2")[12])
+    f = rec_nst_parse(nst)
+    if not isinstance(f, tuple) or f[0] != 30 or f[4] != 0x400:
+        die("RFC 8448 sect 3 NewSessionTicket: unexpected fields")
+    life, age, nn, tk, _ = f
+    ed = (42, (0x400).to_bytes(4, "big"))
+    b = nst[4:]
+    if b[-10:-8] != b"\x00\x08":
+        die("RFC 8448 sect 3 NewSessionTicket: expected one 8-byte extension block")
+    msgs = [("nst 8448s3", nst, 0),
+            ("nst no ext", rec_nst(life, age, nn, tk, []), 0),
+            ("nst empty nonce", rec_nst(life, age, b"", tk, [ed]), 0),
+            ("nst unknown ext ignored", rec_nst(life, age, nn, tk, [(0xfafa, b"\x01\x02"), ed]), 0),
+            ("nst lifetime 604801", rec_nst(604801, age, nn, tk, [ed]), 0),
+            # RFC 9001 4.6.1: the only early_data value a QUIC client may accept
+            ("nst early_data quic", rec_nst(life, age, nn, tk, [(42, b"\xff" * 4)]), 0),
+            ("nst ticket len 0", rec_nst(life, age, nn, b"", [ed]), 50),
+            ("nst early_data len 3", rec_nst(life, age, nn, tk, [(42, b"\0\0\4")]), 50),
+            ("nst early_data len 5", rec_nst(life, age, nn, tk, [(42, b"\0\0\0\4\0")]), 50),
+            ("nst dup early_data", rec_nst(life, age, nn, tk, [ed, ed]), 47),
+            ("nst dup unknown", rec_nst(life, age, nn, tk, [(0xfafa, b""), (0xfafa, b"")]), 47),
+            # RFC 9846 4.3: a recognised extension Table 1 does not allow in NST
+            ("nst key_share", rec_nst(life, age, nn, tk, [ed, (51, b"\x00\x1d\x00\x00")]), 47),
+            ("nst supported_versions", rec_nst(life, age, nn, tk, [(43, b"\x03\x04")]), 47),
+            ("nst server_name", rec_nst(life, age, nn, tk, [(0, b"")]), 47),
+            ("nst pre_shared_key", rec_nst(life, age, nn, tk, [(41, b"\x00\x00")]), 47),
+            ("nst record_size_limit", rec_nst(life, age, nn, tk, [(28, b"\x40\x01")]), 47),
+            ("nst trailing byte", rec_hs(4, b + b"\0"), 50),
+            ("nst ext len overrun", rec_hs(4, b[:-10] + b"\x00\x09" + b[-8:]), 50),
+            ("nst ext truncated", rec_hs(4, b[:-1]), 50),
+            ("nst nonce overrun", rec_hs(4, b[:8] + b"\xff" + b[9:20]), 50),
+            ("nst too short", rec_hs(4, b[:8]), 50),
+            ("nst empty body", rec_hs(4, b""), 50)]
+    for name, m, alert in msgs:
+        got = rec_nst_parse(m)
+        if (alert and got != alert) or (not alert and not isinstance(got, tuple)):
+            die(f"NST row {name}: the Python reader says {got}")
+    msgs += [("ku0", rec_hs(24, b"\0"), 0), ("ku1", rec_hs(24, b"\1"), 0),
+             ("ku len 0", rec_hs(24, b""), 50), ("ku len 2", rec_hs(24, b"\0\0"), 50),
+             ("ku value 2", rec_hs(24, b"\2"), 47), ("ku value 255", rec_hs(24, b"\xff"), 47),
+             ("cr post-handshake", rec_hs(13, b"\0\0\0"), 10),  # 4.7.2: never offered
+             ("finished again", rec_hs(20, bytes(32)), 10),
+             ("server hello again", rec_hs(2, bytes(40)), 10),
+             ("end of early data", rec_hs(5, b""), 10)]
+    hsmsg = []
+    for name, m, alert in msgs:
+        got = rec_nst_parse(m) if m[0] == 4 else None
+        fl = got if isinstance(got, tuple) else (0, 0, b"", b"", 0)
+        hsmsg.append((name, m.hex(), alert, fl[0], fl[1], fl[4], fl[2].hex(), fl[3].hex()))
+
+    # fuzz seeds: [chunk size] || sect 3 server records after its Finished (NST, app, alert), all
+    # under s_ap, which fuzz/fuzz_tls13_rec.c installs as its receive key.
+    post = [bytes.fromhex(r[13]) for r in rows[:n8448] if r[1] == 3 and r[2] == 1 and r[3] >= 2]
+    seeds = [((bytes([c]) + b"".join(post)).hex(), f"sect 3 post-handshake, chunk {c}")
+             for c in (0, 1, 7, 64, 255)]
+    print(f"  tls13 records: {len(rows)} rows ({n8448} RFC 8448), {len(nonces)} nonces, "
+          f"{len(hsmsg)} post-handshake messages")
+    return rows, nonces, hsmsg, seeds, s_ap
+
+
 def cesc(s):
     """A C string body. A row whose whole point is a non-ASCII octet (a U-label reference) is
     written out as escapes, so neither an editor nor -finput-charset can change what it tests;
@@ -5513,6 +5841,7 @@ def main():
     tls13_fx, tls13_chw = tls13_fixture()
     tls13_mut = t_mutations(tls13_parts)
     tls13_cv_keys, tls13_cv = tls13_cv_vectors()
+    rec_rows, rec_nonces, rec_hsmsg, rec_seeds, rec_fuzz_key = tls13_records()
 
     emit("sha2.inc", "struct hash_kat SHA2_KAT", cavp + dhash, lambda r: f"{r[0]}, {cstr(r[1])}, {cstr(r[2])}")
     emit("sha2_monte.inc", "struct monte_kat SHA2_MONTE", monte,
@@ -5651,6 +5980,21 @@ def main():
          lambda r: f"{r[0]}, {cstr(r[1])}")
     emit("tls13_cv.inc", "struct tls13_cv_kat TLS13_CV_KAT", tls13_cv,
          lambda r: f"{r[0]}, 0x{r[1]:04x}u, {cstr(r[2])}, {cstr(r[3])}, {r[4]}", append=True)
+    emit("tls13_record.inc", "struct tls13_rec_kat TLS13_REC_KAT", rec_rows,
+         lambda r: f'"{r[0]}", {r[1]}, {r[2]}, {r[3]}, 0x{r[4]:04x}u, {cstr(r[5])}, {cstr(r[6])}, '
+                   f'{cstr(r[7])}, 0x{r[8]:016x}ULL, {r[9]}, 0x{r[10]:04x}u, {r[11]}u, {cstr(r[12])}, '
+                   f'{cstr(r[13])}, {r[14]}')
+    emit("tls13_record.inc", "struct tls13_nonce_kat TLS13_NONCE_KAT", rec_nonces,
+         lambda r: f'{cstr(r[0])}, 0x{r[1]:016x}ULL, {cstr(r[2])}', append=True)
+    emit("tls13_record.inc", "struct tls13_hsmsg_kat TLS13_HSMSG_KAT", rec_hsmsg,
+         lambda r: f'"{r[0]}", {cstr(r[1])}, {r[2]}, {r[3]}u, {r[4]}u, {r[5]}u, {cstr(r[6])}, '
+                   f'{cstr(r[7])}', append=True)
+    # Seeds for fuzz/fuzz_tls13_rec.c (tools/dev.py fuzz tls13_rec), not included by any test,
+    # and the receive secret the harness installs so the seeds decrypt.
+    emit("tls13_rec_fuzz.inc", "struct tls13_fuzz_seed TLS13_REC_FUZZ_SEED", rec_seeds,
+         lambda r: f'{cstr(r[0])}, "{cesc(r[1])}"')
+    with open(OUT / "tls13_rec_fuzz.inc", "a", newline="\n") as fh:
+        fh.write(f'static const char TLS13_REC_FUZZ_S_AP[] = "{rec_fuzz_key.hex()}";\n')
 
     rows = "\n".join(f"| {k} | {u} | `{h}` |" for k, (u, h) in sorted(fetched.items()))
     (OUT / "SOURCES.md").write_text(
@@ -5716,6 +6060,15 @@ def main():
         "  resumption) is out of this slice: no PSK, no 0-RTT. Sect 6's client flight uses an RSA\n"
         "  client key this library cannot produce, so from there on the values are ours, computed\n"
         "  by the same Python cascade that reproduces sections 3, 5 and 7 byte for byte.\n"
+        "- TLS 1.3 record layer (`tls13_record.inc`): Wycheproof has NO TLS record-layer suite and\n"
+        "  NIST CAVP has no TLS 1.3 record set. The AEADs underneath are covered by M1\n"
+        "  (`aes_gcm.inc`, `chacha20_poly1305.inc`, valid and invalid tags). The official rows are\n"
+        "  every RFC 8448 sect 3-7 record, re-sealed from its payload under the trace's keys, and\n"
+        "  the RFC 9001 A.5 nonce (a multi-byte XOR). ChaCha20-Poly1305 and AES-256-GCM/SHA-384\n"
+        "  records, KeyUpdate ('traffic upd') chains, padding, the size limits and every invalid\n"
+        "  row are generated with the same Python AEADs - no official vector exists for any of\n"
+        "  them. tlsfuzzer's record/keyupdate/zero-length/record_size_limit scripts were used as a\n"
+        "  case catalogue only (they test servers).\n"
         "- There is no P-384 *keygen*, *ECDH* or *signing* vector set here, and there never will\n"
         "  be: docs/ARCHITECTURE.md locks P-384 to verify only, so `KAS_ECC_CDH` `[P-384]`,\n"
         "  `KeyPair.rsp` `[P-384]`, `SigGen.txt` `[P-384]` and `ecdh_secp384r1_*` are all out of\n"

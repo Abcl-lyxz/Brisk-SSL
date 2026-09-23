@@ -1436,8 +1436,12 @@ void brisk__tls_ks_wipe(brisk__tls_ks *ks);
  * BRISK_E_PROTO (everything else: the peer broke the protocol); every later call returns
  * the same code. There is no best-effort continuation anywhere.
  *
- * KNOWN GAP (M3 line 2/3): post-handshake messages (NewSessionTicket, KeyUpdate) are not
- * handled yet, so handshake bytes fed in CONNECTED are unexpected_message.
+ * POST-HANDSHAKE (RFC 9846 4.7): in CONNECTED, hs_feed takes epoch APP. A NewSessionTicket is
+ * parsed strictly and handed to cfg.on_ticket (NULL = silently ignored, the MUST for a client
+ * without resumption; it is not added to the transcript). A KeyUpdate sets hs->ku for the record
+ * layer (refused over QUIC, RFC 9001 6). Anything else, incl. a CertificateRequest (no
+ * post_handshake_auth is ever offered), is unexpected_message. A ticket larger than
+ * BRISK_TLS_MAX_HS_MSG fails closed with illegal_parameter (the local limit, as for any message).
  *
  * STACK: hs_feed is 512 B (-fstack-usage, gcc -Os, x86_64 host) and calls the authenticator
  * from inside it, so the deepest chain is hs_feed -> brisk__tls13_auth_x509 (128) ->
@@ -1449,7 +1453,10 @@ enum { BRISK__EPOCH_INITIAL = 0, BRISK__EPOCH_HANDSHAKE = 2, BRISK__EPOCH_APP = 
 
 /* RFC 9846 6.2 AlertDescription values the engine emits. */
 enum {
+    BRISK__ALERT_CLOSE_NOTIFY = 0,
     BRISK__ALERT_UNEXPECTED_MESSAGE = 10,
+    BRISK__ALERT_BAD_RECORD_MAC = 20,
+    BRISK__ALERT_RECORD_OVERFLOW = 22,
     BRISK__ALERT_HANDSHAKE_FAILURE = 40,
     BRISK__ALERT_BAD_CERTIFICATE = 42,
     BRISK__ALERT_UNSUPPORTED_CERTIFICATE = 43,
@@ -1459,6 +1466,7 @@ enum {
     BRISK__ALERT_DECRYPT_ERROR = 51,
     BRISK__ALERT_PROTOCOL_VERSION = 70,
     BRISK__ALERT_INTERNAL_ERROR = 80,
+    BRISK__ALERT_USER_CANCELED = 90,
     BRISK__ALERT_MISSING_EXTENSION = 109,
     BRISK__ALERT_UNSUPPORTED_EXTENSION = 110
 };
@@ -1561,6 +1569,18 @@ int brisk__tls13_ch_write(const brisk__tls13_ch_params *p, uint8_t *out, size_t 
  * A non-zero return aborts the handshake with internal_error (BRISK_E_ARG). */
 typedef int (*brisk__tls13_tp_fn)(void *ctx, const uint8_t *tp, size_t len);
 
+/* A NewSessionTicket (RFC 9846 4.7.1), strictly parsed. nonce and ticket point into the engine's
+ * scratch and die with the call. lifetime is passed through as sent (a value above 604800 is
+ * not fatal; whoever stores the ticket MUST NOT use it beyond 7 days). max_early_data is 0
+ * when the early_data extension is absent. */
+typedef struct {
+    uint32_t lifetime, age_add, max_early_data;
+    const uint8_t *nonce, *ticket;
+    size_t nonce_len, ticket_len;
+} brisk__tls13_ticket;
+/* Non-zero return = internal_error (BRISK_E_ARG). */
+typedef int (*brisk__tls13_ticket_fn)(void *ctx, const brisk__tls13_ticket *t);
+
 typedef struct {
     brisk__tls13_secret_fn on_secret; /* may be NULL (nothing exported) */
     void *secret_ctx;
@@ -1572,6 +1592,8 @@ typedef struct {
     uint8_t quic;
     brisk__tls13_tp_fn on_peer_tp; /* QUIC: may be NULL (the parameters are dropped) */
     void *tp_ctx;
+    brisk__tls13_ticket_fn on_ticket; /* may be NULL: tickets are silently ignored */
+    void *ticket_ctx;
 } brisk__tls13_hs_cfg;
 
 enum {
@@ -1610,8 +1632,12 @@ typedef struct {
     uint16_t cookie_len;
     uint16_t share_group, suite, hrr_group; /* suite is 0 until the SH/HRR picks one */
     uint16_t peer_rsl; /* server's record_size_limit (RFC 8449 4) from EE; 0 = none sent */
+    uint16_t own_rsl;  /* ours, from the ClientHello; 0 = not offered */
     uint8_t n_ext, n_suites, n_groups, n_sigs, session_id_len;
     uint8_t hrr_seen, cr_seen, state, alert, in_epoch;
+    /* KeyUpdate received in CONNECTED (RFC 9846 4.7.3), for the record layer, which clears it:
+     * bit0 rotate the receive key after this record, bit1 the peer set update_requested */
+    uint8_t ku;
     int err; /* the sticky return code once FAILED */
     /* scratch carve-up: [message reassembly | certificate array | output queue] */
     uint8_t *scratch, *in, *out;
@@ -1653,6 +1679,139 @@ int brisk__tls13_hs_exporter(const brisk__tls13_hs *hs, const char *label, const
 
 /* Wipe everything: secrets, key, transcript, and the whole scratch buffer. Safe on NULL. */
 void brisk__tls13_hs_wipe(brisk__tls13_hs *hs);
+
+/* ---- tls/record.c: TLS 1.3 record layer over TCP (RFC 9846 sect 5), sans-I/O ---------------
+ *
+ * Two layers. brisk__tls_dir / rec_seal / rec_open protect ONE record in one direction: key and
+ * iv from a traffic secret (7.3), nonce = iv XOR the 64-bit sequence number (5.3), AAD = the
+ * 5-byte header as on the wire, TLSInnerPlaintext = content || type || zero padding (5.2, 5.4).
+ * brisk__tls13_conn drives a brisk__tls13_hs over them: framing, the unprotected CCS rule,
+ * alerts, close_notify, KeyUpdate, the send-key switch timing and record_size_limit.
+ *
+ * FAILURE is sticky: the first violation sets c->alert, wipes the receive key, the pending secret
+ * and the engine, and every later call returns c->err (BRISK_E_AUTH for bad_record_mac,
+ * BRISK_E_ARG for internal_error - a local fault - and BRISK_E_PROTO otherwise). conn_pull then
+ * emits exactly one fatal alert {2, desc} under the then-current send key (plaintext before one
+ * is installed, RFC 9846 7.3) and wipes the send key. A fatal alert FROM the peer is
+ * BRISK_E_PEER_ALERT with the value in c->peer_alert; nothing is sent back (6.2) and every key
+ * is wiped at once.
+ *
+ * LOCAL CHOICES the RFC leaves open: a receive sequence number at 2^64-1 (5.3 "MUST NOT wrap") is
+ * unexpected_message - unreachable in practice; a second send secret while one is still pending
+ * is internal_error (a caller bug: the ServerHello was fed before the ClientHello was pulled);
+ * the send side at the 2^48-1 KeyUpdate cap terminates with internal_error at the 5.5 limit.
+ *
+ * CONSTANT TIME: keys, ivs and secrets never reach a branch or an index; the nonce XOR is
+ * branch-free and the AEADs verify the tag before decrypting. The padding scan after a
+ * successful open branches on the authenticated plaintext, which is declassified there: it is
+ * the peer's message, handed to the caller anyway, and its padding length is not a key.
+ *
+ * GCM on the wire: the ARCHITECTURE decision on GHASH timing for early-terminating multipliers
+ * (armv5, some MIPS32) is still open and due before the public API (M3 line 4).
+ */
+#define BRISK__TLS_REC_HDR    5
+#define BRISK__TLS_MAX_PLAIN  16384u              /* 2^14, 5.1 */
+#define BRISK__TLS_MAX_INNER  (16384u + 1)        /* 5.4 */
+#define BRISK__TLS_MAX_CIPHER (16384u + 256)      /* 5.2 */
+#define BRISK__TLS_REC_IN_MAX (5 + 16384 + 256)   /* 16645: the receive buffer conn_init needs */
+#define BRISK__TLS_REKEY_SEQ  ((uint64_t)1 << 24) /* 5.5: below 2^24.5 AES-GCM records */
+enum { BRISK__CT_CCS = 20, BRISK__CT_ALERT = 21, BRISK__CT_HANDSHAKE = 22, BRISK__CT_APP = 23 };
+
+typedef struct { /* one direction's protection state */
+    union {
+        brisk__gcm_key gcm;
+        uint8_t chacha[32];
+    } k;
+    uint8_t iv[12];
+    uint8_t secret[BRISK_HASH_MAX_LEN]; /* traffic secret N, kept for 7.2 "traffic upd" */
+    uint64_t seq;
+    uint64_t n_updates; /* KeyUpdates applied here (send side: the 2^48-1 cap of 4.7.3) */
+    uint16_t suite;     /* 0 = unprotected */
+    uint8_t epoch;      /* BRISK__EPOCH_* */
+} brisk__tls_dir;
+
+/* nonce = iv XOR (seq big-endian, left-padded to 12 bytes) (RFC 9846 5.3, RFC 9001 5.3). */
+void brisk__tls_nonce(const uint8_t iv[12], uint64_t seq, uint8_t nonce[12]);
+
+/* 7.3 key/iv from `secret` (len must be the suite's HashLen), seq = 0, n_updates = 0, the
+ * previous state wiped first. `secret` may point into d. BRISK_E_ARG on an unknown suite or a
+ * wrong len (d wiped). */
+int brisk__tls_dir_init(brisk__tls_dir *d, unsigned epoch, uint16_t suite, const uint8_t *secret,
+                        size_t len);
+/* 7.2: secret = Expand-Label(secret, "traffic upd", "", HashLen), then dir_init; n_updates + 1.
+ * The old secret, key and iv are gone afterwards. BRISK_E_ARG unless d is an APP epoch. */
+int brisk__tls_dir_update(brisk__tls_dir *d);
+void brisk__tls_dir_wipe(brisk__tls_dir *d); /* safe on NULL */
+
+/* Seal ONE record into out: header || AEAD(content || type || zeros[pad]), or a plaintext
+ * record when d->suite == 0 (pad must then be 0, len <= 2^14). `in` may equal out + 5 (no other
+ * overlap). BRISK_E_ARG, nothing written and seq unchanged, if len + 1 + pad > 2^14 + 1 (checked
+ * without overflow), cap is too small, or d->seq == UINT64_MAX. *out_len = 5 + len + 1 + pad + 16
+ * (protected). seq++ on success. `legacy_ver` goes into plaintext headers only: 0x0301 for an
+ * initial ClientHello, 0x0303 otherwise (5.1); protected records always carry 0x0303. */
+int brisk__tls_rec_seal(brisk__tls_dir *d, uint8_t type, uint16_t legacy_ver, const uint8_t *in,
+                        size_t len, size_t pad, uint8_t *out, size_t cap, size_t *out_len);
+
+/* Open ONE complete record in place, rec[0..rec_len) with rec_len == 5 + the header length, any
+ * alignment. The header's type and version are not checked (the version MUST be ignored, 5.1;
+ * both are AAD). BRISK_OK: *type = the inner type 21..23 (or the plaintext type 20..23),
+ * content at rec + 5, *len bytes; seq++ (protected only). BRISK_E_AUTH (*alert = bad_record_mac,
+ * content wiped, seq unchanged), BRISK_E_PROTO (*alert = record_overflow / unexpected_message)
+ * or BRISK_E_ARG (rec_len disagrees with the header). The CCS drop rule, alert parsing and
+ * record ordering are the caller's (conn's) job. */
+int brisk__tls_rec_open(brisk__tls_dir *d, uint8_t *rec, size_t rec_len, uint8_t *type, size_t *len,
+                        uint8_t *alert);
+
+/* The sans-I/O connection. conn_init hooks itself into hs->cfg.on_secret, so hs must be
+ * hs_init'ed first, and hs_client_hello'd before the first conn_pull. */
+typedef struct {
+    brisk__tls13_hs *hs;
+    brisk__tls_dir rd, wr;
+    uint8_t pend[BRISK_HASH_MAX_LEN]; /* send secret waiting for the earlier epoch to drain */
+    uint8_t *in;                      /* the caller's >= BRISK__TLS_REC_IN_MAX byte buffer */
+    size_t in_cap, in_len, app_off, app_len;
+    uint16_t pend_suite;
+    uint8_t pend_epoch; /* 0 = no pending send secret */
+    uint8_t ccs_sent;   /* Appendix E.4 compat CCS already emitted */
+    uint8_t ku_owe;     /* a KeyUpdate(update_not_requested) must precede the next record */
+    uint8_t close;      /* 1 close_notify queued, 2 sent */
+    uint8_t eof;        /* close_notify received */
+    uint8_t alert;      /* the fatal alert we send once failed */
+    uint8_t alert_sent;
+    uint8_t peer_alert; /* the peer's fatal alert (BRISK_E_PEER_ALERT) */
+    int err;            /* sticky once failed */
+} brisk__tls13_conn;
+
+/* BRISK_E_ARG if a pointer is NULL or cap < BRISK__TLS_REC_IN_MAX. */
+int brisk__tls13_conn_init(brisk__tls13_conn *c, brisk__tls13_hs *hs, uint8_t *rec_in, size_t cap);
+/* The brisk__tls13_secret_fn conn_init installs (ctx = c). Receive secrets install at once (the
+ * record in hand is already open, and the engine refuses bytes after SH / server Finished in
+ * it); a send secret waits until every hs_pull byte of the earlier epoch has been sealed, so
+ * c_ap protects only what follows the client Finished (RFC 9846 4, handshake.c contract). */
+int brisk__tls13_conn_on_secret(void *ctx, unsigned epoch, int is_send, uint16_t suite,
+                                const uint8_t *secret, size_t len);
+/* Absorb wire bytes in any split; *used = bytes taken. Stops early (short *used) while
+ * decrypted application data is undrained: conn_read, then feed the rest. After close_notify
+ * every byte is taken and ignored. BRISK_OK, BRISK_E_AUTH / E_PROTO / E_ARG (sticky, the alert
+ * queued for conn_pull) or BRISK_E_PEER_ALERT. */
+int brisk__tls13_conn_feed(brisk__tls13_conn *c, const uint8_t *in, size_t len, size_t *used);
+/* Drain decrypted application data. *n = 0 with c->eof set after close_notify. */
+int brisk__tls13_conn_read(brisk__tls13_conn *c, uint8_t *out, size_t cap, size_t *n);
+/* Whole records of pending protocol output: the ClientHello (plaintext), the compat CCS, the
+ * handshake flight, an owed KeyUpdate, close_notify, or - once failed - the one fatal alert.
+ * Returns the bytes written; 0 when nothing is pending or the next record does not fit. */
+size_t brisk__tls13_conn_pull(brisk__tls13_conn *c, uint8_t *out, size_t cap);
+/* Seal application data: first whatever conn_pull would emit (the client Finished, an owed or
+ * 5.5-threshold KeyUpdate), then records of at most min(peer record_size_limit, 2^14 + 1) - 1
+ * content bytes (RFC 8449 4). *used = plaintext consumed, *out_len = wire bytes; a short *used
+ * means out is full. BRISK_E_ARG before CONNECTED or after conn_close; the sticky code once
+ * failed. */
+int brisk__tls13_conn_write(brisk__tls13_conn *c, const uint8_t *data, size_t len, size_t *used,
+                            uint8_t *out, size_t cap, size_t *out_len);
+/* Queue close_notify {1, 0} (RFC 9846 6.1) for conn_pull; the write side is closed after it. */
+int brisk__tls13_conn_close(brisk__tls13_conn *c);
+/* Wipe both directions, the pending secret, the engine and the receive buffer. Safe on NULL. */
+void brisk__tls13_conn_wipe(brisk__tls13_conn *c);
 
 /* x509/chain.c: an ECDSA-Sig-Value (strict DER, RFC 5480 A.1) as the fixed-width r || s of
  * 2 * flen bytes. BRISK_E_ARG on any encoding error, negative or over-wide integer, trailing

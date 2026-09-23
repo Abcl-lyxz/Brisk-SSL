@@ -39,17 +39,22 @@ extern "C" {
  */
 enum {
     BRISK_OK = 0,
-    BRISK_E_ARG = -1,  /* invalid argument: unknown algorithm, length out of range, ... */
-    BRISK_E_RNG = -2,  /* kernel randomness unavailable; seccomp filters must allow getrandom */
-    BRISK_E_AUTH = -3, /* a cryptographic check failed on data the peer sent: AEAD authentication
-                        * (TLS bad_record_mac; no plaintext released), a signature that does not
-                        * verify (TLS decrypt_error), or a certificate that is not acceptable. Never
-                        * a caller mistake - that is BRISK_E_ARG. */
-    BRISK_E_PROTO = -4 /* the peer violated the TLS protocol: a message out of order, a bad
-                        * length, a field or extension the RFC forbids. The connection is dead and
-                        * the fatal alert has been chosen; retrying the same peer will not help.
-                        * Never a caller mistake (BRISK_E_ARG) or a failed check on the peer's
-                        * credentials (BRISK_E_AUTH). */
+    BRISK_E_ARG = -1,   /* invalid argument: unknown algorithm, length out of range, ... */
+    BRISK_E_RNG = -2,   /* kernel randomness unavailable; seccomp filters must allow getrandom */
+    BRISK_E_AUTH = -3,  /* a cryptographic check failed on data the peer sent: AEAD authentication
+                         * (TLS bad_record_mac; no plaintext released), a signature that does not
+                         * verify (TLS decrypt_error), or a certificate that is not acceptable. Never
+                         * a caller mistake - that is BRISK_E_ARG. */
+    BRISK_E_PROTO = -4, /* the peer violated the TLS protocol: a message out of order, a bad
+                         * length, a field or extension the RFC forbids. The connection is dead
+                         * and the fatal alert has been chosen; retrying the same peer will not
+                         * help. Never a caller mistake (BRISK_E_ARG) or a failed check on the
+                         * peer's credentials (BRISK_E_AUTH). */
+    BRISK_E_PEER_ALERT = -5 /* the peer ended the connection with a fatal TLS alert (RFC 9846
+                             * 6.2; its AlertDescription is kept on the connection). The
+                             * connection is dead and every key is wiped; nothing is sent back.
+                             * Whether a retry helps depends on the alert: internal_error may be
+                             * transient, handshake_failure or bad_certificate are not. */
 };
 
 /* Library version, e.g. "0.1.0-dev". */
@@ -135,8 +140,9 @@ BRISK_API int brisk_hmac(brisk_hash_alg alg, const void *key, size_t key_len, co
  * element, a TPM or an HSM, where this process never sees it. Set this callback on the client
  * config (M3) and the handshake calls it once, for CertificateVerify.
  */
-#    define BRISK_SIG_ECDSA_P256_LEN 64 /* raw r || s; the DER wrap is the handshake layer's job   \
-                                         */
+#    define BRISK_SIG_ECDSA_P256_LEN                                                               \
+        64 /* raw r || s; the DER wrap is the handshake layer's job                                \
+            */
 
 /*   ctx      opaque, passed through unchanged.
  *   scheme   a TLS SignatureScheme code point (RFC 9846 4.3.3). 0x0403 = ecdsa_secp256r1_sha256

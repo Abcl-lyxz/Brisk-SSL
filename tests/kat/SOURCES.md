@@ -118,6 +118,15 @@ reference before emission. Differential vectors come from a fixed seed.
   resumption) is out of this slice: no PSK, no 0-RTT. Sect 6's client flight uses an RSA
   client key this library cannot produce, so from there on the values are ours, computed
   by the same Python cascade that reproduces sections 3, 5 and 7 byte for byte.
+- TLS 1.3 record layer (`tls13_record.inc`): Wycheproof has NO TLS record-layer suite and
+  NIST CAVP has no TLS 1.3 record set. The AEADs underneath are covered by M1
+  (`aes_gcm.inc`, `chacha20_poly1305.inc`, valid and invalid tags). The official rows are
+  every RFC 8448 sect 3-7 record, re-sealed from its payload under the trace's keys, and
+  the RFC 9001 A.5 nonce (a multi-byte XOR). ChaCha20-Poly1305 and AES-256-GCM/SHA-384
+  records, KeyUpdate ('traffic upd') chains, padding, the size limits and every invalid
+  row are generated with the same Python AEADs - no official vector exists for any of
+  them. tlsfuzzer's record/keyupdate/zero-length/record_size_limit scripts were used as a
+  case catalogue only (they test servers).
 - There is no P-384 *keygen*, *ECDH* or *signing* vector set here, and there never will
   be: docs/ARCHITECTURE.md locks P-384 to verify only, so `KAS_ECC_CDH` `[P-384]`,
   `KeyPair.rsp` `[P-384]`, `SigGen.txt` `[P-384]` and `ecdh_secp384r1_*` are all out of

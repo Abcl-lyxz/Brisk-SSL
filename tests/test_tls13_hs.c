@@ -575,8 +575,14 @@ static void hs_epochs(void)
     n = brisk__tls13_hs_pull(&R.hs, &e, buf, sizeof buf);
     CHECK(n == f.cf_len && e == BRISK__EPOCH_HANDSHAKE && memcmp(buf, f.cf, n) == 0);
     CHECK(brisk__tls13_hs_pull(&R.hs, &e, buf, sizeof buf) == 0);
-    /* KNOWN GAP (M3 line 2/3): post-handshake messages are not handled yet */
-    CHECK(brisk__tls13_hs_feed(&R.hs, BRISK__EPOCH_APP, &extra, 1) == BRISK_E_PROTO &&
+    /* post-handshake (RFC 9846 4.7): APP bytes are now reassembled like any other message; a
+     * message type the connected state does not take (an EncryptedExtensions header, 0x08) is
+     * unexpected_message. The post-handshake messages themselves are in test_tls13_rec.c. */
+    CHECK(brisk__tls13_hs_feed(&R.hs, BRISK__EPOCH_APP, &extra, 1) == BRISK_OK);
+    buf[0] = 0;
+    buf[1] = 0;
+    buf[2] = 0;
+    CHECK(brisk__tls13_hs_feed(&R.hs, BRISK__EPOCH_APP, buf, 3) == BRISK_E_PROTO &&
           R.hs.alert == BRISK__ALERT_UNEXPECTED_MESSAGE);
 }
 

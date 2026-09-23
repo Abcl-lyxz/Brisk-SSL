@@ -39,7 +39,7 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
     static uint8_t *scratch;
     static brisk__tls13_hs hs;
     uint8_t ch[512], priv[32], pub[32], rnd[32], out[256];
-    brisk__tls13_hs_cfg cfg = {NULL, NULL, yes, NULL, 0, NULL, NULL};
+    brisk__tls13_hs_cfg cfg = {NULL, NULL, yes, NULL, 0, NULL, NULL, NULL, NULL};
     brisk__tls13_ch_params p;
     size_t ch_len, first, chunk;
     unsigned epoch;

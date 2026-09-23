@@ -49,12 +49,15 @@ Tick a box only when the work is green on **every** arch (`python tools/dev.py t
 ## M3 TLS 1.3 client
 - [x] Handshake engine (messages + epochs, exports secrets), HRR, key schedule
   - Engine landed (`src/tls/handshake.c`): CH/SH/HRR/EE/CR/Certificate/CertificateVerify/
-    Finished, epochs, secrets out, `brisk__tls13_auth_x509`. **Known gap until line 2/3:** handshake
-    bytes in CONNECTED (NewSessionTicket, KeyUpdate) are `unexpected_message`, and real servers
-    send a NewSessionTicket right after their Finished - the record layer must not ship without
-    NST/KeyUpdate handling. CertificateRequest is answered with an empty Certificate (mTLS is
+    Finished, epochs, secrets out, `brisk__tls13_auth_x509`. Post-handshake NewSessionTicket
+    (parsed strictly, handed to `cfg.on_ticket` or ignored) and KeyUpdate are handled since line 2.
+    CertificateRequest is answered with an empty Certificate (mTLS is
     line 3). ALPN in EE is accepted unchecked until line 3.
-- [ ] Record layer (TCP), KeyUpdate, alerts, close_notify
+- [x] Record layer (TCP), KeyUpdate, alerts, close_notify
+  - `src/tls/record.c`: `brisk__tls_rec_seal/open` + the sans-I/O `brisk__tls13_conn` driver.
+    Open before line 4: the GHASH-timing decision for early-terminating multipliers (armv5, some
+    MIPS32) now that GCM is on the wire; post-handshake messages still use the engine's
+    reassembly scratch, so the line-4 arena must keep it alive (or skip NSTs that do not fit).
 - [ ] PSK resumption tickets (export/import blob), ALPN list, SNI, mTLS (ECDSA)
 - [ ] `src/os/` sockets + public API `brisk_connect/read/write/close`, sans-I/O `brisk_feed/pull`
 - [ ] RFC 8448 trace test; Docker interop (nginx, Caddy, openssl s_server); badssl.com

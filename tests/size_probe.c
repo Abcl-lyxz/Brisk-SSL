@@ -148,7 +148,8 @@ int main(int argc, char **argv)
         static uint8_t scratch[4 + BRISK_TLS_MAX_HS_MSG + 8192];
         static brisk__tls13_hs hs;
         brisk__tls13_auth_x509_ctx ax = {"a.example", 9, NULL, 0};
-        brisk__tls13_hs_cfg cfg = {NULL, NULL, brisk__tls13_auth_x509, &ax, 0, NULL, NULL};
+        brisk__tls13_hs_cfg cfg = {NULL, NULL, brisk__tls13_auth_x509, &ax, 0, NULL, NULL,
+                                   NULL, NULL};
         brisk__tls13_ch_params p;
         size_t n;
         unsigned e;
@@ -163,6 +164,19 @@ int main(int argc, char **argv)
         brisk__tls13_hs_feed(&hs, 0, out, n);
         brisk__tls13_hs_pull(&hs, &e, out, sizeof out);
         brisk__tls13_hs_exporter(&hs, "e", out, 1, out, 32);
+        {
+            /* the record layer + connection driver over the same engine */
+            static uint8_t rec_in[BRISK__TLS_REC_IN_MAX];
+            static brisk__tls13_conn conn;
+            size_t used;
+            brisk__tls13_conn_init(&conn, &hs, rec_in, sizeof rec_in);
+            brisk__tls13_conn_feed(&conn, out, n, &used);
+            brisk__tls13_conn_read(&conn, out, sizeof out, &used);
+            brisk__tls13_conn_write(&conn, out, 8, &used, out, sizeof out, &n);
+            brisk__tls13_conn_close(&conn);
+            brisk__tls13_conn_pull(&conn, out, sizeof out);
+            brisk__tls13_conn_wipe(&conn);
+        }
         brisk__tls13_hs_wipe(&hs);
         (void)brisk__tls13_hs_scratch_size();
     }
