@@ -1,4 +1,4 @@
-# Handoff - 2026-09-23 (session 17)
+# Handoff - 2026-09-24 (session 17, continued)
 
 ## Done - M3 TLS 1.3 client is COMPLETE
 - 5d0a8ab **crypto: multiply-free GHASH** (`BRISK_GHASH_MULFREE`, auto on armv4/5 + 32-bit MIPS).
@@ -11,16 +11,19 @@
 - 4f71b10 **examples + interop.** `examples/brisk_get.c` (CLI), `aws_iot_https.c`,
   `mqtt_tls.c`. `python tools/dev.py interop` 18/18 (openssl s_server, nginx, Caddy);
   `python tools/dev.py badssl` 19/19 as expected. Dockerfile gained openssl/nginx/caddy.
+- 0e2cb9b **http: HPACK** (src/http/hpack.c + huffman.c, knob BRISK_ENABLE_H2, off in TINY).
+- 52ead49 **http: HTTP/2 client** (src/http/h2.c, blocking brisk_h2_* API - user chose simple
+  blocking + 4 streams). 3 rfc-auditor findings fixed (padding double credit, 1xx flood cap 16,
+  FRAME_SIZE_ERROR). New BRISK_E_RETRY, knobs BRISK_H2_MAX_STREAMS / BRISK_H2_STREAM_WINDOW.
 - All pushed; 11 archs green, ct clean.
 
 ## In progress
 - Nothing. Tree clean.
 
 ## Next up
-- **M4 HTTP/2 line 1: HPACK** (RFC 7541): static table + literal encoder, decoder with dynamic
-  table, Huffman decode (shared later with QPACK). Vectors: RFC 7541 Appendix C via /kat.
-  Run it with /implement-module. h2 is an explicit optional module over a brisk_conn
-  (`brisk_h2_open(c)`), never auto-switched; ALPN "h2" is the caller's choice.
+- **M4 line 3: h2 interop** (nginx, h2o, nghttpd): extend `python tools/dev.py interop` with
+  h2 scenarios (a small examples/h2_get.c client over brisk_h2_*), multi-stream, large body
+  both ways (flow control), GOAWAY on server reload. Then M5 TLS 1.2.
 
 ## Decisions / gotchas
 - badssl.com has NO TLS 1.3 host: its bad-cert rows prove nothing until M5 (TLS 1.2).
@@ -35,3 +38,8 @@
 - Git-bash mangles `docker -v` paths: use PowerShell for ad-hoc docker runs.
 - Internal errors -> BRISK_E_ARG, never BRISK_E_PROTO; closure alert before CONNECTED ->
   BRISK_E_PEER_ALERT.
+- implement-module agents can die on the session limit mid-review: failed verify agents mean
+  UNVERIFIED findings - read the journal and check them by hand (2 were real this time).
+- h2 flood counter resets on every blocking call (callers retry on TIMEOUT), so per-object caps
+  (1xx per stream) are needed where a peer can repeat forever.
+- QPACK (M7) must prefix its static helpers (qp_*): hpack.c names clash when amalgamated.
