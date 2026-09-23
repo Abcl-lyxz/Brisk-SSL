@@ -1,42 +1,37 @@
-# Handoff - 2026-09-23 (session 16)
+# Handoff - 2026-09-23 (session 17)
 
-## Done
-- da17163 **tls: TLS 1.3 client handshake engine, sans-I/O.** `src/tls/handshake.c`: CH/SH/HRR/EE/
-  CR/Certificate/CertificateVerify/Finished, transcript, epochs, secrets out, QUIC transport
-  params (RFC 9001 8.2). `brisk__x509_ecdsa_raw` exported from chain.c. New `BRISK_E_PROTO`,
-  `BRISK_TLS_MAX_HS_MSG`. Fuzz target `tls13_hs`.
-- 04cbb86 **tls: record layer, KeyUpdate, alerts, close_notify.** `src/tls/record.c`:
-  `brisk__tls_rec_seal/open` + sans-I/O `brisk__tls13_conn` driver. Post-handshake NST
-  (`cfg.on_ticket`) and KeyUpdate handled. Own record_size_limit (RFC 8449) enforced inbound.
-  Fuzz target `tls13_rec`.
-- 5952de0 **tls: PSK tickets, ALPN list, SNI, mTLS ECDSA P-256.** New `src/tls/ticket.c` (blob
-  export/import), binder, obfuscated age, ALPN must match offer, SNI never an IP literal, client
-  auth flight. New knob `BRISK_TLS_MAX_CLIENT_CHAIN` (4096, mTLS builds only). Fuzz `ticket`.
-- All three: 11 archs green, ct ok, fuzz clean, size baseline re-saved (TOTAL flash now
-  53-100 KB: x86_64 70583, armv7hf 52972, mipsel 99780).
+## Done - M3 TLS 1.3 client is COMPLETE
+- 5d0a8ab **crypto: multiply-free GHASH** (`BRISK_GHASH_MULFREE`, auto on armv4/5 + 32-bit MIPS).
+  `brisk__ghash_mulfree` always compiled so every arch runs its KATs; ct suite covers it.
+- e83e41f **tls: public client API.** `src/tls/conn.c` (sans-I/O `brisk_conn_init/feed/pull/
+  app_read/app_write/close_notify/status/alpn/resumed/conn_wipe`), `src/os/linux_net.c`
+  (`brisk_connect/read/write/close`, poll deadlines, per-address time slices, 64-bit time_t).
+  New `BRISK_E_IO/E_TIMEOUT/E_WANT`. `brisk_conn_size()` ~42 KB; blocking ~48 KB/connection.
+  Tests `conn` (all archs), `sock` (Linux); fuzz `conn`. Via /implement-module wf_892459cc-609.
+- 4f71b10 **examples + interop.** `examples/brisk_get.c` (CLI), `aws_iot_https.c`,
+  `mqtt_tls.c`. `python tools/dev.py interop` 18/18 (openssl s_server, nginx, Caddy);
+  `python tools/dev.py badssl` 19/19 as expected. Dockerfile gained openssl/nginx/caddy.
+- All pushed; 11 archs green, ct clean.
 
 ## In progress
-- Nothing. Tree clean and pushed.
+- Nothing. Tree clean.
 
 ## Next up
-- **Multiply-free GHASH (user decided, see docs/ARCHITECTURE.md "Crypto choices").** In
-  src/crypto/gcm.c add a shift + masked-XOR GHASH, chosen by a new tri-state knob in
-  include/brisk_config.h (auto = on for armv5 and 32-bit MIPS). Same SP 800-38D/Wycheproof
-  vectors must pass with the knob forced on for every arch; ct check must stay clean. Do this
-  before line 4; the user said not to start line 4 yet.
-- Then M3 line 4: `src/os/` sockets + public API `brisk_connect/read/write/close`, sans-I/O
-  `brisk_feed/pull`. The line-4 arena must keep the handshake reassembly scratch alive for
-  post-handshake messages (or skip NSTs that do not fit).
+- **M4 HTTP/2 line 1: HPACK** (RFC 7541): static table + literal encoder, decoder with dynamic
+  table, Huffman decode (shared later with QPACK). Vectors: RFC 7541 Appendix C via /kat.
+  Run it with /implement-module. h2 is an explicit optional module over a brisk_conn
+  (`brisk_h2_open(c)`), never auto-switched; ALPN "h2" is the caller's choice.
 
 ## Decisions / gotchas
-- **implement-module build step hit the session limit twice** (record layer, line 3). Resume
-  with `Workflow({scriptPath, resumeFromRunId})` works: spec replays from cache, build picks up
-  the partial tree. A `review round 1: found 3, confirmed 0` result with `build: null` means
-  nothing was reviewed - ignore it.
-- **Safety filters refused some reviewer/verify agents** (crypto-reviewer r1 on line 3, two
-  verify agents). Empty verify results were checked by hand; all were already fixed. Later in
-  the session auto mode's classifier blocked Bash entirely; switching to default permission
-  mode unblocked it.
-- Internal errors map to `BRISK_E_ARG` (alert 80), never `BRISK_E_PROTO` - protocol errors blame
-  the peer, local faults do not.
-- A closure alert before CONNECTED is `BRISK_E_PEER_ALERT`, never a clean EOF.
+- badssl.com has NO TLS 1.3 host: its bad-cert rows prove nothing until M5 (TLS 1.2).
+  revoked.badssl.com must flip to "expect success" at M5 (no CRL/OCSP by design).
+- `brisk_close_notify` before CONNECTED is BRISK_E_ARG (abandon = brisk_conn_wipe).
+- API returns int + out-param (`brisk_connect(&cfg, host, port, &c)`), never NULL-means-error.
+- Open (ROADMAP line 4 notes): runtime cert-time floor not in brisk_cfg yet (must go through
+  the x509 time check, never by raising `now`); sans-I/O stamps tickets with init time.
+- Examples not yet run against a real AWS IoT account.
+- implement-module review loop is capped at 3 rounds: the last round's findings are fixed but
+  never re-reviewed - read the journal and check them by hand (one was missed this session).
+- Git-bash mangles `docker -v` paths: use PowerShell for ad-hoc docker runs.
+- Internal errors -> BRISK_E_ARG, never BRISK_E_PROTO; closure alert before CONNECTED ->
+  BRISK_E_PEER_ALERT.
