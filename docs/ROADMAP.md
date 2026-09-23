@@ -69,8 +69,23 @@ Tick a box only when the work is green on **every** arch (`python tools/dev.py t
     `brisk__x509_time_ok` next to `BRISK_X509_TIME_FLOOR` - never done by raising `now`.
   - Open: sans-I/O connections stamp tickets with the init time (no clock in the core); add a
     public `brisk_conn_set_time` if a long-lived sans-I/O user needs fresher stamps.
-- [ ] RFC 8448 trace test; Docker interop (nginx, Caddy, openssl s_server); badssl.com
-- [ ] Examples: AWS IoT HTTPS over raw TLS (ALPN x-amzn-http-ca), MQTT-over-TLS sketch
+- [x] RFC 8448 trace test; Docker interop (nginx, Caddy, openssl s_server); badssl.com
+  - RFC 8448 traces: covered by tests/test_tls13_hs.c, test_tls13_rec.c, test_tls13_ks.c.
+  - `python tools/dev.py interop` (one container, throwaway PKI under build/interop/pki,
+    examples/brisk_get as the client): openssl 3.5 s_server - default, each of the 3 suites,
+    HRR (P-256-only server), RSA-2048 leaf, P-384 intermediate, ALPN, mTLS (and its refusal
+    without a cert), resumption (2nd run resumed=1), server-requested KeyUpdate, wrong host /
+    untrusted CA -> E_AUTH, TLS 1.2-only server -> E_PEER_ALERT; nginx 1.26 and Caddy 2.6
+    GET a known body. 18/18 pass (2026-09-23).
+  - `python tools/dev.py badssl`: NO badssl.com host speaks TLS 1.3 (checked with
+    `openssl s_client -tls1_3`), so every badssl row fails with handshake_failure until M5 -
+    the bad-certificate rows prove nothing about certificate checks yet. revoked.badssl.com
+    must flip to "expected success" at M5: no CRL/OCSP by design. Positive controls
+    (www.cloudflare.com, www.google.com, system bundle) pass. 19/19 as expected.
+- [x] Examples: AWS IoT HTTPS over raw TLS (ALPN x-amzn-http-ca), MQTT-over-TLS sketch
+  - `examples/brisk_get.c` (generic CLI, the interop/badssl client), `aws_iot_https.c` (mTLS
+    POST /topics on 443), `mqtt_tls.c` (MQTT 3.1.1 CONNECT/PUBLISH, ALPN x-amzn-mqtt-ca on 443).
+    Built on Linux with BRISK_BUILD_EXAMPLES; not yet run against a real AWS account.
 
 ## M4 HTTP/2
 - [ ] HPACK (static + literal encoder, decoder with table, Huffman decode shared with QPACK)

@@ -10,6 +10,7 @@ set(BRISK_X509_TIME_POLICY "" CACHE STRING
     "X.509 validity: STRICT, FLOOR or INSECURE_NO_TIME; empty = header default")
 set_property(CACHE BRISK_X509_TIME_POLICY PROPERTY STRINGS "" STRICT FLOOR INSECURE_NO_TIME)
 option(BRISK_BUILD_TESTS "Build the test suite" ${PROJECT_IS_TOP_LEVEL})
+option(BRISK_BUILD_EXAMPLES "Build examples/ (Linux only)" ${PROJECT_IS_TOP_LEVEL})
 
 # ponytail: static only until M8 (shared builds need BRISK_SHARED_BUILD + tests on internal symbols)
 add_library(brisk STATIC
@@ -132,4 +133,15 @@ if(BRISK_SIZE_PROBE)
     target_link_libraries(brisk_size_probe PRIVATE brisk)
     target_include_directories(brisk_size_probe PRIVATE src)
     target_link_options(brisk_size_probe PRIVATE -static "-Wl,-Map=${CMAKE_BINARY_DIR}/size_probe.map")
+endif()
+
+if(BRISK_BUILD_EXAMPLES AND CMAKE_SYSTEM_NAME STREQUAL "Linux") # the blocking API is Linux-only
+    foreach(ex brisk_get aws_iot_https mqtt_tls)
+        add_executable(${ex} examples/${ex}.c)
+        set_target_properties(${ex} PROPERTIES C_STANDARD 99 C_EXTENSIONS OFF)
+        target_link_libraries(${ex} PRIVATE brisk)
+        if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
+            target_compile_options(${ex} PRIVATE -Wall -Wextra -Wpedantic)
+        endif()
+    endforeach()
 endif()

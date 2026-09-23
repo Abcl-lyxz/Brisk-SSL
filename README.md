@@ -49,6 +49,8 @@ Full table: [docs/CONFIG.md](docs/CONFIG.md).
 cmake --workflow --preset dev                 # host build + tests (gcc)
 python tools/dev.py test --arch all           # every arch under qemu (needs Docker)
 python tools/dev.py size --arch all --md      # per-module size table
+python tools/dev.py interop                   # vs openssl s_server, nginx, Caddy (Docker)
+python tools/dev.py badssl                    # vs badssl.com (Docker + internet)
 ```
 Or add `src/` and `include/` to your own build: plain C99, no dependencies. Configuration:
 [docs/CONFIG.md](docs/CONFIG.md). Design: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).

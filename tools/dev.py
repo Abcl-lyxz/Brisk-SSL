@@ -8,6 +8,8 @@
                                                  per-module flash/RAM from the linker map (-Os, static)
   python tools/dev.py ct                         constant-time check: the ct suite under valgrind
   python tools/dev.py fuzz [der|name|tls13_hs|tls13_rec|ticket|conn] [--seconds N]  libFuzzer over a parser, seeded from its .inc
+  python tools/dev.py interop                    brisk_get vs openssl s_server, nginx, Caddy (test PKI)
+  python tools/dev.py badssl                     brisk_get vs badssl.com (needs internet)
   python tools/dev.py image                      (re)build the brisk-dev Docker image
 
 Docker builds live in the named volume `brisk-build` (fast, and never collide with host builds).
@@ -273,6 +275,262 @@ def cmd_fuzz(target, seconds):
     return rc
 
 
+# ---------------------------------------------------------------------------------------- interop
+# Both run INSIDE one container (`_interop` / `_badssl`): build brisk_get, then drive it against
+# real servers. Each scenario asserts success (and what must appear on stdout/stderr) or the
+# exact failure. brisk_get exits 0 on success, 2 on any connection failure, printing the error.
+IOP = "build/interop"
+PKI = f"{IOP}/pki"
+
+
+def sh(cmd, **kw):
+    r = subprocess.run(cmd, shell=isinstance(cmd, str), capture_output=True, text=True, **kw)
+    if r.returncode:
+        sys.exit(f"command failed: {cmd}\n{r.stdout}{r.stderr}")
+    return r.stdout
+
+
+def build_brisk_get():
+    sh(["cmake", "-S", ".", "-B", IOP, "-G", "Ninja", "-DCMAKE_BUILD_TYPE=Release",
+        "-DBRISK_BUILD_TESTS=OFF", "-DBRISK_BUILD_EXAMPLES=ON"])
+    sh(["cmake", "--build", IOP, "--target", "brisk_get"])
+    return f"./{IOP}/brisk_get"
+
+
+def make_pki():
+    """Throwaway test PKI: two roots, P-256 / RSA-2048 leaves, a P-384 intermediate, a client."""
+    Path(PKI).mkdir(parents=True, exist_ok=True)
+    ossl = lambda *a: sh(["openssl", *a], cwd=PKI)
+    keyopt = {"p256": ["-newkey", "ec", "-pkeyopt", "ec_paramgen_curve:P-256"],
+              "p384": ["-newkey", "ec", "-pkeyopt", "ec_paramgen_curve:P-384"],
+              "rsa": ["-newkey", "rsa:2048"]}
+    ca_ext = "basicConstraints=critical,CA:TRUE,pathlen:1\nkeyUsage=critical,keyCertSign,cRLSign\n"
+    leaf_ext = ("basicConstraints=critical,CA:FALSE\nkeyUsage=critical,digitalSignature\n"
+                "subjectKeyIdentifier=hash\nauthorityKeyIdentifier=keyid\n")
+    Path(PKI, "ca.ext").write_text(ca_ext + "subjectKeyIdentifier=hash\nauthorityKeyIdentifier=keyid\n")
+    Path(PKI, "server.ext").write_text(leaf_ext + "extendedKeyUsage=serverAuth\nsubjectAltName=DNS:localhost\n")
+    Path(PKI, "client.ext").write_text(leaf_ext + "extendedKeyUsage=clientAuth\n")
+    for root in ("root", "other"):
+        ossl("req", "-x509", *keyopt["p256"], "-nodes", "-keyout", f"{root}.key", "-out",
+             f"{root}.pem", "-days", "30", "-subj", f"/CN=Brisk interop {root}")
+
+    def issue(name, kind, ca, ext, md="sha256"):
+        ossl("req", "-new", *keyopt[kind], "-nodes", "-keyout", f"{name}.key", "-out",
+             f"{name}.csr", "-subj", f"/CN={name}")
+        ossl("x509", "-req", "-in", f"{name}.csr", "-CA", f"{ca}.pem", "-CAkey", f"{ca}.key",
+             "-days", "30", f"-{md}", "-extfile", ext, "-out", f"{name}.pem")
+
+    issue("leaf-p256", "p256", "root", "server.ext")
+    issue("leaf-rsa", "rsa", "root", "server.ext")
+    issue("inter-p384", "p384", "root", "ca.ext")
+    issue("leaf-via384", "p256", "inter-p384", "server.ext", "sha384")
+    issue("client", "p256", "root", "client.ext")
+    ossl("x509", "-in", "client.pem", "-outform", "DER", "-out", "client.der")
+    der = subprocess.run(["openssl", "ec", "-in", "client.key", "-outform", "DER"], cwd=PKI,
+                         capture_output=True, check=True).stdout
+    assert der[5:7] == b"\x04\x20", "unexpected SEC1 layout"  # 30 77 02 01 01 04 20 <d>
+    Path(PKI, "client.d").write_bytes(der[7:39])
+
+
+def pki(f):
+    return f"{PKI}/{f}"
+
+
+def wait_port(port, proc, secs=15):
+    import socket
+    import time
+    end = time.time() + secs
+    while time.time() < end:
+        if proc.poll() is not None:
+            sys.exit(f"server on :{port} died:\n{proc.stdout.read() if proc.stdout else ''}")
+        try:
+            socket.create_connection(("127.0.0.1", port), 0.5).close()
+            return
+        except OSError:
+            time.sleep(0.1)
+    sys.exit(f"server on :{port} never listened")
+
+
+def serve(cmd, port, stdin=None):
+    p = subprocess.Popen(cmd, stdin=stdin, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                         text=True)
+    wait_port(port, p)
+    return p
+
+
+def client(exe, args, host="localhost", port=443):
+    r = subprocess.run([exe, *args, host, str(port)], capture_output=True, text=True, timeout=60)
+    return r.returncode, r.stdout, r.stderr
+
+
+def check(res, expect):
+    """expect: ("ok", stdout_needle, stderr_needle) or ("fail", stderr_needle)."""
+    rc, out, err = res
+    if expect[0] == "ok":
+        good = rc == 0 and expect[1] in out and expect[2] in err
+    else:  # a clean failure: exit 2 (never a crash signal), with the expected error named
+        good = rc == 2 and expect[1] in err
+    detail = err.strip().splitlines()[-1] if err.strip() else f"rc={rc}"
+    return good, detail
+
+
+def interop_inside():
+    exe = build_brisk_get()
+    make_pki()
+    ca = ["-c", pki("root.pem")]
+    ok = lambda out="", err="": ("ok", out, err)
+    rows = []
+
+    def s_server(extra, cert="leaf-p256", port=4433):
+        return serve(["openssl", "s_server", "-accept", str(port), "-www", "-cert", pki(f"{cert}.pem"),
+                      "-key", pki(f"{cert}.key"), *extra], port)
+
+    # (name, s_server args, cert, brisk_get args, host, expectation)
+    S = [
+        ("default (TLS 1.3)", ["-tls1_3"], "leaf-p256", ca, "localhost", ok("TLSv1.3")),
+        ("TLS_AES_128_GCM_SHA256", ["-tls1_3", "-ciphersuites", "TLS_AES_128_GCM_SHA256"],
+         "leaf-p256", ca, "localhost", ok("TLS_AES_128_GCM_SHA256")),
+        ("TLS_AES_256_GCM_SHA384", ["-tls1_3", "-ciphersuites", "TLS_AES_256_GCM_SHA384"],
+         "leaf-p256", ca, "localhost", ok("TLS_AES_256_GCM_SHA384")),
+        ("TLS_CHACHA20_POLY1305_SHA256", ["-tls1_3", "-ciphersuites", "TLS_CHACHA20_POLY1305_SHA256"],
+         "leaf-p256", ca, "localhost", ok("TLS_CHACHA20_POLY1305_SHA256")),
+        # our first key share is x25519, so a P-256-only server must send HelloRetryRequest
+        ("HRR: -groups P-256", ["-tls1_3", "-groups", "P-256"], "leaf-p256", ca, "localhost",
+         ok("TLSv1.3")),
+        ("RSA-2048 leaf (rsa_pss_rsae)", ["-tls1_3"], "leaf-rsa", ca, "localhost", ok("TLSv1.3")),
+        ("P-384 intermediate chain", ["-tls1_3", "-cert_chain", pki("inter-p384.pem")],
+         "leaf-via384", ca, "localhost", ok("TLSv1.3")),
+        ("ALPN h2,http/1.1 -> http/1.1", ["-tls1_3", "-alpn", "http/1.1"], "leaf-p256",
+         ca + ["-a", "h2,http/1.1"], "localhost", ok("TLSv1.3", "alpn=http/1.1 ")),
+        ("mTLS P-256 device cert", ["-tls1_3", "-Verify", "1", "-CAfile", pki("root.pem")],
+         "leaf-p256", ca + ["-C", pki("client.der"), "-K", pki("client.d")], "localhost",
+         ok("CN=client")),
+        # TLS 1.3: the client finishes first; the server's certificate_required alert arrives
+        # on the first read
+        ("mTLS required, no cert -> fail", ["-tls1_3", "-Verify", "1", "-CAfile", pki("root.pem")],
+         "leaf-p256", ca, "localhost", ("fail", "E_PEER_ALERT")),
+        ("wrong host name -> fail", ["-tls1_3"], "leaf-p256", ca, "127.0.0.1", ("fail", "E_AUTH")),
+        ("untrusted CA -> fail", ["-tls1_3"], "leaf-p256", ["-c", pki("other.pem")], "localhost",
+         ("fail", "E_AUTH")),
+        ("TLS 1.2-only server -> fail (until M5)", ["-tls1_2"], "leaf-p256", ca, "localhost",
+         ("fail", "E_PEER_ALERT")),
+    ]
+    for name, sargs, cert, cargs, host, expect in S:
+        srv = s_server(sargs, cert)
+        try:
+            rows.append((name, *check(client(exe, cargs, host, 4433), expect)))
+        finally:
+            srv.kill()
+            srv.wait()
+
+    # resumption: same s_server process (same ticket key), two runs sharing one ticket file
+    tk = f"{IOP}/ticket.bin"
+    Path(tk).unlink(missing_ok=True)
+    srv = s_server(["-tls1_3"])
+    try:
+        rows.append(("resumption: 1st run full", *check(client(exe, ca + ["-T", tk], port=4433),
+                                                         ok("TLSv1.3", "resumed=0"))))
+        rows.append(("resumption: 2nd run resumed", *check(client(exe, ca + ["-T", tk], port=4433),
+                                                            ok("Reused", "resumed=1"))))
+    finally:
+        srv.kill()
+        srv.wait()
+    rows.append(keyupdate(exe, ca))
+
+    # nginx and Caddy: TLS 1.3, HTTP/1.1 GET of a known body
+    Path(IOP, "nginx").mkdir(exist_ok=True)
+    Path(IOP, "nginx.conf").write_text(f"""
+pid /src/{IOP}/nginx/nginx.pid; error_log stderr; daemon off; events {{}}
+http {{ access_log off; client_body_temp_path /src/{IOP}/nginx;
+  server {{ listen 127.0.0.1:8443 ssl; ssl_protocols TLSv1.3;
+    ssl_certificate /src/{pki('leaf-p256.pem')}; ssl_certificate_key /src/{pki('leaf-p256.key')};
+    location / {{ return 200 "brisk-nginx-ok\\n"; }} }} }}
+""")
+    Path(IOP, "Caddyfile").write_text(f"""{{
+  admin off
+  storage file_system /src/{IOP}/caddy
+}}
+https://localhost:8444 {{
+  tls /src/{pki('leaf-p256.pem')} /src/{pki('leaf-p256.key')}
+  respond "brisk-caddy-ok"
+}}
+""")
+    env = dict(os.environ, HOME=f"/src/{IOP}", XDG_DATA_HOME=f"/src/{IOP}/caddy",
+               XDG_CONFIG_HOME=f"/src/{IOP}/caddy")
+    for name, cmd, port, body in (
+            ("nginx GET", ["nginx", "-c", f"/src/{IOP}/nginx.conf", "-p", f"/src/{IOP}/nginx"],
+             8443, "brisk-nginx-ok"),
+            ("Caddy GET", ["caddy", "run", "--config", f"{IOP}/Caddyfile", "--adapter", "caddyfile"],
+             8444, "brisk-caddy-ok")):
+        srv = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, env=env)
+        wait_port(port, srv)
+        try:
+            rows.append((name, *check(client(exe, ca, port=port), ok(body))))
+        finally:
+            srv.kill()
+            srv.wait()
+    return report(rows)
+
+
+def keyupdate(exe, ca):
+    """s_server reads commands from stdin: "K" = KeyUpdate(update_requested), "q" = close."""
+    import time
+    srv = serve(["openssl", "s_server", "-accept", "4434", "-tls1_3", "-cert", pki("leaf-p256.pem"),
+                 "-key", pki("leaf-p256.key")], 4434, stdin=subprocess.PIPE)
+    cl = subprocess.Popen([exe, *ca, "-r", "hello\n", "localhost", "4434"], stdout=subprocess.PIPE,
+                          stderr=subprocess.PIPE, text=True)
+    try:
+        time.sleep(2)  # handshake + "hello" (ponytail: fixed sleep; watch s_server stdout if flaky)
+        for line in ("K\n", "after-keyupdate\n", "q\n"):  # one command per read(2)
+            srv.stdin.write(line)
+            srv.stdin.flush()
+            time.sleep(0.5)
+        out, err = cl.communicate(timeout=30)
+    finally:
+        cl.kill()
+        srv.kill()
+        srv.wait()
+    good, detail = check((cl.returncode, out, err), ("ok", "after-keyupdate", ""))
+    # s_server logs "SSL_do_handshake -> 1" once its KeyUpdate is out; an undecryptable answer
+    # from us would log ERROR. (The ERROR before "hello" is wait_port's empty probe connection.)
+    log = srv.stdout.read().partition("hello")[2]
+    good = good and "SSL_do_handshake -> 1" in log and "ERROR" not in log
+    return "KeyUpdate (server-initiated, requested)", good, detail
+
+
+def report(rows):
+    w = max(len(r[0]) for r in rows)
+    for name, good, detail in rows:
+        print(f"{name:<{w}}  {'PASS' if good else 'FAIL'}  {detail}")
+    bad = sum(1 for r in rows if not r[1])
+    print(f"\n{len(rows) - bad}/{len(rows)} passed")
+    return 1 if bad else 0
+
+
+# badssl.com, checked empirically on 2026-09-23 with `openssl s_client -tls1_3`: NO badssl.com
+# host negotiates TLS 1.3 (every one answers handshake_failure), so until M5 (TLS 1.2) every
+# badssl host must fail - and the "bad certificate" rows fail for that reason, not the
+# certificate. They are here so M5 only has to flip expectations. revoked.badssl.com will be
+# EXPECTED TO SUCCEED then: Brisk-SSL does no revocation checking (no CRL/OCSP, by design).
+# Two TLS 1.3 sites with public certificates are the positive control for the system bundle.
+BADSSL = [(f"{h}.badssl.com", 443, "fail") for h in (
+    "sha256", "sha384", "sha512", "ecc256", "ecc384", "rsa2048", "rsa4096", "expired",
+    "wrong.host", "self-signed", "untrusted-root", "revoked", "incomplete-chain",
+    "mozilla-modern")] + [("badssl.com", 443, "fail"), ("tls-v1-2.badssl.com", 1012, "fail"),
+                          ("tls-v1-0.badssl.com", 1010, "fail"),
+                          ("www.cloudflare.com", 443, "ok"), ("www.google.com", 443, "ok")]
+
+
+def badssl_inside():
+    exe = build_brisk_get()
+    rows = []
+    for host, port, want in BADSSL:
+        res = client(exe, ["-r", f"HEAD / HTTP/1.1\nHost: {host}\nConnection: close\n\n"], host, port)
+        rows.append((f"{host}:{port} expect {want}",
+                     *check(res, ("ok", "HTTP/", "") if want == "ok" else ("fail", "brisk:"))))
+    return report(rows)
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -289,6 +547,10 @@ def main():
     f = sub.add_parser("fuzz")
     f.add_argument("target", nargs="?", default="der", choices=sorted(FUZZ))
     f.add_argument("--seconds", type=int, default=60)
+    sub.add_parser("interop")
+    sub.add_parser("badssl")
+    sub.add_parser("_interop")
+    sub.add_parser("_badssl")
     sub.add_parser("image")
     m = sub.add_parser("_measure")
     m.add_argument("arch")
@@ -301,6 +563,12 @@ def main():
         return cmd_ct()
     if a.cmd == "fuzz":
         return cmd_fuzz(a.target, a.seconds)
+    if a.cmd in ("interop", "badssl"):
+        return run(docker_cmd(["python3", "tools/dev.py", "_" + a.cmd]), False)[0]
+    if a.cmd == "_interop":
+        return interop_inside()
+    if a.cmd == "_badssl":
+        return badssl_inside()
     if a.cmd == "image":
         return run(["docker", "build", "-t", IMAGE, "docker/"], False)[0]
     if a.cmd == "_measure":

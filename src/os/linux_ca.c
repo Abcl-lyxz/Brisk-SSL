@@ -41,7 +41,7 @@
  * unit file redirect verification, and on an appliance that is a bigger surface than it is a
  * convenience. A caller who wants another file sets brisk__x509_bundle.path and no search runs.
  *
- * NOT supported either: a hashed directory (/etc/ssl/certs/*.0). It needs getdents and a
+ * NOT supported either: a hashed directory (/etc/ssl/certs/HASH.0). It needs getdents and a
  * second Name-to-hash implementation to find a file, and every system that ships one also
  * ships the concatenated bundle above. */
 static const char *const CA_PATHS[] = {"/etc/ssl/certs/ca-certificates.crt",

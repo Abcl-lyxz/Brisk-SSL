@@ -9,6 +9,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         build-essential cmake ninja-build python3 git ca-certificates curl file \
         clang lld llvm libclang-rt-dev clang-format clang-tidy cppcheck valgrind \
         qemu-user \
+        openssl nginx-light caddy \
         gcc-i686-linux-gnu        libc6-dev-i386-cross \
         gcc-aarch64-linux-gnu     libc6-dev-arm64-cross \
         gcc-arm-linux-gnueabihf   libc6-dev-armhf-cross \
