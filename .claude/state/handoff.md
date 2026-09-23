@@ -19,10 +19,11 @@
 - Nothing. Tree clean and pushed.
 
 ## Next up
-- **Blocked on a user decision before M3 line 4:** GHASH timing on early-terminating
-  multipliers (armv5, some MIPS32) now that AES-GCM is on the wire (see ROADMAP note under the
-  record layer line). Present options + recommendation to the user FIRST; the user explicitly
-  said not to start line 4 yet.
+- **Multiply-free GHASH (user decided, see docs/ARCHITECTURE.md "Crypto choices").** In
+  src/crypto/gcm.c add a shift + masked-XOR GHASH, chosen by a new tri-state knob in
+  include/brisk_config.h (auto = on for armv5 and 32-bit MIPS). Same SP 800-38D/Wycheproof
+  vectors must pass with the knob forced on for every arch; ct check must stay clean. Do this
+  before line 4; the user said not to start line 4 yet.
 - Then M3 line 4: `src/os/` sockets + public API `brisk_connect/read/write/close`, sans-I/O
   `brisk_feed/pull`. The line-4 arena must keep the handshake reassembly scratch alive for
   post-handshake messages (or skip NSTs that do not fit).
