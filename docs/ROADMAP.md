@@ -110,7 +110,12 @@ Tick a box only when the work is green on **every** arch (`python tools/dev.py t
   - QPACK (M7) must prefix its static helpers (qp_*) - hpack.c's generic names (insert,
     put_int, ...) clash when amalgamated; h2.c uses h2_*.
   - Before commit: rfc-auditor pass (not yet run).
-- [ ] Interop: nginx, h2o, nghttpd
+- [x] Interop: nginx, h2o, nghttpd
+  - `python tools/dev.py interop` h2 rows via `examples/h2_get.c`: nginx 1.26, h2o (built from a
+    pinned commit - trixie has no package), nghttpd (with response trailers): small GET + headers,
+    1.5 MB GET (receive flow control), 300 KB POST echo (send flow control), 4 parallel 1.5 MB
+    streams, 404; nginx keepalive_requests 1 -> GOAWAY -> 2nd request E_RETRY; a server without
+    ALPN -> brisk_h2_open E_ARG. 35/35 with the TLS rows (2026-09-24).
 
 ## M5 TLS 1.2 client
 - [ ] ECDHE-ECDSA/RSA x AES-GCM / ChaCha20-Poly1305, EMS required, renegotiation_info, PRF

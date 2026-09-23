@@ -8,7 +8,7 @@
                                                  per-module flash/RAM from the linker map (-Os, static)
   python tools/dev.py ct                         constant-time check: the ct suite under valgrind
   python tools/dev.py fuzz [der|name|tls13_hs|tls13_rec|ticket|conn|hpack|h2] [--seconds N]  libFuzzer over a parser, seeded from its .inc
-  python tools/dev.py interop                    brisk_get vs openssl s_server, nginx, Caddy (test PKI)
+  python tools/dev.py interop                    brisk_get vs s_server/nginx/Caddy; h2_get vs nginx/h2o/nghttpd
   python tools/dev.py badssl                     brisk_get vs badssl.com (needs internet)
   python tools/dev.py image                      (re)build the brisk-dev Docker image
 
@@ -301,7 +301,7 @@ def sh(cmd, **kw):
 def build_brisk_get():
     sh(["cmake", "-S", ".", "-B", IOP, "-G", "Ninja", "-DCMAKE_BUILD_TYPE=Release",
         "-DBRISK_BUILD_TESTS=OFF", "-DBRISK_BUILD_EXAMPLES=ON"])
-    sh(["cmake", "--build", IOP, "--target", "brisk_get"])
+    sh(["cmake", "--build", IOP, "--target", "brisk_get", "h2_get"])
     return f"./{IOP}/brisk_get"
 
 
@@ -477,7 +477,152 @@ https://localhost:8444 {{
         finally:
             srv.kill()
             srv.wait()
+    rows += h2_interop(ca, env)
     return report(rows)
+
+
+def fnv(data):
+    """FNV-1a 32, as h2_get -q prints it."""
+    h = 2166136261
+    for b in data:
+        h = ((h ^ b) * 16777619) & 0xFFFFFFFF
+    return f"{h:08x}"
+
+
+def echo_backend(port):
+    """Plain HTTP/1.1 upstream for the proxies: answers POST/PUT with the request body."""
+    import threading
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+    class Echo(BaseHTTPRequestHandler):
+        def do_POST(self):
+            if self.headers.get("Transfer-Encoding", "").lower() == "chunked":
+                data = b""
+                while (n := int(self.rfile.readline().split(b";")[0], 16)) > 0:
+                    data += self.rfile.read(n)
+                    self.rfile.readline()
+                while self.rfile.readline() not in (b"\r\n", b""):
+                    pass
+            else:
+                data = self.rfile.read(int(self.headers.get("Content-Length", 0)))
+            self.send_response(200)
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+
+        do_PUT = do_POST
+
+        def log_message(self, *a):
+            pass
+
+    srv = ThreadingHTTPServer(("127.0.0.1", port), Echo)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    return srv
+
+
+def h2_interop(ca, env):
+    """h2_get (brisk_h2_*) vs nginx, h2o and nghttpd: TLS 1.3, ALPN h2, the test PKI."""
+    h2 = f"./{IOP}/h2_get"
+    www = Path(IOP, "www")
+    www.mkdir(exist_ok=True)
+    (www / "small.txt").write_text("brisk-h2-ok\n")
+    big = os.urandom(1536 * 1024)  # > 1 MB: several times our 8 KB stream window
+    (www / "big.bin").write_bytes(big)
+    up = 300000                       # > 256 KB upload: send-side flow control
+    big_line = f"status 200 bytes {len(big)} fnv {fnv(big)}"
+    up_line = f"status 200 bytes {up} fnv {fnv(bytes(i % 251 for i in range(up)))}"
+    cert, key = f"/src/{pki('leaf-p256.pem')}", f"/src/{pki('leaf-p256.key')}"
+    echo = echo_backend(9080)
+    rows = []
+
+    def run(args, port, path):
+        r = subprocess.run([h2, *ca, *args, "localhost", str(port), path], capture_output=True,
+                           text=True, timeout=60)
+        return r.returncode, r.stdout, r.stderr
+
+    def row(name, res, good):
+        rc, out, err = res
+        tail = err.strip().splitlines()[-1] if err.strip() else f"rc={rc}"
+        rows.append((name, bool(good(rc, out, err)), tail))
+
+    Path(IOP, "nginx-h2").mkdir(exist_ok=True)
+    Path(IOP, "nginx-h2.conf").write_text(f"""
+pid /src/{IOP}/nginx-h2/nginx.pid; error_log stderr; daemon off; events {{}}
+http {{ access_log off; client_body_temp_path /src/{IOP}/nginx-h2; proxy_temp_path /src/{IOP}/nginx-h2;
+  ssl_protocols TLSv1.3; ssl_certificate {cert}; ssl_certificate_key {key}; root /src/{IOP}/www;
+  server {{ listen 127.0.0.1:8453 ssl; http2 on;
+    location /echo {{ client_max_body_size 4m; proxy_pass http://127.0.0.1:9080; }} }}
+  # one request per connection: nginx answers it, then sends GOAWAY (last stream 1)
+  server {{ listen 127.0.0.1:8454 ssl; http2 on; keepalive_requests 1; }} }}
+""")
+    Path(IOP, "h2o").mkdir(exist_ok=True)
+    Path(IOP, "h2o.conf").write_text(f"""
+user: nobody
+pid-file: /tmp/h2o.pid
+error-log: /src/{IOP}/h2o/error.log
+listen:
+  host: 127.0.0.1
+  port: 8455
+  ssl:
+    certificate-file: {cert}
+    key-file: {key}
+    minimum-version: TLSv1.3
+hosts:
+  "localhost:8455":
+    paths:
+      /echo:
+        proxy.reverse.url: http://127.0.0.1:9080/echo
+      /:
+        file.dir: /src/{IOP}/www
+""")
+    servers = {
+        "nginx": (["nginx", "-c", f"/src/{IOP}/nginx-h2.conf", "-p", f"/src/{IOP}/nginx-h2"], 8453),
+        "h2o": (["h2o", "-c", f"/src/{IOP}/h2o.conf"], 8455),
+        # every nghttpd response carries a trailer field: the API discards it, the body must survive
+        "nghttpd": (["nghttpd", "-d", f"/src/{IOP}/www", "--echo-upload",
+                     "--trailer=x-brisk-trailer: yes", "8456", key, cert], 8456),
+    }
+    for name, (cmd, port) in servers.items():
+        srv = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, env=env)
+        wait_port(port, srv)
+        try:
+            row(f"h2 {name}: GET small + headers", run([], port, "/small.txt"),
+                lambda rc, o, e: rc == 0 and o == "brisk-h2-ok\n" and "< :status: 200" in e
+                and f"< server: {name}" in e)
+            row(f"h2 {name}: GET 1.5 MB (recv flow ctl)", run(["-q"], port, "/big.bin"),
+                lambda rc, o, e: rc == 0 and o.strip() == big_line)
+            row(f"h2 {name}: POST 300 KB echo (send flow ctl)", run(["-q", "-D", str(up)], port, "/echo"),
+                lambda rc, o, e: rc == 0 and o.strip() == up_line)
+            row(f"h2 {name}: 4 parallel streams x 1.5 MB", run(["-q", "-n", "4"], port, "/big.bin"),
+                lambda rc, o, e: rc == 0 and o.splitlines() == [big_line] * 4)
+            row(f"h2 {name}: 404", run([], port, "/missing"),
+                lambda rc, o, e: rc == 0 and "< :status: 404" in e)
+        finally:
+            srv.kill()
+            srv.wait()
+
+    srv = subprocess.Popen(servers["nginx"][0], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+    wait_port(8454, srv)
+    try:  # brisk.h: a request after GOAWAY, or above its last stream id, is BRISK_E_RETRY
+        row("h2 nginx: GOAWAY after 1 request -> E_RETRY", run(["-r", "2"], 8454, "/small.txt"),
+            lambda rc, o, e: rc == 2 and o == "brisk-h2-ok\n" and " 2: E_RETRY" in e)
+    finally:
+        srv.kill()
+        srv.wait()
+    echo.shutdown()
+
+    # a server that ignores ALPN: the handshake completes with none selected, and brisk_h2_open
+    # must refuse (no protocol switching). A server that answers the mismatch with
+    # no_application_protocol (RFC 7301 3.2, what s_server -alpn http/1.1 does) never gets here.
+    srv = serve(["openssl", "s_server", "-accept", "4433", "-www", "-tls1_3",
+                 "-cert", pki("leaf-p256.pem"), "-key", pki("leaf-p256.key")], 4433)
+    try:
+        row("h2 server without ALPN -> h2_open E_ARG", run([], 4433, "/"),
+            lambda rc, o, e: rc == 2 and "h2_open: E_ARG" in e)
+    finally:
+        srv.kill()
+        srv.wait()
+    return rows
 
 
 def keyupdate(exe, ca):
