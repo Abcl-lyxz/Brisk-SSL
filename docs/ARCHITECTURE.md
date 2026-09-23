@@ -44,21 +44,26 @@ legacy_session_id, ALPN mandatory, transport parameters extension 0x39, no KeyUp
 ## Public API shape
 ```c
 brisk_cfg cfg = BRISK_DEFAULTS;              /* zero-init = secure defaults */
-cfg.versions  = BRISK_TLS12 | BRISK_TLS13;
-cfg.alpn      = "x-amzn-http-ca";            /* free-form list: "h2", "mqtt", ... */
-cfg.ca_file   = "/etc/ssl/certs/ca-certificates.crt";   /* NULL = autodetect */
-cfg.cert_file = "dev.crt"; cfg.key_file = "dev.key";    /* mTLS, ECDSA P-256 */
+cfg.alpn      = "x-amzn-http-ca";            /* comma-separated list: "h2,http/1.1", "mqtt" */
+cfg.ca_file   = "/etc/ssl/certs/ca-certificates.crt";   /* NULL (+ no ca_mem) = autodetect */
+cfg.client_chain = dev_der; cfg.client_chain_len = n;   /* mTLS, ECDSA P-256 (in memory)   */
+cfg.client_key   = dev_d32;                             /* or cfg.sign = secure element    */
 
-brisk_conn *c = brisk_connect(&cfg, "iot.example.com", 443);
+brisk_conn *c;
+if (brisk_connect(&cfg, "iot.example.com", 443, &c) != BRISK_OK) { ... }
 brisk_write(c, req, req_len);
-n = brisk_read(c, buf, sizeof buf);
+n = brisk_read(c, buf, sizeof buf);          /* >0 data, 0 close_notify, <0 BRISK_E_* */
 brisk_close(c);
 
-brisk_h2 *h = brisk_h2_open(c);                          /* optional modules */
+brisk_h2 *h = brisk_h2_open(c);                          /* optional modules (M4, M7) */
 brisk_h3 *q = brisk_h3_connect(&cfg, host, 443);
 
-brisk_feed(c, in, n); brisk_pull(c, out, cap);           /* sans-I/O for your own loop */
+/* sans-I/O for your own loop, in your own memory (brisk_conn_size() bytes) */
+brisk_conn_init(mem, sizeof mem, &cfg, host, &c);
+brisk_pull(c, out, cap); brisk_feed(c, in, n, &used); brisk_app_read(c, buf, cap, &got);
 ```
+Status-returning calls (`int` + out-parameter), never a NULL-means-error pointer. TLS 1.2 adds
+no `versions` knob until M5 needs one.
 
 ## Memory model
 - Core: caller-provided memory sized by `brisk_*_size()`; blocking API does one arena malloc
@@ -68,7 +73,15 @@ brisk_feed(c, in, n); brisk_pull(c, out, cap);           /* sans-I/O for your ow
   RFC 8449 record_size_limit, so smaller buffers only work against servers you control
   (opt-in `max_fragment_length`, handshake fails cleanly if not acknowledged).
 - Certificate chain reassembly cap 12 KB (knob); scratch reused for HTTP state after Finished.
-- Estimates until measured: TLS 1.3 ~26 KB peak, + h2 ~35-40 KB, QUIC + h3 ~45 KB.
+- MEASURED (M3 line 4): `brisk_conn_size()` = 41,839 B on 32-bit targets (i686 41,763) and
+  42,663 B on 64-bit: rec_in 16,645 + handshake scratch 19.8-20.4 KB (12 KB reassembly +
+  CertificateVerify + certificate array + 6 KB output queue with mTLS) + ~5.4 KB fixed state
+  (engine, record dirs, the 2 KB PEM scratch of the anchor lookup, host, ALPN). The blocking
+  API adds 6 KB (tx 4 KB, rx 2 KB) to its one malloc, so ~48 KB per connection. The old
+  "~26 KB" estimate ignored that the scratch must outlive the handshake (post-handshake
+  NewSessionTicket/KeyUpdate go through the engine). Cheapest future cuts: a TINY profile with
+  a smaller BRISK_TLS_MAX_HS_MSG, or sharing the PEM scratch with the output queue.
+- Estimates until measured: + h2 ~35-40 KB, QUIC + h3 ~45 KB.
 
 ## Security defaults
 - Verification always on (chain + RFC 9525 hostname, SAN only); `insecure` is explicit and logged.

@@ -411,8 +411,8 @@ static int conn_record(brisk__tls13_conn *c, size_t rlen)
         }
         /* 6: the level is ignored; close_notify and user_canceled are closure alerts, every
          * other value - unknown ones too - is fatal */
-        if (hs->state != BRISK__HS_CONNECTED && (r[1] == BRISK__ALERT_CLOSE_NOTIFY ||
-                                                 r[1] == BRISK__ALERT_USER_CANCELED)) {
+        if (hs->state != BRISK__HS_CONNECTED &&
+            (r[1] == BRISK__ALERT_CLOSE_NOTIFY || r[1] == BRISK__ALERT_USER_CANCELED)) {
             /* 6.1: a closure alert before the handshake is done cancels it - never a clean EOF
              * on a connection that was never authenticated */
             return conn_peer_fatal(c, r[1]);
@@ -702,6 +702,11 @@ int brisk__tls13_conn_close(brisk__tls13_conn *c)
         c->close = 1;
     }
     return BRISK_OK;
+}
+
+int brisk__tls13_conn_abort(brisk__tls13_conn *c, uint8_t alert, int err)
+{
+    return conn_fail(c, alert, err);
 }
 
 void brisk__tls13_conn_wipe(brisk__tls13_conn *c)

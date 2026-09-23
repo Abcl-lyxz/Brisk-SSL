@@ -1774,8 +1774,8 @@ int brisk__tls13_hs_alpn(const brisk__tls13_hs *hs, const uint8_t **name, size_t
 /* 1 if the ServerHello accepted the PSK: no certificate was checked on this connection. */
 int brisk__tls13_hs_resumed(const brisk__tls13_hs *hs);
 
-/* ---- tls/ticket.c: the resumption ticket blob, the ONE parser of caller-stored bytes -------------
- * Blob v1, big-endian, byte-addressed (portable across archs): ver(1)=1 | suite(2) |
+/* ---- tls/ticket.c: the resumption ticket blob, the ONE parser of caller-stored bytes
+ * ------------- Blob v1, big-endian, byte-addressed (portable across archs): ver(1)=1 | suite(2) |
  * issued_ms(8, int64) | lifetime(4) | age_add(4) | psk_len(1) psk | sni_len(1) sni |
  * ticket_len(2) ticket, nothing after. KEY MATERIAL (the PSK). ALPN is per connection (RFC 7301
  * 3.1) and is not stored. The SNI stored and compared is the caller's host with one trailing dot
@@ -1933,6 +1933,10 @@ int brisk__tls13_conn_write(brisk__tls13_conn *c, const uint8_t *data, size_t le
 int brisk__tls13_conn_close(brisk__tls13_conn *c);
 /* Wipe both directions, the pending secret, the engine and the receive buffer. Safe on NULL. */
 void brisk__tls13_conn_wipe(brisk__tls13_conn *c);
+/* A LOCAL fatal condition found by the layer above (conn.c: a ClientHello2 it cannot build):
+ * the same sticky path as the connection's own failures - `alert` queued for conn_pull, every
+ * secret forgotten. Returns the sticky code (`err`, or an earlier one). */
+int brisk__tls13_conn_abort(brisk__tls13_conn *c, uint8_t alert, int err);
 
 /* x509/chain.c: an ECDSA-Sig-Value (strict DER, RFC 5480 A.1) as the fixed-width r || s of
  * 2 * flen bytes. BRISK_E_ARG on any encoding error, negative or over-wide integer, trailing
@@ -1945,5 +1949,95 @@ int brisk__x509_ecdsa_raw(const uint8_t *sig, size_t sig_len, size_t flen, uint8
  * 8..72. The client CertificateVerify's encoder (RFC 9846 4.3.3). */
 size_t brisk__x509_ecdsa_der(const uint8_t raw[64], uint8_t out[72]);
 #endif
+
+/* ---- tls/conn.c: the public connection (brisk_conn), sans-I/O ----------------------------------
+ *
+ * Glue, not protocol: one brisk__tls13_hs + brisk__tls13_conn wired to the caller's brisk_cfg -
+ * the ClientHello pair (CH1 at setup, CH2 inside brisk_feed after an HRR), the X.509
+ * authenticator with the in-memory + file trust store, ALPN, ticket import/export. No syscall,
+ * no malloc, no clock: randomness and time come in through brisk__conn_setup, whose public
+ * wrapper brisk_conn_init lives in src/os/linux_net.c.
+ *
+ * RANDOMNESS: BRISK__CONN_RAND bytes per connection, drawn once, in this order: client random
+ * 32 | legacy_session_id 32 (TCP compatibility mode, RFC 9846 E.4) | x25519 d 32 | P-256 d 32
+ * (must satisfy brisk__p256_scalar_valid - the OS layer redraws it) | sign_rand 32 (the RFC 6979
+ * 3.6 k' of the client CertificateVerify). SECRET; the two key slices are wiped once CH2 is
+ * queued or the ServerHello is processed, the rest at conn_wipe. The fixed layout is what lets
+ * tests/test_conn.c replay tools/kat.py flows byte for byte.
+ *
+ * MEMORY: [align slack | struct brisk_conn | rec_in BRISK__TLS_REC_IN_MAX | hs scratch]. The hs
+ * scratch lives as long as the connection: record.c feeds post-handshake NewSessionTicket and
+ * KeyUpdate through the engine's reassembly buffer. The blocking layer appends BRISK__CONN_TX
+ * (records to send) and BRISK__CONN_RX (received bytes, kept apart because brisk_feed stops
+ * short while application data is unread) to the same single malloc.
+ *
+ * STACK (-fstack-usage, gcc -Os, x86_64): the ticket callback is 2160 B (its BRISK_TICKET_MAX
+ * blob) under hs_feed's 512 and brisk_feed's 128 - about 2.9 KB with record.c in between, still
+ * below the authenticator's ~4.9 KB chain (the handshake.c STACK note). conn_hello is 496,
+ * brisk__conn_setup 320. Move the blob into the arena if an 8 KB thread budget ever needs it. */
+#define BRISK__CONN_RAND 160
+#define BRISK__CONN_TX   4096
+#define BRISK__CONN_RX   2048
+
+struct brisk_conn {
+    brisk__tls13_hs hs;
+    brisk__tls13_conn tc;
+    brisk__tls13_auth_x509_ctx auth;
+    brisk__x509_trust trust;
+    brisk__x509_bundle bundle; /* the file store, and the PEM decode scratch for cfg.ca_mem */
+    brisk_cfg cfg;
+    brisk__x509_anchor_fn sys_anchor; /* the file / system store; NULL = memory anchors only */
+    uint8_t rnd[BRISK__CONN_RAND];    /* SECRET, layout above */
+    uint8_t alpn[BRISK__TLS13_ALPN_MAX];
+    uint16_t alpn_len;
+    char host[256]; /* NUL-terminated copy of the caller's host */
+    size_t host_len;
+    int64_t now_ms; /* wall clock: ticket age / stamp; auth.now holds the same in seconds */
+    int64_t ch1_ms; /* now_ms when CH1 was built: CH2 re-imports its PSK at that time (4.2.2) */
+    /* blocking layer (src/os/linux_net.c) only; fd = -1 and the rest 0 for sans-I/O */
+    int fd, io_err;
+    uint8_t fixed_now; /* test seam: never refresh now_ms from the clock */
+    uint32_t timeout_ms;
+    uint8_t *heap, *tx, *rx;
+    size_t heap_len, rx_off, rx_len;
+};
+
+/* brisk_conn_init without the OS: `rnd` as above, `now_ms` the wall clock in ms since the epoch
+ * (int64, never time_t), `sys_anchor` the file / system store lookup (brisk__os_ca_anchor on
+ * Linux, NULL where there is none: then only cfg.ca_mem anchors exist). */
+int brisk__conn_setup(void *mem, size_t mem_len, const brisk_cfg *cfg, const char *host,
+                      int64_t now_ms, const uint8_t rnd[BRISK__CONN_RAND],
+                      brisk__x509_anchor_fn sys_anchor, brisk_conn **out);
+/* Refresh the wall clock (ms) used for the certificate check and ticket stamps. */
+void brisk__conn_set_time(brisk_conn *c, int64_t now_ms);
+/* The connection's brisk__x509_anchor_fn (ctx = the brisk_conn): cfg.ca_mem's certificates
+ * with a matching subject first, then the file store, numbered on from there. */
+int brisk__conn_anchor(void *ctx, const uint8_t *dn, size_t dn_len, size_t index,
+                       brisk__x509_cert *out);
+/* "h2,http/1.1" -> RFC 7301 ProtocolName entries (u8 length + name each, no outer length).
+ * BRISK_E_ARG on an empty name or more than cap bytes. NULL list = *out_len 0. */
+int brisk__alpn_encode(const char *list, uint8_t *out, size_t cap, size_t *out_len);
+
+/* ---- os/linux_net.c (Linux builds only): clocks and TCP -------------------------------------- */
+int64_t brisk__os_wall_ms(void); /* CLOCK_REALTIME, widened; 0 if the clock cannot be read */
+int64_t brisk__os_mono_ms(void); /* CLOCK_MONOTONIC: deadlines only */
+/* Resolve (getaddrinfo, AF_UNSPEC) and connect a non-blocking TCP socket, trying each address
+ * in turn within timeout_ms (after DNS). BRISK_OK and *fd, or BRISK_E_IO / BRISK_E_TIMEOUT. */
+int brisk__os_tcp_connect(const char *host, uint16_t port, uint32_t timeout_ms, int *fd);
+/* Connect to the first address of the getaddrinfo list `res` that answers before the monotonic
+ * deadline. Each attempt gets a share of the time left (at least 2 s), so one blackholed
+ * address does not starve the next. BRISK_OK and *fd, or BRISK_E_IO / BRISK_E_TIMEOUT. */
+struct addrinfo;
+int brisk__os_dial(const struct addrinfo *res, int64_t deadline_mono_ms, int *fd);
+/* All n bytes, MSG_NOSIGNAL, EINTR retried, polling until the monotonic deadline.
+ * BRISK_OK, BRISK_E_IO or BRISK_E_TIMEOUT. */
+int brisk__os_send_all(int fd, const uint8_t *p, size_t n, int64_t deadline_mono_ms);
+/* Up to cap bytes; *n 0 = the peer closed (TCP EOF). BRISK_OK, BRISK_E_IO or BRISK_E_TIMEOUT. */
+int brisk__os_recv(int fd, uint8_t *p, size_t cap, int64_t deadline_mono_ms, size_t *n);
+/* Test seam for brisk_connect: handshake over an already connected `fd` (always consumed:
+ * closed on failure). rnd NULL = brisk__os_random; now_ms < 0 = the clock, refreshed before
+ * every feed; otherwise that fixed time. */
+int brisk__connect_fd(const brisk_cfg *cfg, const char *host, int fd, const uint8_t *rnd,
+                      int64_t now_ms, brisk_conn **out);
 
 #endif /* BRISK_INT_H */

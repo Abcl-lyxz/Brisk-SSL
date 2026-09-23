@@ -1372,6 +1372,11 @@ int brisk__tls13_hs_client_hello(brisk__tls13_hs *hs, const uint8_t *ch, size_t 
             return BRISK_E_ARG;
         }
     } else {
+        /* 4.2.2: CH2 may drop CH1's PSK only when the HRR's suite has another hash */
+        if (hs->state == BRISK__HS_WAIT_CH2 && hs->psk_offered &&
+            hs_alg(hs->suite) == hs_alg(hs->psk_suite)) {
+            return BRISK_E_ARG;
+        }
         brisk__secure_zero(hs->psk, sizeof hs->psk);
         hs->psk_len = 0;
     }
@@ -1658,11 +1663,11 @@ int brisk__tls13_ch_write(const brisk__tls13_ch_params *p, uint8_t *out, size_t 
             return BRISK_E_ARG;
         }
     }
-    if (p->psk != NULL &&
-        (!p->psk_modes || p->psk->identity == NULL || p->psk->identity_len == 0 ||
-         /* 4.3.11: extension_data<0..2^16-1> also holds 2+2+4 list/age bytes and 2+1+HashLen of
-          * binders */
-         p->psk->identity_len > 0xffff - 11 - (size_t)p->psk->psk_len || (p->psk->psk_len != 32 && p->psk->psk_len != 48))) {
+    if (p->psk != NULL && (!p->psk_modes || p->psk->identity == NULL || p->psk->identity_len == 0 ||
+                           /* 4.3.11: extension_data<0..2^16-1> also holds 2+2+4 list/age bytes and
+                            * 2+1+HashLen of binders */
+                           p->psk->identity_len > 0xffff - 11 - (size_t)p->psk->psk_len ||
+                           (p->psk->psk_len != 32 && p->psk->psk_len != 48))) {
         return BRISK_E_ARG;
     }
     suites = p->suites ? p->suites : DEF_SUITES;

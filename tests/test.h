@@ -31,5 +31,22 @@ void test_tls13_rec(void);  /* TLS 1.3 record layer + connection driver (RFC 984
 void tls13_rec_ct_run(void); /* its constant-time run, called from test_ct */
 void tls13_hs_ct_run(void); /* its constant-time run, called from test_ct */
 void test_rand(void);       /* Linux only */
+void test_conn(void);       /* the public connection API, sans-I/O (src/tls/conn.c) */
+void test_sock(void);       /* Linux only: the blocking API over loopback TCP */
+
+/* test_conn.c -> test_sock.c: the P-256 fixture flow as a server byte stream */
+typedef struct {
+    const uint8_t *root; /* the anchor, DER */
+    size_t root_len;
+    const char *host, *c_ap, *s_ap; /* host, application traffic secrets (hex) */
+    long long now_ms;
+    size_t ch_len, flight_len; /* the client's ClientHello record, CCS + Finished record */
+} t_conn_fixture;
+size_t t_conn_server(uint8_t *out, t_conn_fixture *f); /* SH + flight records into out */
+const uint8_t *t_conn_rnd(void);                       /* the 160 bytes that replay it */
+/* test_rand.c's poll/syscall fault injection, for test_sock.c */
+void t_rand_reset(void);       /* back to pass-through */
+void t_poll_eintr_once(void);  /* the next poll() fails with EINTR */
+int t_poll_injected(void);     /* 1 while an injection is still pending */
 
 #endif

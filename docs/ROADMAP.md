@@ -59,7 +59,16 @@ Tick a box only when the work is green on **every** arch (`python tools/dev.py t
     32-bit MIPS) swaps in a shift + masked-XOR GHASH. Post-handshake messages still use the engine's
     reassembly scratch, so the line-4 arena must keep it alive (or skip NSTs that do not fit).
 - [x] PSK resumption tickets (export/import blob), ALPN list, SNI, mTLS (ECDSA)
-- [ ] `src/os/` sockets + public API `brisk_connect/read/write/close`, sans-I/O `brisk_feed/pull`
+- [x] `src/os/` sockets + public API `brisk_connect/read/write/close`, sans-I/O `brisk_feed/pull`
+  - `src/tls/conn.c` (sans-I/O `brisk_conn`: CH1/CH2 builder, in-memory + file trust store, ALPN
+    list, ticket in/out with the no-PSK retry) and `src/os/linux_net.c` (clocks, getaddrinfo +
+    non-blocking TCP with poll deadlines, `brisk_conn_init`, the blocking API). One malloc per
+    blocking connection; `brisk_conn_size()` per arch is in the commit message.
+  - Open: a RUNTIME certificate-time floor (a persisted last-known-good time) is not in
+    `brisk_cfg` yet. It must be threaded through `brisk__x509_chain_verify` /
+    `brisk__x509_time_ok` next to `BRISK_X509_TIME_FLOOR` - never done by raising `now`.
+  - Open: sans-I/O connections stamp tickets with the init time (no clock in the core); add a
+    public `brisk_conn_set_time` if a long-lived sans-I/O user needs fresher stamps.
 - [ ] RFC 8448 trace test; Docker interop (nginx, Caddy, openssl s_server); badssl.com
 - [ ] Examples: AWS IoT HTTPS over raw TLS (ALPN x-amzn-http-ca), MQTT-over-TLS sketch
 

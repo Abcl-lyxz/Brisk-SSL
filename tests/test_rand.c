@@ -120,6 +120,24 @@ int __wrap_poll(struct pollfd *fds, nfds_t nfds, int timeout)
     return __real_poll(fds, nfds, timeout);
 }
 
+void t_rand_reset(void)
+{
+    mode = PASS;
+    poll_mode = P_PASS;
+    fake_release = NULL;
+    fake_uname26 = 0;
+}
+
+void t_poll_eintr_once(void)
+{
+    poll_mode = P_INTR_ONCE;
+}
+
+int t_poll_injected(void)
+{
+    return poll_mode != P_PASS;
+}
+
 int __wrap_uname(struct utsname *u)
 {
     int r = __real_uname(u);

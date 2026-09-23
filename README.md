@@ -21,10 +21,12 @@ brisk_cfg cfg = BRISK_DEFAULTS;              /* secure defaults */
 cfg.alpn    = "x-amzn-http-ca";              /* any ALPN: "h2", "mqtt", ... */
 cfg.ca_file = "/etc/ssl/certs/ca-certificates.crt";
 
-brisk_conn *c = brisk_connect(&cfg, "iot.example.com", 443);
-brisk_write(c, request, request_len);        /* you decide what to send */
-n = brisk_read(c, buf, sizeof buf);
-brisk_close(c);
+brisk_conn *c;
+if (brisk_connect(&cfg, "iot.example.com", 443, &c) == BRISK_OK) {
+    brisk_write(c, request, request_len);    /* you decide what to send */
+    n = brisk_read(c, buf, sizeof buf);      /* >0 data, 0 close_notify, <0 BRISK_E_* */
+    brisk_close(c);
+}
 ```
 Brisk is an SSL library, not an HTTP client: run MQTT, HTTP/1.1 or your own protocol over the TLS
 stream, or use the optional `brisk_h2_*` / `brisk_h3_*` modules explicitly.

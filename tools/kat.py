@@ -4748,6 +4748,8 @@ TLS13_SUITES = [0x1303, 0x1301, 0x1302]
 TLS13_GROUPS = [0x001d, 0x0017]
 TLS13_SIGS = [0x0403, 0x0503, 0x0804, 0x0805, 0x0806, 0x0401, 0x0501, 0x0601]
 RFC9846 = {}
+FX = {}  # tls13_fixture's keys and helpers, reused by tls13_conn
+MT = {}  # tls13_psk's device identity (mTLS), reused by tls13_conn
 
 
 def t_u16(v):
@@ -5128,6 +5130,8 @@ def tls13_fixture():
            "illegal_parameter", scheme=0x0804)
     flight("RFC 9846 4.3.3: rsa_pkcs1_sha256 is never valid in CertificateVerify",
            "illegal_parameter", scheme=0x0401)
+    FX.update(root_c=root_c, root=root, leaf=leaf, leaf_cert=leaf_cert, seed=seed, c_priv=c_priv,
+              s_priv=s_priv, sid=sid, c_pub=c_pub, s_pub=s_pub, ch=ch)
     print(f"  tls13 fixture: {len(rows)} synthetic flows")
     chw = [(seed(b"client random").hex(), sid.hex(), "".join(f"{v:04x}" for v in TLS13_SUITES),
             "".join(f"{v:04x}" for v in TLS13_GROUPS), "".join(f"{v:04x}" for v in TLS13_SIGS),
@@ -5603,6 +5607,7 @@ def tls13_psk(parts):
             die("mTLS: the client CertificateVerify does not verify")
         return [cert, t_msg(15, t_u16(0x0403) + t_v16(x_seq(x_int(r), x_int(s_))))]
 
+    MT.update(client=client, chain=chain, dev_d=dev_d, srand=srand)
     ks6 = t_ext(t_hello_parse(s6["sh"])["exts"], 51)
     dhe6 = t_dhe(s6["g1"], s6["priv1"], ks6[4:])
     mt = dict(cchain=b"".join(chain), ckey=dev_d.to_bytes(32, "big"), srand=srand)
@@ -5674,6 +5679,130 @@ def tls13_psk(parts):
     print(f"  tls13 psk: sect 4 binder/early/cascade verified, {len(rows)} flows, {len(muts)} "
           f"mutations, {len(mtls)} device chains")
     return rows, chw, muts, mtls, [one]
+
+
+def tls13_conn():
+    """M3 line 4: whole flows the PUBLIC API (src/tls/conn.c) replays byte for byte in
+    tests/test_conn.c. Every flow starts from tls13_fixture's library-default ClientHello (host
+    device.example.com, its random, session id and x25519 key), so brisk__conn_setup fed the 160
+    bytes of TLS13_CONN_RND (random | session_id | x25519 d | P-256 d | sign_rand, the order
+    brisk_conn_init draws them in) must reproduce every CH1 and CH2 exactly. What each flow adds
+    is the next thing the default connection has to get right on its own: CH2 after a
+    HelloRetryRequest (RFC 9846 4.1.4, 4.2.2 - same random and session id, the HRR's group, the
+    cookie copied exactly), ALPN, a PSK offered from a ticket blob (4.2.11, binder 4.3.11.2) and a
+    CertificateRequest answered with the device key (4.4.2, 4.5.1).
+    Returns (rows, rnd, root_pem, blob, now_ms, nst_long, fuzz_streams)."""
+    f, seed = FX, FX["seed"]
+    host = b"device.example.com"
+    rnd, sid, ch1 = seed(b"client random"), f["sid"], f["ch"]
+    if ch1[6:38] != rnd or ch1[38] != 32 or ch1[39:71] != sid:
+        die("conn: the fixture CH1 does not carry random/session_id at bytes 6/39")
+    c_d = int.from_bytes(seed(b"client p256"), "big")
+    s_d = int.from_bytes(seed(b"server p256"), "big")
+    c_p256, s_p256 = py_p256_keygen(c_d)[0], py_p256_keygen(s_d)[0]
+    dhe_x, dhe_p = py_x25519(f["c_priv"], f["s_pub"]), py_p256_ecdh(c_d, s_p256)
+    # both ECDHE directions agree (RFC 7748 6.1, RFC 9846 7.4.2)
+    if dhe_x != py_x25519(f["s_priv"], f["c_pub"]) or dhe_p != py_p256_ecdh(s_d, c_p256):
+        die("conn: ECDHE shared secrets disagree")
+    now_ms = CHAIN_NOW * 1000
+    root = f["root_c"]
+    ee0 = t_msg(8, t_exts_build([(0, b"")]))
+    cert = t_msg(11, b"\x00" + t_v24(t_v24(f["leaf_cert"]()) + t_v16(b"")))
+    rows, streams = [], []
+
+    def ch_of(group=0x001d, pub=None, cookie=b"", alpn=b"", psk=None):
+        return t_ch(rnd, sid, TLS13_SUITES, TLS13_GROUPS, TLS13_SIGS, group, pub or f["c_pub"],
+                    host, cookie=cookie, alpn=alpn, modes=psk is not None, psk=psk)
+
+    if ch_of() != ch1:
+        die("conn: ch_of() does not rebuild the fixture ClientHello")
+
+    def hrr_of(exts):
+        return t_msg(2, t_u16(0x0303) + RFC9846["hrr"] + t_v8(sid) + t_u16(0x1301) + b"\x00"
+                     + t_exts_build([(43, t_u16(0x0304))] + exts))
+
+    def same_but(a, b, drop):
+        """RFC 9846 4.2.2: CH2 is CH1 with only key_share (and an HRR cookie) changed."""
+        pa, pb = t_ch_parse(a), t_ch_parse(b)
+        ea = [e for e in pa["exts"] if e[0] not in drop]
+        eb = [e for e in pb["exts"] if e[0] not in drop]
+        if a[4:38] != b[4:38] or pa["sid"] != pb["sid"] or pa["suites"] != pb["suites"] or ea != eb:
+            die("conn: CH2 differs from CH1 in more than key_share / cookie")
+
+    def flow(note, pre, *, first=ch1, group=0x001d, ee=ee0, cr=b"", psk=None, client=None,
+             hrr=b"", **kw):
+        spub, dhe = (f["s_pub"], dhe_x) if group == 0x001d else (s_p256, dhe_p)
+        exts = ([(41, t_u16(0))] if psk else []) + [(43, t_u16(0x0304)),
+                                                    (51, t_u16(group) + t_v16(spub))]
+        sh = t_msg(2, t_u16(0x0303) + seed(b"server random") + t_v8(sid) + t_u16(0x1301)
+                   + b"\x00" + t_exts_build(exts))
+        crt = cv = b""
+        if not psk:  # 4.4.2 / A.1: no Certificate on a resumed connection
+            crt = cert
+            th = t_th(256, pre + [sh, ee] + ([cr] if cr else []) + [cert])
+            cv = t_msg(15, t_u16(0x0403) + t_v16(f["leaf"]["sign"](t_cv_content(th))))
+        fl = t_flow(256, dhe, pre, sh, ee, cr, crt, cv, psk=psk, client=client)
+        rows.append(t_row(note, fl, ch1=first, priv1=f["c_priv"], g1=0x001d, sh=sh, ee=ee,
+                          cert=crt, cv=cv, cr=cr, root=root, host=host.decode(), now=CHAIN_NOW,
+                          hrr=hrr, **kw))
+        # the server's byte stream as records (fuzz seeds): [HRR] SH in the clear, then
+        # EE..SF under s_hs in one record (RFC 9846 5.1, 5.2)
+        k, iv = rec_keys(0x1301, fl["s_hs"])
+        stream = (rec_hs_plain(hrr) if hrr else b"") + rec_hs_plain(sh)
+        stream += rec_seal(0x1301, k, iv, 0, 22, ee + cr + crt + cv + fl["sf"])
+        streams.append((stream, note))
+
+    # 1. HRR to secp256r1 with a cookie (4.1.4, 4.3.2, 4.3.8)
+    cookie = seed(b"conn cookie") * 2
+    hrr = hrr_of([(51, t_u16(0x0017)), (44, t_v16(cookie))])
+    ch2 = ch_of(0x0017, c_p256, cookie=cookie)
+    same_but(ch1, ch2, (44, 51))
+    flow("fixture: HRR x25519 -> secp256r1 with a cookie", [t_message_hash(256, ch1), hrr, ch2],
+         group=0x0017, hrr=hrr, ch2=ch2, priv2=c_d.to_bytes(32, "big"), g2=0x0017, cookie=cookie)
+    # 2. cookie-only HRR: CH2 re-sends the SAME x25519 share (4.2.2 replaces key_share only
+    #    when the HRR names a group)
+    hrr = hrr_of([(44, t_v16(cookie))])
+    ch2 = ch_of(cookie=cookie)
+    same_but(ch1, ch2, (44,))
+    flow("fixture: cookie-only HRR, the same x25519 share again",
+         [t_message_hash(256, ch1), hrr, ch2], hrr=hrr, ch2=ch2, priv2=f["c_priv"], g2=0x001d,
+         cookie=cookie)
+    # 3. ALPN (RFC 7301 3.1): the cfg list "mqtt,h2", the server picks mqtt
+    alpn_ch = ch_of(alpn=t_alpn([b"mqtt", b"h2"]))
+    same_but(ch1, alpn_ch, (16,))
+    flow("fixture: ALPN mqtt,h2 offered, mqtt selected", [alpn_ch], first=alpn_ch,
+         ee=t_msg(8, t_exts_build([(0, b""), (16, t_v16(t_v8(b"mqtt")))])), alpn="mqtt")
+    # 4. resumption from a ticket blob (4.2.11, 4.3.11.1 obfuscated age, 4.3.11.2 binder)
+    psk, ticket = seed(b"conn resumption psk"), seed(b"conn ticket") * 3
+    lifetime, age_add, issued = 7200, 0x9E3779B9, now_ms - 5000
+    blob = t_ticket_blob(0x1301, issued, lifetime, age_add, psk, host, ticket)
+    obf = (now_ms - issued + age_add) & 0xffffffff
+    psk_ch = t_binder_fill(256, psk, [], ch_of(psk=(ticket, obf, 32)))
+    if t_ch_parse(psk_ch)["exts"][-1][0] != 41:
+        die("conn: pre_shared_key must be the last extension (4.2.11)")
+    same_but(ch1, psk_ch, (41, 45))
+    flow("fixture: resumed from a ticket blob, psk_dhe_ke", [psk_ch], first=psk_ch, psk=psk,
+         psk_suite=0x1301, resumed=1)
+    # 5. mTLS: a CertificateRequest listing ecdsa_secp256r1_sha256, answered by the device key
+    #    with sign_rand = the last rnd slice (4.4.2, 4.5.1, RFC 6979 3.6)
+    cr = t_msg(13, b"\x00" + t_exts_build([(13, t_v16(t_u16(0x0403)))]))
+    flow("fixture: CertificateRequest answered by the P-256 device key", [ch1], cr=cr,
+         client=MT["client"], cchain=b"".join(MT["chain"]), ckey=MT["dev_d"].to_bytes(32, "big"),
+         srand=MT["srand"])
+    rnd160 = rnd + sid + f["c_priv"] + c_d.to_bytes(32, "big") + MT["srand"]
+    # a NewSessionTicket whose ticket makes the blob exceed BRISK_TICKET_MAX (2048): export
+    # fails, and the connection must not notice (4.7.1: a ticket is an optimisation)
+    long_ticket = seed(b"long ticket") * 66
+    nst_long = rec_nst(7200, 1, b"\x00", long_ticket, [])
+    if len(t_ticket_blob(0x1301, 0, 1, 1, psk, host, long_ticket)) <= 2048:
+        die("conn: the long ticket must not fit BRISK_TICKET_MAX")
+    print(f"  tls13 conn: {len(rows)} public-API flows, {len(streams)} fuzz streams")
+    return rows, rnd160, pem_block(root), blob, now_ms, nst_long, streams
+
+
+def rec_hs_plain(msg):
+    """A handshake message in one plaintext record (RFC 9846 5.1), legacy_record_version 0x0303."""
+    return bytes([22, 3, 3]) + len(msg).to_bytes(2, "big") + msg
 
 
 def tls13_ecdsa_der():
@@ -6207,6 +6336,7 @@ def main():
         tls13_mut.append((base + off, names.index(name), msg.hex(), ALERT[alert], note))
     tls13_der = tls13_ecdsa_der()
     rec_rows, rec_nonces, rec_hsmsg, rec_seeds, rec_fuzz_key = tls13_records()
+    conn_rows, conn_rnd, conn_pem, conn_blob, conn_now, conn_nst, conn_streams = tls13_conn()
 
     emit("sha2.inc", "struct hash_kat SHA2_KAT", cavp + dhash, lambda r: f"{r[0]}, {cstr(r[1])}, {cstr(r[2])}")
     emit("sha2_monte.inc", "struct monte_kat SHA2_MONTE", monte,
@@ -6319,12 +6449,30 @@ def main():
                                      + ["NULL"] * (PIN_MAX - len(r[2]))) + "}, "
                    + f'{r[3]}, {r[4]}LL, "{r[5]}"')
 
+    flow_fmt = (lambda r: f'"{cesc(r[0])}", {cstr(r[1])}, "{r[2]}", {r[3]}LL, {r[4]}, {r[5]}, '
+                f'0x{r[6]:04x}u, {cstr(r[7])}, {cstr(r[8])}, {cstr(r[9])}, 0x{r[10]:04x}u, '
+                + ", ".join(cstr(x) for x in r[11:29])
+                + f', 0x{r[29]:04x}u, {r[30]}, "{r[31]}", {cstr(r[32])}, {cstr(r[33])}, '
+                f'{cstr(r[34])}')
     emit("tls13_trace.inc", "struct tls13_flow_kat TLS13_FLOW_KAT", tls13_flows + tls13_fx + tls13_pskf,
-         lambda r: f'"{cesc(r[0])}", {cstr(r[1])}, "{r[2]}", {r[3]}LL, {r[4]}, {r[5]}, '
-                   f'0x{r[6]:04x}u, {cstr(r[7])}, {cstr(r[8])}, {cstr(r[9])}, 0x{r[10]:04x}u, '
-                   + ", ".join(cstr(x) for x in r[11:29])
-                   + f', 0x{r[29]:04x}u, {r[30]}, "{r[31]}", {cstr(r[32])}, {cstr(r[33])}, '
-                   f'{cstr(r[34])}')
+         flow_fmt)
+    # tests/test_conn.c: the public-API flows and what the connection is configured with
+    emit("tls13_conn.inc", "struct tls13_flow_kat TLS13_CONN_KAT", conn_rows, flow_fmt)
+    with open(OUT / "tls13_conn.inc", "a", newline="\n") as fh:
+        fh.write(f"static const char TLS13_CONN_RND[] = {cstr(conn_rnd.hex())};\n"
+                 f"static const char TLS13_CONN_ROOT_PEM[] = {cpem(conn_pem)};\n"
+                 f"static const char TLS13_CONN_BLOB[] = {cstr(conn_blob.hex())};\n"
+                 f"static const long long TLS13_CONN_NOW_MS = {conn_now}LL;\n"
+                 f"static const char TLS13_CONN_NST_LONG[] = {cstr(conn_nst.hex())};\n")
+    # Seeds for fuzz/fuzz_conn.c (tools/dev.py fuzz conn): chunk-size byte 0 (all at once) and
+    # the server's record stream of every public-API flow.
+    emit("tls13_conn_fuzz.inc", "struct tls13_fuzz_seed TLS13_CONN_FUZZ_SEED",
+         [((b"\x00" + st).hex(), note) for st, note in conn_streams],
+         lambda r: f'{cstr(r[0])}, "{cesc(r[1])}"')
+    with open(OUT / "tls13_conn_fuzz.inc", "a", newline="\n") as fh:
+        fh.write(f"static const char TLS13_CONN_FUZZ_RND[] = {cstr(conn_rnd.hex())};\n"
+                 f"static const char TLS13_CONN_FUZZ_ROOT[] = {cstr(FX['root_c'].hex())};\n"
+                 f"static const long long TLS13_CONN_FUZZ_NOW_MS = {conn_now}LL;\n")
     emit("tls13_trace.inc", "struct tls13_rfc_kat TLS13_RFC_KAT", tls13_rfc,
          lambda r: ", ".join(cstr(x) for x in r), append=True)
     emit("tls13_trace.inc", "struct tls13_chw_kat TLS13_CHW_KAT", tls13_chw,
@@ -6465,6 +6613,12 @@ def main():
         "  row are generated with the same Python AEADs - no official vector exists for any of\n"
         "  them. tlsfuzzer's record/keyupdate/zero-length/record_size_limit scripts were used as a\n"
         "  case catalogue only (they test servers).\n"
+        "- TLS 1.3 public connection (`tls13_conn.inc`, `tls13_conn_fuzz.inc`): no official source\n"
+        "  replays a client whose ClientHello is this library's default offer. The five flows (HRR\n"
+        "  to secp256r1 with a cookie, cookie-only HRR, ALPN, resumption from a ticket blob, mTLS)\n"
+        "  are GENERATED on the `tls13_trace.inc` fixture keys with the same Python cascade that\n"
+        "  reproduces RFC 8448 byte for byte; CH2 is checked against CH1 (RFC 9846 4.2.2), both\n"
+        "  ECDHE directions against each other, the binder with the RFC 8448 sect 4 routine.\n"
         "- There is no P-384 *keygen*, *ECDH* or *signing* vector set here, and there never will\n"
         "  be: docs/ARCHITECTURE.md locks P-384 to verify only, so `KAS_ECC_CDH` `[P-384]`,\n"
         "  `KeyPair.rsp` `[P-384]`, `SigGen.txt` `[P-384]` and `ecdh_secp384r1_*` are all out of\n"

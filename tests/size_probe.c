@@ -191,6 +191,37 @@ int main(int argc, char **argv)
         brisk__tls13_hs_wipe(&hs);
         (void)brisk__tls13_hs_scratch_size();
     }
+    {
+        /* the public connection (conn.c); its arena is the probe's BSS, sized generously */
+        static uint8_t mem[96 * 1024];
+        static uint8_t rnd[BRISK__CONN_RAND];
+        brisk_cfg cfg = BRISK_DEFAULTS;
+        brisk_conn *c = NULL;
+        const char *name;
+        size_t used, n;
+        cfg.alpn = "h2";
+        if (brisk_conn_size() <= sizeof mem &&
+            brisk__conn_setup(mem, sizeof mem, &cfg, "a.example", 5, rnd, NULL, &c) == BRISK_OK) {
+            brisk_feed(c, out, sizeof out, &used);
+            brisk_pull(c, out, sizeof out);
+            brisk_app_read(c, out, sizeof out, &n);
+            brisk_app_write(c, out, 8, &used, out, sizeof out, &n);
+            brisk_close_notify(c);
+            out[2] = (uint8_t)(brisk_status(c) + brisk_alert(c) + brisk_resumed(c) +
+                               brisk_alpn(c, &name, &n));
+            brisk_conn_wipe(c);
+        }
+#ifdef __linux__
+        if (brisk_conn_init(mem, sizeof mem, &cfg, "a.example", &c) == BRISK_OK) {
+            brisk_conn_wipe(c);
+        }
+        if (brisk_connect(&cfg, "a.example", 443, &c) == BRISK_OK) {
+            brisk_write(c, out, 8);
+            brisk_read(c, out, sizeof out);
+            brisk_close(c);
+        }
+#endif
+    }
     return out[0] + (brisk_build_info()[0] == brisk_version()[0]) +
            brisk__ct_memeq(out, out + 1, 8);
 }

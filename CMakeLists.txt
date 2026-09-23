@@ -34,9 +34,10 @@ add_library(brisk STATIC
     src/tls/handshake.c   # TLS 1.3 client handshake engine (RFC 9846 sect 4), sans-I/O
     src/tls/record.c      # TLS 1.3 record layer over TCP (RFC 9846 sect 5) + connection driver
     src/tls/ticket.c      # the resumption ticket blob (RFC 9846 4.7.1): export / import
+    src/tls/conn.c        # the public connection (brisk_conn): sans-I/O glue over hs + record
 )
 if(CMAKE_SYSTEM_NAME STREQUAL "Linux") # src/os/ is Linux-only; the mingw host skips it
-    target_sources(brisk PRIVATE src/os/linux_rand.c src/os/linux_ca.c)
+    target_sources(brisk PRIVATE src/os/linux_rand.c src/os/linux_ca.c src/os/linux_net.c)
 endif()
 set_target_properties(brisk PROPERTIES C_STANDARD 99 C_STANDARD_REQUIRED ON C_EXTENSIONS OFF
                                        C_VISIBILITY_PRESET hidden)
@@ -72,7 +73,7 @@ if(BRISK_BUILD_TESTS)
                                tests/test_x25519.c tests/test_p256.c tests/test_p384.c
                                tests/test_rsa.c tests/test_der.c tests/test_x509.c
                                tests/test_ct.c tests/test_tls13_ks.c
-                               tests/test_tls13_hs.c tests/test_tls13_rec.c)
+                               tests/test_tls13_hs.c tests/test_tls13_rec.c tests/test_conn.c)
     set_target_properties(brisk_tests PROPERTIES C_STANDARD 99 C_EXTENSIONS OFF)
     target_link_libraries(brisk_tests PRIVATE brisk)
     target_include_directories(brisk_tests PRIVATE src tests)
@@ -110,12 +111,16 @@ if(BRISK_BUILD_TESTS)
     set_tests_properties(tls13_hs PROPERTIES TIMEOUT 900)
     add_test(NAME tls13_rec COMMAND brisk_tests tls13_rec)
     set_tests_properties(tls13_rec PROPERTIES TIMEOUT 900)
+    add_test(NAME conn COMMAND brisk_tests conn)
+    set_tests_properties(conn PROPERTIES TIMEOUT 900)
     if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
-        target_sources(brisk_tests PRIVATE tests/test_rand.c)
+        target_sources(brisk_tests PRIVATE tests/test_rand.c tests/test_sock.c)
         # fault injection for src/os/linux_rand.c (getrandom, /dev/random wait, kernel version)
         target_link_options(brisk_tests PRIVATE -Wl,--wrap=syscall,--wrap=poll,--wrap=uname,--wrap=personality)
         add_test(NAME rand COMMAND brisk_tests rand)
         set_tests_properties(rand PROPERTIES TIMEOUT 300) # a fill loop that never ends must fail
+        add_test(NAME sock COMMAND brisk_tests sock) # loopback TCP + fork(), the blocking API
+        set_tests_properties(sock PROPERTIES TIMEOUT 900)
     endif()
 endif()
 

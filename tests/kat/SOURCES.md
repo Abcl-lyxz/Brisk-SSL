@@ -144,6 +144,12 @@ reference before emission. Differential vectors come from a fixed seed.
   row are generated with the same Python AEADs - no official vector exists for any of
   them. tlsfuzzer's record/keyupdate/zero-length/record_size_limit scripts were used as a
   case catalogue only (they test servers).
+- TLS 1.3 public connection (`tls13_conn.inc`, `tls13_conn_fuzz.inc`): no official source
+  replays a client whose ClientHello is this library's default offer. The five flows (HRR
+  to secp256r1 with a cookie, cookie-only HRR, ALPN, resumption from a ticket blob, mTLS)
+  are GENERATED on the `tls13_trace.inc` fixture keys with the same Python cascade that
+  reproduces RFC 8448 byte for byte; CH2 is checked against CH1 (RFC 9846 4.2.2), both
+  ECDHE directions against each other, the binder with the RFC 8448 sect 4 routine.
 - There is no P-384 *keygen*, *ECDH* or *signing* vector set here, and there never will
   be: docs/ARCHITECTURE.md locks P-384 to verify only, so `KAS_ECC_CDH` `[P-384]`,
   `KeyPair.rsp` `[P-384]`, `SigGen.txt` `[P-384]` and `ecdh_secp384r1_*` are all out of
