@@ -241,7 +241,9 @@ int main(int argc, char **argv)
 #if BRISK_ENABLE_QUIC
     {
         /* QUIC v1 (M6): packets + the client connection; the scratch is the probe's BSS */
-        static uint8_t qscr[8192 + 2048 + BRISK_QUIC_CRYPTO_BUF + BRISK_TLS_MAX_CLIENT_CHAIN];
+        static uint8_t
+            qscr[8192 + 2048 + BRISK_QUIC_CRYPTO_BUF + BRISK_TLS_MAX_CLIENT_CHAIN +
+                 BRISK_QUIC_MAX_STREAMS * (2 * BRISK_QUIC_STREAM_BUF + BRISK_QUIC_STREAM_BUF / 8)];
         static uint8_t hscr[4 + BRISK_TLS_MAX_HS_MSG + 8192 + BRISK_TLS_MAX_CLIENT_CHAIN];
         static brisk__tls13_hs qhs;
         static brisk__quic_conn qc;
@@ -269,11 +271,18 @@ int main(int argc, char **argv)
         brisk__quic_tp_write(&tp, out, sizeof out, &qo);
         brisk__tls13_hs_init(&qhs, &qcfg, hscr, sizeof hscr);
         if (brisk__quic_scratch_size() <= sizeof qscr &&
-            brisk__quic_conn_init(&qc, &qhs, out, 8, out, 8, qscr, sizeof qscr) == BRISK_OK) {
+            brisk__quic_conn_init(&qc, &qhs, &tp, out, 8, out, 8, qscr, sizeof qscr) == BRISK_OK) {
+            uint64_t qe;
             brisk__quic_recv(&qc, out, sizeof out, 0);
             brisk__quic_send(&qc, out, sizeof out, 0);
             out[1] = (uint8_t)brisk__quic_established(&qc);
             out[2] = (uint8_t)brisk__quic_frames(&qc, 0, out, 8);
+            out[3] = (uint8_t)brisk__quic_stream_open(&qc, 1);
+            out[4] = (uint8_t)brisk__quic_stream_write(&qc, 0, out, 8, 1);
+            out[5] = (uint8_t)brisk__quic_stream_read(&qc, 0, out, 8, &qe);
+            out[6] = (uint8_t)brisk__quic_stream_accept(&qc, &qe);
+            out[7] = (uint8_t)brisk__quic_deadline(&qc);
+            brisk__quic_close(&qc, 0);
         }
     }
 #endif

@@ -45,6 +45,8 @@ add_library(brisk STATIC
     src/http/h2.c         # HTTP/2 frames, streams, flow control, brisk_h2_* (same rule)
     src/quic/packet.c     # QUIC v1 packets + header protection (empty TU without BRISK_ENABLE_QUIC)
     src/quic/conn.c       # QUIC v1 client: TPs, frames, CRYPTO on the TLS 1.3 engine (same rule)
+    src/quic/recovery.c   # QUIC ACK ranges, RTT, loss / PTO, NewReno (same rule)
+    src/quic/stream.c     # QUIC streams + flow control (same rule)
 )
 if(CMAKE_SYSTEM_NAME STREQUAL "Linux") # src/os/ is Linux-only; the mingw host skips it
     target_sources(brisk PRIVATE src/os/linux_rand.c src/os/linux_ca.c src/os/linux_net.c)

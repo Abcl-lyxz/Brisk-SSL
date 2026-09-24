@@ -1,16 +1,13 @@
-/* conn.c - QUIC v1 client connection up to a confirmed handshake (RFC 9000, RFC 9001): transport
- * parameters (RFC 9000 18), frames (12.4, 19), CRYPTO streams per encryption level on the one
- * TLS 1.3 engine (RFC 9001 4), packet number spaces (RFC 9000 12.3), key discard (RFC 9001 4.9)
- * and CONNECTION_CLOSE (RFC 9000 10.2.3). Sans-I/O: datagrams in, datagrams out; no malloc, no
- * clock, no syscall.
+/* conn.c - QUIC v1 client connection (RFC 9000, RFC 9001, RFC 9002): transport parameters
+ * (RFC 9000 18), frames (12.4, 19), CRYPTO streams per encryption level on the one TLS 1.3
+ * engine (RFC 9001 4), packet number spaces (RFC 9000 12.3), ACK generation (13.2), loss
+ * recovery and congestion control via recovery.c (RFC 9002), streams and flow control via
+ * stream.c, connection IDs (5.1), path validation responses (8.2.2), idle timeout (10.1), key
+ * discard (RFC 9001 4.9) and CONNECTION_CLOSE (RFC 9000 10.2). Sans-I/O: datagrams in,
+ * datagrams out, time from the caller; no malloc, no clock, no syscall.
  *
- * NOT here yet (M6 items 2-3): ACK generation, loss recovery, PTO and idle timers, streams and
- * flow control, Retry, Version Negotiation, key update, stateless reset. Until then such input is
- * DROPPED or ignored after a strict syntax check, never half-processed: VN / Retry / unknown
- * versions and 0-RTT packets are dropped, a key-phase flip is dropped, ACK and 1-RTT frames
- * other than CRYPTO / HANDSHAKE_DONE / CONNECTION_CLOSE are parsed and ignored, except for the
- * checks that need no stream state (MAX_STREAMS / STREAMS_BLOCKED <= 2^60, RETIRE_CONNECTION_ID
- * of our only CID, NEW_CONNECTION_ID to an empty DCID).
+ * NOT here yet (M6 item 3): Retry, Version Negotiation, key update, stateless reset. Until then
+ * VN / Retry / unknown versions and 0-RTT packets are dropped and a key-phase flip is dropped.
  *
  * Policy choices (each MAY/SHOULD, recorded so the reviewers need not re-derive them):
  *   - a duplicate transport parameter is TRANSPORT_PARAMETER_ERROR (RFC 9000 7.4 SHOULD) for
@@ -19,8 +16,22 @@
  *   - a server Initial with a non-empty token is dropped, not an error (17.2.2 allows both);
  *   - overlapping CRYPTO data: the first copy wins, differing bytes are not compared (the MAY
  *     error of 19.6 is not taken);
- *   - datagrams are at most 1200 bytes (RFC 9000 14.1's floor) until path MTU exists;
- *   - one packet per sent datagram, except the CONNECTION_CLOSE (coalesced at every level).
+ *   - datagrams are at most 1200 bytes (RFC 9000 14.1's floor) until path MTU exists; one
+ *     datagram coalesces at most one packet per level, Initial -> Handshake -> 1-RTT (12.2);
+ *   - a NEW_CONNECTION_ID that reuses a sequence number with another CID or token, or a CID
+ *     with another sequence number, is PROTOCOL_VIOLATION (19.15 MAY, taken); more pending
+ *     RETIRE_CONNECTION_IDs than 2 * active_connection_id_limit is CONNECTION_ID_LIMIT_ERROR
+ *     (5.1.2 MAY, taken: it bounds a peer's Retire Prior To of 2^62-1);
+ *   - PATH_CHALLENGE: two response slots; a third challenge before they are sent drops the
+ *     oldest (8.2.2 says "each"; a burst of more than two in one flight is not answered in
+ *     full); a PATH_RESPONSE we did not solicit is ignored (19.18 MAY error not taken: we
+ *     never send PATH_CHALLENGE);
+ *   - PTO probes at the Initial / Handshake level resend the unacknowledged CRYPTO data; a
+ *     1-RTT probe carries new data if any, else a PING (RFC 9002 6.2.4 SHOULD);
+ *   - pacing (RFC 9002 7.7: MUST pace or limit bursts): at most 12000 bytes per ms of caller
+ *     time without an ACK in between; the deadline is then now + 1;
+ *   - 13.2.4 (stop acknowledging acked ACK ranges, optional) is not done: 8 ranges bound the
+ *     ACK frame instead.
  *
  * SPDX-License-Identifier: Apache-2.0
  */
@@ -34,6 +45,10 @@
 #    define QC_RET1  BRISK__TLS13_OUT_MAX /* Handshake CRYPTO sent: the client flight */
 #    define QC_DGRAM BRISK__QUIC_MIN_INITIAL
 #    define QC_NONE  UINT64_MAX
+#    define QC_STREAMS                                                                             \
+        ((size_t)BRISK_QUIC_MAX_STREAMS * (2 * BRISK_QUIC_STREAM_BUF + BRISK_QUIC_STREAM_BUF / 8))
+#    define QC_BURST    12000 /* RFC 9002 7.7: bytes per ms of caller time without an ACK */
+#    define QC_MIN_ROOM 8     /* the smallest payload worth a packet */
 
 static const uint8_t QC_EPOCH[3] = {BRISK__EPOCH_INITIAL, BRISK__EPOCH_HANDSHAKE, BRISK__EPOCH_APP};
 
@@ -172,7 +187,10 @@ int brisk__quic_tp_parse(const uint8_t *in, size_t len, brisk__quic_tp *tp)
             if (l < 25 || v[24] == 0 || v[24] > BRISK__QUIC_MAX_CID || l != 41u + v[24]) {
                 goto bad;
             }
-            tp->has_pref_addr = 1; /* validated, then ignored: this client never migrates */
+            tp->has_pref_addr = 1; /* the addresses are ignored: this client never migrates */
+            tp->pref_cid_len = v[24];
+            memcpy(tp->pref_cid, v + 25, v[24]);
+            memcpy(tp->pref_token, v + 25 + v[24], 16);
             break;
         }
     }
@@ -239,7 +257,7 @@ int brisk__quic_tp_write(const brisk__quic_tp *tp, uint8_t *out, size_t cap, siz
 
 /* ------------------------------------------------------------------ failure --------------- */
 
-static size_t cc_build(brisk__quic_conn *q, uint8_t *out);
+static size_t cc_build(brisk__quic_conn *q, uint8_t *out, unsigned type);
 
 static void wipe_all(brisk__quic_conn *q)
 {
@@ -247,24 +265,38 @@ static void wipe_all(brisk__quic_conn *q)
     for (i = 0; i < 3; i++) {
         brisk__quic_keys_wipe(&q->rx[i]);
         brisk__quic_keys_wipe(&q->tx[i]);
+        brisk__quic_rxack_init(&q->rxa[i]);
     }
     brisk__secure_zero(q->ring, QC_RING + QC_BITS);
     brisk__secure_zero(q->ret[0] + q->cc_len, QC_RET0 - q->cc_len);
     brisk__secure_zero(q->ret[1], QC_RET1);
     q->ret_len[0] = q->ret_len[1] = q->ret_sent[0] = q->ret_sent[1] = 0;
+    brisk__secure_zero(q->ap_secret, sizeof q->ap_secret);
+    brisk__secure_zero(q->path_resp, sizeof q->path_resp);
+    brisk__secure_zero(q->cids, sizeof q->cids);
+    brisk__secure_zero(&q->rec, sizeof q->rec);
+    q->ap_len = q->n_path_resp = 0;
+    brisk__quic_streams_wipe(q); /* every stream ring: plaintext */
     brisk__tls13_hs_wipe(q->hs); /* every engine secret, its scratch included */
 }
 
-/* The sticky failure: the CONNECTION_CLOSE is built now, while the keys exist, then every key
- * and secret is wiped. silent = no close (12.3: PN space exhausted; 6.6: key used up). */
-static int q_fail(brisk__quic_conn *q, uint64_t code, int rc, int silent)
+/* The sticky end: the CONNECTION_CLOSE (frame `type`, 0 = none) is built now, while the keys
+ * exist, then every key and secret is wiped. */
+static int q_end(brisk__quic_conn *q, uint64_t code, int rc, unsigned type)
 {
     q->err = rc;
     q->err_code = code;
-    q->cc_len = silent ? 0 : cc_build(q, q->ret[0]);
+    q->cc_len = type != 0 ? cc_build(q, q->ret[0], type) : 0;
     q->cc_state = q->cc_len != 0;
     wipe_all(q);
     return rc;
+}
+
+/* A transport error: CONNECTION_CLOSE 0x1c. silent = no close (12.3: PN space exhausted; 6.6:
+ * key used up). */
+static int q_fail(brisk__quic_conn *q, uint64_t code, int rc, int silent)
+{
+    return q_end(q, code, rc, silent ? 0 : 0x1c);
 }
 
 /* The engine failed: its alert as a QUIC error (RFC 9001 4.8), or what our callback asked for. */
@@ -292,8 +324,14 @@ static int on_secret(void *ctx, unsigned epoch, int is_send, uint16_t suite, con
     brisk__quic_conn *q = (brisk__quic_conn *)ctx;
     unsigned lvl = epoch == BRISK__EPOCH_HANDSHAKE ? 1 : epoch == BRISK__EPOCH_APP ? 2 : 0;
     size_t i;
-    if (lvl == 0) {
+    if (lvl == 0 || len > sizeof q->ap_secret[0]) {
         return -1; /* the engine never exports Initial secrets; they come from the DCID */
+    }
+    if (lvl == 2) {
+        /* RFC 9001 6: key update derives from the 1-RTT secrets, which the engine wipes right
+         * after this call - keep both (6.1) */
+        memcpy(q->ap_secret[is_send ? 1 : 0], secret, len);
+        q->ap_len = (uint8_t)len;
     }
     if (is_send) {
         return brisk__quic_keys_init(&q->tx[lvl], suite, secret, len) == BRISK_OK ? 0 : -1;
@@ -316,7 +354,8 @@ static int on_secret(void *ctx, unsigned epoch, int is_send, uint16_t suite, con
 }
 
 /* RFC 9001 8.2: the server's parameters. Parsed and copied now (the bytes die with the call),
- * acted on only at CONNECTED, when they are authenticated. */
+ * acted on only at CONNECTED, when they are authenticated - except ack_delay_exponent and
+ * max_ack_delay, which only scale our RTT estimate (RFC 9002 5.3). */
 static int on_peer_tp(void *ctx, const uint8_t *tp, size_t len)
 {
     brisk__quic_conn *q = (brisk__quic_conn *)ctx;
@@ -411,16 +450,152 @@ static uint64_t crypto_in(brisk__quic_conn *q, unsigned lvl, uint64_t off, const
     return 0;
 }
 
+/* ------------------------------------------------------------------ records, CIDs ---------- */
+
+/* The records rec_on_ack / rec_on_timeout marked: their retransmission state (RFC 9000 13.3). */
+static void reap(brisk__quic_conn *q)
+{
+    unsigned i, j;
+    for (i = 0; i < BRISK__QUIC_SENT; i++) {
+        brisk__quic_sent *s = &q->rec.s[i];
+        int acked = (s->flags & BRISK__QS_ACKED) != 0;
+        if (!(s->flags & (BRISK__QS_ACKED | BRISK__QS_LOST))) {
+            continue;
+        }
+        if (s->slot == BRISK__QS_CRYPTO && !acked && s->lvl < 2 && q->tx[s->lvl].suite != 0 &&
+            s->off < q->ret_sent[s->lvl]) {
+            q->ret_sent[s->lvl] = (size_t)s->off; /* 13.3: CRYPTO again from the lost offset */
+        }
+        if (s->flags & BRISK__QS_RETIRE) {
+            for (j = 0; j < BRISK__QUIC_RETIRE; j++) {
+                if (q->rq[j].state == 2 && q->rq[j].pn == s->pn) {
+                    q->rq[j].state = acked ? 0 : 1; /* 13.3: resent until acknowledged */
+                }
+            }
+        }
+        if (s->lvl == 2) {
+            brisk__quic_stream_record(q, s);
+        }
+        memset(s, 0, sizeof *s);
+    }
+}
+
+/* Queue RETIRE_CONNECTION_ID for seq (5.1.2). 0 or CONNECTION_ID_LIMIT_ERROR. */
+static uint64_t retire(brisk__quic_conn *q, uint64_t seq)
+{
+    unsigned j, used = 0, fr = BRISK__QUIC_RETIRE;
+    for (j = 0; j < BRISK__QUIC_RETIRE; j++) {
+        if (q->rq[j].state != 0 && q->rq[j].seq == seq) {
+            return 0; /* 19.15: already done for that sequence number */
+        }
+        if (q->rq[j].state != 0) {
+            used++;
+        } else if (fr == BRISK__QUIC_RETIRE) {
+            fr = j;
+        }
+    }
+    /* 5.1.2 (SHOULD track 2 * limit; MAY error beyond it - taken) */
+    if (used >= 2 * q->my_tp.active_connection_id_limit || fr == BRISK__QUIC_RETIRE) {
+        return BRISK__QERR_CONNECTION_ID_LIMIT;
+    }
+    q->rq[fr].seq = seq;
+    q->rq[fr].state = 1;
+    return 0;
+}
+
+/* NEW_CONNECTION_ID (19.15, 5.1.1, 5.1.2). 0 or a QUIC error code. */
+static uint64_t new_cid(brisk__quic_conn *q, uint64_t seq, uint64_t rpt, const uint8_t *cid,
+                        size_t len, const uint8_t *token)
+{
+    brisk__quic_cid *e;
+    unsigned i, active = 0, lo = BRISK__QUIC_CIDS;
+    int dup = 0, cur = 0;
+    uint64_t code;
+    if (q->dcid_len == 0) {
+        return BRISK__QERR_PROTOCOL_VIOLATION; /* 19.15 MUST: we send an empty DCID */
+    }
+    for (i = 0; i < BRISK__QUIC_CIDS; i++) {
+        e = &q->cids[i];
+        if (!e->used) {
+            continue;
+        }
+        if (e->seq == seq) {
+            /* 19.15: the same frame twice is not an error (MUST NOT); another CID or token
+             * under the same number is (MAY, taken) */
+            if (e->len != len || memcmp(e->cid, cid, len) != 0 || memcmp(e->token, token, 16)) {
+                return BRISK__QERR_PROTOCOL_VIOLATION;
+            }
+            dup = 1;
+        } else if (e->len == len && memcmp(e->cid, cid, len) == 0) {
+            return BRISK__QERR_PROTOCOL_VIOLATION; /* the same CID under another number */
+        }
+    }
+    if (rpt > q->rpt_max) {
+        /* 5.1.2 (MUST): stop using and retire every CID below Retire Prior To, before the
+         * new one is added; a Retire Prior To that does not grow is ignored (19.15 MUST) */
+        q->rpt_max = rpt;
+        for (i = 0; i < BRISK__QUIC_CIDS; i++) {
+            e = &q->cids[i];
+            if (e->used && e->seq < rpt) {
+                code = retire(q, e->seq);
+                if (code != 0) {
+                    return code;
+                }
+                e->used = 0;
+            }
+        }
+    }
+    if (seq < q->rpt_max) {
+        code = retire(q, seq); /* 19.15 (MUST): already below Retire Prior To */
+        if (code != 0) {
+            return code;
+        }
+    } else if (!dup) {
+        for (i = 0; i < BRISK__QUIC_CIDS && q->cids[i].used; i++) {
+        }
+        if (i == BRISK__QUIC_CIDS) {
+            return BRISK__QERR_CONNECTION_ID_LIMIT;
+        }
+        e = &q->cids[i];
+        e->used = 1;
+        e->seq = seq;
+        e->len = (uint8_t)len;
+        memcpy(e->cid, cid, len);
+        memcpy(e->token, token, 16);
+    }
+    for (i = 0; i < BRISK__QUIC_CIDS; i++) {
+        e = &q->cids[i];
+        if (e->used) {
+            active++;
+            cur |= e->len == q->dcid_len && memcmp(e->cid, q->dcid, q->dcid_len) == 0;
+            if (lo == BRISK__QUIC_CIDS || e->seq < q->cids[lo].seq) {
+                lo = i;
+            }
+        }
+    }
+    /* 5.1.1 (MUST): more active CIDs than our active_connection_id_limit */
+    if (active > q->my_tp.active_connection_id_limit) {
+        return BRISK__QERR_CONNECTION_ID_LIMIT;
+    }
+    if (!cur && lo != BRISK__QUIC_CIDS) {
+        /* 5.1.2: ours was retired - switch to the lowest active sequence number */
+        memcpy(q->dcid, q->cids[lo].cid, q->cids[lo].len);
+        q->dcid_len = q->cids[lo].len;
+    }
+    return 0;
+}
+
 /* ------------------------------------------------------------------ frames (12.4, 19) ----- */
 
-/* Varints to skip for the frames that are only syntax-checked in this item (19.4-19.19). */
-static const uint8_t QC_SKIP[0x1f] = {[0x04] = 3, [0x05] = 2, [0x10] = 1,
-                                      [0x11] = 2, [0x14] = 1, [0x15] = 2};
+/* Varints to skip for the frames that carry nothing for this client: DATA_BLOCKED 0x14,
+ * STREAMS_BLOCKED 0x16 / 0x17 (their value is checked below) */
+static const uint8_t QC_SKIP[0x1f] = {[0x14] = 1};
 
 uint64_t brisk__quic_frames(brisk__quic_conn *q, unsigned lvl, const uint8_t *p, size_t len)
 {
-    const uint8_t *end, *t0;
+    const uint8_t *end, *t0, *cid;
     uint64_t type, a, b, c, i, code;
+    int newly;
     /* 12.4: a packet containing no frames is PROTOCOL_VIOLATION */
     if (p == NULL || len == 0) {
         return BRISK__QERR_PROTOCOL_VIOLATION;
@@ -453,36 +628,37 @@ uint64_t brisk__quic_frames(brisk__quic_conn *q, unsigned lvl, const uint8_t *p,
         if (lvl != 2 && !(type <= 0x03 || type == 0x06 || type == 0x1c)) {
             return BRISK__QERR_PROTOCOL_VIOLATION;
         }
+        if (q != NULL &&
+            !(type == 0x00 || type == 0x02 || type == 0x03 || type == 0x1c || type == 0x1d)) {
+            q->rx_elicit = 1; /* 13.2: everything but PADDING, ACK and CONNECTION_CLOSE */
+        }
         switch (type) {
         case 0x00: /* PADDING (19.1) */
-        case 0x01: /* PING (19.2) */
             break;
-        case 0x02: /* ACK (19.3): syntax only until loss recovery (M6 item 2) */
+        case 0x01: /* PING (19.2) */
+            if (q != NULL) {
+                q->rx_elicit = 1;
+            }
+            break;
+        case 0x02: /* ACK (19.3): parsed, applied to this space only (13.2.6) */
         case 0x03:
-            QC_GET(a); /* Largest Acknowledged */
-            QC_GET(b); /* ACK Delay */
-            QC_GET(c); /* ACK Range Count */
-            QC_GET(b); /* First ACK Range */
-            if (b > a) {
-                return BRISK__QERR_FRAME_ENCODING; /* 19.3.1: a negative packet number */
-            }
-            a -= b; /* smallest acknowledged so far */
-            for (i = 0; i < c; i++) {
-                QC_GET(b); /* Gap: the next largest is smallest - gap - 2 */
-                if (b > a || a - b < 2) {
-                    return BRISK__QERR_FRAME_ENCODING;
+            if (q == NULL) {
+                code =
+                    brisk__quic_rec_on_ack(NULL, lvl, type == 0x03, &p, end, 0, 0, 0, 0, 0, NULL);
+            } else {
+                code = brisk__quic_rec_on_ack(&q->rec, lvl, type == 0x03, &p, end, q->tx_pn[lvl],
+                                              (unsigned)q->peer_tp.ack_delay_exponent,
+                                              (uint32_t)q->peer_tp.max_ack_delay, q->confirmed,
+                                              q->now, &newly);
+                if (code == 0) {
+                    reap(q);
+                    if (newly) {
+                        q->burst_bytes = 0; /* 7.7: an ACK ends the burst */
+                    }
                 }
-                a -= b + 2;
-                QC_GET(b); /* ACK Range Length */
-                if (b > a) {
-                    return BRISK__QERR_FRAME_ENCODING;
-                }
-                a -= b;
             }
-            if (type == 0x03) { /* ECN counts */
-                QC_GET(a);
-                QC_GET(a);
-                QC_GET(a);
+            if (code != 0) {
+                return code;
             }
             break;
         case 0x06: /* CRYPTO (19.6) */
@@ -500,7 +676,8 @@ uint64_t brisk__quic_frames(brisk__quic_conn *q, unsigned lvl, const uint8_t *p,
             }
             p += (size_t)b;
             break;
-        case 0x07: /* NEW_TOKEN (19.7): an empty token is FRAME_ENCODING_ERROR */
+        case 0x07: /* NEW_TOKEN (19.7): an empty token is FRAME_ENCODING_ERROR; kept for no one
+                    * (address validation tokens are M6 item 3) */
             QC_GET(a);
             if (a == 0) {
                 return BRISK__QERR_FRAME_ENCODING;
@@ -515,7 +692,7 @@ uint64_t brisk__quic_frames(brisk__quic_conn *q, unsigned lvl, const uint8_t *p,
         case 0x0d:
         case 0x0e:
         case 0x0f:
-            QC_GET(a);
+            QC_GET(c);
             a = 0;
             if (type & 0x04) {
                 QC_GET(a);
@@ -528,7 +705,36 @@ uint64_t brisk__quic_frames(brisk__quic_conn *q, unsigned lvl, const uint8_t *p,
             if (b > (uint64_t)(end - p) || a > BRISK__QUIC_VARINT_MAX - b) {
                 return BRISK__QERR_FRAME_ENCODING;
             }
+            if (q != NULL) {
+                code = brisk__quic_stream_frame(q, c, a, p, (size_t)b, (int)(type & 1));
+                if (code != 0) {
+                    return code;
+                }
+            }
             p += (size_t)b;
+            break;
+        case 0x04: /* RESET_STREAM (19.4): id, code, final size */
+        case 0x05: /* STOP_SENDING (19.5): id, code */
+        case 0x11: /* MAX_STREAM_DATA (19.10): id, limit */
+        case 0x15: /* STREAM_DATA_BLOCKED (19.13): id, limit */
+            QC_GET(c);
+            QC_GET(a);
+            b = 0;
+            if (type == 0x04) {
+                QC_GET(b);
+            }
+            if (q != NULL) {
+                code = brisk__quic_stream_ctl(q, type, c, a, b);
+                if (code != 0) {
+                    return code;
+                }
+            }
+            break;
+        case 0x10: /* MAX_DATA (19.9) */
+            QC_GET(a);
+            if (q != NULL) {
+                brisk__quic_stream_limits(q, type, a);
+            }
             break;
         case 0x18: /* NEW_CONNECTION_ID (19.15) */
             QC_GET(a);
@@ -537,9 +743,13 @@ uint64_t brisk__quic_frames(brisk__quic_conn *q, unsigned lvl, const uint8_t *p,
                 return BRISK__QERR_FRAME_ENCODING;
             }
             c = *p++;
+            cid = p;
             QC_SKIPN(c + 16);
-            if (q != NULL && q->dcid_len == 0) {
-                return BRISK__QERR_PROTOCOL_VIOLATION; /* 19.15 MUST: we send an empty DCID */
+            if (q != NULL) {
+                code = new_cid(q, a, b, cid, (size_t)c, cid + c);
+                if (code != 0) {
+                    return code;
+                }
             }
             break;
         case 0x12: /* MAX_STREAMS (19.11), STREAMS_BLOCKED (19.14): MUST be at most 2^60 */
@@ -550,6 +760,9 @@ uint64_t brisk__quic_frames(brisk__quic_conn *q, unsigned lvl, const uint8_t *p,
             if (a > ((uint64_t)1 << 60)) {
                 return BRISK__QERR_FRAME_ENCODING;
             }
+            if (q != NULL && type <= 0x13) {
+                brisk__quic_stream_limits(q, type, a);
+            }
             break;
         case 0x19: /* RETIRE_CONNECTION_ID (19.16): we issued only sequence 0, the DCID of every
                     * 1-RTT packet (MAY), and none at all with an empty SCID (MUST) */
@@ -558,8 +771,17 @@ uint64_t brisk__quic_frames(brisk__quic_conn *q, unsigned lvl, const uint8_t *p,
                 return BRISK__QERR_PROTOCOL_VIOLATION;
             }
             break;
-        case 0x1a: /* PATH_CHALLENGE / PATH_RESPONSE (19.17, 19.18) */
-        case 0x1b:
+        case 0x1a: /* PATH_CHALLENGE (19.17): 8.2.2 (MUST) echo it in a PATH_RESPONSE */
+            QC_SKIPN(8);
+            if (q != NULL) {
+                if (q->n_path_resp == 2) {
+                    memcpy(q->path_resp[0], q->path_resp[1], 8); /* policy: drop the oldest */
+                    q->n_path_resp = 1;
+                }
+                memcpy(q->path_resp[q->n_path_resp++], p - 8, 8);
+            }
+            break;
+        case 0x1b: /* PATH_RESPONSE (19.18): never solicited - ignored (policy) */
             QC_SKIPN(8);
             break;
         case 0x1c: /* CONNECTION_CLOSE (19.19) */
@@ -578,13 +800,17 @@ uint64_t brisk__quic_frames(brisk__quic_conn *q, unsigned lvl, const uint8_t *p,
             }
             break;
         case 0x1e: /* HANDSHAKE_DONE (19.20): 1-RTT only (Table 3 above) */
-            if (q != NULL) {
-                /* RFC 9001 4.1.2: confirmed. 4.9.2 (MUST): discard the Handshake keys. */
+            if (q != NULL && !q->confirmed) {
+                /* RFC 9001 4.1.2: confirmed. 4.9.2 (MUST): discard the Handshake keys;
+                 * RFC 9002 6.4: and that space's recovery state */
                 q->confirmed = 1;
                 brisk__quic_keys_wipe(&q->rx[1]);
                 brisk__quic_keys_wipe(&q->tx[1]);
                 brisk__secure_zero(q->ret[1], QC_RET1);
                 q->ret_len[1] = q->ret_sent[1] = 0;
+                brisk__quic_rec_discard(&q->rec, 1);
+                brisk__quic_rxack_init(&q->rxa[1]);
+                q->probe[1] = 0;
             }
             break;
         default:
@@ -603,20 +829,39 @@ uint64_t brisk__quic_frames(brisk__quic_conn *q, unsigned lvl, const uint8_t *p,
 
 size_t brisk__quic_scratch_size(void)
 {
-    return QC_RING + QC_BITS + QC_RET0 + QC_RET1;
+    return QC_RING + QC_BITS + QC_RET0 + QC_RET1 + QC_STREAMS;
 }
 
-int brisk__quic_conn_init(brisk__quic_conn *q, brisk__tls13_hs *hs, const uint8_t *dcid,
-                          size_t dcid_len, const uint8_t *scid, size_t scid_len, uint8_t *scratch,
-                          size_t scratch_len)
+int brisk__quic_conn_init(brisk__quic_conn *q, brisk__tls13_hs *hs, const brisk__quic_tp *tp,
+                          const uint8_t *dcid, size_t dcid_len, const uint8_t *scid,
+                          size_t scid_len, uint8_t *scratch, size_t scratch_len)
 {
     uint8_t c[32], s[32];
     int rc;
+    size_t i;
     /* RFC 9000 7.2 (MUST): the first DCID is at least 8 unpredictable bytes */
-    if (q == NULL || hs == NULL || !hs->cfg.quic || dcid == NULL || dcid_len < 8 ||
+    if (q == NULL || hs == NULL || tp == NULL || !hs->cfg.quic || dcid == NULL || dcid_len < 8 ||
         dcid_len > BRISK__QUIC_MAX_CID || scid_len > BRISK__QUIC_MAX_CID ||
         (scid == NULL && scid_len != 0) || scratch == NULL ||
         scratch_len < brisk__quic_scratch_size()) {
+        return BRISK_E_ARG;
+    }
+    /* 7.3 (MUST): initial_source_connection_id is the SCID of our first Initial */
+    if (tp->iscid_len != scid_len || (scid_len != 0 && memcmp(tp->iscid, scid, scid_len) != 0)) {
+        return BRISK_E_ARG;
+    }
+    /* The limits we advertise are what the rings can hold: a stream window <= the ring (so
+     * FLOW_CONTROL_ERROR guards memory), a connection window <= all rings, stream credit <=
+     * the slots, and CIDs <= the table (18.2: 2 at least) */
+    if (tp->initial_max_stream_data_bidi_local > BRISK_QUIC_STREAM_BUF ||
+        tp->initial_max_stream_data_bidi_remote > BRISK_QUIC_STREAM_BUF ||
+        tp->initial_max_stream_data_uni > BRISK_QUIC_STREAM_BUF ||
+        tp->initial_max_data > (uint64_t)BRISK_QUIC_MAX_STREAMS * BRISK_QUIC_STREAM_BUF ||
+        tp->initial_max_streams_bidi > BRISK_QUIC_MAX_STREAMS ||
+        tp->initial_max_streams_uni > BRISK_QUIC_MAX_STREAMS ||
+        tp->initial_max_streams_bidi + tp->initial_max_streams_uni > BRISK_QUIC_MAX_STREAMS ||
+        tp->active_connection_id_limit < 2 || tp->active_connection_id_limit > BRISK__QUIC_CIDS ||
+        tp->ack_delay_exponent > 20 || tp->max_ack_delay >= ((uint64_t)1 << 14)) {
         return BRISK_E_ARG;
     }
     memset(q, 0, sizeof *q);
@@ -625,6 +870,8 @@ int brisk__quic_conn_init(brisk__quic_conn *q, brisk__tls13_hs *hs, const uint8_
     hs->cfg.secret_ctx = q;
     hs->cfg.on_peer_tp = on_peer_tp;
     hs->cfg.tp_ctx = q;
+    q->my_tp = *tp;
+    brisk__quic_tp_default(&q->peer_tp);
     memcpy(q->dcid, dcid, dcid_len);
     memcpy(q->odcid, dcid, dcid_len);
     q->dcid_len = q->odcid_len = (uint8_t)dcid_len;
@@ -632,12 +879,20 @@ int brisk__quic_conn_init(brisk__quic_conn *q, brisk__tls13_hs *hs, const uint8_
         memcpy(q->scid, scid, scid_len);
     }
     q->scid_len = (uint8_t)scid_len;
-    q->rx_largest[0] = q->rx_largest[1] = q->rx_largest[2] = QC_NONE;
+    for (i = 0; i < 3; i++) {
+        q->rx_largest[i] = QC_NONE;
+        brisk__quic_rxack_init(&q->rxa[i]);
+    }
+    brisk__quic_rec_init(&q->rec);
+    q->idle_start = INT64_MIN;
+    q->idle_rx = 1;
+    q->burst_t = -1;
     memset(scratch, 0, brisk__quic_scratch_size());
     q->ring = scratch;
     q->bits = scratch + QC_RING;
     q->ret[0] = q->bits + QC_BITS;
     q->ret[1] = q->ret[0] + QC_RET0;
+    q->srings = q->ret[1] + QC_RET1;
     q->ret_cap[0] = QC_RET0;
     q->ret_cap[1] = QC_RET1;
     /* RFC 9001 5.2: Initial keys from the client's first DCID, AES-128-GCM */
@@ -653,35 +908,6 @@ int brisk__quic_conn_init(brisk__quic_conn *q, brisk__tls13_hs *hs, const uint8_
     return rc;
 }
 
-/* RFC 9000 12.3 (MUST): a duplicate is discarded - called only after the AEAD accepted the
- * packet. 1 = seen before (or too old to tell: 64 below the largest). */
-static int dup_seen(brisk__quic_conn *q, unsigned lvl, uint64_t pn)
-{
-    uint64_t d, bit = 1, *seen = &q->rx_seen[lvl];
-    if (q->rx_largest[lvl] == QC_NONE || pn > q->rx_largest[lvl]) {
-        d = q->rx_largest[lvl] == QC_NONE ? 64 : pn - q->rx_largest[lvl];
-        *seen = d >= 64 ? 0 : *seen;
-        while (d-- != 0 && *seen != 0) { /* constant shifts only: no __ashldi3 on 32-bit */
-            *seen <<= 1;
-        }
-        *seen |= 1;
-        q->rx_largest[lvl] = pn;
-        return 0;
-    }
-    d = q->rx_largest[lvl] - pn;
-    if (d >= 64) {
-        return 1; /* ponytail: a 64-packet window; item 2's ACK ranges replace it */
-    }
-    while (d-- != 0) {
-        bit <<= 1;
-    }
-    if (*seen & bit) {
-        return 1;
-    }
-    *seen |= bit;
-    return 0;
-}
-
 /* RFC 9000 7.3 (MUST): the server's CIDs as authenticated by the handshake */
 static int cids_ok(const brisk__quic_conn *q)
 {
@@ -690,6 +916,82 @@ static int cids_ok(const brisk__quic_conn *q)
            memcmp(t->odcid, q->odcid, q->odcid_len) == 0 && t->has_iscid &&
            t->iscid_len == q->dcid_len && memcmp(t->iscid, q->dcid, q->dcid_len) == 0 &&
            !t->has_retry_scid; /* no Retry was received (Retry is M6 item 3) */
+}
+
+static uint32_t peer_mad(const brisk__quic_conn *q)
+{
+    return (uint32_t)q->peer_tp.max_ack_delay;
+}
+
+/* RFC 9000 10.1: min of the non-zero max_idle_timeouts, at least 3 * PTO. INT64_MAX = none. */
+static int64_t idle_deadline(const brisk__quic_conn *q)
+{
+    uint64_t t = q->my_tp.max_idle_timeout, p = q->established ? q->peer_tp.max_idle_timeout : 0;
+    uint32_t pto3;
+    if (p != 0 && (t == 0 || p < t)) {
+        t = p;
+    }
+    if (t == 0 || q->idle_start == INT64_MIN) {
+        return INT64_MAX;
+    }
+    pto3 = brisk__quic_rec_pto(&q->rec, q->confirmed ? 2 : 1, peer_mad(q));
+    pto3 = pto3 + (pto3 << 1); /* pto <= 2^27: no overflow */
+    if (t > UINT32_MAX) {
+        t = UINT32_MAX;
+    }
+    return brisk__quic_tadd(q->idle_start, (uint32_t)t > pto3 ? (uint32_t)t : pto3);
+}
+
+static int64_t rec_deadline(const brisk__quic_conn *q, unsigned *lvl)
+{
+    return brisk__quic_rec_deadline(&q->rec, lvl, q->confirmed, q->tx[1].suite != 0, peer_mad(q));
+}
+
+/* Sans-I/O time: never backwards (clamped to the last value seen), never below 0. */
+static void set_now(brisk__quic_conn *q, int64_t now)
+{
+    if (now > q->now) {
+        q->now = now;
+    }
+}
+
+/* The due timers (RFC 9000 10.1, RFC 9002 6): idle expiry closes silently; the loss / PTO
+ * timer runs once. */
+static void run_timers(brisk__quic_conn *q)
+{
+    unsigned lvl = 0, k, i;
+    uint64_t lo;
+    if (q->err != 0) {
+        return;
+    }
+    if (idle_deadline(q) <= q->now) {
+        /* 10.1 / 10.2.1: silently closed - no CONNECTION_CLOSE, all state discarded */
+        q_end(q, BRISK__QERR_NO_ERROR, BRISK_E_TIMEOUT, 0);
+        return;
+    }
+    if (rec_deadline(q, &lvl) > q->now) {
+        return;
+    }
+    k = brisk__quic_rec_on_timeout(&q->rec, q->now, &lvl, q->confirmed, q->tx[1].suite != 0,
+                                   peer_mad(q));
+    if (k != 0 && q->tx[lvl].suite != 0) {
+        q->probe[lvl] = (uint8_t)(q->probe[lvl] + k > 2 ? 2 : q->probe[lvl] + k);
+        if (lvl < 2) {
+            /* 6.2.4 (SHOULD): the probe carries the unacknowledged CRYPTO data */
+            lo = QC_NONE;
+            for (i = 0; i < BRISK__QUIC_SENT; i++) {
+                const brisk__quic_sent *s = &q->rec.s[i];
+                if ((s->flags & BRISK__QS_USED) && s->lvl == lvl && s->slot == BRISK__QS_CRYPTO &&
+                    s->off < lo) {
+                    lo = s->off;
+                }
+            }
+            if (lo < q->ret_sent[lvl]) {
+                q->ret_sent[lvl] = (size_t)lo;
+            }
+        }
+    }
+    reap(q);
 }
 
 static int one_packet(brisk__quic_conn *q, const brisk__quic_hdr *h, uint8_t *pkt)
@@ -716,7 +1018,8 @@ static int one_packet(brisk__quic_conn *q, const brisk__quic_hdr *h, uint8_t *pk
     if ((is_long && h->version != BRISK__QUIC_V1) || h->dcid_len != q->scid_len ||
         memcmp(h->dcid, q->scid, q->scid_len) != 0 ||
         (is_long && q->got_initial &&
-         (h->scid_len != q->dcid_len || memcmp(h->scid, q->dcid, q->dcid_len) != 0)) ||
+         (h->scid_len != q->server_scid_len ||
+          memcmp(h->scid, q->server_scid, h->scid_len) != 0)) ||
         (lvl == 0 && h->token_len != 0)) {
         return BRISK_OK;
     }
@@ -744,16 +1047,23 @@ static int one_packet(brisk__quic_conn *q, const brisk__quic_hdr *h, uint8_t *pk
     if (first & (is_long ? 0x0c : 0x18)) {
         return q_fail(q, BRISK__QERR_PROTOCOL_VIOLATION, BRISK_E_PROTO, 0);
     }
-    /* key phase flip = key update (M6 item 3): dropped. 12.3: duplicates, after protection. */
-    if ((!is_long && (first & 0x04)) || dup_seen(q, lvl, pn)) {
+    /* key phase flip = key update (M6 item 3): dropped. 12.3 / 13.2.3: duplicates (and PNs
+     * below what we still track), after protection. */
+    if ((!is_long && (first & 0x04)) || brisk__quic_rxack_dup(&q->rxa[lvl], pn)) {
         return BRISK_OK;
+    }
+    if (q->rx_largest[lvl] == QC_NONE || pn > q->rx_largest[lvl]) {
+        q->rx_largest[lvl] = pn;
     }
     if (lvl == 0 && !q->got_initial) {
         /* 7.2 (MUST): switch to the SCID of the first server Initial */
         memcpy(q->dcid, h->scid, h->scid_len);
         q->dcid_len = h->scid_len;
+        memcpy(q->server_scid, h->scid, h->scid_len);
+        q->server_scid_len = h->scid_len;
         q->got_initial = 1;
     }
+    q->rx_elicit = 0;
     code = brisk__quic_frames(q, lvl, pkt + po, pl);
     if (q->err != 0) {
         wipe_all(q); /* the peer closed: draining, no CONNECTION_CLOSE back */
@@ -762,11 +1072,29 @@ static int one_packet(brisk__quic_conn *q, const brisk__quic_hdr *h, uint8_t *pk
     if (code != 0) {
         return q_fail(q, code, fail_rc(q), 0);
     }
+    /* 13.2.1: Initial / Handshake at once, 1-RTT within our max_ack_delay */
+    brisk__quic_rxack_add(&q->rxa[lvl], pn, q->rx_elicit, q->now,
+                          lvl == 2 ? (int64_t)q->my_tp.max_ack_delay : 0, lvl < 2);
+    q->idle_start = q->now; /* 10.1: restarted by every processed packet */
+    q->idle_rx = 1;
     if (!q->established && q->hs->state == BRISK__HS_CONNECTED) {
         if (!cids_ok(q)) {
             return q_fail(q, BRISK__QERR_TRANSPORT_PARAMETER, BRISK_E_PROTO, 0);
         }
         q->established = 1;
+        brisk__quic_streams_init(q);
+        /* 5.1.1: the handshake's server CID is sequence 0 */
+        q->cids[0].used = 1;
+        q->cids[0].len = q->dcid_len;
+        memcpy(q->cids[0].cid, q->dcid, q->dcid_len);
+        memcpy(q->cids[0].token, q->peer_tp.reset_token, 16);
+        if (q->peer_tp.has_pref_addr) { /* 5.1.1: preferred_address carries sequence 1 */
+            q->cids[1].used = 1;
+            q->cids[1].seq = 1;
+            q->cids[1].len = q->peer_tp.pref_cid_len;
+            memcpy(q->cids[1].cid, q->peer_tp.pref_cid, q->peer_tp.pref_cid_len);
+            memcpy(q->cids[1].token, q->peer_tp.pref_token, 16);
+        }
     }
     return BRISK_OK;
 }
@@ -776,10 +1104,11 @@ int brisk__quic_recv(brisk__quic_conn *q, uint8_t *dgram, size_t len, int64_t no
     brisk__quic_hdr h;
     size_t off = 0;
     int rc;
-    (void)now_ms; /* timers are M6 item 2 */
     if (q == NULL || (dgram == NULL && len != 0)) {
         return BRISK_E_ARG;
     }
+    set_now(q, now_ms);
+    run_timers(q);
     if (q->err != 0) {
         return q->err;
     }
@@ -796,6 +1125,32 @@ int brisk__quic_recv(brisk__quic_conn *q, uint8_t *dgram, size_t len, int64_t no
     return BRISK_OK;
 }
 
+int64_t brisk__quic_deadline(const brisk__quic_conn *q)
+{
+    int64_t t, d;
+    unsigned lvl, i;
+    if (q == NULL || q->err != 0) {
+        return q != NULL && q->cc_state == 1 ? q->now : INT64_MAX;
+    }
+    if (q->probe[0] | q->probe[1] | q->probe[2] ||
+        (q->n_path_resp != 0 && brisk__quic_rec_can_send(&q->rec, QC_DGRAM))) {
+        return q->now; /* RFC 9002 6.2.4 / RFC 9000 8.2.2 (MUST): owed now, not at the next timer */
+    }
+    t = idle_deadline(q);
+    d = rec_deadline(q, &lvl);
+    t = d < t ? d : t;
+    for (i = 0; i < 3; i++) { /* 13.2.1: an ACK owed */
+        if (q->tx[i].suite != 0 && q->rxa[i].pending && q->rxa[i].ack_due < t) {
+            t = q->rxa[i].ack_due;
+        }
+    }
+    if (q->burst_bytes >= QC_BURST) {
+        d = brisk__quic_tadd(q->burst_t, 1); /* RFC 9002 7.7: the pacing wait */
+        t = d < t ? d : t;
+    }
+    return t;
+}
+
 /* ------------------------------------------------------------------ sending --------------- */
 
 static size_t hdr_len(const brisk__quic_conn *q, unsigned lvl)
@@ -805,16 +1160,20 @@ static size_t hdr_len(const brisk__quic_conn *q, unsigned lvl)
                     : 1u + 4 + 1 + q->dcid_len + 1 + q->scid_len + (lvl == 0) + 2;
 }
 
-/* Header + 4-byte PN + seal around payload_len bytes already at p + hdr_len + 4. Returns the
- * packet length, 0 if the key refused (6.6 limit) or the PN space is spent (12.3). */
-static size_t pkt_finish(brisk__quic_conn *q, unsigned lvl, uint8_t *p, size_t payload_len)
+/* RFC 9000 17.1 / A.2: the PN length for the next packet at lvl */
+static unsigned pn_len(const brisk__quic_conn *q, unsigned lvl)
+{
+    return brisk__quic_pn_len(q->tx_pn[lvl], q->rec.largest_acked[lvl]);
+}
+
+/* Header + PN of pnl bytes + seal around payload_len bytes already at p + hdr_len + pnl.
+ * Returns the packet length, 0 if the key refused (6.6 limit) or the PN space is spent (12.3). */
+static size_t pkt_finish(brisk__quic_conn *q, unsigned lvl, uint8_t *p, size_t payload_len,
+                         unsigned pnl)
 {
     size_t hl = hdr_len(q, lvl), i = 0;
-    /* 17.1: the full 4-byte PN until the space is acknowledged. The callers lay the payload
-     * out at hl + 4; ACK processing (M6 item 2) must pass brisk__quic_pn_len's value to them. */
-    const unsigned pnl = 4;
     if (q->tx_pn[lvl] >= BRISK__QUIC_VARINT_MAX) {
-        return 0;
+        return 0; /* 12.3 (MUST): PN 2^62-1 is never used - close silently */
     }
     if (lvl == 2) {
         p[i++] = (uint8_t)(0x40 | (pnl - 1)); /* 17.3.1: fixed bit, spin 0, key phase 0 */
@@ -845,35 +1204,40 @@ static size_t pkt_finish(brisk__quic_conn *q, unsigned lvl, uint8_t *p, size_t p
     return hl + pnl + payload_len + 16;
 }
 
-/* RFC 9000 10.2.3: CONNECTION_CLOSE 0x1c (never 0x1d below 1-RTT; this client has no
- * application close yet) in every level we still hold send keys for - Initial and Handshake
- * while unsure what the server has, 1-RTT once it exists - coalesced, padded to 1200 when an
- * Initial is in it (14.1). No reason phrase, frame type 0. */
-static size_t cc_build(brisk__quic_conn *q, uint8_t *out)
+/* RFC 9000 10.2.3: CONNECTION_CLOSE of `type` in every level we still hold send keys for -
+ * 0x1c at Initial and Handshake while unsure what the server has, 1-RTT once it exists; 0x1d
+ * (an application close) in 1-RTT only - coalesced, the last packet padded to 1200 when an
+ * Initial is in it (14.1). No reason phrase; frame type 0. */
+static size_t cc_build(brisk__quic_conn *q, uint8_t *out, unsigned type)
 {
     size_t pos = 0, hl, pl, w, n;
-    unsigned lvl, last = 3;
+    unsigned lvl, last = 3, pnl;
     for (lvl = 0; lvl < 3; lvl++) {
-        if (q->tx[lvl].suite != 0 && q->tx_pn[lvl] < BRISK__QUIC_VARINT_MAX) {
+        if (q->tx[lvl].suite != 0 && q->tx_pn[lvl] < BRISK__QUIC_VARINT_MAX &&
+            (type == 0x1c || lvl == 2)) {
             last = lvl;
         }
     }
     for (lvl = 0; lvl < 3 && last != 3; lvl++) {
-        if (q->tx[lvl].suite == 0 || q->tx_pn[lvl] >= BRISK__QUIC_VARINT_MAX) {
+        if (q->tx[lvl].suite == 0 || q->tx_pn[lvl] >= BRISK__QUIC_VARINT_MAX ||
+            (type == 0x1d && lvl != 2)) {
             continue;
         }
         hl = hdr_len(q, lvl);
-        w = pos + hl + 4;
-        out[w] = 0x1c;
+        pnl = pn_len(q, lvl);
+        w = pos + hl + pnl;
+        out[w] = (uint8_t)type;
         pl = 1 + brisk__quic_varint_put(out + w + 1, 8, q->err_code);
-        out[w + pl++] = 0x00; /* Frame Type */
+        if (type == 0x1c) {
+            out[w + pl++] = 0x00; /* Frame Type */
+        }
         out[w + pl++] = 0x00; /* Reason Phrase Length */
-        if (lvl == last && q->tx[0].suite != 0 && pos + hl + 4 + pl + 16 < QC_DGRAM) {
-            n = QC_DGRAM - (pos + hl + 4 + pl + 16);
+        if (lvl == last && q->tx[0].suite != 0 && pos + hl + pnl + pl + 16 < QC_DGRAM) {
+            n = QC_DGRAM - (pos + hl + pnl + pl + 16);
             memset(out + w + pl, 0, n); /* PADDING */
             pl += n;
         }
-        n = pkt_finish(q, lvl, out + pos, pl);
+        n = pkt_finish(q, lvl, out + pos, pl, pnl);
         if (n == 0) {
             break;
         }
@@ -882,19 +1246,99 @@ static size_t cc_build(brisk__quic_conn *q, uint8_t *out)
     return pos;
 }
 
+int brisk__quic_close(brisk__quic_conn *q, uint64_t app_err)
+{
+    if (q == NULL || app_err > BRISK__QUIC_VARINT_MAX) {
+        return BRISK_E_ARG;
+    }
+    if (q->err != 0) {
+        return q->err;
+    }
+    /* 10.2.3 (MUST NOT): no application error code in Initial / Handshake packets - there it
+     * is APPLICATION_ERROR in a 0x1c frame */
+    if (q->established) {
+        q_end(q, app_err, BRISK_E_ARG, 0x1d);
+    } else {
+        q_end(q, BRISK__QERR_APPLICATION, BRISK_E_ARG, 0x1c);
+    }
+    return BRISK_OK;
+}
+
+/* The ack-eliciting frames of one packet at lvl into w (room bytes); fills the record. */
+static size_t elicit_frames(brisk__quic_conn *q, unsigned lvl, uint8_t *w, size_t room,
+                            brisk__quic_sent *s, int *pad)
+{
+    size_t n = 0, fo, k;
+    uint64_t off;
+    unsigned j;
+    if (lvl < 2) {
+        /* CRYPTO (19.6) from the first byte not sent yet (or lost, 13.3) */
+        off = q->ret_sent[lvl];
+        fo = 1 + brisk__quic_varint_put(NULL, 0, off) + 2; /* type, offset, length (<= 2) */
+        if (q->ret_sent[lvl] < q->ret_len[lvl] && room > fo) {
+            k = q->ret_len[lvl] - q->ret_sent[lvl];
+            k = k < room - fo ? k : room - fo;
+            w[n++] = 0x06;
+            n += brisk__quic_varint_put(w + n, 8, off);
+            n += brisk__quic_varint_put(w + n, 8, k);
+            memcpy(w + n, q->ret[lvl] + q->ret_sent[lvl], k);
+            n += k;
+            q->ret_sent[lvl] += k;
+            s->slot = BRISK__QS_CRYPTO;
+            s->off = off;
+            s->len = (uint16_t)k;
+        }
+    } else {
+        /* PATH_RESPONSE (19.18): each challenge answered once, never retransmitted (13.3) */
+        while (q->n_path_resp != 0 && room - n >= 9) {
+            w[n++] = 0x1b;
+            memcpy(w + n, q->path_resp[0], 8);
+            n += 8;
+            memcpy(q->path_resp[0], q->path_resp[1], 8);
+            brisk__secure_zero(q->path_resp[1], 8);
+            q->n_path_resp--;
+            *pad = 1; /* 8.2.2 (MUST): in a datagram of at least 1200 bytes */
+        }
+        /* RETIRE_CONNECTION_ID (19.16) */
+        for (j = 0; j < BRISK__QUIC_RETIRE; j++) {
+            if (q->rq[j].state == 1 &&
+                1 + brisk__quic_varint_put(NULL, 0, q->rq[j].seq) <= room - n) {
+                w[n++] = 0x19;
+                n += brisk__quic_varint_put(w + n, 8, q->rq[j].seq);
+                q->rq[j].state = 2;
+                q->rq[j].pn = s->pn;
+                s->flags |= BRISK__QS_RETIRE;
+            }
+        }
+        n += brisk__quic_stream_out(q, w + n, room - n, 0, s);
+    }
+    if (n == 0 && q->probe[lvl] != 0) {
+        w[n++] = 0x01; /* PING (19.2): 6.2.4 (MUST) a probe is ack-eliciting */
+    }
+    return n;
+}
+
+typedef struct {
+    size_t pos, pl;
+    unsigned lvl, pnl;
+    int elicit, inflight;
+    brisk__quic_sent s;
+} qc_pkt;
+
 size_t brisk__quic_send(brisk__quic_conn *q, uint8_t *out, size_t cap, int64_t now_ms)
 {
     uint8_t tmp[512];
-    unsigned e, lvl;
-    size_t n, hl, room, fo, pl, w;
-    uint64_t off;
-    (void)now_ms;
+    unsigned e, lvl, np = 0, free_recs, i, pnl;
+    size_t n, hl, room, pos = 0, ackn, el, w;
+    int cc_ok, pad = 0, elicited = 0, handshake = 0;
+    qc_pkt pk[3];
     if (q == NULL || out == NULL || cap < QC_DGRAM) {
         return 0;
     }
+    set_now(q, now_ms);
+    run_timers(q);
     if (q->err == 0) {
-        /* the engine's CRYPTO output joins the level's send stream (kept for item 2's
-         * retransmissions) */
+        /* the engine's CRYPTO output joins the level's send stream, kept for retransmission */
         while ((n = brisk__tls13_hs_pull(q->hs, &e, tmp, sizeof tmp)) != 0) {
             lvl = e == BRISK__EPOCH_INITIAL ? 0 : 1;
             if (e == BRISK__EPOCH_APP || q->tx[lvl].suite == 0 ||
@@ -916,45 +1360,134 @@ size_t brisk__quic_send(brisk__quic_conn *q, uint8_t *out, size_t cap, int64_t n
         q->cc_state = 2;
         return q->cc_len;
     }
-    /* RFC 9001 4.9: new data at the highest level it belongs to; Initial first while it has
-     * unsent CRYPTO (after an HRR, CH2 continues the stream after CH1, RFC 9000 17.2.2) */
-    lvl = q->tx[0].suite != 0 && q->ret_sent[0] < q->ret_len[0] ? 0 : 1;
-    if (q->tx[lvl].suite == 0 || q->ret_sent[lvl] >= q->ret_len[lvl]) {
+    if (q->now != q->burst_t) {
+        q->burst_t = q->now;
+        q->burst_bytes = 0;
+    }
+    if (q->burst_bytes >= QC_BURST) {
+        return 0; /* RFC 9002 7.7: burst limit - the deadline says when */
+    }
+    free_recs = brisk__quic_rec_free(&q->rec);
+    /* RFC 9002 7 (MUST NOT): nothing ack-eliciting past the window; a whole datagram's worth
+     * is checked, so the padded size is covered too. Probes (7.5) and ACK-only packets are
+     * exempt. */
+    cc_ok = brisk__quic_rec_can_send(&q->rec, QC_DGRAM);
+    /* RFC 9000 12.2: one packet per level, Initial -> Handshake -> 1-RTT, in one datagram */
+    for (lvl = 0; lvl < 3; lvl++) {
+        if (q->tx[lvl].suite == 0 || (lvl == 2 && !q->established)) {
+            continue;
+        }
+        hl = hdr_len(q, lvl);
+        pnl = pn_len(q, lvl);
+        if (pos + hl + pnl + 16 + QC_MIN_ROOM > QC_DGRAM) {
+            break;
+        }
+        w = pos + hl + pnl;
+        room = QC_DGRAM - w - 16;
+        memset(&pk[np], 0, sizeof pk[np]);
+        pk[np].s.pn = q->tx_pn[lvl];
+        pk[np].s.lvl = (uint8_t)lvl;
+        pk[np].s.slot = BRISK__QS_NONE;
+        /* 13.2.1: an ACK when one is owed; 13.2.1 SHOULD: piggybacked whenever pending */
+        ackn = 0;
+        if (q->rxa[lvl].pending != 0) {
+            ackn = brisk__quic_ack_write(
+                &q->rxa[lvl],
+                brisk__quic_ack_delay_field(q->now - q->rxa[lvl].largest_t,
+                                            (unsigned)q->my_tp.ack_delay_exponent),
+                out + w, room);
+        }
+        el = 0;
+        /* the last two records are the PTO probes' (RFC 9002 6.2.4 MUST), so a full table
+         * cannot stall recovery */
+        if ((cc_ok && free_recs > 2) || (q->probe[lvl] != 0 && free_recs != 0)) {
+            el = elicit_frames(q, lvl, out + w + ackn, room - ackn, &pk[np].s, &pad);
+        }
+        /* 13.2.1 (MUST NOT): an ACK-only packet only when one is due */
+        if (el == 0 && (ackn == 0 || q->rxa[lvl].ack_due > q->now)) {
+            continue;
+        }
+        if (el == 0 && (pad || lvl == 0)) {
+            /* it may end the datagram and be padded, so in flight (RFC 9002 2): it needs a
+             * record that is not a probe's; otherwise the ACK waits */
+            if (free_recs <= 2) {
+                continue;
+            }
+            free_recs--;
+        }
+        n = ackn + el;
+        if (pnl + n < 4) {
+            memset(out + w + n, 0, 4 - pnl - n); /* RFC 9001 5.4.2: room for the HP sample */
+            n = 4 - pnl;
+        }
+        if (ackn != 0) {
+            q->rxa[lvl].pending = 0;
+            q->rxa[lvl].ack_due = INT64_MAX;
+        }
+        if (el != 0) {
+            free_recs--;
+            elicited = 1;
+            if (q->probe[lvl] != 0) {
+                q->probe[lvl]--;
+            }
+        }
+        pad |= lvl == 0; /* RFC 9000 14.1 (MUST): a datagram with an Initial is >= 1200 */
+        pk[np].pos = pos;
+        pk[np].pl = n;
+        pk[np].lvl = lvl;
+        pk[np].pnl = pnl;
+        pk[np].elicit = el != 0;
+        pk[np].inflight = el != 0;
+        pos = w + n + 16;
+        np++;
+    }
+    if (np == 0) {
         return 0;
     }
-    hl = hdr_len(q, lvl);
-    room = QC_DGRAM - hl - 4 - 16;
-    off = q->ret_sent[lvl];
-    fo = 1 + brisk__quic_varint_put(NULL, 0, off) + 2; /* CRYPTO type, offset, length (<= 2) */
-    n = q->ret_len[lvl] - q->ret_sent[lvl];
-    n = n < room - fo ? n : room - fo;
-    w = hl + 4;
-    out[w] = 0x06; /* CRYPTO (19.6) */
-    pl = 1 + brisk__quic_varint_put(out + w + 1, 8, off);
-    pl += brisk__quic_varint_put(out + w + pl, 8, n);
-    memcpy(out + w + pl, q->ret[lvl] + q->ret_sent[lvl], n);
-    pl += n;
-    if (lvl == 0) {
-        /* RFC 9000 14.1 (MUST): a datagram carrying an Initial is at least 1200 bytes */
-        memset(out + w + pl, 0, room - pl);
-        pl = room;
+    if (pad && pos < QC_DGRAM) {
+        /* PADDING at the end of the last packet (14.1, 8.2.2); a packet with PADDING is in
+         * flight (RFC 9002 2) */
+        i = np - 1;
+        memset(out + pos - 16, 0, QC_DGRAM - pos);
+        pk[i].pl += QC_DGRAM - pos;
+        pk[i].inflight = 1;
+        pos = QC_DGRAM;
     }
-    w = pkt_finish(q, lvl, out, pl);
-    if (w == 0) {
-        /* 12.3: PN space spent, or 6.6: the key is used up - close without a frame */
-        q_fail(q, BRISK__QERR_AEAD_LIMIT_REACHED, BRISK_E_ARG, 1);
-        return 0;
+    for (i = 0; i < np; i++) {
+        n = pkt_finish(q, pk[i].lvl, out + pk[i].pos, pk[i].pl, pk[i].pnl);
+        if (n == 0) {
+            /* 12.3: PN space spent, or 6.6: the key is used up - close without a frame */
+            q_fail(q, BRISK__QERR_AEAD_LIMIT_REACHED, BRISK_E_ARG, 1);
+            return 0;
+        }
+        if (pk[i].inflight) {
+            pk[i].s.t = q->now;
+            pk[i].s.size = (uint16_t)n;
+            pk[i].s.flags |= (uint16_t)(BRISK__QS_INFLIGHT | (pk[i].elicit ? BRISK__QS_ELICIT : 0));
+            (void)brisk__quic_rec_on_sent(&q->rec, &pk[i].s); /* one is always kept free */
+        }
+        handshake |= pk[i].lvl == 1;
     }
-    q->ret_sent[lvl] += n;
-    if (lvl == 1 && q->tx[0].suite != 0) {
+    if (handshake && q->tx[0].suite != 0) {
         /* RFC 9001 4.9.1 / RFC 9000 17.2.2.1 (MUST): the first Handshake packet sent ends the
-         * Initial keys and the Initial CRYPTO state; no Initial is sent after it */
+         * Initial keys and the Initial CRYPTO state; RFC 9002 6.4: and its recovery state */
         brisk__quic_keys_wipe(&q->tx[0]);
         brisk__quic_keys_wipe(&q->rx[0]);
         brisk__secure_zero(q->ret[0], QC_RET0);
         q->ret_len[0] = q->ret_sent[0] = 0;
+        brisk__quic_rec_discard(&q->rec, 0);
+        if (!q->rec.hs_acked && q->rec.last_elicit[1] == INT64_MIN) {
+            q->rec.last_elicit[1] = q->now; /* RFC 9002 6.2.2.1: anchor the anti-deadlock PTO */
+        }
+        brisk__quic_rxack_init(&q->rxa[0]);
+        q->probe[0] = 0;
     }
-    return w;
+    if (elicited && q->idle_rx) {
+        q->idle_start = q->now; /* 10.1: the first ack-eliciting packet after a receive */
+        q->idle_rx = 0;
+    }
+    q->burst_bytes += (uint32_t)pos;
+    return pos;
 }
 
 int brisk__quic_established(const brisk__quic_conn *q)
@@ -969,5 +1502,8 @@ int brisk__quic_established(const brisk__quic_conn *q)
 #    undef QC_RET1
 #    undef QC_DGRAM
 #    undef QC_NONE
+#    undef QC_STREAMS
+#    undef QC_BURST
+#    undef QC_MIN_ROOM
 
 #endif /* BRISK_ENABLE_QUIC */

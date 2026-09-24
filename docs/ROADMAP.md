@@ -143,7 +143,7 @@ Tick a box only when the work is green on **every** arch (`python tools/dev.py t
 
 ## M6 QUIC v1 client
 - [x] Packets + header protection, CRYPTO frames on the TLS 1.3 engine, transport parameters
-- [ ] ACK, loss detection / PTO, NewReno (integer), flow control, streams. Also the stateful
+- [x] ACK, loss detection / PTO, NewReno (integer), flow control, streams. Also the stateful
       1-RTT frame MUSTs that are only syntax-checked now (rfc-auditor, M6 item 1): STREAM /
       STOP_SENDING / MAX_STREAM_DATA on a stream we never opened or a receive-only one
       (STREAM_STATE_ERROR), server stream ids past our initial_max_streams (STREAM_LIMIT_ERROR),

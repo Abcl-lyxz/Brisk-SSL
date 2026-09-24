@@ -84,6 +84,27 @@
 #    error "BRISK_QUIC_CRYPTO_BUF must be 4096..65536"
 #endif
 
+/* QUIC streams (RFC 9000 2-4; src/quic/stream.c). RAM knobs, FULL only, no public struct size
+ * depends on them. BRISK_QUIC_MAX_STREAMS stream slots live at once (local + peer-initiated);
+ * each one takes 2 * BRISK_QUIC_STREAM_BUF + BRISK_QUIC_STREAM_BUF / 8 bytes of the connection
+ * scratch (receive ring + its bitmap, send ring), about 8.5 KB at the defaults, so
+ * brisk__quic_scratch_size() grows by ~34 KB. The per-stream flow-control window we advertise
+ * never exceeds BRISK_QUIC_STREAM_BUF: a peer that sends past it gets FLOW_CONTROL_ERROR
+ * instead of a buffer overrun. */
+#ifndef BRISK_QUIC_MAX_STREAMS
+#    define BRISK_QUIC_MAX_STREAMS 4
+#endif
+#if BRISK_QUIC_MAX_STREAMS < 2 || BRISK_QUIC_MAX_STREAMS > 64
+#    error "BRISK_QUIC_MAX_STREAMS must be 2..64"
+#endif
+#ifndef BRISK_QUIC_STREAM_BUF
+#    define BRISK_QUIC_STREAM_BUF 4096
+#endif
+#if BRISK_QUIC_STREAM_BUF < 1024 || BRISK_QUIC_STREAM_BUF > 65536 ||                               \
+    (BRISK_QUIC_STREAM_BUF & 7) != 0
+#    error "BRISK_QUIC_STREAM_BUF must be 1024..65536 and a multiple of 8"
+#endif
+
 /* The SETTINGS_HEADER_TABLE_SIZE this client advertises, in octets: the largest HPACK dynamic
  * table the peer may make us keep, and exactly the ring memory the caller hands the decoder. A
  * RAM knob. RFC 9113 4.3.1 makes 4096 the initial value, and a smaller one forces every peer to

@@ -39,6 +39,7 @@ SRC = {
     "rfc9846": "https://www.rfc-editor.org/rfc/rfc9846.txt",
     "rfc9001": "https://www.rfc-editor.org/rfc/rfc9001.txt",
     "rfc9000": "https://www.rfc-editor.org/rfc/rfc9000.txt",
+    "rfc9002": "https://www.rfc-editor.org/rfc/rfc9002.txt",
     "rfc8439": "https://www.rfc-editor.org/rfc/rfc8439.txt",
     "rfc7748": "https://www.rfc-editor.org/rfc/rfc7748.txt",
     "wp_x25519": f"{WP}x25519_test.json",
@@ -8287,7 +8288,7 @@ QUIC_VMAX = (1 << 62) - 1
 QUIC_NONE = (1 << 64) - 1  # "no packet number yet": UINT64_MAX in C
 QSUITE = {0x1301: (256, 16), 0x1302: (384, 32), 0x1303: (256, 32)}  # hash bits, key/hp length
 QPV, QFEE, QTPE, QCBE, QALR = 0x0A, 0x07, 0x08, 0x0D, 0x0F  # RFC 9000 20.1
-QUIC_CONN_OPS = 16  # must match QC_OPS in tests/test_quic.c
+QUIC_CONN_OPS = 32  # must match QC_OPS in tests/test_quic.c
 
 
 def qv(v, n=None):
@@ -8888,58 +8889,1273 @@ def quic_frame_vectors(a2_payload, a3_payload):
     return [(b.hex(), lvl, want, note) for lvl, b, want, note in rows]
 
 
+# ---- acknowledgements, loss detection, congestion control (RFC 9000 13.2 / 19.3, RFC 9002)
+# A line-by-line port of RFC 9002 Appendix A (loss recovery) and B (NewReno) pseudocode with the
+# integer semantics the C uses (>> 3, >> 2, byte-counting congestion avoidance, ms clocks,
+# uint32 RTTs clamped to 2^24) and the policy choices written at the head of
+# src/quic/recovery.c. Written from the RFC text, not from the C. GENERATED rows: the only
+# official scenario is RFC 9002 7.6.3 Table 1 (persistent congestion), parsed from the text.
+QT_MAX, QT_MIN = (1 << 63) - 1, -(1 << 63)
+QU32 = (1 << 32) - 1
+Q_RTT_MAX, Q_US_MAX = 1 << 24, 1 << 40
+QS_USED, QS_ELICIT, QS_INFLIGHT, QS_ACKED, QS_LOST = 0x001, 0x002, 0x004, 0x200, 0x400
+
+
+def q_tadd(t, d):
+    return QT_MAX - 1 if t > QT_MAX - 1 - d else t + d
+
+
+def py_ack_delay_field(ms, exp):
+    """RFC 9000 13.2.5: ms -> us (ms * 1000) -> >> ack_delay_exponent; ms clamped to [0, 2^24]."""
+    m = min(max(ms, 0), Q_RTT_MAX)
+    return (m * 1000) >> exp
+
+
+def py_ack_delay_ms(field, exp):
+    """RFC 9000 19.3: field << exp microseconds, saturating at 2^40, then to ms by shifts
+    (us>>10)+(us>>16)+(us>>17) - 0.05% below us/1000 - clamped to 2^24."""
+    us = min(field, Q_US_MAX)
+    for _ in range(exp):
+        us = Q_US_MAX if us >= Q_US_MAX else us << 1
+    return min((us >> 10) + (us >> 16) + (us >> 17), Q_RTT_MAX)
+
+
+class PyRx:
+    """RFC 9000 13.2: received packet numbers of one space, 8 ranges + a floor (13.2.3)."""
+
+    def __init__(self):
+        self.r, self.floor, self.largest_t, self.due, self.pending = [], 0, 0, QT_MAX, 0
+
+    def dup(self, pn):
+        if pn < self.floor or any(lo <= pn <= hi for lo, hi in self.r):
+            return 1
+        return int(len(self.r) == 8 and pn + 1 < self.r[-1][0])
+
+    def add(self, pn, elicit, now, max_delay, immediate):
+        if self.dup(pn):
+            return 1
+        gap = bool(self.r) and (pn < self.r[0][1] or pn > self.r[0][1] + 1)
+        if not self.r or pn > self.r[0][1]:
+            self.largest_t = now
+        small = pn < 4096 and (not self.r or self.r[0][1] < 4096)
+        if small:  # the independent reading: maximal runs of the set of received PNs
+            pns = {p for lo, hi in self.r for p in range(lo, hi + 1)} | {pn}
+            rs = []
+            for p in sorted(pns, reverse=True):
+                if rs and rs[-1][0] == p + 1:
+                    rs[-1][0] = p
+                else:
+                    rs.append([p, p])
+            want_r = [tuple(x) for x in rs[:8]]
+            want_floor = rs[8][1] + 1 if len(rs) > 8 else self.floor
+        r, i = self.r, 0
+        while i < len(r) and r[i][1] > pn:
+            i += 1
+        up = i > 0 and r[i - 1][0] == pn + 1
+        down = i < len(r) and r[i][1] + 1 == pn
+        if up and down:
+            r[i - 1] = (r[i][0], r[i - 1][1])
+            del r[i]
+        elif up:
+            r[i - 1] = (pn, r[i - 1][1])
+        elif down:
+            r[i] = (r[i][0], pn)
+        else:
+            if len(r) == 8:  # 13.2.3: the oldest range is forgotten, the floor rises past it
+                self.floor = r[-1][1] + 1
+                r.pop()
+            r.insert(i, (pn, pn))
+        if small and (r != want_r or self.floor != want_floor):
+            die(f"PyRx: range bookkeeping disagrees with the set reading at pn {pn}")
+        if elicit:
+            self.pending = min(self.pending + 1, 255)
+            due = now if immediate or self.pending >= 2 or gap else q_tadd(now, max(max_delay, 0))
+            self.due = min(self.due, due)
+        return 0
+
+    def ack(self, delay, cap):
+        """RFC 9000 19.3 ACK frame 0x02: newest ranges first, the oldest dropped to fit."""
+        if not self.r:
+            return b""
+        lo0, hi0 = self.r[0][0], self.r[0][1]
+        body = [qv(hi0 - lo0)]
+        size = 1 + len(qv(hi0)) + len(qv(delay)) + 1 + len(body[0])
+        if size > cap:
+            return b""
+        k = 1
+        for i in range(1, len(self.r)):
+            add = qv(self.r[i - 1][0] - self.r[i][1] - 2) + qv(self.r[i][1] - self.r[i][0])
+            if size + len(add) > cap:
+                break
+            size += len(add)
+            body.append(add)
+            k += 1
+        return b"\x02" + qv(hi0) + qv(delay) + qv(k - 1) + b"".join(body)
+
+
+def py_ack_parse(b, i, ecn):
+    """RFC 9000 19.3 / 19.3.1: (error, ranges [(lo, hi)...], largest, delay, next index)."""
+    try:
+        def get():
+            nonlocal i
+            r = qv_get(b, i)
+            if r is None:
+                raise ValueError
+            i = r[1]
+            return r[0]
+        largest, delay, count, first = get(), get(), get(), get()
+        if first > largest:
+            return QFEE, None, 0, 0, i
+        lo = largest - first
+        ranges = [(lo, largest)]
+        for _ in range(count):
+            gap = get()
+            if lo - gap - 2 < 0:
+                return QFEE, None, 0, 0, i
+            ln = get()
+            if lo - gap - 2 - ln < 0:
+                return QFEE, None, 0, 0, i
+            hi = lo - gap - 2
+            lo = hi - ln
+            ranges.append((lo, hi))
+        if ecn:  # ECT0, ECT1, ECN-CE: parsed, ignored (we never set ECN; RFC 9002 7.1 n/a)
+            get(), get(), get()
+    except ValueError:
+        return QFEE, None, 0, 0, i
+    return 0, ranges, largest, delay, i
+
+
+class PyRec:
+    """RFC 9002 A (loss recovery) and B (NewReno), integer. Records: dicts pn lvl t size flags."""
+
+    def __init__(self):
+        self.recs = [None] * 32
+        self.la, self.loss, self.le = [QUIC_NONE] * 3, [QT_MAX] * 3, [QT_MIN] * 3
+        self.rs, self.fst = QT_MIN, QT_MAX
+        self.srtt, self.rttvar, self.min_rtt, self.latest = 333, 166, 0, 0  # 6.2.2 kInitialRtt
+        self.cwnd, self.ssth, self.inf, self.ca = 12000, QU32, 0, 0  # 7.2
+        self.has, self.pto, self.hs = 0, 0, 0
+
+    @staticmethod
+    def out(s):
+        return s is not None and not s["flags"] & (QS_ACKED | QS_LOST)
+
+    def elicit_out(self, lvl):
+        return any(self.out(s) and s["lvl"] == lvl and s["flags"] & QS_ELICIT for s in self.recs)
+
+    def on_sent(self, s):
+        for i in range(32):
+            if self.recs[i] is None:
+                self.recs[i] = dict(s, flags=s["flags"] | QS_USED)
+                if s["flags"] & QS_INFLIGHT:
+                    self.inf += s["size"]
+                if s["flags"] & QS_ELICIT:
+                    self.le[s["lvl"]] = s["t"]
+                return 0
+        return -8  # BRISK_E_WANT
+
+    def free(self):
+        return sum(s is None for s in self.recs)
+
+    def can_send(self, n):
+        return int(self.inf + n <= self.cwnd)
+
+    def pto_base(self):
+        return self.srtt + max(4 * self.rttvar, 1)
+
+    def pto_value(self, lvl, mad):
+        return self.pto_base() + (mad if lvl == 2 else 0)
+
+    @staticmethod
+    def backoff(d, n):
+        for _ in range(n):
+            d = QU32 if d > 0x7FFFFFFF else d << 1
+        return d
+
+    def congestion(self, sent_t, now):  # B.6
+        if sent_t <= self.rs:
+            return
+        self.rs = now
+        self.ssth = self.cwnd >> 1
+        self.cwnd = max(self.ssth, 2400)
+        self.ca = 0
+
+    def persistent(self, lvl, mad, ranges, truncated):  # B.8 / 7.6.2
+        if not self.has:
+            return False
+        dur = (self.pto_base() + mad) * 3
+        lost = sorted((s for s in self.recs if s is not None and s["lvl"] == lvl
+                       and s["flags"] & QS_LOST and s["flags"] & QS_ELICIT and s["t"] > self.fst),
+                      key=lambda s: s["pn"])
+
+        def acked_between(a, b):
+            if any(lo < b and hi > a for lo, hi in ranges):
+                return True
+            return truncated and a < ranges[-1][0]
+        start = None
+        for j, s in enumerate(lost):
+            if j == 0 or acked_between(lost[j - 1]["pn"], s["pn"]):
+                start = s["t"]
+            elif s["t"] - start > dur:
+                return True
+        return False
+
+    def detect_lost(self, lvl, now, mad, ranges=None, truncated=False):  # A.10
+        self.loss[lvl] = QT_MAX
+        la = self.la[lvl]
+        if la == QUIC_NONE:
+            return
+        x = max(self.latest, self.srtt)
+        delay = max(x + (x >> 3), 1)
+        lost_send = now - delay
+        last, anyl = QT_MIN, False
+        for s in self.recs:
+            if not self.out(s) or s["lvl"] != lvl or s["pn"] > la:
+                continue
+            if s["t"] <= lost_send or la >= s["pn"] + 3:
+                s["flags"] |= QS_LOST
+                if s["flags"] & QS_INFLIGHT:
+                    self.inf -= s["size"]
+                    last = max(last, s["t"])
+                    anyl = True
+            else:
+                self.loss[lvl] = min(self.loss[lvl], q_tadd(s["t"], delay))
+        if not anyl:
+            return
+        self.congestion(last, now)
+        if ranges is not None and self.persistent(lvl, mad, ranges, truncated):
+            self.cwnd, self.rs, self.ca, self.min_rtt = 2400, QT_MIN, 0, self.latest
+
+    def update_rtt(self, lat, ad, confirmed, mad, now):  # A.7 UpdateRtt
+        self.latest = lat
+        if not self.has:
+            self.min_rtt, self.srtt, self.rttvar = lat, lat, lat >> 1
+            self.has, self.fst = 1, now
+            return
+        self.min_rtt = min(self.min_rtt, lat)
+        if confirmed:
+            ad = min(ad, mad)
+        adj = lat - ad if lat >= self.min_rtt + ad else lat
+        self.rttvar = (3 * self.rttvar + abs(self.srtt - adj)) >> 2
+        self.srtt = (7 * self.srtt + adj) >> 3
+
+    def on_ack(self, lvl, ecn, b, next_pn, exp, mad, confirmed, now):
+        """A.7 OnAckReceived + B.5 OnPacketsAcked. (code, newly)."""
+        err, ranges, largest, delay, _ = py_ack_parse(b, 0, ecn)
+        if err:
+            return err, 0
+        if largest >= next_pn:
+            return QPV, 0  # RFC 9000 13.1
+        if lvl == 1:
+            self.hs = 1
+        limited = self.inf + 1200 > self.cwnd
+        newly = largest_newly = elicit = False
+        largest_t = 0
+        kept, truncated = ranges[:8], len(ranges) > 8
+        for lo, hi in ranges:
+            for s in self.recs:
+                if not self.out(s) or s["lvl"] != lvl or not lo <= s["pn"] <= hi:
+                    continue
+                s["flags"] |= QS_ACKED
+                newly = True
+                if s["pn"] == largest:
+                    largest_newly, largest_t = True, s["t"]
+                if s["flags"] & QS_ELICIT:
+                    elicit = True
+                if not s["flags"] & QS_INFLIGHT:
+                    continue
+                self.inf -= s["size"]
+                if s["t"] <= self.rs or not limited:
+                    continue
+                if self.cwnd < self.ssth:
+                    self.cwnd += s["size"]
+                else:
+                    self.ca += s["size"]
+                    while self.ca >= self.cwnd:
+                        self.ca -= self.cwnd
+                        self.cwnd += 1200
+        if self.la[lvl] == QUIC_NONE or largest > self.la[lvl]:
+            self.la[lvl] = largest
+        if not newly:
+            return 0, 0
+        if largest_newly and elicit:
+            lat = min(max(now - largest_t, 0), Q_RTT_MAX)
+            self.update_rtt(lat, 0 if lvl == 0 else py_ack_delay_ms(delay, exp), confirmed, mad, now)
+        self.detect_lost(lvl, now, mad, kept, truncated)
+        if self.hs or confirmed:
+            self.pto = 0
+        return 0, 1
+
+    def pto_time(self, confirmed, have_hs, mad):  # A.8 GetPtoTimeAndSpace
+        anyo = self.elicit_out(0) or self.elicit_out(1) or self.elicit_out(2)
+        if not anyo and (self.hs or confirmed):
+            return QT_MAX, 0
+        dur = self.backoff(self.pto_base(), self.pto)
+        if not anyo:
+            anchor = max(self.le)
+            return (QT_MAX if anchor == QT_MIN else q_tadd(anchor, dur)), (1 if have_hs else 0)
+        t, lvl = QT_MAX, 0
+        for sp in range(3):
+            if not self.elicit_out(sp):
+                continue
+            if sp == 2:
+                if not confirmed:
+                    break
+                dur = min(dur + self.backoff(mad, self.pto), QU32)
+            tl = q_tadd(self.le[sp], dur)
+            if tl < t:
+                t, lvl = tl, sp
+        return t, lvl
+
+    def loss_armed(self):
+        t, lvl = QT_MAX, 0
+        for sp in range(3):
+            if self.loss[sp] < t:
+                t, lvl = self.loss[sp], sp
+        return t, lvl
+
+    def deadline(self, confirmed, have_hs, mad):
+        t, lvl = self.loss_armed()
+        return (t, lvl) if t != QT_MAX else self.pto_time(confirmed, have_hs, mad)
+
+    def on_timeout(self, now, confirmed, have_hs, mad):  # A.9
+        t, lvl = self.loss_armed()
+        if t != QT_MAX:
+            self.detect_lost(lvl, now, mad)
+            return 0, lvl
+        t, lvl = self.pto_time(confirmed, have_hs, mad)
+        if t == QT_MAX:
+            return 0, 0
+        self.pto = min(self.pto + 1, 16)
+        return 1, lvl
+
+    def discard(self, lvl):  # A.11 / RFC 9002 6.4
+        for i, s in enumerate(self.recs):
+            if s is not None and s["lvl"] == lvl:
+                if self.out(s) and s["flags"] & QS_INFLIGHT:
+                    self.inf -= s["size"]
+                self.recs[i] = None
+        self.loss[lvl], self.le[lvl], self.pto = QT_MAX, QT_MIN, 0
+
+    def reap(self):
+        """What the connection does after every ack / timeout: the marked records go."""
+        acked = lost = 0
+        for i, s in enumerate(self.recs):
+            if s is not None and s["flags"] & (QS_ACKED | QS_LOST):
+                if s["flags"] & QS_ACKED:
+                    acked |= 1 << s["pn"]
+                else:
+                    lost |= 1 << s["pn"]
+                self.recs[i] = None
+        return acked, lost
+
+
+QUIC_REC_W = 16  # must match the want[] size in tests/test_quic.c
+
+
+def rfc9002_table1():
+    """RFC 9002 7.6.3 Table 1, out of the text: [(time in units, 'send'|'ack', packet #)]."""
+    text = "\n".join(rfc_lines(fetch("rfc9002")))
+    sec = text[text.rindex("7.6.3.  Example"):text.rindex("7.7.  Pacing")]
+    ev = [(float(t), "send" if s else "ack", int(s or a)) for t, s, a in re.findall(
+        r"\|\s*t=([\d.]+)\s*\|\s*(?:Send packet #(\d+)[^|]*|Receive acknowledgment of #(\d+))\s*\|",
+        sec)]
+    if len(ev) != 11 or ev[-1] != (12.2, "ack", 9) or not re.search(
+            r'smoothed_rtt \+ max\(4\*rttvar, kGranularity\) \+ max_ack_delay = 2', sec) or \
+            "Packets 2 through 8 are declared lost" not in sec:
+        die(f"RFC 9002 7.6.3: table not parsed: {ev}")
+    return ev
+
+
+def quic_rec_vectors(a3_payload):
+    """Scripts over brisk__quic_rec / brisk__quic_rxack. Each rec row: (op, args[6], hex, want[16],
+    note); op n = a fresh rec, c = context (confirmed, have_hs_keys, peer exp, peer max_ack_delay),
+    s = on_sent (pn, lvl, t, size, flags), a = on_ack (lvl, now, next_pn, ecn; hex = the frame
+    after its type byte), x = on_timeout (now), d = discard (lvl), z = override the RTT state
+    (srtt, rttvar, min_rtt, has_sample, first_sample_t) for the RFC's "assume" lines, p = check
+    can_send(a0). want = ret, lvl, srtt, rttvar, min_rtt, latest, cwnd, ssthresh, in_flight,
+    pto_count, acked pn mask, lost pn mask, deadline, deadline space, has_sample, largest_acked."""
+    rows = []
+    st = {}
+
+    def emit_row(op, args, hx, ret, lvl, note):
+        r = st["r"]
+        acked, lost = r.reap() if op in "ax" else (0, 0)
+        dl, dlv = r.deadline(*st["ctx"][:2], st["ctx"][3])
+        la = r.la[args[0] if op == "a" else 0]
+        want = [ret, lvl, r.srtt, r.rttvar, r.min_rtt, r.latest, r.cwnd, r.ssth, r.inf, r.pto,
+                acked, lost, dl, dlv, r.has, -1 if la == QUIC_NONE else la]
+        rows.append((op, list(args) + [0] * (6 - len(args)), hx, want, note))
+
+    def new(note):
+        st["r"], st["ctx"] = PyRec(), [0, 0, 3, 25]
+        emit_row("n", [], "", 0, 0, note)
+
+    def ctx(confirmed, have_hs, exp=3, mad=25):
+        st["ctx"] = [confirmed, have_hs, exp, mad]
+        emit_row("c", [confirmed, have_hs, exp, mad], "", 0, 0, "")
+
+    def sent(pn, lvl, t, size=1200, flags=QS_ELICIT | QS_INFLIGHT):
+        ret = st["r"].on_sent({"pn": pn, "lvl": lvl, "t": t, "size": size, "flags": flags})
+        emit_row("s", [pn, lvl, t, size, flags], "", ret, 0, "")
+
+    def ack(lvl, now, frame, next_pn=64, ecn=0, note=""):
+        c = st["ctx"]
+        code, _ = st["r"].on_ack(lvl, ecn, frame, next_pn, c[2], c[3], c[0], now)
+        emit_row("a", [lvl, now, next_pn, ecn], frame.hex(), code, 0, note)
+
+    def timeout(now, note=""):
+        c = st["ctx"]
+        n, lvl = st["r"].on_timeout(now, c[0], c[1], c[3])
+        emit_row("x", [now], "", n, lvl, note)
+
+    def discard(lvl):
+        st["r"].discard(lvl)
+        emit_row("d", [lvl], "", 0, 0, "")
+
+    def override(srtt, rttvar, min_rtt, has, fst):
+        r = st["r"]
+        r.srtt, r.rttvar, r.min_rtt, r.has, r.fst = srtt, rttvar, min_rtt, has, fst
+        emit_row("z", [srtt, rttvar, min_rtt, has, fst], "", 0, 0, "")
+
+    def can(n, note=""):
+        emit_row("p", [n], "", st["r"].can_send(n), 0, note)
+
+    def fr(largest, first=0, delay=0, gaps=()):
+        """ACK frame body (after the type): gaps = [(gap, len)...]"""
+        return qv(largest) + qv(delay) + qv(len(gaps)) + qv(first) + b"".join(
+            qv(g) + qv(ln) for g, ln in gaps)
+
+    # OFFICIAL: RFC 9001 A.3's server Initial opens with an ACK of the client's Initial PN 0 (A.2)
+    if a3_payload[0] != 0x02:
+        die("RFC 9001 A.3: the payload does not start with an ACK frame")
+    err, rng, largest, _, end = py_ack_parse(a3_payload, 1, 0)
+    if err or rng != [(0, 0)] or largest != 0:
+        die(f"RFC 9001 A.3: ACK frame {a3_payload[:end].hex()} is not 'PN 0 only'")
+    new("RFC 9001 A.3: the server's ACK of client Initial PN 0 (RFC 9001 A.2)")
+    ctx(0, 0)
+    sent(0, 0, 0)
+    ack(0, 30, a3_payload[1:end], next_pn=1, note="RFC 9001 A.3 ACK frame")
+    # 5.3 first sample, then smoothing; ack delay honoured only above min_rtt
+    new("RTT: first sample, then ack delay subtracted only when latest >= min_rtt + delay")
+    ctx(1, 1)
+    sent(0, 2, 0)
+    ack(2, 100, fr(0), note="first sample: srtt 100, rttvar 50, min_rtt 100")
+    sent(1, 2, 200)
+    ack(2, 340, fr(1, 1, delay=py_ack_delay_field(20, 3) >> 0), note="latest 140, delay 20 -> 120")
+    sent(2, 2, 400)
+    ack(2, 505, fr(2, 2, delay=py_ack_delay_field(20, 3)), note="latest 105 < min 100 + 20: kept")
+    new("RTT: ack delay clamped to max_ack_delay only once confirmed")
+    ctx(0, 1)
+    sent(0, 1, 0)
+    ack(1, 50, fr(0))
+    sent(1, 1, 100)
+    ack(1, 400, fr(1, 1, delay=py_ack_delay_field(200, 3)), note="unconfirmed: 200 ms honoured")
+    ctx(1, 1)
+    sent(2, 2, 500)
+    ack(2, 800, fr(2, delay=py_ack_delay_field(200, 3)), note="confirmed: clamped to 25")
+    new("RTT: Initial ack delay ignored; exponent 0 and 20; a huge ack delay saturates")
+    ctx(0, 0, 0, 25)
+    sent(0, 0, 0)
+    sent(1, 0, 10)
+    ack(0, 100, fr(0, delay=90000), note="Initial: delay ignored")
+    ack(0, 400, fr(1, 1, delay=QUIC_VMAX), note="Initial: 2^62-1 delay ignored")
+    ctx(0, 1, 20, 25)
+    sent(0, 1, 500)
+    ack(1, 900, fr(0, delay=QUIC_VMAX), note="2^62-1 << 20 saturates, no UB")
+    sent(1, 1, 1000)
+    ack(1, 1300, fr(1, 1, delay=100), note="exponent 20: 100 << 20 us")
+    new("RTT: no sample unless the largest is newly acked and something ack-eliciting")
+    ctx(1, 1)
+    sent(0, 2, 0, flags=QS_INFLIGHT)
+    ack(2, 100, fr(0), note="only a non-ack-eliciting packet: no sample")
+    sent(1, 2, 200)
+    sent(2, 2, 210)
+    ack(2, 300, fr(2), note="sample from 2")
+    ack(2, 700, fr(2, 1), note="1 newly acked, largest 2 not: no sample")
+    sent(3, 2, 800)
+    ack(2, 90000000000, fr(3, 3), note="an RTT beyond 2^24 ms is clamped")
+    new("ACK syntax and 13.1")
+    ctx(1, 1)
+    sent(0, 2, 0)
+    ack(2, 10, fr(5), next_pn=5, note="13.1: largest 5 never sent -> PROTOCOL_VIOLATION")
+    ack(2, 10, fr(4, 5), note="19.3.1: first range below 0")
+    ack(2, 10, fr(10, 0, gaps=[(9, 0)]), note="19.3.1: a gap below 0")
+    ack(2, 10, fr(10, 0, gaps=[(1, 8)]), note="19.3.1: a range below 0")
+    ack(2, 10, qv(10) + qv(0) + qv(QUIC_VMAX) + qv(0) + b"\x01\x01", note="range count past the frame")
+    ack(2, 10, fr(0)[:-1], note="truncated")
+    ack(2, 10, fr(0) + b"\x01\x02", ecn=1, note="ACK_ECN counts truncated")
+    ack(2, 20, fr(0) + b"\x01\x02\x03", ecn=1, note="ACK_ECN: counts parsed, ignored")
+    # 6.1 loss detection
+    new("loss: packet threshold 3, the 2nd later ack does not declare it")
+    ctx(1, 1)
+    for pn in range(5):
+        sent(pn, 2, pn)
+    ack(2, 100, fr(2, 0, gaps=[(0, 0)]), note="0 and 2 acked; 1 not lost yet (2 < 1 + 3)")
+    ack(2, 101, fr(4), note="4 acked: 1 lost by packet threshold (4 >= 1 + 3), 3 not")
+    new("loss: time threshold 9/8 and the loss timer")
+    ctx(1, 1)
+    sent(0, 2, 0)
+    sent(1, 2, 10)
+    sent(2, 2, 20)
+    ack(2, 120, fr(2), note="0 lost by time; 1 not yet: loss_time armed")
+    timeout(200, note="loss-time pass: 0 and 1 lost")
+    sent(3, 2, 300)
+    sent(4, 2, 1000)
+    sent(5, 2, 1001)
+    ack(2, 1100, fr(5), note="time threshold 9/8 * rtt")
+    new("PTO: max_ack_delay only in the application space; earliest space; backoff; resets")
+    ctx(0, 1)
+    sent(0, 0, 0)
+    sent(0, 1, 5)
+    sent(0, 2, 6)
+    timeout(1000, note="Initial PTO first (0 + 333 + 664)")
+    timeout(3000, note="backoff 2")
+    ack(0, 3100, fr(0), note="an Initial ACK does not reset pto_count at the client")
+    ack(1, 3200, fr(0), note="a Handshake ACK resets it")
+    ctx(1, 1)
+    discard(0)
+    discard(1)
+    timeout(9000, note="1-RTT PTO once confirmed")
+    new("PTO: none for the application space before confirmation")
+    ctx(0, 0)
+    sent(0, 2, 0)
+    ctx(1, 0)
+    new("6.2.2.1: armed with nothing in flight before the Handshake ACK; Initial then Handshake")
+    ctx(0, 0)
+    sent(0, 0, 0)
+    ack(0, 50, fr(0), note="nothing in flight, not validated: still armed")
+    timeout(500, note="probe: an Initial (no Handshake keys)")
+    ctx(0, 1)
+    timeout(2000, note="probe: Handshake")
+    sent(0, 1, 2100)
+    ack(1, 2150, fr(0), note="Handshake ACK: validated, nothing in flight: no timer")
+    new("6.4: discarding a space drops its records, bytes in flight and timers")
+    ctx(0, 1)
+    sent(0, 0, 0)
+    sent(1, 0, 1)
+    sent(0, 1, 2)
+    discard(0)
+    discard(1)
+    # NewReno
+    new("NewReno: slow start, one reduction per recovery period, congestion avoidance")
+    ctx(1, 1)
+    for pn in range(10):
+        sent(pn, 2, pn)
+    can(1200, note="12000 in flight: nothing more")
+    ack(2, 100, fr(3, 3), note="slow start: +4800")
+    for pn in range(10, 14):
+        sent(pn, 2, 100 + pn)
+    ack(2, 200, fr(9, 3), note="6..9 acked (app-limited: no growth), 4 and 5 lost: halved")
+    ack(2, 210, fr(11, 1), note="10, 11 sent before the recovery started: no growth")
+    for pn in range(14, 40):
+        if st["r"].free() == 0:
+            break
+        sent(pn, 2, 300 + pn)
+    ack(2, 500, fr(39, 25), note="after recovery: congestion avoidance")
+    new("NewReno: the floor 2400 and app-limited")
+    ctx(1, 1)
+    sent(0, 2, 0)
+    ack(2, 100, fr(0), note="app-limited: no growth")
+    for pn in range(1, 6):
+        sent(pn, 2, 100 + pn)
+    ack(2, 300, fr(5), note="1 and 2 lost (packet threshold): 12000 -> 6000")
+    for pn in range(6, 12):
+        sent(pn, 2, 400 + pn)
+    ack(2, 600, fr(11), note="6..8 lost after recovery: 6000 -> 3000")
+    for pn in range(12, 18):
+        sent(pn, 2, 700 + pn)
+    ack(2, 900, fr(17), note="-> 2400 floor")
+    new("probes bypass the window but count in flight; ACK-only packets are not counted")
+    ctx(1, 1)
+    for pn in range(10):
+        sent(pn, 2, 0)
+    can(1, note="window full")
+    sent(10, 2, 1, size=1200, flags=QS_ELICIT | QS_INFLIGHT)
+    sent(11, 2, 1, size=60, flags=0)
+    can(0, note="13200 > 12000")
+    # 7.6 persistent congestion: RFC 9002 7.6.3 Table 1 (1 unit = 1000 ms), with the RFC's
+    # "assume" (srtt + max(4*rttvar, 1) + max_ack_delay = 2 units at the ACK of #9: srtt 200,
+    # rttvar 600 before, updated by the 200 ms sample to 200 + 1800 = 2000) and a prior sample
+    ev = rfc9002_table1()
+    for variant in ("RFC 9002 7.6.3 Table 1: persistent congestion at t=12.2",
+                    "Table 1 but #5 acknowledged at t=12.2: no persistent congestion",
+                    "Table 1 without a prior RTT sample: no persistent congestion",
+                    "Table 1 with #8 at t=7: duration exactly 6, not exceeded"):
+        new(variant)
+        ctx(1, 1, 3, 0)
+        override(200, 600, 200, 0 if "without" in variant else 1, -1)
+        for t, what, n in ev:
+            ms = int(round(t * 1000))
+            if what == "send":
+                if n == 8 and "exactly" in variant:
+                    ms = 7000
+                sent(n - 1, 2, ms)
+            else:
+                acked = [n] + ([5, 1] if n == 9 and "#5" in variant else [1] if n == 9 else [])
+                if n == 9:
+                    override(200, 600, 200, 0 if "without" in variant else 1, -1)
+                pns = sorted({a - 1 for a in acked}, reverse=True)
+                gaps, prev = [], pns[0]
+                for p in pns[1:]:
+                    gaps.append((prev - p - 2, 0))
+                    prev = p
+                ack(2, ms, fr(pns[0], 0, gaps=gaps), note=f"t={t}")
+    r_ok = [w for o, a, h, w, nn in rows if o == "a" and w[6] == 2400]
+    if not r_ok:
+        die("RFC 9002 7.6.3: the model does not reach kMinimumWindow")
+    # every row checked against a second, independent reading? The model is the reading; the
+    # Table 1 row pins it to the RFC's stated outcome:
+    t1 = [w for o, a, h, w, nn in rows if nn.startswith("t=12.2")]
+    if len(t1) != 4 or t1[0][6] != 2400 or t1[0][11] != 0b11111110 or any(w[6] == 2400 for w in t1[1:]):
+        die(f"RFC 9002 7.6.3: {[(w[6], bin(w[11])) for w in t1]}")
+    # rxack rows: (pn, elicit, now, max_delay, immediate, delay_field, cap, want[ret, n, floor,
+    # pending, ack_due, largest_t], ack hex, note); pn -1 = a fresh rxack
+    rx = []
+    cur = {}
+
+    def rnew(note):
+        cur["a"] = PyRx()
+        rx.append((-1, 0, 0, 0, 0, 0, 0, [0, 0, 0, 0, QT_MAX, 0], "", note))
+
+    def radd(pn, elicit=1, now=0, maxd=25, imm=0, delay=0, cap=64, note=""):
+        a = cur["a"]
+        ret = a.add(pn, elicit, now, maxd, imm)
+        rx.append((pn, elicit, now, maxd, imm, delay, cap,
+                   [ret, len(a.r), a.floor, a.pending, a.due, a.largest_t], a.ack(delay, cap).hex(),
+                   note))
+
+    rnew("in order: one range, ACK after 2 packets (13.2.2)")
+    radd(0, now=5, note="first: due at now + 25")
+    radd(1, now=6, note="second: due now")
+    radd(1, now=7, note="duplicate")
+    radd(2, elicit=0, now=8, note="non-ack-eliciting: nothing due")
+    rnew("reordered and gaps: immediate (13.2.1), ranges merge")
+    radd(5, now=1)
+    radd(7, now=2, note="gap")
+    radd(6, now=3, note="fills the gap: merge")
+    radd(3, now=4, note="out of order")
+    radd(9, now=5, delay=py_ack_delay_field(17, 3), note="ACK Delay at exponent 3")
+    radd(11, now=6, delay=py_ack_delay_field(17, 0), note="ACK Delay at exponent 0")
+    rnew("more than 8 ranges: the oldest dropped, the floor rises")
+    for pn in range(0, 20, 2):
+        radd(pn, now=pn)
+    radd(1, note="below the floor: dropped")
+    radd(4, note="a duplicate inside the floor")
+    radd(19, note="merges with 18")
+    radd(3, note="extends the lowest range down to the floor")
+    radd(5, note="joins 3..4 and 6")
+    radd(2, note="below the floor with 7 ranges in use: dropped")
+    radd(40, cap=12, note="the frame keeps the newest ranges that fit in 12 bytes")
+    rnew("Initial/Handshake: immediate; PN 2^62-1")
+    radd(QUIC_VMAX - 1, imm=1, now=3)
+    radd(QUIC_VMAX, imm=1, now=4)
+    radd(QUIC_VMAX - 3, imm=0, now=5, maxd=(1 << 32) - 1, note="a huge max_delay")
+    rnew("a full table: a PN below every range is dropped")
+    for pn in range(100, 116, 2):
+        radd(pn, elicit=0, now=1)
+    radd(50, note="no room below the lowest range: dropped")
+    radd(99, note="adjacent to the lowest range: kept")
+    print(f"  quic recovery: {len(rows)} rec rows, {len(rx)} rxack rows")
+    return rows, rx
+
+
 # ---- a whole client handshake (RFC 9001 4, RFC 9000 7, 12, 17)
-class QClient:
-    """What src/quic/conn.c sends, restated: one packet per datagram (CRYPTO, 4-byte PN, 2-byte
-    Length), a datagram with an Initial padded to 1200 (RFC 9000 14.1), the Initial keys dropped
-    at the first Handshake packet (RFC 9001 4.9.1), and on failure CONNECTION_CLOSE 0x1c at every
-    level it holds send keys for, coalesced, the last packet padded when an Initial is in it."""
+class PyQConn:
+    """What src/quic/conn.c sends, restated from the RFCs for the scripts below: one packet per
+    level per datagram, Initial -> Handshake -> 1-RTT (RFC 9000 12.2); in each an ACK when one
+    is pending (13.2.1: sent alone only once due - at once for Initial / Handshake, after
+    max_ack_delay or a second / out-of-order packet for 1-RTT), then CRYPTO (from the first
+    unsent byte) or the 1-RTT frames, then PING for a PTO probe (RFC 9002 6.2.4); the PN length
+    of RFC 9000 A.2 against the largest acknowledged; PADDING for the 5.4.2 sample; the last
+    packet padded to 1200 when an Initial or a PATH_RESPONSE is in the datagram (14.1, 8.2.2);
+    the Initial keys dropped at the first Handshake packet (RFC 9001 4.9.1); loss recovery and
+    NewReno from PyRec (RFC 9002). On failure: CONNECTION_CLOSE at every level with send keys,
+    coalesced, the last packet padded when an Initial is in it (10.2.3). Only what the scripts
+    use is modelled; anything else dies rather than guess."""
 
-    def __init__(self, dcid, scid):
-        self.dcid, self.scid = dcid, scid
+    def __init__(self, dcid, scid, my):
+        self.dcid, self.scid, self.my = dcid, scid, my
         self.tx = {0: q_keys(0x1301, q_initial(dcid)[0])}
-        self.pn, self.stream, self.sent = [0, 0, 0], [b"", b""], [0, 0]
+        self.pn, self.ret, self.rs = [0, 0, 0], [b"", b""], [0, 0]
+        self.rec, self.rxa = PyRec(), [PyRx(), PyRx(), PyRx()]
+        self.now, self.est, self.conf, self.probe = 0, False, False, [0, 0, 0]
+        self.burst_t, self.burst = -1, 0
+        self.idle_start, self.idle_rx = None, True
+        self.peer = {"exp": 3, "mad": 25, "idle": 0}
+        self.st = [None] * 4  # BRISK_QUIC_MAX_STREAMS stream slots
+        self.next_local = [0, 0]
+        self.max_data_tx = self.sent_tx = 0
+        self.err = None
 
+    # ---- helpers
     def hl(self, lvl):
         return 1 + len(self.dcid) if lvl == 2 else 9 + len(self.dcid) + len(self.scid) + (lvl == 0)
 
-    def pkt(self, lvl, payload):
+    def pnl(self, lvl):
+        la = self.rec.la[lvl]
+        return py_pn_len(self.pn[lvl], None if la == QUIC_NONE else la)
+
+    def hdr(self, lvl, pnl, plen):
+        if lvl == 2:
+            return bytes([0x40 | (pnl - 1)]) + self.dcid
+        return (bytes([0xC0 | (0x20 if lvl else 0) | (pnl - 1)]) + (1).to_bytes(4, "big")
+                + bytes([len(self.dcid)]) + self.dcid + bytes([len(self.scid)]) + self.scid
+                + (b"" if lvl else b"\x00") + qv(pnl + plen + 16, 2))
+
+    def seal(self, lvl, pnl, payload):
         pn = self.pn[lvl]
         self.pn[lvl] += 1
-        if lvl == 2:
-            hdr = b"\x43" + self.dcid
-        else:
-            hdr = (bytes([0xC3 | (0x20 if lvl else 0)]) + (1).to_bytes(4, "big") + bytes([len(self.dcid)])
-                   + self.dcid + bytes([len(self.scid)]) + self.scid + (b"" if lvl else b"\x00")
-                   + qv(4 + len(payload) + 16, 2))
-        return q_protect(self.tx[lvl], hdr, pn, 4, payload)
+        return q_protect(self.tx[lvl], self.hdr(lvl, pnl, len(payload)), pn, pnl, payload)
 
-    def send(self):
-        lvl = 0 if 0 in self.tx and self.sent[0] < len(self.stream[0]) else 1
-        if lvl not in self.tx or self.sent[lvl] >= len(self.stream[lvl]):
-            return b""
-        room, off = 1200 - self.hl(lvl) - 20, self.sent[lvl]
-        n = min(len(self.stream[lvl]) - off, room - (1 + len(qv(off)) + 2))
-        payload = b"\x06" + qv(off) + qv(n) + self.stream[lvl][off:off + n]
-        if lvl == 0:
-            payload += bytes(room - len(payload))
-        out = self.pkt(lvl, payload)
-        self.sent[lvl] += n
-        if lvl == 1 and 0 in self.tx:
-            del self.tx[0]
+    def set_now(self, now):
+        self.now = max(self.now, now)
+
+    def discard(self, lvl):
+        """RFC 9001 4.9.1 / 4.9.2 + RFC 9002 6.4"""
+        del self.tx[lvl]
+        if lvl < 2:
+            self.ret[lvl], self.rs[lvl] = b"", 0
+        self.rec.discard(lvl)
+        self.rxa[lvl], self.probe[lvl] = PyRx(), 0
+
+    # ---- handshake hooks (the TLS side is the fixture's)
+    def keys(self, lvl, k):
+        self.tx[lvl] = k
+
+    def crypto(self, lvl, data):
+        self.ret[lvl] += data
+
+    def established(self, peer):
+        self.est = True
+        self.peer.update(peer)
+        self.max_data_tx = peer.get("max_data", 0)
+
+    # ---- streams (send side, and whole-stream reads) - RFC 9000 2, 4, 19.8
+    def open_bidi(self):
+        i = self.st.index(None)
+        sid = self.next_local[0] << 2
+        self.next_local[0] += 1
+        self.st[i] = {"id": sid, "data": b"", "fin": False, "fin_sent": False, "fin_acked": False,
+                      "base": 0, "next": 0, "hi": 0, "max": self.peer["sd_bidi_remote"],
+                      "ack": (0, 0), "rx": {}, "rx_read": 0, "rx_final": None, "rx_done": False}
+        return sid
+
+    def write(self, sid, data, fin):
+        s = next(x for x in self.st if x and x["id"] == sid)
+        room = 4096 - (len(s["data"]) - s["base"])
+        k = min(len(data), room)
+        s["data"] += data[:k]
+        if fin and k == len(data):
+            s["fin"] = True
+        return k
+
+    def read(self, sid):
+        s = next(x for x in self.st if x and x["id"] == sid)
+        out = b""
+        while s["rx_read"] in s["rx"]:
+            out += bytes([s["rx"].pop(s["rx_read"])])
+            s["rx_read"] += 1
+        if not out and s["rx_final"] == s["rx_read"]:
+            s["rx_done"] = True
+            self.maybe_free(sid)
+        elif out and s["rx_read"] >= 2048:
+            die("PyQConn: MAX_STREAM_DATA credit is not modelled")
         return out
 
-    def cc(self, code):
-        levels = [lv for lv in (0, 1, 2) if lv in self.tx]
+    def maybe_free(self, sid):
+        i = next(j for j, x in enumerate(self.st) if x and x["id"] == sid)
+        s = self.st[i]
+        if s["fin_acked"] and s["base"] >= len(s["data"]) and s["rx_done"]:
+            self.st[i] = None
+            for r in self.rec.recs:
+                if r is not None and r.get("slot") == i:
+                    r["slot"] = 0xFE
+
+    def stream_out(self, room, rec):
+        for i, s in enumerate(self.st):
+            if s is None:
+                continue
+            alo, ahi = s["ack"]
+            if ahi != alo and alo <= s["next"] < ahi:
+                s["next"] = ahi
+            ln = len(s["data"])
+            avail = min(ln, s["max"])
+            if ahi != alo and s["next"] < alo < avail:
+                avail = alo
+            avail = max(avail - s["next"], 0)
+            conn = max(s["hi"] - s["next"], 0) + (self.max_data_tx - self.sent_tx)
+            avail = min(avail, conn)
+            fin = s["fin"] and not s["fin_sent"]
+            if avail == 0 and not (fin and s["next"] == ln):
+                continue
+            hdr = 1 + len(qv(s["id"])) + (len(qv(s["next"])) if s["next"] else 0) + 2
+            if hdr > room:
+                continue
+            n = min(avail, room - hdr)
+            fin = fin and s["next"] + n == ln
+            if n == 0 and not fin:
+                continue
+            p = s["next"] - s["base"] + s["base"]
+            fr = (bytes([0x08 | (0x04 if s["next"] else 0) | 0x02 | (1 if fin else 0)]) + qv(s["id"])
+                  + (qv(s["next"]) if s["next"] else b"") + qv(n) + s["data"][p:p + n])
+            rec.update(slot=i, off=s["next"], len=n)
+            if fin:
+                rec["flags"] |= 0x008
+                s["fin_sent"] = True
+            v = s["next"] + n
+            if v > s["hi"]:
+                self.sent_tx += v - s["hi"]
+                s["hi"] = v
+            s["next"] = v
+            return fr
+        return b""
+
+    def stream_record(self, r, acked):
+        i = r.get("slot", 0xFE)
+        if i >= 4 or self.st[i] is None:
+            return
+        s = self.st[i]
+        end = r["off"] + r["len"]
+        if acked:
+            if r["flags"] & 0x008:
+                s["fin_acked"] = True
+            alo, ahi = s["ack"]
+            if r["off"] <= s["base"]:
+                s["base"] = max(s["base"], end)
+            elif ahi == alo:
+                s["ack"] = (r["off"], end)
+            elif r["off"] <= ahi and end >= alo:
+                s["ack"] = (min(r["off"], alo), max(end, ahi))
+            elif r["off"] < s["next"]:
+                s["next"] = r["off"]
+            alo, ahi = s["ack"]
+            if ahi != alo and alo <= s["base"]:
+                s["base"] = max(s["base"], ahi)
+                s["ack"] = (0, 0)
+            s["next"] = max(s["next"], s["base"])
+        elif end > s["base"] or r["flags"] & 0x008:
+            if r["off"] < s["next"]:
+                s["next"] = max(r["off"], s["base"])
+            if r["flags"] & 0x008:
+                s["fin_sent"] = False
+        if s["fin_acked"] and s["base"] >= len(s["data"]) and s["rx_done"]:
+            self.maybe_free(s["id"])
+
+    # ---- recovery glue (conn.c reap / run_timers)
+    def reap(self):
+        for i, r in enumerate(self.rec.recs):
+            if r is None or not r["flags"] & (QS_ACKED | QS_LOST):
+                continue
+            acked = bool(r["flags"] & QS_ACKED)
+            lvl = r["lvl"]
+            if r.get("slot") == 0xFF and not acked and lvl < 2 and lvl in self.tx and r["off"] < self.rs[lvl]:
+                self.rs[lvl] = r["off"]
+            if lvl == 2:
+                self.stream_record(r, acked)
+            self.rec.recs[i] = None
+
+    def run_timers(self):
+        mad = self.peer["mad"]
+        t, lvl = self.rec.deadline(self.conf, 1 in self.tx, mad)
+        if t > self.now:
+            return
+        k, lvl = self.rec.on_timeout(self.now, self.conf, 1 in self.tx, mad)
+        if k and lvl in self.tx:
+            self.probe[lvl] = min(self.probe[lvl] + k, 2)
+            if lvl < 2:
+                offs = [r["off"] for r in self.rec.recs
+                        if r is not None and r["lvl"] == lvl and r.get("slot") == 0xFF]
+                if offs and min(offs) < self.rs[lvl]:
+                    self.rs[lvl] = min(offs)
+        self.reap()
+
+    # ---- receiving: one packet the C accepted, after decryption (conn.c one_packet)
+    def packet(self, lvl, pn, payload, now=None):
+        if now is not None:
+            self.set_now(now)
+        if self.rxa[lvl].dup(pn):
+            return
+        elicit, i = False, 0
+        while i < len(payload):
+            t = payload[i]
+            i += 1
+            if t not in (0x00, 0x02, 0x03, 0x1C, 0x1D):
+                elicit = True
+            if t in (0x00, 0x01):
+                continue
+            if t in (0x02, 0x03):
+                err, _, _, _, j = py_ack_parse(payload, i, t == 3)
+                code, newly = self.rec.on_ack(lvl, t == 3, payload[i:j], self.pn[lvl],
+                                              self.peer["exp"], self.peer["mad"], self.conf, self.now)
+                if err or code:
+                    die("PyQConn: a failing ACK is not modelled")
+                self.reap()
+                if newly:
+                    self.burst = 0
+                i = j
+            elif t == 0x06:
+                off, i = qv_get(payload, i)
+                ln, i = qv_get(payload, i)
+                i += ln
+            elif 0x08 <= t <= 0x0F:
+                sid, i = qv_get(payload, i)
+                off = 0
+                if t & 4:
+                    off, i = qv_get(payload, i)
+                ln, i = qv_get(payload, i) if t & 2 else (len(payload) - i, i)
+                s = next(x for x in self.st if x and x["id"] == sid)
+                for k in range(ln):
+                    if off + k >= s["rx_read"]:
+                        s["rx"].setdefault(off + k, payload[i + k])
+                if t & 1:
+                    s["rx_final"] = off + ln
+                i += ln
+            elif t == 0x1E:
+                if not self.conf:
+                    self.conf = True
+                    self.discard(1)
+            else:
+                die(f"PyQConn: frame {t:#x} is not modelled")
+        self.rxa[lvl].add(pn, elicit, self.now, self.my["mad"] if lvl == 2 else 0, lvl < 2)
+        self.idle_start, self.idle_rx = self.now, True
+
+    # ---- sending (conn.c brisk__quic_send)
+    def elicit(self, lvl, room, rec):
+        out = b""
+        if lvl < 2:
+            off = self.rs[lvl]
+            fo = 1 + len(qv(off)) + 2
+            if off < len(self.ret[lvl]) and room > fo:
+                k = min(len(self.ret[lvl]) - off, room - fo)
+                out = b"\x06" + qv(off) + qv(k) + self.ret[lvl][off:off + k]
+                self.rs[lvl] += k
+                rec.update(slot=0xFF, off=off, len=k)
+        else:
+            out = self.stream_out(room, rec)
+        if not out and self.probe[lvl]:
+            out = b"\x01"
+        return out
+
+    def send(self, now=None):
+        if now is not None:
+            self.set_now(now)
+        if self.err is not None:
+            out, self.err = self.err, b""
+            return out
+        self.run_timers()
+        if self.now != self.burst_t:
+            self.burst_t, self.burst = self.now, 0
+        if self.burst >= 12000:
+            return b""
+        free, cc_ok = self.rec.free(), self.rec.can_send(1200)
+        pos, pk, pad = 0, [], False
+        for lvl in range(3):
+            if lvl not in self.tx or (lvl == 2 and not self.est):
+                continue
+            hl, pnl = self.hl(lvl), self.pnl(lvl)
+            if pos + hl + pnl + 16 + 8 > 1200:
+                break
+            room = 1200 - pos - hl - pnl - 16
+            rec = {"pn": self.pn[lvl], "lvl": lvl, "slot": 0xFE, "off": 0, "len": 0, "flags": 0}
+            ack = b""
+            a = self.rxa[lvl]
+            if a.pending:
+                ack = a.ack(py_ack_delay_field(self.now - a.largest_t, self.my["exp"]), room)
+            el = b""
+            if free and (cc_ok or self.probe[lvl]):
+                el = self.elicit(lvl, room - len(ack), rec)
+            if not el and (not ack or a.due > self.now):
+                continue
+            payload = ack + el
+            if pnl + len(payload) < 4:
+                payload += bytes(4 - pnl - len(payload))
+            if ack:
+                a.pending, a.due = 0, QT_MAX
+            if el:
+                free -= 1
+                self.probe[lvl] = max(self.probe[lvl] - 1, 0)
+            pad |= lvl == 0
+            pk.append([lvl, pnl, payload, bool(el), bool(el), rec])
+            pos += hl + pnl + len(payload) + 16
+        if not pk:
+            return b""
+        if pad and pos < 1200:
+            pk[-1][2] += bytes(1200 - pos)
+            pk[-1][4] = True
+        out = b""
+        for lvl, pnl, payload, el, infl, rec in pk:
+            pkt = self.seal(lvl, pnl, payload)
+            out += pkt
+            if infl:
+                rec.update(t=self.now, size=len(pkt),
+                           flags=rec["flags"] | QS_INFLIGHT | (QS_ELICIT if el else 0))
+                self.rec.on_sent(rec)
+        if any(p[0] == 1 for p in pk) and 0 in self.tx:
+            self.discard(0)
+        if any(p[3] for p in pk) and self.idle_rx:
+            self.idle_start, self.idle_rx = self.now, False
+        self.burst += len(out)
+        return out
+
+    def deadline(self):
+        t, _ = self.rec.deadline(self.conf, 1 in self.tx, self.peer["mad"])
+        for lvl in range(3):
+            if lvl in self.tx and self.rxa[lvl].pending:
+                t = min(t, self.rxa[lvl].due)
+        if self.burst >= 12000:
+            t = min(t, self.burst_t + 1)
+        idle = self.my["idle"]
+        if self.est and self.peer["idle"] and (not idle or self.peer["idle"] < idle):
+            idle = self.peer["idle"]
+        if idle and self.idle_start is not None:
+            pto3 = 3 * self.rec.pto_value(2 if self.conf else 1, self.peer["mad"])
+            t = min(t, q_tadd(self.idle_start, max(idle, pto3)))
+        return t
+
+    def cc(self, code, typ=0x1C):
+        """RFC 9000 10.2.3: CONNECTION_CLOSE at every level with send keys (0x1d: 1-RTT only)."""
+        levels = [lv for lv in (0, 1, 2) if lv in self.tx and (typ == 0x1C or lv == 2)]
         out = b""
         for lv in levels:
-            payload = b"\x1c" + qv(code) + b"\x00\x00"
-            used = len(out) + self.hl(lv) + 4 + len(payload) + 16
+            pnl = self.pnl(lv)
+            payload = bytes([typ]) + qv(code) + (b"\x00" if typ == 0x1C else b"") + b"\x00"
+            used = len(out) + self.hl(lv) + pnl + len(payload) + 16
             if lv == levels[-1] and 0 in self.tx and used < 1200:
                 payload += bytes(1200 - used)
-            out += self.pkt(lv, payload)
-        self.tx = {}
+            out += self.seal(lv, pnl, payload)
+        self.tx, self.err = {}, b""
         return out
+
+
+class PyRxState:
+    """The receiving rules of RFC 9000 for 1-RTT frames that need connection state, read from
+    the RFC text: stream ids (2.1), implicit opening (3.2), flow control (4.1), final size
+    (4.5), stream limits (4.6), STREAM_STATE_ERROR cases (19.4, 19.5, 19.8, 19.10, 19.13),
+    NEW_CONNECTION_ID (5.1.1, 5.1.2, 19.15), MAX_* (19.9-19.11: only increases count). Verdicts
+    only: the QUIC error code of the first failing frame, 0 otherwise. The policy choices are
+    src/quic/stream.c's and conn.c's (same-seq / different-CID -> PROTOCOL_VIOLATION, 2 * limit
+    pending retirements, final-size SHOULDs taken)."""
+
+    def __init__(self, my, peer, server_cid):
+        self.win = {0: my["sd_bidi_local"], 1: my["sd_bidi_remote"], 3: my["sd_uni"]}
+        self.max_data, self.sum, self.consumed, self.dwin = my["max_data"], 0, 0, my["max_data"]
+        self.my_max = [my["streams_bidi"], my["streams_uni"]]
+        self.peer_max = [peer["streams_bidi"], peer["streams_uni"]]
+        self.next_local, self.next_peer, self.accepted = [0, 0], [0, 0], [0, 0]
+        self.max_data_tx = peer["max_data"]
+        self.streams = {}  # id -> state; missing = never opened or closed
+        self.limit = my["cid_limit"]
+        self.cids = {0: (server_cid, bytes(16))}
+        self.rpt, self.retire, self.cur = 0, [], server_cid
+
+    def _new(self, sid):
+        self.streams[sid] = {"hi": 0, "max": self.win.get(sid & 3, 0), "final": None,
+                             "read": 0, "reset": False, "done": False, "data": {},
+                             "tx": sid & 3 != 3, "rx": sid & 3 != 2}
+
+    def open(self, bidi):
+        d = 0 if bidi else 1
+        if self.next_local[d] >= self.peer_max[d]:
+            return -8
+        sid = self.next_local[d] << 2 | (0 if bidi else 2)
+        self.next_local[d] += 1
+        self._new(sid)
+        return sid
+
+    def accept(self):
+        for d in (0, 1):
+            if self.accepted[d] < self.next_peer[d]:
+                self.accepted[d] += 1
+                return (self.accepted[d] - 1) << 2 | (3 if d else 1)
+        return -8
+
+    def lookup(self, sid, rx):
+        d, idx = (sid >> 1) & 1, sid >> 2
+        if not sid & 1:
+            if idx >= self.next_local[d]:
+                return 0x05, None  # 19.8 / 19.5 / 19.10: not yet created
+            if rx and d:
+                return 0x05, None  # 19.8 / 19.4 / 19.13: our send-only stream
+        else:
+            if not rx and d:
+                return 0x05, None  # 19.5 / 19.10: a receive-only stream
+            if idx >= self.my_max[d]:
+                return 0x04, None  # 4.6
+            while self.next_peer[d] <= idx:  # 3.2: every lower one opens too
+                self._new(self.next_peer[d] << 2 | (sid & 3))
+                self.next_peer[d] += 1
+        return 0, self.streams.get(sid)
+
+    def grow(self, s, end):
+        if end > s["max"]:
+            return 0x03
+        if end > s["hi"]:
+            self.sum += end - s["hi"]
+            s["hi"] = end
+            if self.sum > self.max_data:
+                return 0x03
+        return 0
+
+    def read(self, sid):
+        s = self.streams[sid]
+        if s["reset"]:
+            s["done"] = True
+            self._maybe_close(sid)
+            return -5, b""
+        out = b""
+        while s["read"] in s["data"]:
+            out += bytes([s["data"].pop(s["read"])])
+            s["read"] += 1
+        self.consumed += len(out)
+        self.credit()
+        if not out:
+            if s["final"] == s["read"]:
+                s["done"] = True
+                self._maybe_close(sid)
+                return 0, b""
+            return -8, b""
+        return len(out), out
+
+    def credit(self):
+        """4.2: the connection window slides once half of it is consumed (stream.c's policy)"""
+        nl = self.consumed + self.dwin
+        if nl > self.max_data and nl - self.max_data >= self.dwin >> 1:
+            self.max_data = nl
+
+    def _maybe_close(self, sid):
+        s = self.streams[sid]
+        if s["tx"] and sid & 1 == 0:
+            return  # our send side is not modelled as finished in these scripts
+        del self.streams[sid]
+        if sid & 1:
+            self.my_max[(sid >> 1) & 1] += 1  # 4.6: MAX_STREAMS as the slot frees
+
+    def frames(self, b):
+        i = 0
+
+        def get():
+            nonlocal i
+            v, i = qv_get(b, i)
+            return v
+        while i < len(b):
+            t = get()
+            if 8 <= t <= 0x0F:
+                sid, off = get(), 0
+                if t & 4:
+                    off = get()
+                ln = get() if t & 2 else len(b) - i
+                data, fin = b[i:i + ln], t & 1
+                i += ln
+                if off + ln > QUIC_VMAX:
+                    return QFEE
+                code, s = self.lookup(sid, True)
+                if code or s is None:
+                    if code:
+                        return code
+                    continue
+                end = off + ln
+                if s["final"] is not None and (end > s["final"] or (fin and end != s["final"])):
+                    return 0x06  # 4.5
+                if fin and end < s["hi"]:
+                    return 0x06
+                code = self.grow(s, end)
+                if code:
+                    return code
+                if fin:
+                    s["final"] = end
+                if not s["reset"] and not s["done"]:
+                    for k in range(ln):
+                        if off + k >= s["read"]:
+                            s["data"].setdefault(off + k, data[k])
+            elif t in (0x04, 0x05, 0x11, 0x15):
+                sid, a = get(), get()
+                bb = get() if t == 0x04 else 0
+                code, s = self.lookup(sid, t in (0x04, 0x15))
+                if code:
+                    return code
+                if s is None:
+                    continue
+                if t == 0x04:
+                    if (s["final"] is not None and bb != s["final"]) or bb < s["hi"]:
+                        return 0x06
+                    code = self.grow(s, bb)
+                    if code:
+                        return code
+                    s["final"] = bb
+                    if not s["reset"] and not s["done"]:
+                        s["reset"], s["data"] = True, {}
+                        self.consumed += bb - s["read"]
+                        s["read"] = bb
+                        self.credit()
+            elif t == 0x10:
+                self.max_data_tx = max(self.max_data_tx, get())
+            elif t in (0x12, 0x13):
+                v = get()
+                if v > 1 << 60:
+                    return QFEE
+                self.peer_max[t - 0x12] = max(self.peer_max[t - 0x12], v)
+            elif t == 0x18:
+                seq, rpt = get(), get()
+                ln = b[i]
+                cid, tok = b[i + 1:i + 1 + ln], b[i + 1 + ln:i + 17 + ln]
+                i += 17 + ln
+                if rpt > seq:
+                    return QFEE
+                code = self.new_cid(seq, rpt, cid, tok)
+                if code:
+                    return code
+            elif t in (0x1A, 0x1B):
+                i += 8
+            elif t in (0x02, 0x03):
+                err, _, _, _, i = py_ack_parse(b, i, t == 3)  # its effects: PyRec's business
+                if err:
+                    return err
+            elif t in (0x00, 0x01):
+                pass
+            else:
+                die(f"PyRxState: frame {t:#x}")
+        return 0
+
+    def _retire(self, seq):
+        if seq in self.retire:
+            return 0
+        if len(self.retire) >= 2 * self.limit:
+            return 0x09  # 5.1.2: more pending than tracked (MAY, taken)
+        self.retire.append(seq)
+        return 0
+
+    def new_cid(self, seq, rpt, cid, tok):
+        dup = False
+        for s, (c, t) in self.cids.items():
+            if s == seq:
+                if (c, t) != (cid, tok):
+                    return 0x0A  # 19.15 MAY, taken
+                dup = True
+            elif c == cid:
+                return 0x0A
+        if rpt > self.rpt:  # 5.1.2: retire everything below it first
+            self.rpt = rpt
+            for s in sorted(self.cids):
+                if s < rpt:
+                    code = self._retire(s)
+                    if code:
+                        return code
+                    del self.cids[s]
+        if seq < self.rpt:
+            return self._retire(seq)  # 19.15: retire it right away
+        if not dup:
+            if len(self.cids) == 4:
+                return 0x09
+            self.cids[seq] = (cid, tok)
+        if len(self.cids) > self.limit:
+            return 0x09  # 5.1.1
+        if self.cur not in [c for c, _ in self.cids.values()]:
+            self.cur = self.cids[min(self.cids)][0]  # 5.1.2: stop using a retired CID
+        return 0
+
+    def acked_retire(self):
+        self.retire = []
 
 
 def q_long(k, typ, dcid, scid, pn, pn_len, payload, token=b""):
@@ -8958,15 +10174,38 @@ def q_crypto(off, data):
     return b"\x06" + qv(off) + qv(len(data)) + data
 
 
+def q_ackf(largest, first=0, delay=0, gaps=()):
+    """ACK frame 0x02 (RFC 9000 19.3), gaps = [(gap, range length)...]"""
+    return (b"\x02" + qv(largest) + qv(delay) + qv(len(gaps)) + qv(first)
+            + b"".join(qv(g) + qv(n) for g, n in gaps))
+
+
+def q_stream(sid, off, data, fin=False):
+    """STREAM with an explicit offset (when not 0) and length (RFC 9000 19.8)"""
+    return (bytes([0x08 | (0x04 if off else 0) | 0x02 | (1 if fin else 0)]) + qv(sid)
+            + (qv(off) if off else b"") + qv(len(data)) + data)
+
+
+def q_newcid(seq, rpt, cid, token):
+    return b"\x18" + qv(seq) + qv(rpt) + bytes([len(cid)]) + cid + token
+
+
 def quic_conn_vectors():
-    """Client handshakes the C connection replays byte for byte (tests/test_quic.c), each a
-    script of ops: C<hex> = the next datagram brisk__quic_send must produce ("C" alone: none),
-    S<hex> = a server datagram brisk__quic_recv accepts, F<hex> = one that fails the
-    connection, E<code> = the QUIC error code, K / k = established or not, I / W = Initial /
-    Handshake keys discarded, O<n> = packets that passed the AEAD so far, H = build and absorb
-    ClientHello2, R<hex> = install a 1-RTT receive key directly, L = one short of the 6.6
-    integrity limit, A<n> = packets that failed the AEAD so far (0: dropped before it). The TLS side is tls13_fixture's server (the P-256 leaf for
-    device.example.com), wrapped in QUIC packets with the RFC 9001 A.1 DCID."""
+    """Client connections the C replays byte for byte (tests/test_quic.c), each a script of ops:
+    C<hex> = the next datagram brisk__quic_send must produce ("C" alone: none), c = send and
+    ignore the output, S<hex> = a server datagram brisk__quic_recv accepts, F<hex> = one that
+    fails the connection, E<code> = the QUIC error code, K / k = established or not, I / W =
+    Initial / Handshake keys discarded, O<n> = packets that passed the AEAD so far, H = build and
+    absorb ClientHello2, R<hex> = install a 1-RTT receive key directly, L = one short of the 6.6
+    integrity limit, A<n> = packets that failed the AEAD so far, T<ms> = the time for the next
+    calls, D<ms> = brisk__quic_deadline() ("Dnone": INT64_MAX), G<n> = the congestion window,
+    ob<ret> / ou<ret> = open a bidi / uni stream, w<id>:<fin>:<hex>:<ret> = write,
+    r<id>:<ret>:<hex> = read (cap 4096), a<ret> = accept, X<code> = application close,
+    f<code>:<hex> = 1-RTT frames straight into brisk__quic_frames, P<min>:<dcid>:<hex> = the next
+    datagram's 1-RTT packet, opened with our send secret, goes to dcid and contains hex,
+    p = no datagram, Q<field>:<v> = a connection field. The TLS side is tls13_fixture's server
+    (the P-256 leaf for device.example.com), wrapped in QUIC packets with the RFC 9001 A.1
+    DCID; the client side is PyQConn / PyRxState, written from the RFCs."""
     f, seed = FX, FX["seed"]
     host = b"device.example.com"
     rnd = seed(b"quic client random")
@@ -8975,7 +10214,12 @@ def quic_conn_vectors():
     c_d = int.from_bytes(seed(b"client p256"), "big")
     s_d = int.from_bytes(seed(b"server p256"), "big")
     c_p256, s_p256 = py_p256_keygen(c_d)[0], py_p256_keygen(s_d)[0]
-    ctp = tp_enc([(0x01, qv(30000)), (0x04, qv(1 << 20)), (0x08, qv(16)), (0x0F, cscid)])
+    # our TPs: windows <= BRISK_QUIC_STREAM_BUF, connection <= slots * buffer, 2 uni streams
+    # (test_quic.c rig_start sets the same)
+    MY = {"exp": 3, "mad": 25, "idle": 30000, "max_data": 8192, "sd_bidi_local": 4096,
+          "sd_bidi_remote": 0, "sd_uni": 4096, "streams_bidi": 0, "streams_uni": 2, "cid_limit": 2}
+    ctp = tp_enc([(0x01, qv(30000)), (0x04, qv(8192)), (0x05, qv(4096)), (0x07, qv(4096)),
+                  (0x09, qv(2)), (0x0F, cscid)])
     alpn = t_alpn([b"h3"])
 
     def ch_of(group, pub, cookie=b""):
@@ -8985,7 +10229,10 @@ def quic_conn_vectors():
     ch1 = ch_of(0x001D, f["c_pub"])
     reset = seed(b"quic reset token")[:16]
     stp_ok = [(0x00, dcid), (0x01, qv(30000)), (0x02, reset), (0x04, qv(1 << 20)),
-              (0x08, qv(100)), (0x0E, qv(4)), (27, b"grease"), (0x0F, sscid)]
+              (0x05, qv(65536)), (0x06, qv(65536)), (0x07, qv(65536)), (0x08, qv(100)),
+              (0x09, qv(100)), (0x0E, qv(4)), (27, b"grease"), (0x0F, sscid)]
+    PEER = {"max_data": 1 << 20, "sd_bidi_remote": 65536, "idle": 30000, "exp": 3, "mad": 25,
+            "streams_bidi": 100, "streams_uni": 100}
     s_init = q_keys(0x1301, q_initial(dcid)[1])
     good_cert = t_msg(11, b"\x00" + t_v24(t_v24(f["leaf_cert"]()) + t_v16(b"")))
 
@@ -9003,9 +10250,9 @@ def quic_conn_vectors():
         return {"suite": suite, "sh": sh, "flight": ee + cert + cv + fl["sf"], "cf": fl["cf"],
                 "hs_r": q_keys(suite, fl["s_hs"]), "hs_w": q_keys(suite, fl["c_hs"]),
                 "ap_r": q_keys(suite, fl["s_ap"]), "ap_w": q_keys(suite, fl["c_ap"]),
-                "s_ap": fl["s_ap"]}
+                "s_ap": fl["s_ap"], "c_ap": fl["c_ap"]}
 
-    ACK0 = b"\x02\x00\x00\x00\x00"  # the server acknowledges our Initial 0 (syntax only here)
+    ACK0 = q_ackf(0)  # the server acknowledges our Initial 0
 
     def s_initial(pn, payload, dc=cscid, sc=sscid, token=b""):
         return q_long(s_init, 0, dc, sc, pn, 2, payload, token)
@@ -9013,18 +10260,25 @@ def quic_conn_vectors():
     rows = []
 
     def start():
-        c = QClient(dcid, cscid)
-        c.stream[0] = ch1
+        c = PyQConn(dcid, cscid, MY)
+        c.crypto(0, ch1)
         return c, ["C" + c.send().hex()]
 
-    def after_sh(c, s):
-        """The client once the ServerHello is processed: new DCID (7.2), Handshake keys."""
-        c.dcid = sscid
-        c.tx[1] = s["hs_w"]
+    def sh_in(c, s, payload=None, pn=0, now=None, sc=sscid):
+        """The first server Initial processed: 7.2 DCID switch, then the Handshake keys."""
+        c.dcid = sc
+        c.packet(0, pn, ACK0 + q_crypto(0, s["sh"]) if payload is None else payload, now)
+        c.keys(1, s["hs_w"])
 
-    def connected(c, s):
-        c.tx[2] = s["ap_w"]
-        c.stream[1] = s["cf"]
+    def connect(c, s):
+        """The engine reached CONNECTED (the server's flight was processed)."""
+        c.keys(2, s["ap_w"])
+        c.crypto(1, s["cf"])
+        c.established(PEER)
+
+    def fl_in(c, s, payload=None, pn=0, now=None):
+        c.packet(1, pn, q_crypto(0, s["flight"]) if payload is None else payload, now)
+        connect(c, s)
 
     def fail(c, ops, dgram, code):
         ops += ["F" + dgram.hex(), f"E{code:x}", "C" + c.cc(code).hex(), "C"]
@@ -9038,38 +10292,48 @@ def quic_conn_vectors():
         return (s_initial(0, ACK0 + q_crypto(0, s["sh"]))
                 + q_long(s["hs_r"], 2, cscid, sscid, 0, 2, q_crypto(0, s["flight"])))
 
-    # 1. the full handshake per suite, Initial + Handshake coalesced (RFC 9000 12.2)
+    def std_in(c, s, now=None):
+        sh_in(c, s, now=now)
+        fl_in(c, s, now=now)
+
+    # 1. the full handshake per suite, Initial + Handshake coalesced (RFC 9000 12.2); the client
+    # acknowledges both (13.2.1 at once) next to its Finished, padded (14.1)
     for suite in (0x1301, 0x1302, 0x1303):
         c, ops = start()
         s = server(suite, [ch1])
         ops += ["S" + std(s).hex(), "O2", "K"]
-        after_sh(c, s)
-        connected(c, s)
+        std_in(c, s)
         ops += ["C" + c.send().hex(), "I"]
-        ops += ["S" + q_short(s["ap_r"], cscid, 0, 2, b"\x1e\x00").hex(), "W", "O3", "C"]
-        row(f"handshake {suite:#06x}: coalesced server flight, HANDSHAKE_DONE", suite, ops)
+        ops += ["S" + q_short(s["ap_r"], cscid, 0, 2, b"\x1e\x00").hex(), "W", "O3"]
+        c.packet(2, 0, b"\x1e\x00")
+        ops += ["C" + c.send().hex(), f"D{c.deadline()}"]
+        row(f"handshake {suite:#06x}: coalesced server flight, HANDSHAKE_DONE, ACK owed at +25",
+            suite, ops)
     s = server(0x1301, [ch1])
     # 2. separate datagrams; the Handshake packet decrypts only once the SH installed its keys
     c, ops = start()
     hs_pkt = q_long(s["hs_r"], 2, cscid, sscid, 0, 2, q_crypto(0, s["flight"]))
-    ops += ["S" + hs_pkt.hex(), "O0", "S" + s_initial(0, q_crypto(0, s["sh"])).hex(), "O1", "k",
-            "S" + hs_pkt.hex(), "O2", "K"]
-    after_sh(c, s)
-    connected(c, s)
+    ops += ["S" + hs_pkt.hex(), "O0", "S" + s_initial(0, q_crypto(0, s["sh"])).hex(), "O1", "k"]
+    sh_in(c, s, q_crypto(0, s["sh"]))
+    ops += ["C" + c.send().hex(), "S" + hs_pkt.hex(), "O2", "K"]
+    fl_in(c, s)
     ops += ["C" + c.send().hex(), "I", "C"]
-    row("separate datagrams; a Handshake packet before its keys is dropped", 0x1301, ops)
+    row("separate datagrams; a Handshake packet before its keys is dropped; Initial ACK alone",
+        0x1301, ops)
     # 3. CRYPTO split, out of order, overlapping, over several coalesced packets
     s3 = server(0x1303, [ch1])
     fl, sh = s3["flight"], s3["sh"]
     a, b = len(fl) // 3, 2 * len(fl) // 3
-    d = (s_initial(0, q_crypto(40, sh[40:]) + q_crypto(0, sh[:40]))
-         + q_long(s3["hs_r"], 2, cscid, sscid, 0, 1, q_crypto(b, fl[b:]))
-         + q_long(s3["hs_r"], 2, cscid, sscid, 1, 1, q_crypto(0, fl[:a]) + q_crypto(5, fl[5:a + 9]))
-         + q_long(s3["hs_r"], 2, cscid, sscid, 2, 1, q_crypto(a, fl[a:b])))
+    p0 = q_crypto(40, sh[40:]) + q_crypto(0, sh[:40])
+    p1, p2, p3 = q_crypto(b, fl[b:]), q_crypto(0, fl[:a]) + q_crypto(5, fl[5:a + 9]), q_crypto(a, fl[a:b])
+    d = (s_initial(0, p0) + q_long(s3["hs_r"], 2, cscid, sscid, 0, 1, p1)
+         + q_long(s3["hs_r"], 2, cscid, sscid, 1, 1, p2) + q_long(s3["hs_r"], 2, cscid, sscid, 2, 1, p3))
     c, ops = start()
     ops += ["S" + d.hex(), "O4", "K"]
-    after_sh(c, s3)
-    connected(c, s3)
+    sh_in(c, s3, p0)
+    c.packet(1, 0, p1)
+    c.packet(1, 1, p2)
+    fl_in(c, s3, p3, pn=2)
     ops += ["C" + c.send().hex(), "I"]
     row("split CRYPTO: reversed, overlapping, over four coalesced packets", 0x1303, ops)
     # 4. HelloRetryRequest to secp256r1 with a cookie; CH2 continues the Initial stream
@@ -9081,21 +10345,22 @@ def quic_conn_vectors():
     c, ops = start()
     ops += ["S" + s_initial(0, ACK0 + q_crypto(0, hrr)).hex(), "k", "H"]
     c.dcid = sscid
-    c.stream[0] += ch2
+    c.packet(0, 0, ACK0 + q_crypto(0, hrr))
+    c.crypto(0, ch2)
     ops.append("C" + c.send().hex())
     ops.append("S" + (s_initial(1, q_crypto(len(hrr), sh4["sh"]))
                       + q_long(sh4["hs_r"], 2, cscid, sscid, 0, 2, q_crypto(0, sh4["flight"]))).hex())
     ops.append("K")
-    after_sh(c, sh4)
-    connected(c, sh4)
+    c.packet(0, 1, q_crypto(len(hrr), sh4["sh"]))
+    c.keys(1, sh4["hs_w"])
+    fl_in(c, sh4)
     ops += ["C" + c.send().hex(), "I"]
     row("HelloRetryRequest: CH2 at Initial offset len(CH1), secp256r1", 0x1301, ops)
     # 5. duplicates are dropped after the AEAD (RFC 9000 12.3)
     c, ops = start()
     reuse = q_long(s["hs_r"], 2, cscid, sscid, 0, 2, b"\x21\x00\x00")  # an error if processed
     ops += ["S" + std(s).hex(), "O2", "K", "S" + std(s).hex(), "O4", "K", "S" + reuse.hex(), "O5"]
-    after_sh(c, s)
-    connected(c, s)
+    std_in(c, s)
     ops += ["C" + c.send().hex(), "I"]
     row("12.3: a datagram twice, then another packet reusing PN 0: opened, dropped as duplicates",
         0x1301, ops)
@@ -9108,8 +10373,7 @@ def quic_conn_vectors():
             "S" + s_initial(0, q_crypto(0, s["sh"]), dc=b"\x99" * 8).hex(), "O0", "k",
             "S" + std(s).hex(), "O2", "K",
             "S" + s_initial(1, b"\x01" + bytes(20), sc=b"\x77" * 8).hex(), "O2"]
-    after_sh(c, s)
-    connected(c, s)
+    std_in(c, s)
     ops += ["C" + c.send().hex()]
     row("7.2/5.2.1/17.2.2: token, foreign DCID, new SCID later - all dropped", 0x1301, ops)
     # 7. RFC 9001 5.7: 1-RTT before CONNECTED, even with its key in place
@@ -9128,7 +10392,7 @@ def quic_conn_vectors():
             ("18.2: a duplicate transport parameter at EE -> TRANSPORT_PARAMETER_ERROR",
              server(0x1301, [ch1], stp=stp_ok + [(0x01, qv(5))]), QTPE)):
         c, ops = start()
-        after_sh(c, sv)
+        sh_in(c, sv)
         fail(c, ops, std(sv), code)
         row(note, 0x1301, ops)
     for note, stp in (("7.3: original_destination_connection_id missing",
@@ -9143,8 +10407,8 @@ def quic_conn_vectors():
                        stp_ok + [(0x10, sscid)])):
         sv = server(0x1301, [ch1], stp=stp)
         c, ops = start()
-        after_sh(c, sv)
-        c.tx[2] = sv["ap_w"]
+        sh_in(c, sv)
+        c.keys(2, sv["ap_w"])
         fail(c, ops, std(sv), QTPE)
         row(note + " -> TRANSPORT_PARAMETER_ERROR at completion", 0x1301, ops)
     # reserved bits: a PROTOCOL_VIOLATION only after the AEAD accepted them (RFC 9001 9.5)
@@ -9163,8 +10427,7 @@ def quic_conn_vectors():
                                 ("12.4: unknown frame type in a Handshake packet", b"\x21\x00\x00", QFEE)):
         c, ops = start()
         ops += ["S" + std(s).hex(), "K"]
-        after_sh(c, s)
-        c.tx[2] = s["ap_w"]
+        std_in(c, s)
         fail(c, ops, q_long(s["hs_r"], 2, cscid, sscid, 1, 2, payload), code)
         row(note, 0x1301, ops)
     # post-handshake CRYPTO in 1-RTT (Initial keys gone, Handshake keys still here)
@@ -9174,16 +10437,14 @@ def quic_conn_vectors():
                             ("RFC 9001 6: KeyUpdate -> 0x010a", t_msg(24, b"\x00"), 0x10A)):
         c, ops = start()
         ops += ["S" + std(s).hex(), "K"]
-        after_sh(c, s)
-        connected(c, s)
+        std_in(c, s)
         ops += ["C" + c.send().hex()]
         fail(c, ops, q_short(s["ap_r"], cscid, 0, 2, q_crypto(0, msg)), code)
         row(note, 0x1301, ops)
     # 1-RTT connection-ID frames this client cannot accept (RFC 9000 19.15, 19.16)
     c, ops = start()
     ops += ["S" + std(s).hex(), "K"]
-    after_sh(c, s)
-    connected(c, s)
+    std_in(c, s)
     ops += ["C" + c.send().hex()]
     fail(c, ops, q_short(s["ap_r"], cscid, 0, 2, b"\x19\x00"), QPV)
     row("19.16: RETIRE_CONNECTION_ID of our only CID -> PROTOCOL_VIOLATION", 0x1301, ops)
@@ -9192,9 +10453,8 @@ def quic_conn_vectors():
     ops += ["S" + (s_initial(0, ACK0 + q_crypto(0, se["sh"]), sc=b"")
                    + q_long(se["hs_r"], 2, cscid, b"", 0, 2, q_crypto(0, se["flight"]))).hex(),
             "K"]
-    after_sh(c, se)
-    c.dcid = b""
-    connected(c, se)
+    sh_in(c, se, sc=b"")
+    fl_in(c, se)
     ops += ["C" + c.send().hex()]
     fail(c, ops, q_short(se["ap_r"], cscid, 0, 2, b"\x18\x01\x00\x08" + bytes(8) + bytes(16)),
          QPV)
@@ -9202,7 +10462,8 @@ def quic_conn_vectors():
         0x1301, ops)
     # RFC 9001 4.1.3 at the Initial level
     c, ops = start()
-    after_sh(c, s)
+    c.dcid = sscid
+    c.keys(1, s["hs_w"])
     fail(c, ops, s_initial(0, q_crypto(0, s["sh"] + b"\x08")), QPV)
     row("RFC 9001 4.1.3: CRYPTO after the ServerHello in the same stream -> PROTOCOL_VIOLATION",
         0x1301, ops)
@@ -9220,11 +10481,218 @@ def quic_conn_vectors():
     c, ops = start()
     ops += ["F" + s_initial(0, b"\x1c\x0a\x00\x02no").hex(), "E0a", "C"]
     row("10.2.2: the server's CONNECTION_CLOSE: draining, no close sent", 0x1301, ops)
+    # 10.2.3: an application close before the handshake: 0x1c APPLICATION_ERROR, no app code
+    c, ops = start()
+    ops += ["X42", "E0c", "C" + c.cc(0x0C).hex(), "C"]
+    row("10.2.3: close before establishment -> 0x1c APPLICATION_ERROR in Initial", 0x1301, ops)
+
+    # ---- M6 item 2: streams, ACKs, loss recovery over a whole connection
+    def hs_to_confirmed(c, ops, t_srv=50, t_done=100):
+        """Handshake at t_srv, the client's flight, then the server's Handshake ACK and
+        HANDSHAKE_DONE at t_done (RFC 9001 4.1.2 confirmed, 4.9.2 Handshake keys dropped)."""
+        ops += ["T%d" % t_srv, "S" + std(s).hex(), "K"]
+        std_in(c, s, now=t_srv)
+        ops += ["C" + c.send(t_srv).hex(), "I"]
+        d = (q_long(s["hs_r"], 2, cscid, sscid, 1, 1, q_ackf(0))
+             + q_short(s["ap_r"], cscid, 0, 2, b"\x1e\x00"))
+        ops += ["T%d" % t_done, "S" + d.hex(), "W"]
+        c.packet(1, 1, q_ackf(0), t_done)
+        c.packet(2, 0, b"\x1e\x00", t_done)
+
+    # request / response on stream 0, ACK after max_ack_delay, application close
+    c, ops = start()
+    hs_to_confirmed(c, ops)
+    sid = c.open_bidi()
+    req = b"GET /index.html\r\n"
+    c.write(sid, req, True)
+    ops += [f"ob{sid}", f"w{sid}:1:{req.hex()}:{len(req)}", "C" + c.send(100).hex(), "C",
+            f"D{c.deadline()}"]
+    resp = b"hello, quic"
+    d = q_short(s["ap_r"], cscid, 1, 1, q_ackf(0) + q_stream(sid, 0, resp, True))
+    ops += ["T150", "S" + d.hex()]
+    c.packet(2, 1, q_ackf(0) + q_stream(sid, 0, resp, True), 150)
+    ops += [f"D{c.deadline()}", "C" + c.send(150).hex()]
+    got = c.read(sid)
+    ops += [f"r{sid}:{len(got)}:{got.hex()}", f"r{sid}:0:"]
+    c.read(sid)
+    ops += ["T175", "C" + c.send(175).hex()]
+    ops.append(f"D{c.deadline()}")
+    ops += ["X42", "E42", "C" + c.cc(0x42, 0x1D).hex(), "C"]
+    row("request / response on stream 0: ACK piggybacked, then after max_ack_delay; 0x1d close",
+        0x1301, ops)
+    # the server's first Handshake datagram is lost: anti-deadlock PTO, Handshake PING probe
+    c, ops = start()
+    ops += ["T50", "S" + s_initial(0, ACK0 + q_crypto(0, s["sh"])).hex()]
+    sh_in(c, s, now=50)
+    ops += ["C" + c.send(50).hex(), f"D{c.deadline()}"]
+    t = c.deadline()
+    ops += [f"T{t}", "C" + c.send(t).hex(), "I", f"D{c.deadline()}"]
+    ops += ["T200", "S" + hs_pkt.hex(), "K"]
+    fl_in(c, s, now=200)
+    ops += ["C" + c.send(200).hex()]
+    row("RFC 9002 6.2.2.1: the server's Handshake flight lost - PTO probe in Handshake, then on",
+        0x1301, ops)
+    # a lost 1-RTT STREAM packet: packet threshold, go back, cwnd halved, reassembled
+    c, ops = start()
+    hs_to_confirmed(c, ops)
+    sid = c.open_bidi()
+    body = bytes((i * 7) & 0xFF for i in range(4096))
+    n = c.write(sid, body, True)
+    ops += [f"ob{sid}", f"w{sid}:1:{body.hex()}:{n}"]
+    pns = []
+    while True:
+        o = c.send(100)
+        ops.append("C" + o.hex())
+        if not o:
+            break
+        pns.append(c.pn[2] - 1)
+    if len(pns) < 4:
+        die("quic conn: the loss script needs 4 data packets")
+    ack = q_ackf(pns[-1], pns[-1] - pns[1])  # all but the first data packet
+    ops += ["T150", "S" + q_short(s["ap_r"], cscid, 1, 1, ack).hex()]
+    c.packet(2, 1, ack, 150)
+    ops += [f"G{c.rec.cwnd}", "C" + c.send(150).hex(), "C"]
+    if c.rec.cwnd != 6000:
+        die(f"quic conn: loss script cwnd {c.rec.cwnd}")
+    ack = q_ackf(c.pn[2] - 1, c.pn[2] - 1)
+    d = q_short(s["ap_r"], cscid, 2, 1, ack + q_stream(sid, 0, b"ok", True))
+    ops += ["T200", "S" + d.hex()]
+    c.packet(2, 2, ack + q_stream(sid, 0, b"ok", True), 200)
+    ops += [f"r{sid}:2:{b'ok'.hex()}", f"r{sid}:0:"]
+    c.read(sid)
+    c.read(sid)
+    row("a lost 1-RTT STREAM packet: packet threshold, retransmission from its offset, cwnd halved",
+        0x1301, ops)
     print(f"  quic connection scripts: {len(rows)}")
+
+    # ---- stateful 1-RTT frame rules, one MUST per script, straight into brisk__quic_frames on an
+    # established connection (the TLS side done). Verdicts from PyRxState.
+    PRE = ["c", "S" + std(s).hex(), "K", "c", "S" + q_short(s["ap_r"], cscid, 0, 2, b"\x1e\x00").hex()]
+    srows = []
+
+    def srow(note, steps):
+        st = PyRxState(MY, PEER, sscid)
+        st.cids[0] = (sscid, reset)
+        ops = list(PRE)
+        for step in steps:
+            kind = step[0]
+            if kind == "f":
+                code = st.frames(step[1])
+                if len(step) > 2 and step[2] != code:
+                    die(f"quic state: {note}: model says {code:#x}, script expects {step[2]:#x}")
+                ops.append(f"f{code:x}:{step[1].hex()}")
+            elif kind == "o":
+                ops.append(("ob" if step[1] else "ou") + str(st.open(step[1])))
+            elif kind == "a":
+                ops.append(f"a{st.accept()}")
+            elif kind == "r":
+                rc, data = st.read(step[1])
+                ops.append(f"r{step[1]}:{rc}:{data.hex()}")
+            else:
+                ops.append(step[1])  # a raw op (w, c, P, p, Q)
+        if len(ops) > QUIC_CONN_OPS:
+            die(f"quic state: {note}: {len(ops)} ops")
+        srows.append((note, 0x1301, ops))
+        return st
+
+    x = b"\x0a"  # STREAM with a length, offset 0
+    srow("19.8 (MUST): STREAM on local bidi 8, never opened -> STREAM_STATE_ERROR",
+         [("f", x + qv(8) + b"\x01x", 0x05)])
+    srow("19.8 (MUST): STREAM on our send-only uni stream 2 -> STREAM_STATE_ERROR",
+         [("o", 0), ("f", x + qv(2) + b"\x01x", 0x05)])
+    srow("19.4 (MUST): RESET_STREAM on our send-only uni stream -> STREAM_STATE_ERROR",
+         [("o", 0), ("f", b"\x04\x02\x00\x00", 0x05)])
+    srow("19.13 (MUST): STREAM_DATA_BLOCKED on our send-only uni stream -> STREAM_STATE_ERROR",
+         [("o", 0), ("f", b"\x15\x02\x00", 0x05)])
+    srow("19.5 (MUST): STOP_SENDING on the server's receive-only uni 3 -> STREAM_STATE_ERROR",
+         [("f", b"\x05\x03\x00", 0x05)])
+    srow("19.10 (MUST): MAX_STREAM_DATA on the server's uni 3 -> STREAM_STATE_ERROR",
+         [("f", b"\x11\x03\x40\x00", 0x05)])
+    srow("19.5 (MUST): STOP_SENDING on local bidi 0, never opened -> STREAM_STATE_ERROR",
+         [("f", b"\x05\x00\x00", 0x05)])
+    srow("19.10 (MUST): MAX_STREAM_DATA on local bidi 4 (only 0 opened) -> STREAM_STATE_ERROR",
+         [("o", 1), ("f", b"\x11\x00\x44\x00", 0), ("f", b"\x11\x04\x44\x00", 0x05)])
+    srow("4.6 (MUST): server bidi 1 with our limit 0 -> STREAM_LIMIT_ERROR",
+         [("f", x + qv(1) + b"\x01x", 0x04)])
+    srow("4.6 / 3.2: uni 7 (limit 2) opens 3 and 7; accept() in order; uni 11 -> STREAM_LIMIT_ERROR",
+         [("f", x + qv(7) + b"\x01y", 0), ("a",), ("a",), ("a",), ("f", x + qv(11) + b"\x01x", 0x04)])
+    srow("4.1 (MUST): stream data exactly at the limit, then 1 byte past -> FLOW_CONTROL_ERROR",
+         [("f", b"\x0e\x03" + qv(4095) + b"\x01z", 0), ("f", b"\x0e\x03" + qv(4096) + b"\x01z", 0x03)])
+    srow("4.1 (MUST): the sum over streams past initial_max_data -> FLOW_CONTROL_ERROR",
+         [("o", 1), ("f", b"\x0e\x03" + qv(4095) + b"\x01z", 0), ("f", b"\x0e\x07" + qv(4095) + b"\x01z", 0),
+          ("f", x + qv(0) + b"\x01z", 0x03)])
+    srow("4.5 (MUST): a RESET_STREAM final size past the stream limit -> FLOW_CONTROL_ERROR",
+         [("f", b"\x04\x03\x00" + qv(4097), 0x03)])
+    srow("4.5 (MUST): a RESET_STREAM final size counts toward connection credit",
+         [("o", 1), ("f", b"\x0e\x07" + qv(4095) + b"\x01z", 0),
+          ("f", b"\x0e\x00" + qv(4095) + b"\x01z", 0), ("f", b"\x04\x03\x07\x01", 0x03)])
+    srow("4.5: a FIN that moves a known final size -> FINAL_SIZE_ERROR",
+         [("f", b"\x0b\x03\x02hi", 0), ("f", b"\x0f\x03\x02\x01x", 0x06)])
+    srow("4.5: data past the final size -> FINAL_SIZE_ERROR",
+         [("f", b"\x0b\x03\x02hi", 0), ("f", b"\x0e\x03\x02\x01x", 0x06)])
+    srow("4.5: a FIN below the highest offset received -> FINAL_SIZE_ERROR",
+         [("f", bytes([0x0E, 0x03, 0x05, 0x02]) + b"hi", 0), ("f", bytes([0x0B, 0x03, 0x01]) + b"x", 0x06)])
+    srow("4.5: RESET_STREAM final size below the highest offset received -> FINAL_SIZE_ERROR",
+         [("f", b"\x0e\x03\x05\x02hi", 0), ("f", b"\x04\x03\x00\x06", 0x06)])
+    srow("19.8: offset + length past 2^62-1 -> FRAME_ENCODING_ERROR",
+         [("f", b"\x0e\x03" + qv(QUIC_VMAX, 8) + b"\x01z", QFEE)])
+    srow("4.1 / 4.6 (MUST): MAX_DATA, MAX_STREAM_DATA, MAX_STREAMS that do not grow are ignored",
+         [("o", 1), ("x", "Qmd:%d" % (1 << 20)), ("f", b"\x10\x05", 0), ("x", "Qmd:%d" % (1 << 20)),
+          ("f", b"\x10" + qv(1 << 21), 0), ("x", "Qmd:%d" % (1 << 21)),
+          ("f", b"\x11\x00\x05", 0), ("x", "Qt0:65536"), ("f", b"\x11\x00" + qv(70000), 0),
+          ("x", "Qt0:70000"), ("f", b"\x12\x05", 0), ("x", "Qsb:100"), ("f", b"\x13" + qv(300), 0),
+          ("x", "Qsu:300")])
+    rst = b"\x04\x00" + qv(0x77) + qv(3)
+    srow("3.5 (MUST): STOP_SENDING -> one RESET_STREAM (code, final = bytes sent), resent after loss",
+         [("o", 1), ("x", "w0:0:616263:3"), ("x", "c"), ("f", b"\x05\x00" + qv(0x77), 0),
+          ("x", f"P1:{sscid.hex()}:{rst.hex()}"), ("x", "p"), ("o", 1), ("x", "w4:0:61:1"), ("x", "c"),
+          ("x", "w4:0:62:1"), ("x", "c"), ("x", "w4:0:63:1"), ("x", "c"),
+          ("f", q_ackf(4, 2), 0), ("x", f"P1:{sscid.hex()}:{rst.hex()}"), ("x", "p")])
+    ms3, rt0, rt12 = (b"\x13" + qv(3)).hex(), "1900", "19011902"
+    srow("frames for a closed stream (read to FIN, slot freed) are ignored; MAX_STREAMS follows",
+         [("f", b"\x0b\x03\x02hi", 0), ("r", 3), ("r", 3), ("f", b"\x0b\x03\x02hi", 0),
+          ("x", f"P1:{sscid.hex()}:{ms3}")])
+    cid1, cid2, cid3 = b"\xc1" * 8, b"\xc2" * 8, b"\xc3" * 8
+    tk1, tk2, tk3 = b"\x11" * 16, b"\x22" * 16, b"\x33" * 16
+    srow("5.1.1 (MUST): a 3rd active CID with our limit 2 -> CONNECTION_ID_LIMIT_ERROR",
+         [("f", q_newcid(1, 0, cid1, tk1), 0), ("f", q_newcid(2, 0, cid2, tk2), 0x09)])
+    srow("19.15: the same NEW_CONNECTION_ID twice is not an error",
+         [("f", q_newcid(1, 0, cid1, tk1), 0), ("f", q_newcid(1, 0, cid1, tk1), 0)])
+    srow("19.15 (MAY, taken): the same sequence number with another CID -> PROTOCOL_VIOLATION",
+         [("f", q_newcid(1, 0, cid1, tk1), 0), ("f", q_newcid(1, 0, cid2, tk1), 0x0A)])
+    srow("19.15 (MAY, taken): the same CID under another sequence number -> PROTOCOL_VIOLATION",
+         [("f", q_newcid(1, 0, cid1, tk1), 0), ("f", q_newcid(2, 1, cid1, tk2), 0x0A)])
+    srow("5.1.2 (MUST): Retire Prior To 1 retires seq 0 and switches the DCID; seq < rpt retired at once",
+         [("f", q_newcid(1, 1, cid1, tk1), 0),
+          ("x", f"P1:{cid1.hex()}:{rt0}"),
+          ("f", q_newcid(3, 3, cid3, tk3), 0), ("f", q_newcid(2, 0, cid2, tk2), 0),
+          ("x", f"P1:{cid3.hex()}:{rt12}")])
+    steps = []
+    st_probe = PyRxState(MY, PEER, sscid)
+    for j in range(8):
+        fr = q_newcid(QUIC_VMAX - j, QUIC_VMAX if j == 0 else 0, bytes([0xd0 + j]) * 8, bytes([j]) * 16)
+        code = st_probe.frames(fr)
+        steps.append(("f", fr, code))
+        if code:
+            break
+    if steps[-1][2] != 0x09:
+        die("quic state: Retire Prior To 2^62-1 never reaches the retire bound")
+    srow("5.1.2: Retire Prior To 2^62-1, then more old CIDs -> CONNECTION_ID_LIMIT_ERROR, bounded",
+         steps)
+    ch_a, ch_b = bytes(range(8)), bytes(range(8, 16))
+    srow("8.2.2 (MUST): PATH_CHALLENGE -> one PATH_RESPONSE in a 1200-byte datagram, not resent",
+         [("f", b"\x1a" + ch_a, 0), ("x", "P1200:" + sscid.hex() + ":" + (b"\x1b" + ch_a).hex()),
+          ("x", "p")])
+    srow("8.2.2: two PATH_CHALLENGEs in one packet -> two PATH_RESPONSEs; an unsolicited one ignored",
+         [("f", b"\x1a" + ch_a + b"\x1a" + ch_b, 0),
+          ("x", "P1200:" + sscid.hex() + ":" + (b"\x1b" + ch_a + b"\x1b" + ch_b).hex()),
+          ("f", b"\x1b" + ch_a, 0), ("x", "p")])
+    print(f"  quic state scripts: {len(srows)}")
     glob = {"RND": rnd, "X25519": f["c_priv"], "P256": c_d.to_bytes(32, "big"), "DCID": dcid,
             "SCID": cscid, "CTP": ctp, "ROOT": f["root_c"], "CH1": ch1, "SH": s["sh"],
-            "FLIGHT": s["flight"], "S_INIT": s_initial(0, q_crypto(0, s["sh"]))}
-    return rows, glob
+            "FLIGHT": s["flight"], "S_INIT": s_initial(0, q_crypto(0, s["sh"])),
+            "C_AP": s["c_ap"], "S_AP": s["s_ap"]}
+    return rows + srows, glob
 
 
 def main():
@@ -9364,6 +10832,7 @@ def main():
     q_tp, _ = quic_tp_vectors(q_a2)
     q_frames = quic_frame_vectors(q_a2, q_a3)
     q_conn, q_glob = quic_conn_vectors()
+    q_rec, q_rx = quic_rec_vectors(q_a3)
 
     emit("sha2.inc", "struct hash_kat SHA2_KAT", cavp + dhash, lambda r: f"{r[0]}, {cstr(r[1])}, {cstr(r[2])}")
     emit("sha2_monte.inc", "struct monte_kat SHA2_MONTE", monte,
@@ -9590,10 +11059,24 @@ def main():
                    + ", ".join(cstr(x) for x in r[3:7]) + f', {r[7]}u, "{cesc(r[8])}"')
     emit("quic_frames.inc", "struct quic_frame_kat QUIC_FRAME_KAT", q_frames,
          lambda r: f'{cstr(r[0])}, {r[1]}u, 0x{r[2]:x}u, "{cesc(r[3])}"')
-    qop = lambda o: f'"{o[0]}" {cstr(o[1:])}' if len(o) > 1 and o[0] in "CSFR" else f'"{o}"'
+    qop = lambda o: f'"{o[0]}" {cstr(o[1:])}' if len(o) > 1 else f'"{o}"'
     emit("quic_conn.inc", "struct quic_conn_kat QUIC_CONN_KAT", q_conn,
          lambda r: f'"{cesc(r[0])}", 0x{r[1]:04x}u, {{' + ", ".join(
              [qop(o) for o in r[2]] + ["NULL"] * (QUIC_CONN_OPS - len(r[2]))) + "}")
+    ll = lambda v: f"{v}LL"
+    emit("quic_rec.inc", "struct quic_rec_kat QUIC_REC_KAT", q_rec,
+         lambda r: f"'{r[0]}', {{" + ", ".join(ll(v) for v in r[1]) + f"}}, {cstr(r[2])}, {{"
+                   + ", ".join(ll(v) for v in r[3]) + f'}}, "{cesc(r[4])}"')
+    emit("quic_rec.inc", "struct quic_rx_kat QUIC_RX_KAT", q_rx,
+         lambda r: f"{ll(r[0])}, {r[1]}, {ll(r[2])}, {ll(r[3])}, {r[4]}, {ll(r[5])}, {r[6]}u, {{"
+                   + ", ".join(ll(v) for v in r[7]) + f'}}, {cstr(r[8])}, "{cesc(r[9])}"',
+         append=True)
+    emit("quic_rec.inc", "struct quic_ackdelay_kat QUIC_ACKDELAY_KAT",
+         [(ms, e, py_ack_delay_field(ms, e), py_ack_delay_ms(py_ack_delay_field(ms, e), e))
+          for ms in (-3, 0, 1, 17, 25, 1000, 1 << 24, (1 << 24) + 5) for e in (0, 3, 20)]
+         + [(0, e, f, py_ack_delay_ms(f, e)) for f in (QUIC_VMAX, 1 << 40, (1 << 40) - 1, 999, 1000)
+            for e in (0, 1, 20)],
+         lambda r: f"{r[0]}LL, {r[1]}u, {r[2]}ULL, {r[3]}u", append=True)
     with open(OUT / "quic_conn.inc", "a", newline="\n") as fh:
         for k, v in q_glob.items():
             fh.write(f"static const char QUIC_CONN_{k}[] = {cstr(v.hex())};\n")
@@ -9863,7 +11346,19 @@ def main():
         "  Table 3, 19), and the client handshakes of `quic_conn.inc`: tls13_fixture's server\n"
         "  wrapped in QUIC packets for 0x1301/0x1302/0x1303, an HRR, split CRYPTO and every failure\n"
         "  path, the client's datagrams byte for byte. A shared misreading passes them;\n"
-        "  quic-interop-runner (M6 item 4) is the independent oracle.\n\n"
+        "  quic-interop-runner (M6 item 4) is the independent oracle.\n"
+        "- **QUIC recovery and streams (M6 item 2, `quic_rec.inc`, the later `quic_conn.inc`\n"
+        "  scripts).** OFFICIAL: RFC 9002 7.6.3 Table 1 (persistent congestion), parsed out of the\n"
+        "  RFC text, with the RFC's own 'assume' lines applied as state overrides; the RFC 9001 A.3\n"
+        "  ACK frame against the A.2 client Initial PN 0; the RFC 9000 A.2 PN-length examples\n"
+        "  driving the packet builder. GENERATED: every other recovery row, from a line-by-line\n"
+        "  Python port of RFC 9002 Appendix A / B with integer semantics (PyRec, PyRx); the\n"
+        "  connection scripts (ACK generation, PTO probe, loss + retransmission, streams, close)\n"
+        "  from PyQConn; the stateful 1-RTT frame verdicts (stream state / limit, flow control,\n"
+        "  final size, connection IDs, path validation) from PyRxState, each written from the RFC\n"
+        "  text. Wycheproof covers primitives only and NIST CAVP has no transport algorithm: no\n"
+        "  third-party vector exists for loss recovery or flow control, so interop (M6 item 4,\n"
+        "  lossy links) is the real check of behaviour beyond self-consistency.\n\n"
         "## x509-limbo skip tally\n\n"
         f"limbo.json carries {len(x509_limbo) + sum(x509_limbo_skipped.values())} testcases and this "
         f"library exercises {len(x509_limbo)} of them.\n"

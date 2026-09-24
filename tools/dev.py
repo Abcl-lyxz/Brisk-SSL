@@ -258,7 +258,7 @@ FUZZ = {"der": ("fuzz/fuzz_der.c src/x509/der.c", "tests/kat/der.inc"),
                "tests/kat/h2_fuzz.inc"),
         # QUIC (M6): datagrams through the header parser, Initial-key open and the frame parser;
         # seeds are every quic_pkt.inc packet. The -D rides in the source list: QUIC is FULL only.
-        "quic_pkt": ("-DBRISK_ENABLE_QUIC=1 fuzz/fuzz_quic_pkt.c src/quic/packet.c src/quic/conn.c "
+        "quic_pkt": ("-DBRISK_ENABLE_QUIC=1 fuzz/fuzz_quic_pkt.c src/quic/packet.c src/quic/conn.c src/quic/recovery.c src/quic/stream.c "
                      "src/tls/handshake.c src/tls/tls12.c src/tls/keyschedule.c src/util.c "
                      "src/crypto/sha2.c src/crypto/hkdf.c src/crypto/chacha20_poly1305.c "
                      "src/crypto/aes_ct.c src/crypto/aes_ct64.c src/crypto/gcm.c src/crypto/x25519.c "
@@ -266,7 +266,7 @@ FUZZ = {"der": ("fuzz/fuzz_der.c src/x509/der.c", "tests/kat/der.inc"),
                      "src/x509/der.c src/x509/cert.c src/x509/chain.c src/x509/name.c",
                      "tests/kat/quic_pkt.inc"),
         # QUIC transport parameters (RFC 9000 18): parse, and write-back of what parsed.
-        "quic_tp": ("-DBRISK_ENABLE_QUIC=1 fuzz/fuzz_quic_tp.c src/quic/packet.c src/quic/conn.c "
+        "quic_tp": ("-DBRISK_ENABLE_QUIC=1 fuzz/fuzz_quic_tp.c src/quic/packet.c src/quic/conn.c src/quic/recovery.c src/quic/stream.c "
                     "src/tls/handshake.c src/tls/tls12.c src/tls/keyschedule.c src/util.c "
                     "src/crypto/sha2.c src/crypto/hkdf.c src/crypto/chacha20_poly1305.c "
                     "src/crypto/aes_ct.c src/crypto/aes_ct64.c src/crypto/gcm.c src/crypto/x25519.c "

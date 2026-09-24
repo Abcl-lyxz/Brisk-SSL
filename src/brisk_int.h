@@ -1507,7 +1507,7 @@ enum {
     BRISK__ALERT_USER_CANCELED = 90,
     BRISK__ALERT_MISSING_EXTENSION = 109,
     BRISK__ALERT_UNSUPPORTED_EXTENSION = 110,
-    BRISK__ALERT_CERTIFICATE_REQUIRED = 116,   /* 4.5.1.3 / 6.2: only ever received */
+    BRISK__ALERT_CERTIFICATE_REQUIRED = 116,    /* 4.5.1.3 / 6.2: only ever received */
     BRISK__ALERT_NO_APPLICATION_PROTOCOL = 120, /* RFC 7301 3.2; RFC 9001 8.1 over QUIC */
     /* never on the wire: over QUIC only, a violation RFC 9001 maps to PROTOCOL_VIOLATION rather
      * than CRYPTO_ERROR (4.6.1: NewSessionTicket early_data other than 0xffffffff) */
@@ -2172,10 +2172,17 @@ enum {
 };
 /* QUIC transport error codes (RFC 9000 20.1) + the CRYPTO_ERROR base (RFC 9001 4.8) */
 enum {
+    BRISK__QERR_NO_ERROR = 0x00,
     BRISK__QERR_INTERNAL = 0x01,
+    BRISK__QERR_FLOW_CONTROL = 0x03,
+    BRISK__QERR_STREAM_LIMIT = 0x04,
+    BRISK__QERR_STREAM_STATE = 0x05,
+    BRISK__QERR_FINAL_SIZE = 0x06,
     BRISK__QERR_FRAME_ENCODING = 0x07,
     BRISK__QERR_TRANSPORT_PARAMETER = 0x08,
+    BRISK__QERR_CONNECTION_ID_LIMIT = 0x09,
     BRISK__QERR_PROTOCOL_VIOLATION = 0x0a,
+    BRISK__QERR_APPLICATION = 0x0c,
     BRISK__QERR_CRYPTO_BUFFER_EXCEEDED = 0x0d,
     BRISK__QERR_AEAD_LIMIT_REACHED = 0x0f,
     BRISK__QERR_CRYPTO = 0x0100
@@ -2247,21 +2254,124 @@ int brisk__quic_open(const brisk__quic_keys *k, uint8_t *pkt, size_t pn_off, siz
                      uint64_t largest, uint8_t *first, uint64_t *pn, size_t *payload_off,
                      size_t *payload_len);
 
+/* ---- quic/recovery.c: ACK ranges, RTT, loss detection, PTO, NewReno (RFC 9000 13, RFC 9002) --
+ * Pure functions over plain structs: no callbacks, no clock (every call takes now in ms), no
+ * division, no float, no variable 64-bit shift. Times are int64 ms; RTTs uint32 ms clamped to
+ * 2^24. Levels = packet number spaces: 0 Initial, 1 Handshake, 2 Application. */
+#    define BRISK__QUIC_SENT   32   /* sent-packet records, all spaces */
+#    define BRISK__QUIC_RANGES 8    /* received-PN ranges per space */
+#    define BRISK__QUIC_MDS    1200 /* max_datagram_size: we never send more (RFC 9002 7.2) */
+#    define BRISK__QUIC_MINWIN 2400 /* kMinimumWindow = 2 * max_datagram_size (7.2) */
+
+typedef struct {
+    uint64_t lo, hi;
+} brisk__quic_range;
+/* The receive side of one space (RFC 9000 13.2): ranges highest first, r[0].hi = largest. */
+typedef struct {
+    brisk__quic_range r[BRISK__QUIC_RANGES];
+    uint64_t floor;    /* PNs below it are treated as duplicates (13.2.3) */
+    int64_t largest_t; /* receive time of the largest */
+    int64_t ack_due;   /* INT64_MAX = no ACK owed */
+    uint8_t n;         /* ranges used */
+    uint8_t pending;   /* ack-eliciting packets not acknowledged yet */
+} brisk__quic_rxack;
+void brisk__quic_rxack_init(brisk__quic_rxack *a);
+/* 1 = duplicate, below the floor, or no room to track it (the caller drops the packet unread).
+ * Call after the AEAD accepted the packet and before its frames are processed. */
+int brisk__quic_rxack_dup(const brisk__quic_rxack *a, uint64_t pn);
+/* Records a PN: 1 = duplicate / dropped (see _dup), 0 = new. An ack-eliciting one makes an ACK
+ * due at now + max_delay_ms, or at now when `immediate`, when two are pending (13.2.2) or when it
+ * arrived out of order or after a gap (13.2.1). */
+int brisk__quic_rxack_add(brisk__quic_rxack *a, uint64_t pn, int ack_eliciting, int64_t now,
+                          int64_t max_delay_ms, int immediate);
+/* ACK frame 0x02 (19.3) into out: the largest range first, the oldest ranges dropped to fit. 0 if
+ * nothing to acknowledge or cap is too small. */
+size_t brisk__quic_ack_write(const brisk__quic_rxack *a, uint64_t delay_field, uint8_t *out,
+                             size_t cap);
+/* 13.2.5: the ACK Delay field for `ms` milliseconds at our ack_delay_exponent (0..20). */
+uint64_t brisk__quic_ack_delay_field(int64_t ms, unsigned exp);
+/* 19.3: a received ACK Delay field at the peer's exponent, in ms (saturating, 2^24 max). */
+uint32_t brisk__quic_ack_delay_ms(uint64_t field, unsigned exp);
+
+enum {
+    BRISK__QS_USED = 0x001,
+    BRISK__QS_ELICIT = 0x002,   /* ack-eliciting */
+    BRISK__QS_INFLIGHT = 0x004, /* counted in bytes_in_flight */
+    BRISK__QS_FIN = 0x008,      /* the STREAM frame carried FIN */
+    BRISK__QS_MAXDATA = 0x010,  /* carried MAX_DATA */
+    BRISK__QS_MSD = 0x020,      /* carried MAX_STREAM_DATA */
+    BRISK__QS_RESET = 0x040,    /* carried RESET_STREAM */
+    BRISK__QS_RETIRE = 0x080,   /* carried RETIRE_CONNECTION_ID */
+    BRISK__QS_MAXSTR = 0x100,   /* carried MAX_STREAMS */
+    BRISK__QS_ACKED = 0x200,    /* set by rec_on_ack: newly acknowledged */
+    BRISK__QS_LOST = 0x400      /* set by rec_on_ack / rec_on_timeout: declared lost */
+};
+#    define BRISK__QS_CRYPTO 0xff /* slot: the record carried CRYPTO data */
+#    define BRISK__QS_NONE   0xfe /* slot: no CRYPTO / STREAM data */
+typedef struct {
+    uint64_t pn, off; /* off/len: the CRYPTO or STREAM data it carried */
+    int64_t t;        /* send time, ms */
+    uint16_t size;    /* bytes of the packet (counted in flight when INFLIGHT) */
+    uint16_t len;
+    uint16_t flags; /* BRISK__QS_*; 0 = a free record */
+    uint8_t lvl, slot;
+} brisk__quic_sent;
+typedef struct {
+    brisk__quic_sent s[BRISK__QUIC_SENT];
+    uint64_t largest_acked[3];                  /* UINT64_MAX = none: feeds brisk__quic_pn_len */
+    int64_t loss_time[3];                       /* INT64_MAX = not armed (6.1.2) */
+    int64_t last_elicit[3];                     /* last ack-eliciting send, INT64_MIN = none */
+    int64_t recovery_start;                     /* INT64_MIN = never in recovery (7.3.2) */
+    int64_t first_sample_t;                     /* INT64_MAX = no RTT sample yet (7.6.2) */
+    uint32_t srtt, rttvar, min_rtt, latest_rtt; /* ms, RFC 9002 5 */
+    uint32_t cwnd, ssthresh, in_flight, ca_acc; /* bytes, RFC 9002 7 / B */
+    uint8_t has_sample, pto_count, hs_acked;
+} brisk__quic_rec;
+void brisk__quic_rec_init(brisk__quic_rec *r); /* kInitialRtt 333 ms, cwnd 12000 */
+/* s->flags must include BRISK__QS_USED. BRISK_OK, or BRISK_E_WANT when no record is free (the
+ * caller does not send an ack-eliciting packet then). */
+int brisk__quic_rec_on_sent(brisk__quic_rec *r, const brisk__quic_sent *s);
+unsigned brisk__quic_rec_free(const brisk__quic_rec *r); /* free records */
+/* One ACK frame after its type byte (ecn = type 0x03): parses it (19.3), marks ACKED / LOST in
+ * r->s, updates RTT (5) and NewReno (7). The caller then processes and frees the marked records.
+ * 0, FRAME_ENCODING, or PROTOCOL_VIOLATION (largest >= next_pn, 13.1). r == NULL = syntax only.
+ * *newly = 1 when something was newly acknowledged (may be NULL). */
+uint64_t brisk__quic_rec_on_ack(brisk__quic_rec *r, unsigned lvl, int ecn, const uint8_t **p,
+                                const uint8_t *end, uint64_t next_pn, unsigned peer_ack_exp,
+                                uint32_t peer_max_ack_delay, int confirmed, int64_t now,
+                                int *newly);
+/* 1 if a datagram of `bytes` more may be sent now (7). Probes bypass it. */
+int brisk__quic_rec_can_send(const brisk__quic_rec *r, size_t bytes);
+/* Earliest loss / PTO deadline (6.1.2, 6.2.1, 6.2.2.1) and its space in *lvl; INT64_MAX = none. */
+int64_t brisk__quic_rec_deadline(const brisk__quic_rec *r, unsigned *lvl, int confirmed,
+                                 int have_hs_keys, uint32_t peer_max_ack_delay);
+/* The timer fired (call only when deadline <= now): 0 = a loss-time pass marked records LOST,
+ * else the number of probes owed in *lvl (6.2.4). */
+unsigned brisk__quic_rec_on_timeout(brisk__quic_rec *r, int64_t now, unsigned *lvl, int confirmed,
+                                    int have_hs_keys, uint32_t peer_max_ack_delay);
+void brisk__quic_rec_discard(brisk__quic_rec *r, unsigned lvl); /* RFC 9002 6.4 + timer reset */
+/* srtt + max(4*rttvar, 1) + max_ack_delay (0 below level 2), without backoff (6.2.1) */
+uint32_t brisk__quic_rec_pto(const brisk__quic_rec *r, unsigned lvl, uint32_t peer_max_ack_delay);
+/* t + d, saturating at INT64_MAX - 1 (so INT64_MAX keeps meaning "never") */
+int64_t brisk__quic_tadd(int64_t t, uint32_t d);
+
 /* ---- quic/conn.c: transport parameters, frames, CRYPTO streams, the client connection -------
  *
  * The client side of RFC 9000/9001 up to a confirmed handshake: Initial/Handshake/1-RTT packet
  * spaces, CRYPTO reassembly per level feeding the TLS 1.3 engine (cfg.quic = 1), transport
- * parameters, CONNECTION_CLOSE. Sans-I/O, no malloc, no clock. NOT yet here (M6 items 2-3):
- * ACK generation, loss recovery and timers, streams, Retry, Version Negotiation, key update -
- * VN/Retry/unknown versions are dropped, a key-phase flip is dropped. */
+ * parameters, ACKs, loss recovery and timers (quic/recovery.c), streams (quic/stream.c),
+ * CONNECTION_CLOSE. Sans-I/O, no malloc, no clock. NOT yet here (M6 item 3): Retry, Version
+ * Negotiation, key update - VN/Retry/unknown versions are dropped, a key-phase flip is dropped. */
 typedef struct {
     uint64_t max_idle_timeout, max_udp_payload_size, initial_max_data,
         initial_max_stream_data_bidi_local, initial_max_stream_data_bidi_remote,
         initial_max_stream_data_uni, initial_max_streams_bidi, initial_max_streams_uni,
         ack_delay_exponent, max_ack_delay, active_connection_id_limit;
     uint8_t odcid[20], iscid[20], retry_scid[20], reset_token[16];
-    uint8_t odcid_len, iscid_len, retry_scid_len;
-    /* preferred_address is validated, then ignored: the client never migrates */
+    /* preferred_address: the addresses are ignored (the client never migrates), but its CID is
+     * sequence 1 (RFC 9000 5.1.1) and must be retired like any other (5.1.2) */
+    uint8_t pref_cid[20], pref_token[16];
+    uint8_t odcid_len, iscid_len, retry_scid_len, pref_cid_len;
     uint8_t has_odcid, has_iscid, has_retry_scid, has_reset_token, disable_active_migration,
         has_pref_addr;
 } brisk__quic_tp;
@@ -2277,55 +2387,153 @@ int brisk__quic_tp_write(const brisk__quic_tp *tp, uint8_t *out, size_t cap, siz
 int brisk__quic_tp_parse(const uint8_t *in, size_t len, brisk__quic_tp *tp);
 
 /* Levels = packet number spaces: 0 Initial, 1 Handshake, 2 Application (1-RTT). */
+#    define BRISK__QUIC_CIDS   4 /* server CIDs kept: our active_connection_id_limit is 2..4 */
+#    define BRISK__QUIC_RETIRE 8 /* pending RETIRE_CONNECTION_ID: 2 * the limit (5.1.2) */
+
+/* One stream slot (RFC 9000 2-4). The rings live in the connection scratch; offsets are stream
+ * offsets, *_pos the ring index of rx_read / tx_base. The flags belong to stream.c. */
+typedef struct {
+    uint64_t id;
+    uint64_t rx_read, rx_hi, rx_max, rx_final, rx_err; /* final UINT64_MAX = not known yet */
+    uint64_t tx_base, tx_next, tx_hi, tx_len, tx_max;  /* acked prefix .. written by the app */
+    uint64_t ack_lo, ack_hi;                           /* one acked range above tx_base */
+    uint64_t tx_err, reset_pn, msd_pn;                 /* STOP_SENDING code; last carrying PNs */
+    uint32_t rx_pos, tx_pos;
+    uint16_t flags;
+} brisk__quic_stream;
+typedef struct {
+    uint64_t seq;
+    uint8_t cid[20], token[16], len, used;
+} brisk__quic_cid;
+typedef struct {
+    uint64_t seq, pn;
+    uint8_t state; /* 0 free, 1 to send, 2 in flight in packet pn */
+} brisk__quic_retire;
+
 struct brisk__quic_conn {
     brisk__tls13_hs *hs;
     brisk__quic_keys rx[3], tx[3];
-    brisk__quic_tp peer_tp;
-    uint64_t rx_largest[3]; /* largest authenticated PN, UINT64_MAX = none */
-    uint64_t rx_seen[3];    /* bit i: largest - i was received (duplicates, RFC 9000 12.3) */
+    brisk__quic_tp peer_tp; /* the server's (defaults until its EE) */
+    brisk__quic_tp my_tp;   /* ours, as sent: every limit we enforce comes from here */
+    brisk__quic_rec rec;
+    brisk__quic_rxack rxa[3];
+    uint64_t rx_largest[3]; /* largest authenticated PN, UINT64_MAX = none (A.3 decoding) */
     uint64_t tx_pn[3];      /* next PN to send */
     uint64_t crx[3];        /* CRYPTO bytes delivered to TLS per level */
     uint64_t auth_fail;     /* RFC 9001 6.6: packets that failed authentication */
     uint64_t n_opened;      /* packets that passed the AEAD (tests) */
     uint64_t err_code;      /* the QUIC error code once failed (the peer's on a peer close) */
     uint64_t pend_err;      /* set by a callback that refused, read when the engine fails */
-    /* scratch carve-up: [CRYPTO ring | its bitmap | Initial CRYPTO out | Handshake CRYPTO out].
-     * The out areas keep every byte sent (retransmission is M6 item 2); after a failure the
-     * Initial one holds the CONNECTION_CLOSE datagram. */
-    uint8_t *ring, *bits, *ret[2];
+    /* flow control (RFC 9000 4): tx = the peer's limits on us, rx = ours on the peer */
+    uint64_t max_data_tx, sent_tx;          /* MAX_DATA; sum of the highest offsets sent */
+    uint64_t max_data_rx, sum_rx, consumed; /* advertised; highest offsets received; read */
+    uint64_t md_pn;                         /* PN of the last MAX_DATA sent */
+    uint64_t next_local[2], next_peer[2];   /* [0] bidi [1] uni: streams opened so far */
+    uint64_t accepted[2];                   /* peer streams reported by stream_accept */
+    uint64_t peer_max_streams[2], my_max_streams[2], ms_pn[2];
+    brisk__quic_stream st[BRISK_QUIC_MAX_STREAMS];
+    /* connection IDs (RFC 9000 5.1) */
+    brisk__quic_cid cids[BRISK__QUIC_CIDS];
+    brisk__quic_retire rq[BRISK__QUIC_RETIRE];
+    uint64_t rpt_max;
+    /* timers (sans-I/O: every time is the caller's now_ms, clamped monotonic) */
+    int64_t now, idle_start, burst_t;
+    uint32_t burst_bytes;
+    /* scratch carve-up: [CRYPTO ring | its bitmap | Initial CRYPTO out | Handshake CRYPTO out |
+     * stream rings]. The CRYPTO out areas keep every byte sent for retransmission; after a
+     * failure the Initial one holds the CONNECTION_CLOSE datagram. */
+    uint8_t *ring, *bits, *ret[2], *srings;
     size_t ring_pos, ret_cap[2], ret_len[2], ret_sent[2], cc_len;
     int err;
-    uint8_t dcid[20], scid[20], odcid[20];
-    uint8_t dcid_len, scid_len, odcid_len;
+    uint8_t ap_secret[2][48]; /* RFC 9001 6: the 1-RTT secrets [0] receive [1] send, kept for
+                               * key update (M6 item 3); the engine wipes its own copies */
+    uint8_t path_resp[2][8];  /* RFC 9000 8.2.2: PATH_CHALLENGE data owed a PATH_RESPONSE */
+    uint8_t dcid[20], scid[20], odcid[20], server_scid[20]; /* server_scid: of its Initial */
+    uint8_t dcid_len, scid_len, odcid_len, server_scid_len, ap_len, n_path_resp;
     uint8_t rx_level;    /* level whose CRYPTO stream the ring holds */
     uint8_t got_initial; /* the first server Initial switched dcid (RFC 9000 7.2) */
     uint8_t tp_seen, established, confirmed;
     uint8_t cc_state; /* 1 a CONNECTION_CLOSE waits in ret[0], 2 sent */
+    uint8_t probe[3]; /* PTO probes owed per space (RFC 9002 6.2.4) */
+    uint8_t md_pend, ms_pend[2], rx_elicit, idle_rx;
 };
 typedef struct brisk__quic_conn brisk__quic_conn;
-/* CRYPTO reassembly (BRISK_QUIC_CRYPTO_BUF + bitmap) + send retention. */
+/* CRYPTO reassembly (BRISK_QUIC_CRYPTO_BUF + bitmap) + send retention + the stream rings
+ * (BRISK_QUIC_MAX_STREAMS * (2 * BRISK_QUIC_STREAM_BUF + BRISK_QUIC_STREAM_BUF / 8)). */
 size_t brisk__quic_scratch_size(void);
-/* Takes over hs->cfg.on_secret / on_peer_tp. hs must be hs_init'ed with cfg.quic = 1. dcid:
- * 8..20 unpredictable bytes (RFC 9000 7.2); scid 0..20 bytes. BRISK_E_ARG otherwise. Caller order:
- * brisk__quic_tp_write -> brisk__tls13_ch_write(quic_tp, session_id_len 0, tls12 0) ->
- * brisk__tls13_hs_client_hello -> brisk__quic_send. After an HRR (hs->state WAIT_CH2) the caller
- * builds and absorbs CH2 the same way. */
-int brisk__quic_conn_init(brisk__quic_conn *q, brisk__tls13_hs *hs, const uint8_t *dcid,
-                          size_t dcid_len, const uint8_t *scid, size_t scid_len, uint8_t *scratch,
-                          size_t scratch_len);
+/* Takes over hs->cfg.on_secret / on_peer_tp. hs must be hs_init'ed with cfg.quic = 1. tp: our
+ * transport parameters, exactly as the caller encodes them into the ClientHello (copied into
+ * q->my_tp). dcid: 8..20 unpredictable bytes (RFC 9000 7.2); scid 0..20 bytes. BRISK_E_ARG
+ * otherwise, or when tp->iscid differs from scid (7.3), a stream window exceeds
+ * BRISK_QUIC_STREAM_BUF, initial_max_data exceeds MAX_STREAMS * STREAM_BUF, the stream counts
+ * exceed MAX_STREAMS, or active_connection_id_limit exceeds 4. Caller order: brisk__quic_tp_write
+ * -> brisk__tls13_ch_write(quic_tp, session_id_len 0, tls12 0) -> brisk__tls13_hs_client_hello
+ * -> brisk__quic_send. After an HRR (hs->state WAIT_CH2) the caller builds and absorbs CH2 the
+ * same way. */
+int brisk__quic_conn_init(brisk__quic_conn *q, brisk__tls13_hs *hs, const brisk__quic_tp *tp,
+                          const uint8_t *dcid, size_t dcid_len, const uint8_t *scid,
+                          size_t scid_len, uint8_t *scratch, size_t scratch_len);
 /* One received UDP datagram, decrypted in place, coalesced packets one by one (RFC 9000 12.2).
- * BRISK_OK (dropped packets are not errors), or the sticky BRISK_E_PROTO / E_AUTH / E_ARG
- * (q->err_code = the QUIC error code) or BRISK_E_PEER_ALERT (the peer's CONNECTION_CLOSE). */
+ * Due timers run first. BRISK_OK (dropped packets are not errors), or the sticky BRISK_E_PROTO /
+ * E_AUTH / E_ARG (q->err_code = the QUIC error code), BRISK_E_PEER_ALERT (the peer's
+ * CONNECTION_CLOSE) or BRISK_E_TIMEOUT (idle timeout, RFC 9000 10.1: closed silently). */
 int brisk__quic_recv(brisk__quic_conn *q, uint8_t *dgram, size_t len, int64_t now_ms);
-/* The next datagram (at most 1200 bytes; one carrying an Initial is padded to 1200), 0 = none
- * or cap < 1200. After a failure: one CONNECTION_CLOSE 0x1c datagram, then 0. */
+/* The next datagram (at most 1200 bytes; one carrying an Initial or a PATH_RESPONSE is padded
+ * to 1200), 0 = nothing to send now or cap < 1200. Due timers run first. Coalesces Initial,
+ * Handshake and 1-RTT packets (12.2). After a failure or close: one CONNECTION_CLOSE datagram,
+ * then 0. */
 size_t brisk__quic_send(brisk__quic_conn *q, uint8_t *out, size_t cap, int64_t now_ms);
+/* The earliest of the loss / PTO timer, an owed ACK, the idle timeout and the pacing wait:
+ * absolute ms, INT64_MAX = none. Call send/recv with now_ms >= it. */
+int64_t brisk__quic_deadline(const brisk__quic_conn *q);
+/* Close with an application error code (RFC 9000 10.2): CONNECTION_CLOSE 0x1d in 1-RTT once
+ * established, else 0x1c APPLICATION_ERROR in Initial/Handshake (10.2.3: no application code
+ * there). The next send returns the datagram. BRISK_OK, or the sticky error. */
+int brisk__quic_close(brisk__quic_conn *q, uint64_t app_err);
 /* 1 once the engine is CONNECTED and the 7.3 CID checks passed; the TPs are in q->peer_tp. */
 int brisk__quic_established(const brisk__quic_conn *q);
 /* The frames of one decrypted payload at `level` (RFC 9000 12.4, 19). q == NULL checks syntax
  * and Table 3 only (tests, fuzzing). 0 or the QUIC error code. */
 uint64_t brisk__quic_frames(brisk__quic_conn *q, unsigned level, const uint8_t *p, size_t len);
-#endif /* BRISK_ENABLE_QUIC */
+
+/* ---- quic/stream.c: streams and flow control (RFC 9000 2-4, 19.4-19.14) --------------------
+ * Fixed slots; a peer stream's slot is reserved for as long as our MAX_STREAMS credit allows it
+ * to be opened, so the implicit opening of lower ids (3.2) always finds one. The public
+ * brisk_quic_* comes with the item-4 interop harness / M7, as an opaque handle. */
+void brisk__quic_streams_init(brisk__quic_conn *q); /* at establishment: limits from both TPs */
+/* id >= 0; BRISK_E_WANT = the peer's MAX_STREAMS reached; BRISK_E_ARG = not established, no slot
+ * free outside the peer's reservation, or closed. */
+int64_t brisk__quic_stream_open(brisk__quic_conn *q, int bidi);
+/* Bytes copied into the send ring (0..n, less when full); fin once all n are taken. BRISK_E_ARG
+ * on a receive-only / unknown / finished stream or a closed connection; BRISK_E_PEER_ALERT after
+ * the peer's STOP_SENDING. */
+int brisk__quic_stream_write(brisk__quic_conn *q, uint64_t id, const uint8_t *d, size_t n, int fin);
+/* > 0 bytes in order; 0 = FIN consumed; BRISK_E_WANT = nothing yet; BRISK_E_PEER_ALERT =
+ * RESET_STREAM (*app_err set); BRISK_E_ARG = unknown / send-only / closed. Consuming queues
+ * MAX_STREAM_DATA / MAX_DATA. */
+int brisk__quic_stream_read(brisk__quic_conn *q, uint64_t id, uint8_t *out, size_t cap,
+                            uint64_t *app_err);
+/* The next peer-opened stream not reported yet: BRISK_OK with *id, or BRISK_E_WANT. */
+int brisk__quic_stream_accept(brisk__quic_conn *q, uint64_t *id);
+/* Frame handlers (level 2 only): 0 or a QUIC error code. STREAM 0x08..0x0f. */
+uint64_t brisk__quic_stream_frame(brisk__quic_conn *q, uint64_t id, uint64_t off, const uint8_t *d,
+                                  size_t n, int fin);
+/* RESET_STREAM 0x04 (a = code, b = final size), STOP_SENDING 0x05 (a = code), MAX_STREAM_DATA
+ * 0x11 (a), STREAM_DATA_BLOCKED 0x15 (a). */
+uint64_t brisk__quic_stream_ctl(brisk__quic_conn *q, uint64_t type, uint64_t id, uint64_t a,
+                                uint64_t b);
+/* MAX_DATA 0x10, MAX_STREAMS 0x12 (bidi) / 0x13 (uni): a value that does not raise the limit
+ * is ignored (4.1, 4.6). */
+void brisk__quic_stream_limits(brisk__quic_conn *q, uint64_t type, uint64_t v);
+/* The stream frames of one 1-RTT packet into out (room bytes): RESET_STREAM, MAX_DATA,
+ * MAX_STREAM_DATA, MAX_STREAMS, then STREAM data of one stream within both flow-control limits
+ * unless `ctl_only`. Sets s->flags / slot / off / len; s->pn is the packet's. Returns bytes. */
+size_t brisk__quic_stream_out(brisk__quic_conn *q, uint8_t *out, size_t room, int ctl_only,
+                              brisk__quic_sent *s);
+/* A record rec_on_ack / rec_on_timeout marked ACKED or LOST (RFC 9000 13.3). */
+void brisk__quic_stream_record(brisk__quic_conn *q, const brisk__quic_sent *s);
+void brisk__quic_streams_wipe(brisk__quic_conn *q); /* every ring and slot */
+#endif                                              /* BRISK_ENABLE_QUIC */
 
 #if BRISK_ENABLE_H2
 /* ---- http/huffman.c + http/hpack.c: HTTP/2 HPACK (RFC 7541) ----------------------------------

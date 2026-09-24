@@ -61,6 +61,7 @@ reference before emission. Differential vectors come from a fixed seed.
 | rfc8448 | https://www.rfc-editor.org/rfc/rfc8448.txt | `6564d1376d1ec744fc7a9993da15ebc1b9be361908b166091f47ef605c537fba` |
 | rfc9000 | https://www.rfc-editor.org/rfc/rfc9000.txt | `f88aae47f8b18e102024916e975e919201d8dde689cba79b01079eaedd402e22` |
 | rfc9001 | https://www.rfc-editor.org/rfc/rfc9001.txt | `3bbaecdf5afd278052a2c48348ce118c4ff8d0cf6b9915549858171b3f98a591` |
+| rfc9002 | https://www.rfc-editor.org/rfc/rfc9002.txt | `3a8a54eea1ad5d1c134a548bf15edfa0e21bfb4106dbd7db3c09cace842099af` |
 | rfc9113 | https://www.rfc-editor.org/rfc/rfc9113.txt | `a00ef91b64e111a282e77ec66980f5242e77c0bb5e33e0927e3b6757080506de` |
 | rfc9846 | https://www.rfc-editor.org/rfc/rfc9846.txt | `b1bee06a814f92ca4677c85b97519be53869b2bf8edc79ade955fb51c0402b17` |
 | tls13_wp_p384_ecdsa_der | https://raw.githubusercontent.com/C2SP/wycheproof/main/testvectors_v1/ecdsa_secp384r1_sha384_test.json | `8a5b3ae1760975143414811f13588c24d951d9d8c904195087ba327591dfe9cc` |
@@ -328,6 +329,18 @@ reference before emission. Differential vectors come from a fixed seed.
   wrapped in QUIC packets for 0x1301/0x1302/0x1303, an HRR, split CRYPTO and every failure
   path, the client's datagrams byte for byte. A shared misreading passes them;
   quic-interop-runner (M6 item 4) is the independent oracle.
+- **QUIC recovery and streams (M6 item 2, `quic_rec.inc`, the later `quic_conn.inc`
+  scripts).** OFFICIAL: RFC 9002 7.6.3 Table 1 (persistent congestion), parsed out of the
+  RFC text, with the RFC's own 'assume' lines applied as state overrides; the RFC 9001 A.3
+  ACK frame against the A.2 client Initial PN 0; the RFC 9000 A.2 PN-length examples
+  driving the packet builder. GENERATED: every other recovery row, from a line-by-line
+  Python port of RFC 9002 Appendix A / B with integer semantics (PyRec, PyRx); the
+  connection scripts (ACK generation, PTO probe, loss + retransmission, streams, close)
+  from PyQConn; the stateful 1-RTT frame verdicts (stream state / limit, flow control,
+  final size, connection IDs, path validation) from PyRxState, each written from the RFC
+  text. Wycheproof covers primitives only and NIST CAVP has no transport algorithm: no
+  third-party vector exists for loss recovery or flow control, so interop (M6 item 4,
+  lossy links) is the real check of behaviour beyond self-consistency.
 
 ## x509-limbo skip tally
 
