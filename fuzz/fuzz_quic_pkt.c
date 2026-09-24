@@ -5,10 +5,12 @@
  * The input is one UDP datagram. Every coalesced packet goes through brisk__quic_hdr_parse (both
  * 0- and 8-byte short-header DCIDs), then brisk__quic_open under the RFC 9001 A.1 Initial keys
  * (client and server side, so the A.2 / A.3 seeds decrypt), then - when it opens - the frame
- * parser at every level. What is hunted is the length arithmetic: Length vs the datagram, the
- * sample offset, the PN length, varints, CRYPTO / STREAM / ACK bounds. Then the same bytes go in
- * as the 1-RTT frames of an established connection (stateful(): streams, flow control, CIDs,
- * ACKs against sent packets), with reads, writes and a send after them.
+ * parser at every level; a Retry goes through brisk__quic_retry_verify and a Version
+ * Negotiation packet's version list is walked. What is hunted is the length arithmetic: Length vs
+ * the datagram, the sample offset, the PN length, varints, CRYPTO / STREAM / ACK bounds. Then the
+ * same bytes go in as the 1-RTT frames of an established connection (stateful(): streams, flow
+ * control, CIDs, ACKs against sent packets), with reads, writes and a send after them, and then as
+ * a datagram to that connection (key phase, stateless reset, Retry / VN discards).
  *
  * SPDX-License-Identifier: Apache-2.0
  */
@@ -31,7 +33,7 @@ static void stateful(const uint8_t *data, size_t size)
 {
     static brisk__tls13_hs hs;
     static brisk__quic_conn q;
-    static uint8_t *scratch, out[1500], rd[256];
+    static uint8_t *scratch, out[1500], rd[256], dg[1500];
     static const uint8_t SCID[8] = {1, 2, 3, 4, 5, 6, 7, 8}, SECRET[32] = {9};
     static const uint8_t DCID[8] = {0x83, 0x94, 0xc8, 0xf0, 0x3e, 0x51, 0x57, 0x08};
     brisk__quic_tp tp;
@@ -90,6 +92,13 @@ static void stateful(const uint8_t *data, size_t size)
     }
     (void)brisk__quic_send(&q, out, sizeof out, 100);
     (void)brisk__quic_deadline(&q);
+    if (size <= sizeof dg) { /* the datagram path: recv decrypts in place, so a copy */
+        memcpy(dg, data, size);
+        brisk__quic_keys_wipe(&q.rx[0]); /* nothing may reach the zeroed engine */
+        q.cids[0].has_token = 1;
+        memset(q.cids[0].token, 0x5a, 16);
+        (void)brisk__quic_recv(&q, dg, size, 200);
+    }
     brisk__quic_keys_wipe(&q.tx[2]);
 }
 
@@ -133,6 +142,19 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
                         (void)brisk__quic_frames(NULL, 0, pkt + po, pl);
                         (void)brisk__quic_frames(NULL, 2, pkt + po, pl);
                     }
+                }
+            }
+            if (h.version == BRISK__QUIC_V1 && h.type == BRISK__QPKT_RETRY) {
+                /* RFC 9001 5.8 over any Retry the parser accepts (the A.4 ODCID) */
+                if (h.token_len == 0 || h.token + h.token_len + 16 != buf + off + h.pkt_len) {
+                    abort();
+                }
+                (void)brisk__quic_retry_verify(DCID, 8, buf + off, h.pkt_len);
+            }
+            if (h.type == BRISK__QPKT_VN) { /* RFC 8999 6: the version list inside the datagram */
+                for (k = 7u + h.dcid_len + h.scid_len; k + 4 <= h.pkt_len; k += 4) {
+                    pn = brisk__load_be32(buf + off + k);
+                    (void)pn;
                 }
             }
             (void)brisk__quic_frames(NULL, 2, buf + off, h.pkt_len); /* the parser on raw bytes */

@@ -993,6 +993,110 @@ def rfc9001_gcm():
     return out
 
 
+# RFC 9001 5.8: the Retry integrity key / nonce and the secret they come from
+RETRY_SECRET = bytes.fromhex("d9c9943e6101fd200021506bcc02814c73030f25c79d71ce876eca876e6fca8e")
+RETRY_KEY = bytes.fromhex("be0c690b9f66575a1d766b54e368c84e")
+RETRY_NONCE = bytes.fromhex("461599d35d632bf2239825bb")
+
+
+def py_retry_tag(odcid, body):
+    """RFC 9001 5.8: AEAD_AES_128_GCM(K, N, "", ODCID Length || ODCID || Retry without its tag)."""
+    return py_gcm_seal(RETRY_KEY, RETRY_NONCE, bytes([len(odcid)]) + odcid + body, b"")[1]
+
+
+def rfc9001_retry():
+    """RFC 9001 5.8 K / N (re-derived from the secret) and the A.4 Retry, its tag recomputed.
+    Returns (odcid, packet, label rows)."""
+    k = py_expand_label(256, RETRY_SECRET, b"quic key", b"", 16)
+    n = py_expand_label(256, RETRY_SECRET, b"quic iv", b"", 12)
+    if (k, n) != (RETRY_KEY, RETRY_NONCE):
+        die("RFC 9001 5.8: the Retry key / nonce do not derive from the secret")
+    text = "\n".join(rfc_lines(fetch("rfc9001")))
+    sec = text[text.rindex("\nA.4.  Retry\n") : text.rindex("\nA.5.  ChaCha20-Poly1305")]
+    m = re.search(r"0x([0-9a-f]{16})", sec)
+    odcid = bytes.fromhex(m.group(1))
+    pkt = hexbytes(sec[sec.index("packet:") + 7 :])
+    if (odcid.hex() != "8394c8f03e515708" or len(pkt) != 36 or pkt[5] != 0 or pkt[6] != 8
+            or pkt[15:20] != b"token" or py_retry_tag(odcid, pkt[:-16]) != pkt[-16:]):
+        die("RFC 9001 A.4: bad parse or tag mismatch")
+    labels = [(256, RETRY_SECRET.hex(), "quic key", "", k.hex()), (256, RETRY_SECRET.hex(), "quic iv", "", n.hex())]
+    return odcid, pkt, labels
+
+
+def py_retry_verdict(odcid, pkt):
+    """brisk__quic_retry_verify's answer: 0 OK, 1 BRISK_E_AUTH, 2 BRISK_E_ARG."""
+    if len(odcid) > 20 or len(pkt) < 16 or len(pkt) - 16 > 47 + 256:  # the longest header + token
+        return 2
+    return 0 if py_retry_tag(odcid, pkt[:-16]) == pkt[-16:] else 1
+
+
+def quic_retry_vectors():
+    """A.4 as is (official), every tag bit and the first 32 header / token bits flipped, wrong
+    ODCIDs, the E_ARG bounds. Every verdict from py_retry_verdict."""
+    odcid, pkt, _ = rfc9001_retry()
+    rows = [(odcid, pkt, 0, "RFC 9001 A.4 Retry")]
+    for bit in range(128):
+        m = bytearray(pkt)
+        m[20 + bit // 8] ^= 0x80 >> (bit % 8)
+        rows.append((odcid, bytes(m), None, f"A.4 tag bit {bit} flipped"))
+    for bit in range(32):
+        m = bytearray(pkt)
+        m[bit // 8] ^= 0x80 >> (bit % 8)
+        rows.append((odcid, bytes(m), None, f"A.4 header bit {bit} flipped"))
+    for bit in (0, 7):  # the token bytes
+        m = bytearray(pkt)
+        m[15] ^= 1 << bit
+        rows.append((odcid, bytes(m), None, f"A.4 token bit {bit} flipped"))
+    rows.append((odcid[:-1] + bytes([odcid[-1] ^ 1]), pkt, None, "A.4 with an ODCID last byte ^ 1"))
+    rows.append((odcid[:7], pkt, None, "A.4 with a 7-byte ODCID"))
+    rows.append((b"", pkt, None, "A.4 with an empty ODCID"))
+    rows.append((bytes(21), pkt, None, "ODCID of 21 bytes -> E_ARG"))
+    rows.append((odcid, pkt[:15], None, "15 bytes: no room for a tag -> E_ARG"))
+    big = pkt[:5] + b"\x14" + bytes(20) + b"\x14" + bytes(20) + bytes(257)
+    rows.append((odcid, big + py_retry_tag(odcid, big), None, "20-byte CIDs + 257-byte token -> E_ARG"))
+    ok = pkt[:5] + b"\x14" + bytes(20) + b"\x14" + bytes(20) + bytes(256)
+    rows.append((odcid, ok + py_retry_tag(odcid, ok), None, "20-byte CIDs + 256-byte token: the largest"))
+    out = []
+    for o, p, v, note in rows:
+        got = py_retry_verdict(o, p)
+        if v is not None and got != v:
+            die(f"quic retry: {note}")
+        out.append((o.hex(), p.hex(), got, note))
+    if sum(1 for r in out if r[2] == 1) != 128 + 32 + 2 + 3 or out[-1][2] != 0 or out[-2][2] != 2:
+        die("quic retry: verdict counts")
+    print(f"  quic retry: {len(out)} rows")
+    return out
+
+
+def quic_ku_vectors():
+    """RFC 9001 6.1 "quic ku" chains (RFC-derived, no official vector exists): secret_n+1 =
+    HKDF-Expand-Label(secret_n, "quic ku", "", Hash.length); key / iv from each secret (5.1), the
+    hp of step 0 throughout. From the A.5 ChaCha20 secret and seeded SHA-256 / SHA-384 ones."""
+    a5 = rfc9001_chacha()[0][0]
+    rows, labels = [], []
+    for suite, s0 in ((0x1303, a5), (0x1301, hashlib.sha256(b"brisk quic ku 1301").digest()),
+                      (0x1302, hashlib.sha384(b"brisk quic ku 1302").digest())):
+        bits, kl = QSUITE[suite]
+        chain = [s0]
+        for _ in range(3):
+            nxt = py_expand_label(bits, chain[-1], b"quic ku", b"", len(s0))
+            labels.append((bits, chain[-1].hex(), "quic ku", "", nxt.hex()))
+            chain.append(nxt)
+        hp0 = q_keys(suite, s0)["hp"]
+        for s in chain:
+            if q_ku_keys(suite, s, hp0)["hp"] != hp0:
+                die("quic ku: hp changed")
+        rows.append((suite, [s.hex() for s in chain]))
+    return rows, labels
+
+
+def q_ku_keys(suite, secret, hp):
+    """RFC 9001 6.1: key / iv from the updated secret, the header protection key unchanged."""
+    k = q_keys(suite, secret)
+    k["hp"] = hp
+    return k
+
+
 def differential_gcm():
     rnd = random.Random(20260922)
     rb = lambda n: bytes(rnd.getrandbits(8) for _ in range(n))
@@ -8520,7 +8624,10 @@ def py_quic_hdr(d, short_len):
     if not d[0] & 0x40:
         return None
     h["type"] = (d[0] >> 4) & 3
-    if h["type"] == 3:
+    if h["type"] == 3:  # 17.2.5: Retry Token (>= 1 byte, policy of the parser) + 16-byte tag
+        if len(d) - i < 17:
+            return None
+        h["token"] = d[i:len(d) - 16]
         return h
     if h["type"] == 0:
         r = qv_get(d, i)
@@ -8565,6 +8672,8 @@ def quic_pkt_vectors():
             return 1, b"", b"", 0
         if h["version"] != 1:
             return 5, b"", b"", 0
+        if h["type"] == 3:
+            return 6, b"", h["token"], 0  # Retry: parsed, token = pt
         r = q_unprotect(q_keys(suite, secret), pkt[:h["len"]], h["pn_off"], largest)
         if r[0] != "ok":
             return (3 if r[0] == "short" else 2), b"", b"", 0
@@ -8610,6 +8719,19 @@ def quic_pkt_vectors():
         out.append((m, 0x1301, a2[2], b"", b"", 0, QUIC_NONE, 0, 5, f"RFC 9001 A.2 as {what}"))
     m = a2[0][:5] + bytes([21]) + a2[0][6:]
     out.append((m, 0x1301, a2[2], b"", b"", 0, QUIC_NONE, 0, 1, "RFC 9001 A.2 with DCID length 21"))
+    # 17.2.5 Retry: the A.4 packet, and token lengths around the parser's bound
+    _, rp, _ = rfc9001_retry()
+    for pkt, what in ((rp, "RFC 9001 A.4 Retry"), (rp[:15] + rp[-16:], "Retry with a 0-byte token"),
+                      (rp[:15] + rp[-17:], "Retry with a 1-byte token"),
+                      (bytes([0xF0 | 0x0B]) + rp[1:], "RFC 9001 A.4 with other Unused bits"),
+                      (rp[:14], "Retry cut inside the SCID"),
+                      # RFC 9000 17.2.1 VN and a 10.3 stateless-reset-shaped datagram (fuzz seeds)
+                      (b"\xaa" + bytes(4) + b"\x08" + bytes(8) + b"\x08" + bytes.fromhex("8394c8f03e515708")
+                       + bytes.fromhex("ff00001d6b3343cf"), "Version Negotiation, two versions"),
+                      (b"\x55" + hashlib.sha256(b"quic reset seed").digest()[:26] + bytes(range(16)),
+                       "a 43-byte stateless reset shape")):
+        v = verdict(pkt, 0x1301, a2[2], QUIC_NONE, 0)
+        out.append((pkt, 0x1301, a2[2], v[1], v[2], v[3], QUIC_NONE, 0, v[0], what))
     pn_off = len(a3[3]) - 2
     cut = a3[0][:pn_off - 2] + qv(19, 2) + a3[0][pn_off:pn_off + 19]
     out.append((cut, 0x1301, a3[2], b"", b"", 0, QUIC_NONE, 0, 1,
@@ -9587,10 +9709,12 @@ class PyQConn:
         self.next_local = [0, 0]
         self.max_data_tx = self.sent_tx = 0
         self.err = None
+        self.token, self.kp, self.ku_until, self.c_ap = b"", 0, QT_MAX, None
 
     # ---- helpers
     def hl(self, lvl):
-        return 1 + len(self.dcid) if lvl == 2 else 9 + len(self.dcid) + len(self.scid) + (lvl == 0)
+        tok = len(qv(len(self.token))) + len(self.token) if lvl == 0 else 0
+        return 1 + len(self.dcid) if lvl == 2 else 9 + len(self.dcid) + len(self.scid) + tok
 
     def pnl(self, lvl):
         la = self.rec.la[lvl]
@@ -9598,10 +9722,10 @@ class PyQConn:
 
     def hdr(self, lvl, pnl, plen):
         if lvl == 2:
-            return bytes([0x40 | (pnl - 1)]) + self.dcid
+            return bytes([0x40 | self.kp << 2 | (pnl - 1)]) + self.dcid  # 17.3.1 key phase
         return (bytes([0xC0 | (0x20 if lvl else 0) | (pnl - 1)]) + (1).to_bytes(4, "big")
                 + bytes([len(self.dcid)]) + self.dcid + bytes([len(self.scid)]) + self.scid
-                + (b"" if lvl else b"\x00") + qv(pnl + plen + 16, 2))
+                + (b"" if lvl else qv(len(self.token)) + self.token) + qv(pnl + plen + 16, 2))
 
     def seal(self, lvl, pnl, payload):
         pn = self.pn[lvl]
@@ -9610,6 +9734,8 @@ class PyQConn:
 
     def set_now(self, now):
         self.now = max(self.now, now)
+        if self.now >= self.ku_until:
+            self.ku_until = QT_MAX  # RFC 9001 6.5: the previous keys go, the next ones are derived
 
     def discard(self, lvl):
         """RFC 9001 4.9.1 / 4.9.2 + RFC 9002 6.4"""
@@ -9622,6 +9748,25 @@ class PyQConn:
     # ---- handshake hooks (the TLS side is the fixture's)
     def keys(self, lvl, k):
         self.tx[lvl] = k
+
+    def retry(self, scid, token):
+        """RFC 9000 17.2.5.2 / 7.2: the Retry SCID is the DCID, the token rides in every Initial;
+        RFC 9001 5.2: Initial keys from it; 17.2.5.3: the same ClientHello again, PNs go on;
+        RFC 9002 6.3: recovery and congestion state reset."""
+        self.dcid, self.token = scid, token
+        self.tx[0] = q_keys(0x1301, q_initial(scid)[0])
+        self.rs[0], self.probe[0] = 0, 0
+        self.rec, self.rxa[0] = PyRec(), PyRx()
+
+    def key_update(self, now=None):
+        """RFC 9001 6.1 / 6.2: the next send secret, key and iv; hp and PNs unchanged; the key
+        phase bit flips; the previous receive keys live until now + 3 * PTO (6.5)."""
+        bits = QSUITE[self.tx[2]["suite"]][0]
+        self.c_ap = py_expand_label(bits, self.c_ap, b"quic ku", b"", len(self.c_ap))
+        self.tx[2] = q_ku_keys(self.tx[2]["suite"], self.c_ap, self.tx[2]["hp"])
+        self.kp ^= 1
+        if now is not None:
+            self.ku_until = q_tadd(now, 3 * self.rec.pto_value(2, self.peer["mad"]))
 
     def crypto(self, lvl, data):
         self.ret[lvl] += data
@@ -9905,6 +10050,7 @@ class PyQConn:
                 t = min(t, self.rxa[lvl].due)
         if self.burst >= 12000:
             t = min(t, self.burst_t + 1)
+        t = min(t, self.ku_until)
         idle = self.my["idle"]
         if self.est and self.peer["idle"] and (not idle or self.peer["idle"] < idle):
             idle = self.peer["idle"]
@@ -9914,18 +10060,48 @@ class PyQConn:
         return t
 
     def cc(self, code, typ=0x1C):
-        """RFC 9000 10.2.3: CONNECTION_CLOSE at every level with send keys (0x1d: 1-RTT only)."""
-        levels = [lv for lv in (0, 1, 2) if lv in self.tx and (typ == 0x1C or lv == 2)]
+        """RFC 9000 10.2.3: CONNECTION_CLOSE at every level with send keys; 0x1d only in 1-RTT,
+        in Initial / Handshake a 0x1c APPLICATION_ERROR (0x0c) without reason in its place."""
+        levels = [lv for lv in (0, 1, 2) if lv in self.tx]
         out = b""
         for lv in levels:
             pnl = self.pnl(lv)
-            payload = bytes([typ]) + qv(code) + (b"\x00" if typ == 0x1C else b"") + b"\x00"
+            t, c = (typ, code) if lv == 2 or typ == 0x1C else (0x1C, 0x0C)
+            payload = bytes([t]) + qv(c) + (b"\x00" if t == 0x1C else b"") + b"\x00"
             used = len(out) + self.hl(lv) + pnl + len(payload) + 16
             if lv == levels[-1] and 0 in self.tx and used < 1200:
                 payload += bytes(1200 - used)
             out += self.seal(lv, pnl, payload)
         self.tx, self.err = {}, b""
         return out
+
+
+class PyKU:
+    """RFC 9001 6 receive side, the two-key-set design (6.3 / 6.5): the current generation, the
+    other slot (next, or previous until `until`), and the PNs opened with the current keys.
+    rx() returns ok / flip (6.2: switch on a successful open) / drop (AEAD failure) / err
+    (6.4 KEY_UPDATE_ERROR). The two 6.2 MAYs are not taken (conn.c policy)."""
+
+    def __init__(self):
+        self.cur, self.other, self.until, self.kmin, self.kmax = 0, 1, QT_MAX, None, None
+
+    def rx(self, gen, pn, now, pto3, valid=True):
+        if self.until <= now:  # 6.5: previous keys discarded, next derived (conn.c run_timers)
+            self.other, self.until = self.cur + 1, QT_MAX
+        use = self.cur if (gen & 1) == (self.cur & 1) else self.other
+        if use != gen or not valid:
+            return "drop"
+        if use == self.cur:
+            self.kmin = pn if self.kmin is None else min(self.kmin, pn)
+            self.kmax = pn if self.kmax is None else max(self.kmax, pn)
+            return "ok"
+        if use > self.cur:  # the next keys
+            if self.kmax is not None and pn < self.kmax:
+                return "err"  # 6.4: the old keys protected a higher PN
+            self.other, self.cur, self.until = self.cur, use, q_tadd(now, pto3)
+            self.kmin = self.kmax = pn
+            return "flip"
+        return "err" if self.kmin is not None and pn > self.kmin else "ok"  # 6.4
 
 
 class PyRxState:
@@ -10166,8 +10342,8 @@ def q_long(k, typ, dcid, scid, pn, pn_len, payload, token=b""):
     return q_protect(k, hdr, pn, pn_len, payload)
 
 
-def q_short(k, dcid, pn, pn_len, payload):
-    return q_protect(k, bytes([0x40 | (pn_len - 1)]) + dcid, pn, pn_len, payload)
+def q_short(k, dcid, pn, pn_len, payload, phase=0):
+    return q_protect(k, bytes([0x40 | phase << 2 | (pn_len - 1)]) + dcid, pn, pn_len, payload)
 
 
 def q_crypto(off, data):
@@ -10273,6 +10449,7 @@ def quic_conn_vectors():
     def connect(c, s):
         """The engine reached CONNECTED (the server's flight was processed)."""
         c.keys(2, s["ap_w"])
+        c.c_ap = s["c_ap"]
         c.crypto(1, s["cf"])
         c.established(PEER)
 
@@ -10563,6 +10740,245 @@ def quic_conn_vectors():
     c.read(sid)
     row("a lost 1-RTT STREAM packet: packet threshold, retransmission from its offset, cwnd halved",
         0x1301, ops)
+
+    # ---- M6 item 3: Retry (RFC 9000 17.2.5, 7.3; RFC 9001 5.8)
+    s2, rtok = seed(b"quic retry scid")[:8], seed(b"quic retry token")[:24]
+
+    def retry_pkt(dc=cscid, sc=s2, token=rtok, unused=0x0A):
+        body = (bytes([0xF0 | unused]) + (1).to_bytes(4, "big") + bytes([len(dc)]) + dc
+                + bytes([len(sc)]) + sc + token)
+        return body + py_retry_tag(dcid, body)  # the tag covers our first DCID (5.8)
+
+    def after_retry(sv, sc=s2, ack=1):
+        """The server's Initial under keys from the Retry SCID (RFC 9001 5.2) + its Handshake."""
+        si = q_keys(0x1301, q_initial(sc)[1])
+        return (q_long(si, 0, cscid, sscid, 0, 2, q_ackf(ack) + q_crypto(0, sv["sh"]))
+                + q_long(sv["hs_r"], 2, cscid, sscid, 0, 2, q_crypto(0, sv["flight"])))
+
+    stp_r = stp_ok + [(0x10, s2)]
+    sr = server(0x1301, [ch1], stp=stp_r)
+    c, ops = start()
+    ops += ["S" + retry_pkt().hex(), "O0", "k"]
+    c.retry(s2, rtok)
+    ops += ["C" + c.send().hex(), "S" + after_retry(sr).hex(), "O2", "K"]
+    sh_in(c, sr, q_ackf(1) + q_crypto(0, sr["sh"]))
+    fl_in(c, sr)
+    ops += ["C" + c.send().hex(), "I"]
+    row("17.2.5: Retry -> same CH, token, new DCID + Initial keys, PN 1; TPs odcid/retry/iscid",
+        0x1301, ops)
+    c, ops = start()
+    ops += ["S" + retry_pkt(unused=0x05).hex()]
+    c.retry(s2, rtok)
+    ops += ["C" + c.send().hex(), "X42", "E0c", "C" + c.cc(0x0C).hex(), "C"]
+    row("8.1.2 / 17.2.5.3: the close Initial after a Retry carries the token", 0x1301, ops)
+    for note, bad in (("a bad Integrity Tag", retry_pkt()[:-1] + bytes([retry_pkt()[-1] ^ 1])),
+                      ("an empty token", retry_pkt(token=b"")),
+                      ("SCID == our first DCID", retry_pkt(sc=dcid)),
+                      ("a DCID that is not our SCID", retry_pkt(dc=b"\x99" * 8)),
+                      ("a 257-byte token (policy: 256 kept)", retry_pkt(token=bytes(257)))):
+        c, ops = start()
+        ops += ["S" + bad.hex(), "C", "O0", "S" + std(s).hex(), "O2", "K"]
+        std_in(c, s)
+        ops += ["C" + c.send().hex()]
+        row("17.2.5.2: Retry with " + note + " -> discarded, the handshake goes on", 0x1301, ops)
+    c, ops = start()
+    ops += ["S" + retry_pkt().hex()]
+    c.retry(s2, rtok)
+    ops += ["C" + c.send().hex(), "S" + retry_pkt(sc=b"\x55" * 8).hex(), "C",
+            "S" + after_retry(sr).hex(), "K"]
+    sh_in(c, sr, q_ackf(1) + q_crypto(0, sr["sh"]))
+    fl_in(c, sr)
+    ops += ["C" + c.send().hex()]
+    row("17.2.5.2 (MUST): a second Retry is discarded", 0x1301, ops)
+    c, ops = start()
+    ops += ["S" + s_initial(0, ACK0 + q_crypto(0, s["sh"])).hex(), "S" + retry_pkt().hex(), "O1",
+            "S" + hs_pkt.hex(), "K"]
+    sh_in(c, s)
+    fl_in(c, s)
+    ops += ["C" + c.send().hex()]
+    row("17.2.5.2 (MUST): a Retry after the server's Initial is discarded", 0x1301, ops)
+    sz = server(0x1301, [ch1], stp=stp_ok + [(0x10, b"")])
+    c, ops = start()
+    ops += ["S" + retry_pkt(sc=b"").hex()]
+    c.retry(b"", rtok)
+    ops += ["C" + c.send().hex(), "S" + after_retry(sz, sc=b"").hex(), "K"]
+    sh_in(c, sz, q_ackf(1) + q_crypto(0, sz["sh"]))
+    fl_in(c, sz)
+    ops += ["C" + c.send().hex()]
+    row("RFC 9001 5.2: a zero-length Retry SCID - Initial keys from the empty DCID", 0x1301, ops)
+    for note, stp in (("no retry_source_connection_id", stp_ok),
+                      ("retry_source_connection_id != the Retry SCID", stp_ok + [(0x10, b"\x66" * 8)]),
+                      ("original_destination_connection_id = the Retry SCID",
+                       [(0x00, s2) if t[0] == 0x00 else t for t in stp_r]),
+                      ("initial_source_connection_id = the Retry SCID",
+                       [(0x0F, s2) if t[0] == 0x0F else t for t in stp_r])):
+        sv = server(0x1301, [ch1], stp=stp)
+        c, ops = start()
+        ops += ["S" + retry_pkt().hex()]
+        c.retry(s2, rtok)
+        ops += ["C" + c.send().hex()]
+        sh_in(c, sv, q_ackf(1) + q_crypto(0, sv["sh"]))
+        c.keys(2, sv["ap_w"])
+        fail(c, ops, after_retry(sv), QTPE)
+        row("7.3 after a Retry: " + note + " -> TRANSPORT_PARAMETER_ERROR", 0x1301, ops)
+
+    # ---- Version Negotiation (RFC 9000 6.2, 17.2.1; RFC 8999 6)
+    def vn(vers, dc=cscid, sc=dcid, first=0xAA):
+        return bytes([first]) + bytes(4) + bytes([len(dc)]) + dc + bytes([len(sc)]) + sc + vers
+
+    two = (0xFF00001D).to_bytes(4, "big") + (0x6B3343CF).to_bytes(4, "big")
+    c, ops = start()
+    ops += ["F" + vn(two).hex(), "E11", "C"]
+    row("6.2: Version Negotiation without v1 -> the attempt ends, nothing sent", 0x1301, ops)
+    c, ops = start()
+    ops += ["S" + vn(two + (1).to_bytes(4, "big")).hex(),
+            "S" + vn(b"").hex(), "S" + vn(two[:3]).hex(), "S" + vn(two[:5]).hex(), "S" + vn(two[:7]).hex(),
+            "S" + vn(two, dc=b"\x99" * 8).hex(), "S" + vn(two, sc=sscid).hex(),
+            "S" + vn(two, dc=bytes(21)).hex(), "S" + vn(two, sc=bytes(255)).hex(), "k", "C",
+            "S" + std(s).hex(), "K"]
+    std_in(c, s)
+    ops += ["C" + c.send().hex()]
+    row("6.2 / RFC 8999 6: VN listing v1, 0/3/5/7 version bytes, wrong CIDs, 21/255-byte CIDs "
+        "-> ignored", 0x1301, ops)
+    c, ops = start()
+    ops += ["S" + s_initial(0, ACK0 + q_crypto(0, s["sh"])).hex(), "S" + vn(two).hex(), "k",
+            "S" + hs_pkt.hex(), "K"]
+    row("6.2 (MUST): a VN after a packet was processed is discarded", 0x1301, ops)
+    bad = bytearray(s_initial(0, ACK0 + q_crypto(0, s["sh"])))
+    bad[-1] ^= 1
+    c, ops = start()
+    ops += ["S" + (bytes(bad) + vn(two)).hex(), "k", "C"]
+    row("17.2.1: a VN coalesced after another packet (here one failing its AEAD) is not a VN "
+        "- ignored", 0x1301, ops)
+    c, ops = start()
+    ops += ["S" + retry_pkt().hex(), "S" + vn(two).hex(), "S" + vn(two, sc=s2).hex()]
+    c.retry(s2, rtok)
+    ops += ["C" + c.send().hex(), "k"]
+    row("6.2 (MUST): a VN after a Retry is discarded", 0x1301, ops)
+
+    # ---- stateless reset (RFC 9000 10.3, 10.3.1)
+    cid1, tk1 = b"\xc1" * 8, b"\x11" * 16
+
+    def rst(n, tok, first=0x55):
+        return bytes([first]) + (seed(b"quic reset filler") * 40)[:n - 17] + tok
+
+    def est(sv=s, ops_=None):
+        c, ops = start()
+        ops += ["S" + std(sv).hex(), "K"]
+        std_in(c, sv)
+        ops += ["C" + c.send().hex()]
+        return c, ops
+
+    for n in (21, 43, 1200):
+        c, ops = est()
+        ops += ["S" + rst(20, reset).hex(), "K", "F" + rst(n, reset).hex(), "E0", "C"]
+        row(f"10.3: a {n}-byte datagram ending in the reset token -> draining, nothing sent "
+            "(a 20-byte one ignored)", 0x1301, ops)
+    c, ops = est()
+    ops += ["S" + rst(20, reset, first=0xC5).hex(), "F" + rst(60, reset, first=0xC5).hex(), "E0", "C"]
+    row("10.3: a long-header datagram ending in the token still resets", 0x1301, ops)
+    c, ops = est()
+    ops += ["S" + rst(43, tk1).hex(), "K",
+            "S" + q_short(s["ap_r"], cscid, 0, 2, q_newcid(1, 0, cid1, tk1)).hex(), "S" + rst(43, tk1).hex(), "K",
+            "S" + q_short(s["ap_r"], cscid, 1, 2, q_newcid(1, 1, cid1, tk1)).hex(), "S" + rst(43, reset).hex(),
+            "K", "S" + rst(43, tk1).hex(), "K", "c", "F" + rst(43, tk1).hex(), "E0", "C"]
+    row("10.3.1 (MUST NOT): an unused CID's token ignored, also once switched to it until we "
+        "sent on it, then it resets; the retired CID's token ignored", 0x1301, ops)
+    pcid, ptok = seed(b"quic pref cid")[:8], seed(b"quic pref token")[:16]
+    sp = server(0x1301, [ch1], stp=stp_ok + [(0x0D, bytes(24) + b"\x08" + pcid + ptok)])
+    c, ops = est(sp)
+    ops += ["S" + rst(43, ptok).hex(), "K"]
+    row("10.3.1 (MUST NOT): the preferred_address CID's token (never used) is ignored", 0x1301, ops)
+    sn = server(0x1301, [ch1], stp=[t for t in stp_ok if t[0] != 0x02])
+    c, ops = est(sn)
+    ops += ["S" + rst(43, bytes(16)).hex(), "K"]
+    row("10.3: no stateless_reset_token TP -> 16 zero bytes are not a reset", 0x1301, ops)
+    c, ops = start()
+    ops += ["S" + rst(43, reset).hex(), "k", "S" + std(s).hex(), "K"]
+    row("10.3: a token match before establishment is ignored", 0x1301, ops)
+    c, ops = start()
+    ops += ["S" + std(s).hex(), "K",
+            "S" + (q_long(s["hs_r"], 2, cscid, sscid, 1, 2, b"\x01\x00\x00") + reset).hex(), "K", "O3"]
+    row("10.3.1: the first packet decrypts -> a trailing token is not checked", 0x1301, ops)
+
+    # ---- key update (RFC 9001 6)
+    ks, sec = [s["ap_r"]], s["s_ap"]
+    for _ in range(3):
+        sec = py_expand_label(256, sec, b"quic ku", b"", 32)
+        ks.append(q_ku_keys(0x1301, sec, s["ap_r"]["hp"]))
+
+    def ku_in(c, ku, ops, gen, pn, now, want, valid=True, pre=b""):
+        v = ku.rx(gen, pn, now, 3 * c.rec.pto_value(2, 25), valid)
+        if v != want:
+            die(f"quic ku: model says {v}, script {want}")
+        d = q_short(ks[gen], cscid, pn, 2, b"\x01\x00", gen & 1)
+        if not valid:
+            d = d[:-1] + bytes([d[-1] ^ 1])
+        ops.append("T%d" % now)
+        if v == "err":
+            c.set_now(now)
+            fail(c, ops, pre + d, 0x0E)
+            return
+        ops.append("S" + (pre + d).hex())
+        if v == "flip":
+            c.key_update(now)
+        if v != "drop":
+            c.packet(2, pn, b"\x01\x00", now)
+
+    def ku_start():
+        c, ops = start()
+        hs_to_confirmed(c, ops)
+        ku = PyKU()
+        ku.rx(0, 0, 100, 0)  # HANDSHAKE_DONE, PN 0
+        return c, ops, ku
+
+    c, ops, ku = ku_start()
+    ku_in(c, ku, ops, 0, 1, 110, "ok")
+    ku_in(c, ku, ops, 1, 5, 120, "flip")
+    o = c.send(120)
+    if not o:
+        die("quic ku: no ACK after the flip")
+    ops += ["C" + o.hex(), f"D{c.deadline()}"]
+    ku_in(c, ku, ops, 0, 3, 130, "ok")
+    t = c.ku_until
+    ku_in(c, ku, ops, 0, 3, t, "drop")
+    ops.append("A1")
+    ku_in(c, ku, ops, 2, 7, t + 10, "flip")
+    ops += ["C" + c.send(t + 10).hex(), f"D{c.deadline()}"]
+    row("RFC 9001 6.2/6.5: peer update accepted, ours follows before the ACK; a reordered old "
+        "packet inside 3*PTO opens, after it not; a second update", 0x1301, ops)
+    c, ops, ku = ku_start()
+    ku_in(c, ku, ops, 1, 5, 120, "flip")
+    ku_in(c, ku, ops, 0, 6, 130, "err")
+    row("RFC 9001 6.4 (MUST): old keys at a PN above one the new keys used -> KEY_UPDATE_ERROR",
+        0x1301, ops)
+    c, ops, ku = ku_start()
+    ku_in(c, ku, ops, 1, 5, 120, "drop", valid=False)
+    ops.append("A1")
+    ku_in(c, ku, ops, 1, 6, 130, "flip")
+    ops += ["C" + c.send(130).hex()]
+    row("RFC 9001 6.3: a forged key phase flip is dropped, the next keys kept", 0x1301, ops)
+    c, ops, ku = ku_start()
+    ku_in(c, ku, ops, 0, 8, 110, "ok")
+    ku_in(c, ku, ops, 1, 6, 120, "err")
+    row("RFC 9001 6.4 (MUST): new keys below a PN the old keys used -> KEY_UPDATE_ERROR",
+        0x1301, ops)
+    c, ops = start()
+    ops += ["S" + std(s).hex(), "K"]
+    std_in(c, s)
+    ku = PyKU()
+    hsp = q_long(s["hs_r"], 2, cscid, sscid, 1, 2, b"\x01\x00\x00")
+    c.packet(1, 1, b"\x01\x00\x00")
+    ku_in(c, ku, ops, 1, 0, 0, "flip", pre=hsp)
+    ops += ["C" + c.send().hex()]
+    row("RFC 9001 6 / 5.7: Handshake + a flipped 1-RTT packet coalesced before HANDSHAKE_DONE",
+        0x1301, ops)
+
+    # ---- RFC 9000 10.2.3: an application close before confirmation
+    c, ops = est()
+    ops += ["X42", "E42", "C" + c.cc(0x42, 0x1D).hex(), "C"]
+    row("10.2.3: close established but unconfirmed -> Handshake 0x1c APPLICATION_ERROR + 1-RTT 0x1d",
+        0x1301, ops)
     print(f"  quic connection scripts: {len(rows)}")
 
     # ---- stateful 1-RTT frame rules, one MUST per script, straight into brisk__quic_frames on an
@@ -10844,7 +11260,9 @@ def main():
          lambda r: f"{r[0]}, {cstr(r[1])}, {cstr(r[2])}, {cstr(r[3])}, {r[4]}, {cstr(r[5])}, {r[6]}, {cstr(r[7])}")
     emit("hkdf_extract.inc", "struct extract_kat EXTRACT_KAT", x8448 + x9001,
          lambda r: f"{r[0]}, {cstr(r[1])}, {cstr(r[2])}, {cstr(r[3])}")
-    emit("expand_label.inc", "struct label_kat LABEL_KAT", l8448 + l9001,
+    _, _, l_retry = rfc9001_retry()  # RFC 9001 5.8 K / N from their secret
+    q_ku, l_ku = quic_ku_vectors()  # RFC 9001 6.1 "quic ku" chains
+    emit("expand_label.inc", "struct label_kat LABEL_KAT", l8448 + l9001 + l_retry + l_ku,
          lambda r: f'{r[0]}, {cstr(r[1])}, "{r[2]}", {cstr(r[3])}, {cstr(r[4])}')
 
     hx = lambda b: cstr(b.hex())
@@ -11054,6 +11472,10 @@ def main():
     emit("quic_pkt.inc", "struct quic_pkt_kat QUIC_PKT_KAT", q_pkt,
          lambda r: f'{cstr(r[0])}, 0x{r[1]:04x}u, {cstr(r[2])}, {cstr(r[3])}, {cstr(r[4])}, '
                    f'{u64(r[5])}, {u64(r[6])}, {r[7]}u, {r[8]}, "{cesc(r[9])}"')
+    emit("quic_pkt.inc", "struct quic_retry_kat QUIC_RETRY_KAT", quic_retry_vectors(),
+         lambda r: f'{cstr(r[0])}, {cstr(r[1])}, {r[2]}, "{cesc(r[3])}"', append=True)
+    emit("quic_pkt.inc", "struct quic_ku_kat QUIC_KU_KAT", q_ku,
+         lambda r: f'0x{r[0]:04x}u, {{' + ", ".join(cstr(x) for x in r[1]) + '}', append=True)
     emit("quic_tp.inc", "struct quic_tp_kat QUIC_TP_KAT", q_tp,
          lambda r: f'{cstr(r[0])}, {r[1]}, {{' + ", ".join(u64(v) for v in r[2]) + '}, '
                    + ", ".join(cstr(x) for x in r[3:7]) + f', {r[7]}u, "{cesc(r[8])}"')

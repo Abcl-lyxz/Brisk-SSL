@@ -155,7 +155,7 @@ Tick a box only when the work is green on **every** arch (`python tools/dev.py t
       traffic secret for key update (the engine wipes it after on_secret). Before M7 adds
       another FULL-only knob, take BRISK_PROFILE=FULL off the `base` preset so host x64 builds
       the shipped DEFAULT (TLS 1.2 on) again.
-- [ ] Retry, version negotiation, stateless-reset detection, receive-side key update
+- [x] Retry, version negotiation, stateless-reset detection, receive-side key update
 - [ ] quic-interop-runner harness (hq-interop)
 
 ## M7 HTTP/3

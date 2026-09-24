@@ -35,8 +35,18 @@ struct quic_pkt_kat {
     const char *secret, *hdr, *pt;
     uint64_t pn, largest;
     unsigned short_len;
-    int expect; /* 0 opens, 1 header discarded, 2 AEAD failure, 4 reserved bits, 5 other version */
+    int expect; /* 0 opens, 1 header discarded, 2 AEAD failure, 4 reserved bits, 5 other version,
+                 * 6 a v1 Retry (pt = its token) */
     const char *note;
+};
+struct quic_retry_kat {
+    const char *odcid, *pkt;
+    int expect; /* 0 BRISK_OK, 1 BRISK_E_AUTH, 2 BRISK_E_ARG */
+    const char *note;
+};
+struct quic_ku_kat {
+    uint16_t suite;
+    const char *secret[4]; /* secret_0 and three "quic ku" steps (RFC 9001 6.1) */
 };
 struct quic_tp_kat {
     const char *tp;
@@ -193,7 +203,11 @@ static void test_keys(void)
     CHECK(memcmp(c, want, 32) == 0);
     t_unhex(QUIC_GCM_KAT[1].secret, want, 32);
     CHECK(memcmp(s, want, 32) == 0);
-    CHECK(brisk__quic_initial_secrets(DCID, 0, c, s) == BRISK_E_ARG);
+    /* 5.2 note: a zero-length Retry SCID gives an empty DCID - allowed (the conn script with a
+     * zero-length Retry SCID pins its bytes) */
+    CHECK(brisk__quic_initial_secrets(DCID, 0, want, sec) == BRISK_OK);
+    CHECK(brisk__quic_initial_secrets(NULL, 0, want, sec) == BRISK_OK);
+    CHECK(brisk__quic_initial_secrets(NULL, 1, c, s) == BRISK_E_ARG);
     CHECK(brisk__quic_initial_secrets(DCID, 21, c, s) == BRISK_E_ARG);
     /* 5.1: hp and key lengths by suite; the iv of A.1 ("quic iv" of client in) */
     CHECK(brisk__quic_keys_init(&k, 0x1301, c, 32) == BRISK_OK && k.suite == 0x1301 &&
@@ -254,6 +268,13 @@ static void test_packets(void)
             }
             if (v->expect == 5) {
                 CHECKI(h.version != BRISK__QUIC_V1, i);
+                continue;
+            }
+            if (v->expect == 6) { /* 17.2.5: the token between the SCID and the 16-byte tag */
+                CHECKI(h.type == BRISK__QPKT_RETRY && h.pkt_len == plen && h.token_len == ptlen &&
+                           h.token + ptlen + 16 == g_buf + off + plen &&
+                           memcmp(h.token, pt, ptlen) == 0,
+                       i);
                 continue;
             }
             CHECKI(h.type == BRISK__QPKT_1RTT || h.version == BRISK__QUIC_V1, i);
@@ -333,6 +354,133 @@ static void test_packets(void)
     CHECK(brisk__quic_hdr_parse(g_buf, 1 + 8 + 19, 8, &h) == BRISK_E_PROTO);
     g_buf[0] = 0x01; /* fixed bit 0 */
     CHECK(brisk__quic_hdr_parse(g_buf, 1 + 8 + 20, 8, &h) == BRISK_E_PROTO);
+}
+
+/* RFC 9001 5.8: the A.4 Retry and its mutations, every verdict from tools/kat.py */
+static void test_retry(void)
+{
+    static uint8_t odcid[32], pkt[400];
+    static const int RC[3] = {BRISK_OK, BRISK_E_AUTH, BRISK_E_ARG};
+    size_t i, off, ol, pl;
+    for (i = 0; i < N(QUIC_RETRY_KAT); i++) {
+        const struct quic_retry_kat *v = &QUIC_RETRY_KAT[i];
+        ol = t_unhex(v->odcid, odcid, sizeof odcid);
+        pl = t_unhex(v->pkt, pkt, sizeof pkt);
+        for (off = 0; off < 4; off++) {
+            memcpy(g_buf + off, pkt, pl);
+            CHECKI(brisk__quic_retry_verify(odcid, ol, g_buf + off, pl) == RC[v->expect], i);
+        }
+    }
+    CHECK(brisk__quic_retry_verify(NULL, 1, pkt, 36) == BRISK_E_ARG);
+    CHECK(brisk__quic_retry_verify(odcid, 8, NULL, 36) == BRISK_E_ARG);
+}
+
+/* RFC 9001 6.1: keys_next against the "quic ku" chains - secret, key and iv of every step, the
+ * hp of step 0 throughout, the phase toggling, next_pn carried and n_sealed restarted */
+static void test_keys_next(void)
+{
+    static const brisk__quic_keys ZERO;
+    uint8_t sec[48], want[48], fill[sizeof(brisk__quic_keys)];
+    brisk__quic_keys cur, nx, ref;
+    size_t i, j, sl;
+    for (i = 0; i < N(QUIC_KU_KAT); i++) {
+        const struct quic_ku_kat *v = &QUIC_KU_KAT[i];
+        sl = t_unhex(v->secret[0], sec, sizeof sec);
+        CHECKI(brisk__quic_keys_init(&cur, v->suite, sec, sl) == BRISK_OK && cur.phase == 0, i);
+        cur.next_pn = 77;
+        cur.n_sealed = 5;
+        for (j = 1; j < 4; j++) {
+            memset(&nx, 0xAA, sizeof nx);
+            CHECKI(brisk__quic_keys_next(&nx, &cur, sec, sl) == BRISK_OK, i);
+            t_unhex(v->secret[j], want, sizeof want);
+            CHECKI(memcmp(sec, want, sl) == 0, (long)(i * 10 + j));
+            CHECKI(brisk__quic_keys_init(&ref, v->suite, want, sl) == BRISK_OK, i);
+            CHECKI(memcmp(&nx.k, &ref.k, sizeof nx.k) == 0 && memcmp(nx.iv, ref.iv, 12) == 0 &&
+                       memcmp(&nx.hp, &cur.hp, sizeof nx.hp) == 0 && nx.suite == v->suite &&
+                       nx.phase == (j & 1) && nx.next_pn == 77 && nx.n_sealed == 0,
+                   (long)(i * 10 + j));
+            if (j == 2) { /* in place (next == cur) gives the same keys */
+                memcpy(&ref, &cur, sizeof ref);
+                t_unhex(v->secret[1], want, sizeof want);
+                CHECKI(brisk__quic_keys_next(&ref, &ref, want, sl) == BRISK_OK &&
+                           memcmp(&ref.k, &nx.k, sizeof ref.k) == 0 &&
+                           memcmp(ref.iv, nx.iv, 12) == 0 &&
+                           memcmp(&ref.hp, &nx.hp, sizeof ref.hp) == 0 && ref.phase == nx.phase,
+                       i);
+            }
+            memcpy(&cur, &nx, sizeof cur);
+        }
+        /* a wrong secret length or no keys: BRISK_E_ARG, nothing written */
+        memset(fill, 0xAA, sizeof fill);
+        memcpy(&nx, fill, sizeof nx);
+        CHECKI(brisk__quic_keys_next(&nx, &cur, sec, sl == 32 ? 48 : 32) == BRISK_E_ARG &&
+                   memcmp(&nx, fill, sizeof nx) == 0,
+               i);
+        CHECKI(brisk__quic_keys_next(&nx, &ZERO, sec, 32) == BRISK_E_ARG &&
+                   memcmp(&nx, fill, sizeof nx) == 0,
+               i);
+    }
+}
+
+/* RFC 9001 6.3 / 6.5: brisk__quic_open_kp picks the key set by the Key Phase bit */
+static void test_open_kp(void)
+{
+    uint8_t sec[32], pkt[64], first;
+    brisk__quic_keys k0, k1, s0, s1;
+    uint64_t pn;
+    size_t po, pl, off, t;
+    memset(sec, 0x5d, sizeof sec);
+    CHECK(brisk__quic_keys_init(&k0, 0x1301, sec, 32) == BRISK_OK &&
+          brisk__quic_keys_next(&k1, &k0, sec, 32) == BRISK_OK);
+    for (t = 0; t < 2; t++) {
+        for (off = 1; off < 4; off += 2) { /* odd offsets: pn_off unaligned */
+            memcpy(&s0, &k0, sizeof s0);
+            memcpy(&s1, &k1, sizeof s1);
+            memset(g_buf, 0, 64);
+            g_buf[off] = (uint8_t)(0x41 | (t << 2)); /* short header, 2-byte PN, phase t */
+            memset(g_buf + off + 1, 0x77, 8);        /* DCID */
+            memset(g_buf + off + 11, 0x01, 20);      /* payload */
+            CHECKI(brisk__quic_seal(t ? &s1 : &s0, g_buf + off, 9, 2, 40 + t, 20) == BRISK_OK, t);
+            memcpy(pkt, g_buf + off, 47);
+            /* the phase-t packet opens through k (t == 0) or alt (t == 1) */
+            CHECKI(brisk__quic_open_kp(&k0, &k1, g_buf + off, 9, 47, 39, &first, &pn, &po, &pl) ==
+                           BRISK_OK &&
+                       pn == 40 + t && ((first >> 2) & 1) == t && pl == 20,
+                   t);
+            /* the same with the roles swapped (k1 current, k0 the other phase) */
+            memcpy(g_buf + off, pkt, 47);
+            CHECKI(brisk__quic_open_kp(&k1, &k0, g_buf + off, 9, 47, 39, &first, &pn, &po, &pl) ==
+                       BRISK_OK,
+                   t);
+            /* without alt a flipped packet fails and its header is restored */
+            memcpy(g_buf + off, pkt, 47);
+            CHECKI(brisk__quic_open_kp(&k0, NULL, g_buf + off, 9, 47, 39, &first, &pn, &po, &pl) ==
+                       (t ? BRISK_E_AUTH : BRISK_OK),
+                   t);
+            if (t) {
+                CHECKI(memcmp(g_buf + off, pkt, 11) == 0, t);
+            }
+        }
+    }
+    /* coalesced: a Handshake packet, then a phase-1 1-RTT one; only the second uses alt */
+    memcpy(&s0, &k0, sizeof s0);
+    memcpy(&s1, &k1, sizeof s1);
+    memset(g_buf, 0, 128);
+    g_buf[1] = 0xe1; /* Handshake, 2-byte PN */
+    brisk__store_be32(g_buf + 2, BRISK__QUIC_V1);
+    g_buf[6] = 0;
+    g_buf[7] = 0;
+    brisk__store_be16(g_buf + 8, 0x4000 | (2 + 20 + 16));
+    CHECK(brisk__quic_seal(&s0, g_buf + 1, 9, 2, 3, 20) == BRISK_OK);
+    t = 1 + 9 + 2 + 20 + 16;
+    g_buf[t] = 0x45;
+    CHECK(brisk__quic_seal(&s1, g_buf + t, 1, 2, 9, 20) == BRISK_OK);
+    CHECK(brisk__quic_open_kp(&k0, &k1, g_buf + 1, 9, 47, 2, &first, &pn, &po, &pl) == BRISK_OK &&
+          pn == 3);
+    CHECK(brisk__quic_open_kp(&k0, &k1, g_buf + t, 1, 39, 8, &first, &pn, &po, &pl) == BRISK_OK &&
+          pn == 9 && (first & 0x04));
+    brisk__quic_keys_wipe(&k0);
+    brisk__quic_keys_wipe(&k1);
 }
 
 /* ---------------------------------------------------------------- transport parameters --- */
@@ -637,6 +785,7 @@ typedef struct {
     brisk__tls13_ch_params p;
     uint8_t root[1024], rnd[32], x_priv[32], x_pub[32], p_priv[32], p_pub[65], dcid[8], scid[8];
     uint8_t ctp[128], ch[1024];
+    uint8_t ap0[48]; /* the first 1-RTT send secret: peek_1rtt follows key updates from it */
     size_t ctp_len;
 } rig;
 
@@ -726,9 +875,10 @@ static int rig_start(void)
 static int all_wiped(void)
 {
     return is_zero(R.q.rx, sizeof R.q.rx) && is_zero(R.q.tx, sizeof R.q.tx) &&
-           is_zero(&R.hs, sizeof R.hs) && is_zero(R.q.ap_secret, sizeof R.q.ap_secret) &&
-           is_zero(R.q.st, sizeof R.q.st) && is_zero(&R.q.rec, sizeof R.q.rec) &&
-           is_zero(R.q.path_resp, sizeof R.q.path_resp) &&
+           is_zero(&R.q.rx_ku, sizeof R.q.rx_ku) && is_zero(R.q.token, sizeof R.q.token) &&
+           is_zero(R.q.retry_scid, sizeof R.q.retry_scid) && is_zero(&R.hs, sizeof R.hs) &&
+           is_zero(R.q.ap_secret, sizeof R.q.ap_secret) && is_zero(R.q.st, sizeof R.q.st) &&
+           is_zero(&R.q.rec, sizeof R.q.rec) && is_zero(R.q.path_resp, sizeof R.q.path_resp) &&
            is_zero(R.q.ring, BRISK_QUIC_CRYPTO_BUF + (BRISK_QUIC_CRYPTO_BUF + 7) / 8) &&
            is_zero(R.q.srings, (size_t)BRISK_QUIC_MAX_STREAMS *
                                    (2 * BRISK_QUIC_STREAM_BUF + BRISK_QUIC_STREAM_BUF / 8));
@@ -790,15 +940,30 @@ static int peek_1rtt(size_t n, const uint8_t *dcid, size_t dl, const uint8_t *ne
     brisk__quic_hdr h;
     uint64_t pn;
     size_t off = 0, po, pl;
-    uint8_t first;
+    uint8_t first, sec[48];
+    unsigned step;
     int ok = 0;
     while (off < n && brisk__quic_hdr_parse(g_buf + off, n - off, dl, &h) == BRISK_OK &&
            h.type != BRISK__QPKT_1RTT) {
         off += h.pkt_len;
     }
     if (off >= n || h.type != BRISK__QPKT_1RTT || h.dcid_len != dl ||
-        memcmp(h.dcid, dcid, dl) != 0 ||
-        brisk__quic_keys_init(&k, R.q.tx[2].suite, R.q.ap_secret[1], R.q.ap_len) != BRISK_OK) {
+        memcmp(h.dcid, dcid, dl) != 0) {
+        return 0;
+    }
+    /* RFC 9001 6.1: keys_init from the first secret, then "quic ku" steps until the secret is
+     * the current one (the hp key stays the first one's) */
+    memcpy(sec, R.ap0, sizeof sec);
+    if (brisk__quic_keys_init(&k, R.q.tx[2].suite, sec, R.q.ap_len) != BRISK_OK) {
+        return 0;
+    }
+    for (step = 0; step < 4 && memcmp(sec, R.q.ap_secret[1], R.q.ap_len) != 0; step++) {
+        if (brisk__quic_keys_next(&k, &k, sec, R.q.ap_len) != BRISK_OK) {
+            return 0;
+        }
+    }
+    brisk__secure_zero(sec, sizeof sec);
+    if (step == 4) {
         return 0;
     }
     if (brisk__quic_open(&k, g_buf + off, h.pn_off, h.pkt_len, *largest, &first, &pn, &po, &pl) ==
@@ -955,6 +1120,9 @@ static void run_ops_n(size_t idx, size_t nops)
         default:
             CHECKI(0 && "unknown op", tag);
         }
+        if (R.q.ap_len != 0 && is_zero(R.ap0, sizeof R.ap0)) {
+            memcpy(R.ap0, R.q.ap_secret[1], sizeof R.ap0);
+        }
         CHECKI(credit_ok(), tag); /* the invariant sweep, after every op */
     }
 }
@@ -1070,6 +1238,86 @@ static void test_conn_timers(void)
     n = brisk__quic_send(&R.q, g_buf, BUF, 0);
     CHECK(n > 0 && n < 100 && (g_buf[0] & 0xc0) == 0x40 &&
           brisk__quic_send(&R.q, g_buf, BUF, 0) == 0);
+    brisk__tls13_hs_wipe(&R.hs);
+    /* RFC 9001 6.6 (MUST): at 2^23 - 2^16 AES-GCM packets we update, once an ACK covers the
+     * current phase (6.1); the next packet has key phase 1 and opens under "quic ku" */
+    CHECK(rig_established() == 0);
+    CHECK(brisk__quic_stream_open(&R.q, 1) == 0 &&
+          brisk__quic_stream_write(&R.q, 0, (const uint8_t *)"abc", 3, 0) == 3);
+    R.q.tx[2].n_sealed = ((uint64_t)1 << 23) - ((uint64_t)1 << 16);
+    R.q.rec.largest_acked[2] = 0;
+    t = (int64_t)R.q.tx_pn[2];
+    n = brisk__quic_send(&R.q, g_buf, BUF, R.q.now);
+    CHECK(n > 0 && R.q.key_phase == 1 && R.q.tx[2].n_sealed == 1 && R.q.ku_until != INT64_MAX &&
+          R.q.ku_tx_first == (uint64_t)t && R.q.rx[2].phase == 1 && R.q.rx_ku.phase == 0);
+    {
+        uint64_t la = NONE;
+        CHECK((g_buf[0] & 0x80) == 0 &&
+              peek_1rtt(n, R.q.dcid, R.q.dcid_len, (const uint8_t *)"abc", 3, &la));
+    }
+    /* 6.1 (MUST): the previous keys stay until a packet opens with the new ones - no timer while
+     * the peer has not switched, so a phase-0 packet 3 * PTO + 1 later still opens; the first
+     * phase-1 packet arms the 6.5 timer */
+    CHECK(R.q.ku_until == INT64_MAX - 1 && brisk__quic_deadline(&R.q) != INT64_MAX - 1);
+    {
+        brisk__quic_keys s0, s1;
+        uint64_t op = R.q.n_opened;
+        int64_t at = R.q.now + 3 * (int64_t)brisk__quic_rec_pto(&R.q.rec, 2, 25) + 1;
+        size_t k, dl = R.q.scid_len, len = 1 + dl + 2 + 20;
+        memcpy(&s0, &R.q.rx_ku, sizeof s0);
+        memcpy(&s1, &R.q.rx[2], sizeof s1);
+        for (k = 0; k < 2; k++) {
+            memset(g_buf, 0, len + 16);
+            g_buf[0] = (uint8_t)(0x41 | (k << 2)); /* short header, 2-byte PN, phase k */
+            memcpy(g_buf + 1, R.q.scid, dl);
+            g_buf[1 + dl + 2] = 0x01; /* PING, then PADDING */
+            CHECKI(brisk__quic_seal(k ? &s1 : &s0, g_buf, 1 + dl, 2, R.q.rx_largest[2] + 1, 20) ==
+                           BRISK_OK &&
+                       brisk__quic_recv(&R.q, g_buf, len + 16, at) == BRISK_OK &&
+                       R.q.n_opened == op + k + 1 && R.q.err == 0,
+                   k);
+        }
+        CHECK(R.q.ku_until == at + 3 * (int64_t)brisk__quic_rec_pto(&R.q.rec, 2, 25) &&
+              R.q.rx_ku.phase == 0);
+        /* 6.5 (SHOULD): the ACK confirming this update arrives after our 3 * PTO drop timer
+         * was armed; at the limit again, no new update until 3 * PTO after that ACK */
+        {
+            int64_t ack_t = at + 5, ok_at;
+            memset(g_buf, 0, len + 16);
+            g_buf[0] = 0x45; /* short header, 2-byte PN, phase 1 */
+            memcpy(g_buf + 1, R.q.scid, dl);
+            g_buf[1 + dl + 2] = 0x02;                                  /* ACK */
+            g_buf[1 + dl + 3] = (uint8_t)R.q.ku_tx_first;              /* largest (< 64) */
+            CHECK(R.q.ku_tx_first < 64 && R.q.ku_ack_at == INT64_MAX); /* delay, ranges, first: 0 */
+            CHECK(brisk__quic_seal(&s1, g_buf, 1 + dl, 2, R.q.rx_largest[2] + 1, 20) == BRISK_OK &&
+                  brisk__quic_recv(&R.q, g_buf, len + 16, ack_t) == BRISK_OK && R.q.err == 0);
+            ok_at = R.q.ku_ack_at;
+            CHECK(ok_at == ack_t + 3 * (int64_t)brisk__quic_rec_pto(&R.q.rec, 2, 25) &&
+                  R.q.ku_until < ok_at);
+            CHECK(brisk__quic_recv(&R.q, d, 0, R.q.ku_until) == BRISK_OK &&
+                  R.q.ku_until == INT64_MAX && R.q.rx_ku.suite != 0);
+            R.q.tx[2].n_sealed = ((uint64_t)1 << 23) - ((uint64_t)1 << 16);
+            CHECK(brisk__quic_stream_write(&R.q, 0, (const uint8_t *)"def", 3, 0) == 3 &&
+                  brisk__quic_send(&R.q, g_buf, BUF, ok_at - 1) > 0 && R.q.key_phase == 1 &&
+                  R.q.err == 0);
+            CHECK(brisk__quic_stream_write(&R.q, 0, (const uint8_t *)"ghi", 3, 0) == 3 &&
+                  brisk__quic_send(&R.q, g_buf, BUF, ok_at) > 0 && R.q.key_phase == 0 &&
+                  R.q.ku_ack_at == INT64_MAX);
+        }
+        brisk__quic_keys_wipe(&s0);
+        brisk__quic_keys_wipe(&s1);
+    }
+    brisk__tls13_hs_wipe(&R.hs);
+    /* without an ACK for the current phase no update: at the last packet the key may protect,
+     * CONNECTION_CLOSE AEAD_LIMIT_REACHED (6.6 RECOMMENDED) instead of going silent */
+    CHECK(rig_established() == 0);
+    no_ack_owed();
+    R.q.tx[2].n_sealed = ((uint64_t)1 << 23) - 1;
+    CHECK(brisk__quic_stream_open(&R.q, 1) == 0 &&
+          brisk__quic_stream_write(&R.q, 0, (const uint8_t *)"abc", 3, 0) == 3);
+    n = brisk__quic_send(&R.q, g_buf, BUF, R.q.now);
+    CHECK(n > 0 && n < 100 && R.q.err != 0 && R.q.err_code == BRISK__QERR_AEAD_LIMIT_REACHED &&
+          all_wiped() && brisk__quic_send(&R.q, g_buf, BUF, R.q.now) == 0);
     brisk__tls13_hs_wipe(&R.hs);
 }
 
@@ -1412,6 +1660,40 @@ void quic_ct_run(void)
         CHECK(memcmp(g_buf, pkt, 13) == 0); /* the protected header is back */
         brisk__quic_keys_wipe(&k);
     }
+    /* RFC 9001 6.1 / 6.3: keys_next from a secret-marked secret; open_kp with both key sets,
+     * a phase-0 and a phase-1 packet, and a bad tag */
+    {
+        brisk__quic_keys k0, k1, s1;
+        uint8_t tok[16], tail[16];
+        memset(secret, 0x6e, 32);
+        BRISK__CT_SECRET(secret, 32);
+        CHECK(brisk__quic_keys_init(&k0, 0x1301, secret, 32) == BRISK_OK &&
+              brisk__quic_keys_next(&k1, &k0, secret, 32) == BRISK_OK);
+        for (i = 0; i < 3; i++) {
+            memcpy(&s1, i == 0 ? &k0 : &k1, sizeof s1);
+            memset(pkt, 0x22, sizeof pkt);
+            pkt[0] = (uint8_t)(i == 0 ? 0x41 : 0x45);
+            CHECK(brisk__quic_seal(&s1, pkt, 9, 2, 0x51, 40) == BRISK_OK);
+            BRISK__CT_PUBLIC(pkt, sizeof pkt);
+            if (i == 2) {
+                pkt[30] ^= 1;
+            }
+            CHECK(brisk__quic_open_kp(&k0, &k1, pkt, 9, 9 + 2 + 40 + 16, 0x50, &first, &pn, &po,
+                                      &pl) == (i == 2 ? BRISK_E_AUTH : BRISK_OK));
+        }
+        brisk__quic_keys_wipe(&k0);
+        brisk__quic_keys_wipe(&k1);
+        brisk__quic_keys_wipe(&s1);
+        /* RFC 9001 5.8: the Retry tag compare; RFC 9000 10.3.1: the reset token compare */
+        t_unhex(QUIC_RETRY_KAT[0].pkt, pkt, sizeof pkt);
+        BRISK__CT_SECRET(pkt + 20, 16);
+        t_unhex(QUIC_RETRY_KAT[0].odcid, secret, sizeof secret);
+        CHECK(brisk__quic_retry_verify(secret, 8, pkt, 36) == BRISK_OK);
+        memset(tok, 0x3a, 16);
+        memset(tail, 0x3a, 16);
+        BRISK__CT_SECRET(tok, 16);
+        CHECK(brisk__ct_memeq(tail, tok, 16) == 1);
+    }
 }
 
 void test_quic(void)
@@ -1426,6 +1708,9 @@ void test_quic(void)
     test_pn();
     test_keys();
     test_packets();
+    test_retry();
+    test_keys_next();
+    test_open_kp();
     test_tp();
     test_frames();
     test_rec();

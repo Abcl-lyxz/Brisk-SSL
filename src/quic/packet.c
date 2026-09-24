@@ -8,6 +8,11 @@
  * and always runs the AEAD; the one value it declassifies is the PN length, because the AEAD's
  * payload length differs with it (inherent - every implementation does this). The mask itself
  * depends only on the (public) sample and the hp key through the constant-time AES / ChaCha20.
+ * brisk__quic_open_kp declassifies one more bit, the unmasked Key Phase: it selects which of two
+ * equal-sized key sets runs the (one, same-cost) AEAD, a data-dependent address otherwise. The
+ * bit is what RFC 9001 6.2 has the receiver act on, and the peer set it; both key sets exist
+ * before the packet arrives (6.3: next keys derived ahead, on a timer), so no derivation is timed
+ * by it.
  *
  * 32-bit targets: every 64-bit operation is an add, a compare, a mask or a CONSTANT shift, so no
  * libgcc helper (__udivdi3, __ashldi3, ...) is pulled in; variable shifts are 32-bit only.
@@ -116,7 +121,8 @@ int brisk__quic_initial_secrets(const uint8_t *dcid, size_t dcid_len, uint8_t cl
                                      0x9a, 0xe6, 0xa4, 0xc8, 0x0c, 0xad, 0xcc, 0xbb, 0x7f, 0x0a};
     uint8_t init[32];
     int rc;
-    if (dcid == NULL || dcid_len < 1 || dcid_len > BRISK__QUIC_MAX_CID || client == NULL ||
+    /* 5.2 note: a Retry SCID, and so the DCID the keys come from, may be empty */
+    if ((dcid == NULL && dcid_len != 0) || dcid_len > BRISK__QUIC_MAX_CID || client == NULL ||
         server == NULL) {
         return BRISK_E_ARG;
     }
@@ -176,6 +182,101 @@ void brisk__quic_keys_wipe(brisk__quic_keys *k)
     if (k != NULL) {
         brisk__secure_zero(k, sizeof *k);
     }
+}
+
+int brisk__quic_keys_next(brisk__quic_keys *next, const brisk__quic_keys *cur, uint8_t *secret,
+                          size_t len)
+{
+    brisk_hash_alg alg;
+    size_t kl;
+    uint8_t ns[48], key[32], iv[12], phase;
+    uint16_t suite;
+    uint64_t next_pn;
+    int rc;
+    if (next == NULL || cur == NULL || secret == NULL || cur->suite == 0) {
+        return BRISK_E_ARG;
+    }
+    suite = cur->suite;
+    alg = suite == 0x1302 ? BRISK_HASH_SHA384 : BRISK_HASH_SHA256;
+    kl = suite == 0x1301 ? 16 : 32;
+    if (len != brisk_hash_len(alg)) {
+        return BRISK_E_ARG;
+    }
+    /* 6.1: secret_<n+1> = HKDF-Expand-Label(secret_<n>, "quic ku", "", Hash.length); key and iv
+     * from it as in 5.1; the header protection key is not updated */
+    rc = brisk__hkdf_expand_label(alg, secret, len, "quic ku", NULL, 0, ns, len);
+    if (rc == BRISK_OK) {
+        rc = brisk__hkdf_expand_label(alg, ns, len, "quic key", NULL, 0, key, kl);
+    }
+    if (rc == BRISK_OK) {
+        rc = brisk__hkdf_expand_label(alg, ns, len, "quic iv", NULL, 0, iv, 12);
+    }
+    if (rc == BRISK_OK) {
+        phase = (uint8_t)(cur->phase ^ 1);
+        next_pn = cur->next_pn;
+        if (next != cur) {
+            memcpy(&next->hp, &cur->hp, sizeof next->hp);
+        }
+        brisk__secure_zero(&next->k, sizeof next->k);
+        if (suite == 0x1303) {
+            memcpy(next->k.chacha, key, 32);
+        } else {
+            rc = brisk__gcm_init(&next->k.gcm, key, kl);
+            if (rc != BRISK_OK) {
+                next->suite = 0; /* its key is gone: never seal with a zeroed key */
+            }
+        }
+    }
+    if (rc == BRISK_OK) {
+        memcpy(next->iv, iv, 12);
+        next->suite = suite;
+        next->phase = phase;
+        next->next_pn = next_pn;
+        next->n_sealed = 0;
+        memcpy(secret, ns, len); /* the old secret is gone */
+    }
+    brisk__secure_zero(ns, sizeof ns);
+    brisk__secure_zero(key, sizeof key);
+    brisk__secure_zero(iv, sizeof iv);
+    return rc;
+}
+
+/* ------------------------------------------------------------------ Retry (RFC 9001 5.8) --- */
+
+int brisk__quic_retry_verify(const uint8_t *odcid, size_t odcid_len, const uint8_t *pkt,
+                             size_t len)
+{
+    /* 5.8: the fixed v1 key and nonce, HKDF-Expand-Label(0xd9c9943e...6fca8e, "quic key" /
+     * "quic iv"); tools/kat.py re-derives both from the secret */
+    static const uint8_t K[16] = {0xbe, 0x0c, 0x69, 0x0b, 0x9f, 0x66, 0x57, 0x5a,
+                                  0x1d, 0x76, 0x6b, 0x54, 0xe3, 0x68, 0xc8, 0x4e};
+    static const uint8_t N[12] = {0x46, 0x15, 0x99, 0xd3, 0x5d, 0x63,
+                                  0x2b, 0xf2, 0x23, 0x98, 0x25, 0xbb};
+    /* Retry Pseudo-Packet: ODCID Length, ODCID, the Retry without its tag - at most a 47-byte
+     * header (17.2.5 with 20-byte CIDs) and our token bound */
+    uint8_t ps[1 + BRISK__QUIC_MAX_CID + 47 + BRISK__QUIC_TOKEN_MAX], dummy[1] = {0};
+    brisk__gcm_key g;
+    size_t n;
+    int rc;
+    if ((odcid == NULL && odcid_len != 0) || odcid_len > BRISK__QUIC_MAX_CID || pkt == NULL ||
+        len < 16 || len - 16 > 47 + BRISK__QUIC_TOKEN_MAX) {
+        return BRISK_E_ARG;
+    }
+    n = len - 16;
+    ps[0] = (uint8_t)odcid_len;
+    if (odcid_len != 0) {
+        memcpy(ps + 1, odcid, odcid_len);
+    }
+    if (n != 0) {
+        memcpy(ps + 1 + odcid_len, pkt, n);
+    }
+    rc = brisk__gcm_init(&g, K, sizeof K);
+    if (rc == BRISK_OK) {
+        /* the tag over the empty plaintext, compared in constant time by gcm_open */
+        rc = brisk__gcm_open(&g, N, ps, 1 + odcid_len + n, dummy, 0, dummy, pkt + n);
+    }
+    brisk__secure_zero(&g, sizeof g);
+    return rc;
 }
 
 /* ------------------------------------------------------------------ headers (17.2, 17.3) -- */
@@ -239,7 +340,15 @@ int brisk__quic_hdr_parse(const uint8_t *d, size_t len, size_t short_dcid_len, b
     }
     h->type = (uint8_t)((d[0] >> 4) & 3);
     if (h->type == BRISK__QPKT_RETRY) {
-        return BRISK_OK; /* dropped by the connection (M6 item 3) */
+        /* 17.2.5: Retry Token then a 16-byte Retry Integrity Tag, the rest of the datagram; the
+         * 4 Unused bits are the tag's to cover (the client ignores them). A Retry without a
+         * token is discarded (17.2.5.2), so at least 1 token byte is required here. */
+        if (len - i < 16 + 1) {
+            return BRISK_E_PROTO;
+        }
+        h->token = d + i;
+        h->token_len = len - i - 16;
+        return BRISK_OK;
     }
     p = d + i;
     end = d + len;
@@ -336,7 +445,16 @@ int brisk__quic_open(const brisk__quic_keys *k, uint8_t *pkt, size_t pn_off, siz
                      uint64_t largest, uint8_t *first, uint64_t *pn, size_t *payload_off,
                      size_t *payload_len)
 {
-    uint8_t mask[5], nonce[12], save[5], b0;
+    return brisk__quic_open_kp(k, NULL, pkt, pn_off, pkt_len, largest, first, pn, payload_off,
+                               payload_len);
+}
+
+int brisk__quic_open_kp(const brisk__quic_keys *k, const brisk__quic_keys *alt, uint8_t *pkt,
+                        size_t pn_off, size_t pkt_len, uint64_t largest, uint8_t *first,
+                        uint64_t *pn, size_t *payload_off, size_t *payload_len)
+{
+    const brisk__quic_keys *use;
+    uint8_t mask[5], nonce[12], save[5], b0, ph;
     uint32_t full, tpn = 0, pl, m, n;
     uint64_t win = 0, p;
     size_t hl, ctl, i;
@@ -376,12 +494,18 @@ int brisk__quic_open(const brisk__quic_keys *k, uint8_t *pkt, size_t pn_off, siz
     BRISK__CT_PUBLIC(&pl, sizeof pl);
     hl = pn_off + pl;
     ctl = pkt_len - hl - 16;
-    make_nonce(k, p, nonce);
-    if (k->suite == 0x1303) {
-        rc = brisk__chacha20_poly1305_open(k->k.chacha, nonce, pkt, hl, pkt + hl, ctl, pkt + hl,
+    /* RFC 9001 6.2 / 6.3: the Key Phase bit (17.3.1: 0x04 of a short header) picks the key set;
+     * declassified - see the file head */
+    ph = (uint8_t)((b0 >> 2) & 1);
+    BRISK__CT_PUBLIC(&ph, sizeof ph);
+    use = alt != NULL && !(pkt[0] & 0x80) && ph != k->phase ? alt : k;
+    make_nonce(use, p, nonce);
+    if (use->suite == 0x1303) {
+        rc = brisk__chacha20_poly1305_open(use->k.chacha, nonce, pkt, hl, pkt + hl, ctl, pkt + hl,
                                            pkt + hl + ctl);
     } else {
-        rc = brisk__gcm_open(&k->k.gcm, nonce, pkt, hl, pkt + hl, ctl, pkt + hl, pkt + hl + ctl);
+        rc = brisk__gcm_open(&use->k.gcm, nonce, pkt, hl, pkt + hl, ctl, pkt + hl,
+                             pkt + hl + ctl);
     }
     brisk__secure_zero(nonce, sizeof nonce);
     if (rc != BRISK_OK) {
