@@ -38,8 +38,10 @@ enum {
     EXT_SERVER_NAME = 0,
     EXT_SUPPORTED_GROUPS = 10,
     EXT_SIGNATURE_ALGORITHMS = 13,
+    EXT_EC_POINT_FORMATS = 11, /* RFC 8422 5.1.2, TLS 1.2 only */
     EXT_ALPN = 16,
     EXT_PADDING = 21,
+    EXT_EMS = 23, /* extended_main_secret, RFC 7627 5.1 / RFC 9846 D, TLS 1.2 only */
     EXT_RECORD_SIZE_LIMIT = 28,
     EXT_SESSION_TICKET = 35,
     EXT_PSK = 41,
@@ -114,12 +116,21 @@ static const uint16_t CH_ALLOWED[] = {EXT_SERVER_NAME,
                                       EXT_PSK_MODES,
                                       EXT_KEY_SHARE,
                                       EXT_QUIC_TP,
+#if BRISK_ENABLE_TLS12
+                                      EXT_EC_POINT_FORMATS,
+                                      EXT_EMS,
+#endif
                                       EXT_RENEGOTIATION_INFO};
 
 /* The library's default offer (brisk_int.h, brisk__tls13_ch_params). ChaCha20 first: AES here
  * is bitsliced software on every target (docs/ARCHITECTURE.md). */
 static const uint16_t DEF_SUITES[] = {0x1303, 0x1301, 0x1302};
 static const uint16_t DEF_GROUPS[] = {GROUP_X25519, GROUP_P256};
+#if BRISK_ENABLE_TLS12
+/* Appended when ch_params.tls12 is set: ECDHE + AEAD only (RFC 9325 4.2, RFC 9846 E.5), ChaCha20
+ * first as above - RFC 7905 2, RFC 5289 3.2. Never CBC, static RSA, DHE, RC4 or the SCSV. */
+static const uint16_t DEF12_SUITES[] = {0xCCA9, 0xCCA8, 0xC02B, 0xC02F, 0xC02C, 0xC030};
+#endif
 static const uint16_t DEF_SIGS[] = {0x0403,
 #if BRISK_ENABLE_P384
                                     0x0503,
@@ -128,7 +139,13 @@ static const uint16_t DEF_SIGS[] = {0x0403,
 
 /* A CertificateVerify is at most scheme(2) + len(2) + the widest signature this build checks:
  * RSA at BRISK_RSA_MAX_BITS. A DER ECDSA-Sig-Value at P-384 is ~104 bytes, far below. */
-#define HS_CV_MAX (4 + 4 + BRISK_RSA_MAX_BITS / 8)
+#if BRISK_ENABLE_TLS12
+/* ... or, in TLS 1.2, a ServerKeyExchange (RFC 8422 5.4): header(4) + curve_type(1) +
+ * namedcurve(2) + a 65-byte point with its length(1) + scheme(2) + length(2) + the signature. */
+#    define HS_CV_MAX (4 + 4 + 4 + 65 + 4 + BRISK_RSA_MAX_BITS / 8)
+#else
+#    define HS_CV_MAX (4 + 4 + BRISK_RSA_MAX_BITS / 8)
+#endif
 #define HS_IN_CAP (4 + BRISK_TLS_MAX_HS_MSG + HS_CV_MAX)
 
 struct hs_align_probe {
@@ -139,8 +156,20 @@ struct hs_align_probe {
 
 /* ------------------------------------------------------------------ small helpers ---------- */
 
-static brisk_hash_alg hs_alg(uint16_t suite)
+/* Shared with tls12.c when TLS 1.2 is on; file-local otherwise. */
+#if BRISK_ENABLE_TLS12
+#    define HS_SHARED
+#else
+#    define HS_SHARED static
+#endif
+
+HS_SHARED brisk_hash_alg brisk__hs_alg(uint16_t suite)
 {
+#if BRISK_ENABLE_TLS12
+    if (suite == 0xC02C || suite == 0xC030) {
+        return BRISK_HASH_SHA384; /* RFC 5289 3.2: the PRF / handshake hash of these two */
+    }
+#endif
     return suite == 0x1302 ? BRISK_HASH_SHA384 : BRISK_HASH_SHA256; /* RFC 9846 B.4 */
 }
 
@@ -154,7 +183,7 @@ static size_t hs_share_len(uint16_t group)
     return group == GROUP_X25519 ? 32u : group == GROUP_P256 ? 65u : 0u; /* 4.3.8.2, RFC 7748 */
 }
 
-static int hs_in_list(const uint16_t *list, size_t n, uint16_t v)
+HS_SHARED int brisk__hs_in_list(const uint16_t *list, size_t n, uint16_t v)
 {
     size_t i;
     for (i = 0; i < n; i++) {
@@ -177,8 +206,8 @@ static int hs_ext_index(uint16_t type)
 }
 
 /* One step over an extension block: 1 with type, data and dlen set, 0 at the end, -1 malformed. */
-static int hs_ext_next(const uint8_t **p, const uint8_t *end, uint16_t *type, const uint8_t **data,
-                       size_t *dlen)
+HS_SHARED int brisk__hs_ext_next(const uint8_t **p, const uint8_t *end, uint16_t *type,
+                                 const uint8_t **data, size_t *dlen)
 {
     size_t left = (size_t)(end - *p), n;
     if (left == 0) {
@@ -205,7 +234,7 @@ static int hs_ext_find(const uint8_t *p, size_t n, uint16_t type, const uint8_t 
     const uint8_t *end = p + n;
     uint16_t t;
     int r;
-    while ((r = hs_ext_next(&p, end, &t, data, dlen)) == 1) {
+    while ((r = brisk__hs_ext_next(&p, end, &t, data, dlen)) == 1) {
         if (t == type) {
             return 1;
         }
@@ -226,7 +255,7 @@ static uint8_t hs_ext_check(const brisk__tls13_hs *hs, const uint8_t *p, size_t 
     uint16_t t;
     size_t dl;
     int r, idx;
-    while ((r = hs_ext_next(&p, end, &t, &d, &dl)) == 1) {
+    while ((r = brisk__hs_ext_next(&p, end, &t, &d, &dl)) == 1) {
         idx = hs_ext_index(t);
         if (idx >= 0) {
             if (seen & ((uint32_t)1 << idx)) {
@@ -240,7 +269,8 @@ static uint8_t hs_ext_check(const brisk__tls13_hs *hs, const uint8_t *p, size_t 
             }
             continue;
         }
-        if (!hs_in_list(hs->offered_ext, hs->n_ext, t) && !(where == IN_HRR && t == EXT_COOKIE)) {
+        if (!brisk__hs_in_list(hs->offered_ext, hs->n_ext, t) &&
+            !(where == IN_HRR && t == EXT_COOKIE)) {
             return BRISK__ALERT_UNSUPPORTED_EXTENSION;
         }
         if (idx < 0 || !(EXT_TABLE[idx].where & where)) {
@@ -253,20 +283,23 @@ static uint8_t hs_ext_check(const brisk__tls13_hs *hs, const uint8_t *p, size_t 
 /* ------------------------------------------------------------------ transcript ------------ */
 
 /* RFC 9846 4.1. Until a ServerHello or HRR picks the suite, both hashes run. */
-static void th_add(brisk__tls13_hs *hs, const uint8_t *m, size_t n)
+HS_SHARED void brisk__hs_th_add(brisk__tls13_hs *hs, const uint8_t *m, size_t n)
 {
-    if (hs->suite == 0 || hs_alg(hs->suite) == BRISK_HASH_SHA256) {
+    /* TLS 1.2 keeps both: a SHA-384 suite's client CertificateVerify is still
+     * ecdsa_secp256r1_sha256 over the same messages (RFC 5246 7.4.8) */
+    int both = hs->suite == 0 || hs->version == 0x0303;
+    if (both || brisk__hs_alg(hs->suite) == BRISK_HASH_SHA256) {
         brisk__hash_update(&hs->th256, BRISK_HASH_SHA256, m, n);
     }
-    if (hs->suite == 0 || hs_alg(hs->suite) == BRISK_HASH_SHA384) {
+    if (both || brisk__hs_alg(hs->suite) == BRISK_HASH_SHA384) {
         brisk__hash_update(&hs->th384, BRISK_HASH_SHA384, m, n);
     }
 }
 
 /* Transcript-Hash of everything added so far, by finalising a copy. */
-static void th_snap(const brisk__tls13_hs *hs, uint8_t *out)
+HS_SHARED void brisk__hs_th_snap(const brisk__tls13_hs *hs, uint8_t *out)
 {
-    brisk_hash_alg alg = hs_alg(hs->suite);
+    brisk_hash_alg alg = brisk__hs_alg(hs->suite);
     brisk_hash_ctx c = alg == BRISK_HASH_SHA384 ? hs->th384 : hs->th256;
     brisk__hash_final(&c, alg, out);
 }
@@ -275,7 +308,7 @@ static void th_snap(const brisk__tls13_hs *hs, uint8_t *out)
 static void th_pick(brisk__tls13_hs *hs, uint16_t suite)
 {
     hs->suite = suite;
-    if (hs_alg(suite) == BRISK_HASH_SHA384) {
+    if (brisk__hs_alg(suite) == BRISK_HASH_SHA384) {
         brisk__secure_zero(&hs->th256, sizeof hs->th256);
     } else {
         brisk__secure_zero(&hs->th384, sizeof hs->th384);
@@ -291,9 +324,13 @@ static void hs_wipe_secrets(brisk__tls13_hs *hs)
     brisk__secure_zero(hs->s_hs, sizeof hs->s_hs);
     brisk__secure_zero(hs->ks.secret, sizeof hs->ks.secret);
     brisk__secure_zero(hs->psk, sizeof hs->psk);
+#if BRISK_ENABLE_TLS12
+    brisk__secure_zero(hs->priv_p256, sizeof hs->priv_p256);
+    brisk__secure_zero(hs->main, sizeof hs->main);
+#endif
 }
 
-static int hs_fail(brisk__tls13_hs *hs, uint8_t alert)
+HS_SHARED int brisk__hs_fail(brisk__tls13_hs *hs, uint8_t alert)
 {
     hs_wipe_secrets(hs);
     brisk__secure_zero(hs->exp_ms, sizeof hs->exp_ms);
@@ -316,7 +353,7 @@ static int hs_fail(brisk__tls13_hs *hs, uint8_t alert)
 
 /* Queue a message for pull() and add it to the transcript. Epochs only move forward, so the
  * queue is one INITIAL run [0, out_split) followed by one HANDSHAKE run [out_split, out_len). */
-static uint8_t *hs_reserve(brisk__tls13_hs *hs, unsigned epoch, size_t n)
+HS_SHARED uint8_t *brisk__hs_reserve(brisk__tls13_hs *hs, unsigned epoch, size_t n)
 {
     uint8_t *p = hs->out + hs->out_len;
     if (n > BRISK__TLS13_OUT_MAX - hs->out_len) {
@@ -329,14 +366,14 @@ static uint8_t *hs_reserve(brisk__tls13_hs *hs, unsigned epoch, size_t n)
     return p;
 }
 
-static int hs_queue(brisk__tls13_hs *hs, unsigned epoch, const uint8_t *m, size_t n)
+HS_SHARED int brisk__hs_queue(brisk__tls13_hs *hs, unsigned epoch, const uint8_t *m, size_t n)
 {
-    uint8_t *p = hs_reserve(hs, epoch, n);
+    uint8_t *p = brisk__hs_reserve(hs, epoch, n);
     if (p == NULL) {
         return 0;
     }
     memcpy(p, m, n);
-    th_add(hs, p, n);
+    brisk__hs_th_add(hs, p, n);
     return 1;
 }
 
@@ -346,7 +383,7 @@ static int hs_export(brisk__tls13_hs *hs, unsigned epoch, int is_send, const uin
         return 1;
     }
     return hs->cfg.on_secret(hs->cfg.secret_ctx, epoch, is_send, hs->suite, secret,
-                             brisk_hash_len(hs_alg(hs->suite))) == 0;
+                             brisk_hash_len(brisk__hs_alg(hs->suite))) == 0;
 }
 
 /* ------------------------------------------------------------------ ServerHello / HRR ------ */
@@ -357,39 +394,41 @@ static int hs_on_hrr(brisk__tls13_hs *hs, const uint8_t *m, size_t n, const uint
 {
     uint8_t h[BRISK_HASH_MAX_LEN + 4];
     const uint8_t *d;
-    size_t dl, hl = brisk_hash_len(hs_alg(suite));
+    size_t dl, hl = brisk_hash_len(brisk__hs_alg(suite));
     uint16_t group = 0;
     int have_ks, have_cookie;
 
     have_ks = hs_ext_find(ext, ext_len, EXT_KEY_SHARE, &d, &dl) == 1;
     if (have_ks) {
         if (dl != 2) {
-            return hs_fail(hs, BRISK__ALERT_DECODE_ERROR);
+            return brisk__hs_fail(hs, BRISK__ALERT_DECODE_ERROR);
         }
         group = (uint16_t)brisk__load_be16(d);
         /* 4.3.8: offered in supported_groups, and not a group CH1 already had a share for. */
-        if (!hs_in_list(hs->offered_groups, hs->n_groups, group) || group == hs->share_group) {
-            return hs_fail(hs, BRISK__ALERT_ILLEGAL_PARAMETER);
+        if (!brisk__hs_in_list(hs->offered_groups, hs->n_groups, group) ||
+            group == hs->share_group) {
+            return brisk__hs_fail(hs, BRISK__ALERT_ILLEGAL_PARAMETER);
         }
         if (hs_share_len(group) == 0) {
             /* Offered by a caller-built ClientHello, but no ECDHE here can answer it. */
-            return hs_fail(hs, BRISK__ALERT_HANDSHAKE_FAILURE);
+            return brisk__hs_fail(hs, BRISK__ALERT_HANDSHAKE_FAILURE);
         }
     }
     have_cookie = hs_ext_find(ext, ext_len, EXT_COOKIE, &d, &dl) == 1;
     if (have_cookie) {
         /* 4.3.2: opaque cookie<1..2^16-1>, exactly filling the extension. */
         if (dl < 3 || brisk__load_be16(d) != dl - 2) {
-            return hs_fail(hs, BRISK__ALERT_DECODE_ERROR);
+            return brisk__hs_fail(hs, BRISK__ALERT_DECODE_ERROR);
         }
         if (dl - 2 > BRISK__TLS13_COOKIE_MAX) {
-            return hs_fail(hs, BRISK__ALERT_ILLEGAL_PARAMETER); /* local limit, see the #define */
+            return brisk__hs_fail(
+                hs, BRISK__ALERT_ILLEGAL_PARAMETER); /* local limit, see the #define */
         }
         memcpy(hs->cookie, d + 2, dl - 2);
         hs->cookie_len = (uint16_t)(dl - 2);
     }
     if (!have_ks && !have_cookie) {
-        return hs_fail(hs, BRISK__ALERT_ILLEGAL_PARAMETER); /* 4.2.4: would change nothing */
+        return brisk__hs_fail(hs, BRISK__ALERT_ILLEGAL_PARAMETER); /* 4.2.4: would change nothing */
     }
 
     /* 4.1: ClientHello1 becomes message_hash(254) || 00 00 HashLen || Hash(ClientHello1). */
@@ -398,12 +437,16 @@ static int hs_on_hrr(brisk__tls13_hs *hs, const uint8_t *m, size_t n, const uint
     h[1] = 0;
     h[2] = 0;
     h[3] = (uint8_t)hl;
-    th_snap(hs, h + 4);
-    brisk__hash_init(hs_alg(suite) == BRISK_HASH_SHA384 ? &hs->th384 : &hs->th256, hs_alg(suite));
-    th_add(hs, h, 4 + hl);
-    th_add(hs, m, n);
+    brisk__hs_th_snap(hs, h + 4);
+    brisk__hash_init(brisk__hs_alg(suite) == BRISK_HASH_SHA384 ? &hs->th384 : &hs->th256,
+                     brisk__hs_alg(suite));
+    brisk__hs_th_add(hs, h, 4 + hl);
+    brisk__hs_th_add(hs, m, n);
 
     brisk__secure_zero(hs->priv, sizeof hs->priv); /* CH1's share is dead */
+#if BRISK_ENABLE_TLS12
+    brisk__secure_zero(hs->priv_p256, sizeof hs->priv_p256); /* an HRR commits to TLS 1.3 */
+#endif
     hs->hrr_group = group;
     hs->hrr_seen = 1;
     hs->state = BRISK__HS_WAIT_CH2;
@@ -425,7 +468,7 @@ static int hs_on_sh(brisk__tls13_hs *hs, const uint8_t *m, size_t n)
      * ServerHello may omit extensions entirely (RFC 5246 7.4.1.3): that parses as "no
      * supported_versions" so it reaches the downgrade-sentinel test below. */
     if (bl < 35 || b[34] > 32 || bl - 35 < (size_t)b[34] + 3) {
-        return hs_fail(hs, BRISK__ALERT_DECODE_ERROR);
+        return brisk__hs_fail(hs, BRISK__ALERT_DECODE_ERROR);
     }
     sid = b + 35;
     sid_len = b[34];
@@ -435,20 +478,20 @@ static int hs_on_sh(brisk__tls13_hs *hs, const uint8_t *m, size_t n)
     ext_len = 0;
     if (bl - i != 3) {
         if (bl - i < 5) {
-            return hs_fail(hs, BRISK__ALERT_DECODE_ERROR);
+            return brisk__hs_fail(hs, BRISK__ALERT_DECODE_ERROR);
         }
         ext_len = brisk__load_be16(b + i + 3);
         ext = b + i + 5;
     }
     if ((bl - i != 3 && ext_len != bl - i - 5) || hs_ext_find(ext, ext_len, 0xffff, &d, &dl) < 0) {
-        return hs_fail(hs, BRISK__ALERT_DECODE_ERROR);
+        return brisk__hs_fail(hs, BRISK__ALERT_DECODE_ERROR);
     }
 
     /* 4.2.3: examine the random first; the HRR value is SHA-256("HelloRetryRequest"). */
     brisk_sha256(HRR_LABEL, sizeof HRR_LABEL - 1, hrr_random);
     is_hrr = memcmp(b + 2, hrr_random, 32) == 0;
     if (is_hrr && hs->hrr_seen) {
-        return hs_fail(hs, BRISK__ALERT_UNEXPECTED_MESSAGE); /* 4.2.4: a second HRR */
+        return brisk__hs_fail(hs, BRISK__ALERT_UNEXPECTED_MESSAGE); /* 4.2.4: a second HRR */
     }
 
     /* 4.3.1: supported_versions before anything else; legacy_version is ignored for it. */
@@ -456,32 +499,39 @@ static int hs_on_sh(brisk__tls13_hs *hs, const uint8_t *m, size_t n)
         /* A TLS 1.2 (or older) answer. The downgrade sentinels MUST be checked first (4.2.3);
          * M5 inserts its TLS 1.2 branch AFTER this test, never before it. */
         if (memcmp(b + 2 + 24, "DOWNGRD", 7) == 0 && b[2 + 31] <= 1) {
-            return hs_fail(hs, BRISK__ALERT_ILLEGAL_PARAMETER);
+            return brisk__hs_fail(hs, BRISK__ALERT_ILLEGAL_PARAMETER);
         }
-        return hs_fail(hs, BRISK__ALERT_PROTOCOL_VERSION); /* local: no TLS 1.2 until M5 */
+#if BRISK_ENABLE_TLS12
+        if (hs->tls12_offered) {
+            return brisk__tls12_on_sh(hs, m, n, ext, ext_len, is_hrr);
+        }
+#endif
+        /* E.1: a version the client did not offer is not acceptable */
+        return brisk__hs_fail(hs, BRISK__ALERT_PROTOCOL_VERSION);
     }
     if (dl != 2) {
-        return hs_fail(hs, BRISK__ALERT_DECODE_ERROR);
+        return brisk__hs_fail(hs, BRISK__ALERT_DECODE_ERROR);
     }
     if (brisk__load_be16(d) != 0x0304) {
-        return hs_fail(hs, BRISK__ALERT_ILLEGAL_PARAMETER); /* not offered, or below 1.3 */
+        return brisk__hs_fail(hs, BRISK__ALERT_ILLEGAL_PARAMETER); /* not offered, or below 1.3 */
     }
     if (brisk__load_be16(b) != 0x0303) {
-        return hs_fail(hs, BRISK__ALERT_PROTOCOL_VERSION);
+        return brisk__hs_fail(hs, BRISK__ALERT_PROTOCOL_VERSION);
     }
     if (sid_len != hs->session_id_len || memcmp(sid, hs->session_id, sid_len) != 0) {
-        return hs_fail(hs, BRISK__ALERT_ILLEGAL_PARAMETER);
+        return brisk__hs_fail(hs, BRISK__ALERT_ILLEGAL_PARAMETER);
     }
-    if (!hs_in_list(hs->offered_suites, hs->n_suites, suite) ||
+    if (!brisk__hs_in_list(hs->offered_suites, hs->n_suites, suite) ||
+        !hs_known_suite(suite) || /* B.4: a TLS 1.2 suite we offered is not a 1.3 suite */
         (hs->hrr_seen && suite != hs->suite)) { /* 4.2.4: the SH keeps the HRR's suite */
-        return hs_fail(hs, BRISK__ALERT_ILLEGAL_PARAMETER);
+        return brisk__hs_fail(hs, BRISK__ALERT_ILLEGAL_PARAMETER);
     }
     if (b[i + 2] != 0) {
-        return hs_fail(hs, BRISK__ALERT_ILLEGAL_PARAMETER);
+        return brisk__hs_fail(hs, BRISK__ALERT_ILLEGAL_PARAMETER);
     }
     alert = hs_ext_check(hs, ext, ext_len, is_hrr ? IN_HRR : IN_SH);
     if (alert) {
-        return hs_fail(hs, alert);
+        return brisk__hs_fail(hs, alert);
     }
     if (is_hrr) {
         return hs_on_hrr(hs, m, n, ext, ext_len, suite);
@@ -493,44 +543,49 @@ static int hs_on_sh(brisk__tls13_hs *hs, const uint8_t *m, size_t n)
      * (4.3.9), so a selected PSK without key_share is illegal_parameter as well. */
     psk = hs_ext_find(ext, ext_len, EXT_PSK, &d, &dl) == 1;
     if (psk && dl != 2) {
-        return hs_fail(hs, BRISK__ALERT_DECODE_ERROR);
+        return brisk__hs_fail(hs, BRISK__ALERT_DECODE_ERROR);
     }
-    if (psk && (brisk__load_be16(d) != 0 || hs_alg(suite) != hs_alg(hs->psk_suite) ||
+    if (psk && (brisk__load_be16(d) != 0 || brisk__hs_alg(suite) != brisk__hs_alg(hs->psk_suite) ||
                 hs_ext_find(ext, ext_len, EXT_KEY_SHARE, &d, &dl) != 1)) {
-        return hs_fail(hs, BRISK__ALERT_ILLEGAL_PARAMETER);
+        return brisk__hs_fail(hs, BRISK__ALERT_ILLEGAL_PARAMETER);
     }
     /* 4.3.8: exactly one KeyShareEntry, in the group of the client's share (which after an HRR
      * is the HRR's selected_group, enforced when CH2 was absorbed). */
     if (hs_ext_find(ext, ext_len, EXT_KEY_SHARE, &d, &dl) != 1) {
-        return hs_fail(hs, BRISK__ALERT_MISSING_EXTENSION); /* local: 9.2 names no alert */
+        return brisk__hs_fail(hs, BRISK__ALERT_MISSING_EXTENSION); /* local: 9.2 names no alert */
     }
     if (dl < 4 || brisk__load_be16(d + 2) != dl - 4) {
-        return hs_fail(hs, BRISK__ALERT_DECODE_ERROR);
+        return brisk__hs_fail(hs, BRISK__ALERT_DECODE_ERROR);
     }
     group = (uint16_t)brisk__load_be16(d);
     /* 4.2.8: key_exchange<1..2^16-1>, a valid encoding for a group this engine can finish */
     if (group != hs->share_group || hs_share_len(group) == 0 || dl - 4 != hs_share_len(group)) {
-        return hs_fail(hs, BRISK__ALERT_ILLEGAL_PARAMETER);
+        return brisk__hs_fail(hs, BRISK__ALERT_ILLEGAL_PARAMETER);
     }
 
     if (!hs->hrr_seen) {
         th_pick(hs, suite);
     }
-    th_add(hs, m, n);
-    th_snap(hs, th);
+    brisk__hs_th_add(hs, m, n);
+    brisk__hs_th_snap(hs, th);
     /* 7.4.2: the shared secret; an all-zero X25519 result and an invalid P-256 point (4.3.8.2)
      * both MUST abort. Both verdicts are public (x25519.c / p256.c). */
     rc = group == GROUP_X25519 ? brisk__x25519(dhe, hs->priv, d + 4)
          : group == GROUP_P256 ? brisk__p256_ecdh(dhe, hs->priv, d + 4)
                                : BRISK_E_ARG;
     brisk__secure_zero(hs->priv, sizeof hs->priv);
+#if BRISK_ENABLE_TLS12
+    brisk__secure_zero(hs->priv_p256, sizeof hs->priv_p256); /* TLS 1.3 it is */
+#endif
+    hs->version = 0x0304;
     if (rc != BRISK_OK) {
         brisk__secure_zero(dhe, sizeof dhe);
-        return hs_fail(hs, BRISK__ALERT_ILLEGAL_PARAMETER);
+        return brisk__hs_fail(hs, BRISK__ALERT_ILLEGAL_PARAMETER);
     }
     /* 7.1: early_secret = HKDF-Extract(0, PSK) only when the PSK was selected; otherwise this is
      * a full handshake and the certificate path runs. The PSK is dead either way. */
-    rc = brisk__tls_ks_init(&hs->ks, hs_alg(suite), psk ? hs->psk : NULL, psk ? hs->psk_len : 0u);
+    rc = brisk__tls_ks_init(&hs->ks, brisk__hs_alg(suite), psk ? hs->psk : NULL,
+                            psk ? hs->psk_len : 0u);
     brisk__secure_zero(hs->psk, sizeof hs->psk);
     hs->psk_ok = (uint8_t)psk;
     if (rc == BRISK_OK) {
@@ -539,7 +594,7 @@ static int hs_on_sh(brisk__tls13_hs *hs, const uint8_t *m, size_t n)
     brisk__secure_zero(dhe, sizeof dhe);
     if (rc != BRISK_OK || !hs_export(hs, BRISK__EPOCH_HANDSHAKE, 0, hs->s_hs) ||
         !hs_export(hs, BRISK__EPOCH_HANDSHAKE, 1, hs->c_hs)) {
-        return hs_fail(hs, BRISK__ALERT_INTERNAL_ERROR);
+        return brisk__hs_fail(hs, BRISK__ALERT_INTERNAL_ERROR);
     }
     hs->in_epoch = BRISK__EPOCH_HANDSHAKE;
     hs->state = BRISK__HS_WAIT_EE;
@@ -548,33 +603,56 @@ static int hs_on_sh(brisk__tls13_hs *hs, const uint8_t *m, size_t n)
 
 /* ------------------------------------------------------------------ server parameters ----- */
 
+/* RFC 7301 3.1, for EE (TLS 1.3) and the TLS 1.2 ServerHello: the answer is a ProtocolNameList
+ * of EXACTLY one non-empty name, filling the extension, and a name we offered - no alert is
+ * named for that, illegal_parameter is the local choice over TCP, and RFC 9001 8.1 makes it
+ * no_application_protocol over QUIC. 0, or the alert; the pick is recorded for hs_alpn. */
+HS_SHARED uint8_t brisk__hs_alpn_check(brisk__tls13_hs *hs, const uint8_t *d, size_t dl)
+{
+    size_t off;
+    if (dl < 4 || brisk__load_be16(d) != dl - 2 || d[2] == 0 || d[2] != dl - 3) {
+        return BRISK__ALERT_DECODE_ERROR;
+    }
+    for (off = 0; off < hs->alpn_len; off += 1 + (size_t)hs->alpn[off]) {
+        if (hs->alpn[off] == d[2] && memcmp(hs->alpn + off + 1, d + 3, d[2]) == 0) {
+            break;
+        }
+    }
+    if (off >= hs->alpn_len) {
+        return hs->cfg.quic ? BRISK__ALERT_NO_APPLICATION_PROTOCOL : BRISK__ALERT_ILLEGAL_PARAMETER;
+    }
+    hs->alpn_sel_off = (uint16_t)(off + 1);
+    hs->alpn_sel_len = d[2];
+    return 0;
+}
+
 static int hs_on_ee(brisk__tls13_hs *hs, const uint8_t *m, size_t n)
 {
     const uint8_t *b = m + 4, *p, *d, *tp = NULL;
-    size_t bl = n - 4, dl, tp_len = 0, off;
+    size_t bl = n - 4, dl, tp_len = 0;
     uint16_t t;
     uint8_t alert;
 
     if (bl < 2 || brisk__load_be16(b) != bl - 2) {
-        return hs_fail(hs, BRISK__ALERT_DECODE_ERROR);
+        return brisk__hs_fail(hs, BRISK__ALERT_DECODE_ERROR);
     }
     alert = hs_ext_check(hs, b + 2, bl - 2, IN_EE);
     if (alert) {
-        return hs_fail(hs, alert); /* 4.4.1: forbidden extensions are illegal_parameter */
+        return brisk__hs_fail(hs, alert); /* 4.4.1: forbidden extensions are illegal_parameter */
     }
     p = b + 2;
-    while (hs_ext_next(&p, b + bl, &t, &d, &dl) == 1) {
+    while (brisk__hs_ext_next(&p, b + bl, &t, &d, &dl) == 1) {
         /* server_name: RFC 6066 3, the answer's extension_data is empty. record_size_limit:
          * RFC 8449 4, a uint16; below 64 MUST be illegal_parameter; kept in peer_rsl for the
          * record layer. supported_groups MUST NOT be acted on before the handshake completes
          * (4.3.7) and is ignored. ALPN is not in CH_ALLOWED until M3 line 3 checks the answer
          * against the offer, so it can only arrive here unsolicited (hs_ext_check). */
         if ((t == EXT_SERVER_NAME && dl != 0) || (t == EXT_RECORD_SIZE_LIMIT && dl != 2)) {
-            return hs_fail(hs, BRISK__ALERT_DECODE_ERROR);
+            return brisk__hs_fail(hs, BRISK__ALERT_DECODE_ERROR);
         }
         if (t == EXT_RECORD_SIZE_LIMIT) {
             if (brisk__load_be16(d) < 64) {
-                return hs_fail(hs, BRISK__ALERT_ILLEGAL_PARAMETER);
+                return brisk__hs_fail(hs, BRISK__ALERT_ILLEGAL_PARAMETER);
             }
             hs->peer_rsl = (uint16_t)brisk__load_be16(d);
         }
@@ -582,42 +660,25 @@ static int hs_on_ee(brisk__tls13_hs *hs, const uint8_t *m, size_t n)
             tp = d; /* RFC 9001 8.2; only offered, so only accepted, when cfg.quic is set */
             tp_len = dl;
         }
-        if (t == EXT_ALPN) {
-            /* RFC 7301 3.1: the answer is a ProtocolNameList of EXACTLY one non-empty name,
-             * filling the extension; it must be a name we offered - no alert is named for that,
-             * illegal_parameter is the local choice over TCP, and RFC 9001 8.1 makes it
-             * no_application_protocol over QUIC. */
-            if (dl < 4 || brisk__load_be16(d) != dl - 2 || d[2] == 0 || d[2] != dl - 3) {
-                return hs_fail(hs, BRISK__ALERT_DECODE_ERROR);
-            }
-            for (off = 0; off < hs->alpn_len; off += 1 + (size_t)hs->alpn[off]) {
-                if (hs->alpn[off] == d[2] && memcmp(hs->alpn + off + 1, d + 3, d[2]) == 0) {
-                    break;
-                }
-            }
-            if (off >= hs->alpn_len) {
-                return hs_fail(hs, hs->cfg.quic ? BRISK__ALERT_NO_APPLICATION_PROTOCOL
-                                                : BRISK__ALERT_ILLEGAL_PARAMETER);
-            }
-            hs->alpn_sel_off = (uint16_t)(off + 1);
-            hs->alpn_sel_len = d[2];
+        if (t == EXT_ALPN && (alert = brisk__hs_alpn_check(hs, d, dl)) != 0) {
+            return brisk__hs_fail(hs, alert);
         }
     }
     /* RFC 9001 8.2: EE without quic_transport_parameters over QUIC is missing_extension. The
      * value is handed over here, the only moment it is in memory; its contents are the QUIC
      * layer's to judge (RFC 9000 7.4) - a refusal is a local verdict, internal_error. */
     if (hs->cfg.quic && tp == NULL) {
-        return hs_fail(hs, BRISK__ALERT_MISSING_EXTENSION);
+        return brisk__hs_fail(hs, BRISK__ALERT_MISSING_EXTENSION);
     }
     /* RFC 9001 8.1: over QUIC the server MUST select an application protocol */
     if (hs->cfg.quic && hs->alpn_sel_len == 0) {
-        return hs_fail(hs, BRISK__ALERT_NO_APPLICATION_PROTOCOL);
+        return brisk__hs_fail(hs, BRISK__ALERT_NO_APPLICATION_PROTOCOL);
     }
     if (tp != NULL && hs->cfg.on_peer_tp != NULL &&
         hs->cfg.on_peer_tp(hs->cfg.tp_ctx, tp, tp_len) != 0) {
-        return hs_fail(hs, BRISK__ALERT_INTERNAL_ERROR);
+        return brisk__hs_fail(hs, BRISK__ALERT_INTERNAL_ERROR);
     }
-    th_add(hs, m, n);
+    brisk__hs_th_add(hs, m, n);
     /* A.1: a PSK handshake has no Certificate/CertificateVerify, and 4.4.2 forbids a
      * CertificateRequest in it - both are unexpected_message from WAIT_FIN. */
     hs->state = hs->psk_ok ? BRISK__HS_WAIT_FIN : BRISK__HS_WAIT_CERT_CR;
@@ -633,26 +694,27 @@ static int hs_on_cr(brisk__tls13_hs *hs, const uint8_t *m, size_t n)
 
     /* certificate_request_context<0..2^8-1> extensions<0..2^16-1> (4.4.2) */
     if (bl < 1 || bl - 1 < (size_t)b[0] + 2) {
-        return hs_fail(hs, BRISK__ALERT_DECODE_ERROR);
+        return brisk__hs_fail(hs, BRISK__ALERT_DECODE_ERROR);
     }
     el = brisk__load_be16(b + 1 + b[0]);
     if (el != bl - 3 - b[0]) {
-        return hs_fail(hs, BRISK__ALERT_DECODE_ERROR);
+        return brisk__hs_fail(hs, BRISK__ALERT_DECODE_ERROR);
     }
     if (b[0] != 0) {
-        return hs_fail(hs, BRISK__ALERT_ILLEGAL_PARAMETER); /* zero length in the handshake */
+        return brisk__hs_fail(hs,
+                              BRISK__ALERT_ILLEGAL_PARAMETER); /* zero length in the handshake */
     }
     alert = hs_ext_check(hs, b + 3, el, IN_CR);
     if (alert) {
-        return hs_fail(hs, alert);
+        return brisk__hs_fail(hs, alert);
     }
     r = hs_ext_find(b + 3, el, EXT_SIGNATURE_ALGORITHMS, &d, &dl);
     if (r != 1) {
-        return hs_fail(hs, BRISK__ALERT_MISSING_EXTENSION); /* "MUST be specified" */
+        return brisk__hs_fail(hs, BRISK__ALERT_MISSING_EXTENSION); /* "MUST be specified" */
     }
     /* 4.3.3: SignatureScheme supported_signature_algorithms<2..2^16-2> */
     if (dl < 4 || brisk__load_be16(d) != dl - 2 || (dl & 1) != 0) {
-        return hs_fail(hs, BRISK__ALERT_DECODE_ERROR);
+        return brisk__hs_fail(hs, BRISK__ALERT_DECODE_ERROR);
     }
     /* 4.5.2: our CertificateVerify scheme must be one the server listed. certificate_authorities,
      * oid_filters and signature_algorithms_cert are parsed (hs_ext_check) but not acted on:
@@ -660,7 +722,7 @@ static int hs_on_cr(brisk__tls13_hs *hs, const uint8_t *m, size_t n)
     for (el = 2; el < dl; el += 2) {
         hs->cr_sig_ok |= (uint8_t)(brisk__load_be16(d + el) == 0x0403);
     }
-    th_add(hs, m, n);
+    brisk__hs_th_add(hs, m, n);
     hs->cr_seen = 1;
     hs->state = BRISK__HS_WAIT_CERT;
     return BRISK_OK;
@@ -675,41 +737,42 @@ static int hs_on_cert(brisk__tls13_hs *hs, const uint8_t *m, size_t n)
 
     /* certificate_request_context<0..2^8-1> CertificateEntry certificate_list<0..2^24-1> */
     if (bl < 1 || bl - 1 < (size_t)b[0] + 3) {
-        return hs_fail(hs, BRISK__ALERT_DECODE_ERROR);
+        return brisk__hs_fail(hs, BRISK__ALERT_DECODE_ERROR);
     }
     if (brisk__load_be24(b + 1 + b[0]) != bl - 4 - b[0]) {
-        return hs_fail(hs, BRISK__ALERT_DECODE_ERROR);
+        return brisk__hs_fail(hs, BRISK__ALERT_DECODE_ERROR);
     }
     if (b[0] != 0) {
-        return hs_fail(hs, BRISK__ALERT_ILLEGAL_PARAMETER); /* 4.5.1: server auth => empty */
+        return brisk__hs_fail(hs, BRISK__ALERT_ILLEGAL_PARAMETER); /* 4.5.1: server auth => empty */
     }
     if (bl == 4) {
-        return hs_fail(hs, BRISK__ALERT_DECODE_ERROR); /* 4.5.1.3: an empty certificate_list */
+        return brisk__hs_fail(hs,
+                              BRISK__ALERT_DECODE_ERROR); /* 4.5.1.3: an empty certificate_list */
     }
     /* Pass 1, structure only: cert_data<1..2^24-1> extensions<0..2^16-1> per entry. */
     for (p = b + 4, end = b + bl; p != end; p += len + 2 + el) {
         if ((size_t)(end - p) < 3) {
-            return hs_fail(hs, BRISK__ALERT_DECODE_ERROR);
+            return brisk__hs_fail(hs, BRISK__ALERT_DECODE_ERROR);
         }
         len = brisk__load_be24(p);
         p += 3;
         if (len == 0 || (size_t)(end - p) < 2 || len > (size_t)(end - p) - 2) {
-            return hs_fail(hs, BRISK__ALERT_DECODE_ERROR);
+            return brisk__hs_fail(hs, BRISK__ALERT_DECODE_ERROR);
         }
         el = brisk__load_be16(p + len);
         if (el > (size_t)(end - p) - len - 2) {
-            return hs_fail(hs, BRISK__ALERT_DECODE_ERROR);
+            return brisk__hs_fail(hs, BRISK__ALERT_DECODE_ERROR);
         }
         if (el != 0) {
             /* 4.5.1: entry extensions answer ClientHello ones; this client requests none
              * (status_request and friends are refused at absorb), so any is unsolicited. */
             if (hs_ext_find(p + len + 2, el, 0xffff, &xd, &xl) < 0) {
-                return hs_fail(hs, BRISK__ALERT_DECODE_ERROR);
+                return brisk__hs_fail(hs, BRISK__ALERT_DECODE_ERROR);
             }
-            return hs_fail(hs, BRISK__ALERT_UNSUPPORTED_EXTENSION);
+            return brisk__hs_fail(hs, BRISK__ALERT_UNSUPPORTED_EXTENSION);
         }
         if (++count > BRISK__X509_MAX_CHAIN) {
-            return hs_fail(hs, BRISK__ALERT_BAD_CERTIFICATE); /* local limit, fail closed */
+            return brisk__hs_fail(hs, BRISK__ALERT_BAD_CERTIFICATE); /* local limit, fail closed */
         }
     }
     /* Pass 2: parse in place. The structs point into this message, which stays in the
@@ -718,11 +781,11 @@ static int hs_on_cert(brisk__tls13_hs *hs, const uint8_t *m, size_t n)
         len = brisk__load_be24(p);
         p += 3;
         if (brisk__x509_parse(&hs->certs[count++], p, len) != BRISK_OK) {
-            return hs_fail(hs, BRISK__ALERT_BAD_CERTIFICATE);
+            return brisk__hs_fail(hs, BRISK__ALERT_BAD_CERTIFICATE);
         }
     }
     hs->n_certs = count;
-    th_add(hs, m, n);
+    brisk__hs_th_add(hs, m, n);
     hs->in_base = n;
     hs->state = BRISK__HS_WAIT_CV;
     return BRISK_OK;
@@ -737,26 +800,26 @@ static int hs_on_cv(brisk__tls13_hs *hs, const uint8_t *m, size_t n)
     int rc;
 
     if (bl < 4 || brisk__load_be16(b + 2) != bl - 4) {
-        return hs_fail(hs, BRISK__ALERT_DECODE_ERROR);
+        return brisk__hs_fail(hs, BRISK__ALERT_DECODE_ERROR);
     }
     scheme = (uint16_t)brisk__load_be16(b);
     /* 4.5.2: a scheme the client offered; 4.3.3: never rsa_pkcs1_* (certificates only), never
      * SHA-1 (0x02xx) or SHA-224 (0x03xx). The auth function refuses what it cannot verify. */
-    if (!hs_in_list(hs->offered_sigs, hs->n_sigs, scheme) || (scheme & 0xff) == 0x01 ||
+    if (!brisk__hs_in_list(hs->offered_sigs, hs->n_sigs, scheme) || (scheme & 0xff) == 0x01 ||
         (scheme >> 8) == 0x02 || (scheme >> 8) == 0x03) {
-        return hs_fail(hs, BRISK__ALERT_ILLEGAL_PARAMETER);
+        return brisk__hs_fail(hs, BRISK__ALERT_ILLEGAL_PARAMETER);
     }
-    th_snap(hs, th);
-    tbs_len = brisk__tls13_cv_content(1, th, brisk_hash_len(hs_alg(hs->suite)), tbs);
-    rc = hs->cfg.auth(hs->cfg.auth_ctx, hs->certs, hs->n_certs, scheme, tbs, tbs_len, b + 4, bl - 4,
-                      &alert);
+    brisk__hs_th_snap(hs, th);
+    tbs_len = brisk__tls13_cv_content(1, th, brisk_hash_len(brisk__hs_alg(hs->suite)), tbs);
+    rc = hs->cfg.auth(hs->cfg.auth_ctx, 0x0304, hs->certs, hs->n_certs, scheme, tbs, tbs_len, b + 4,
+                      bl - 4, &alert);
     if (rc != BRISK_OK) {
         if (alert == 0) {
             alert = rc == BRISK_E_AUTH ? BRISK__ALERT_DECRYPT_ERROR : BRISK__ALERT_BAD_CERTIFICATE;
         }
-        return hs_fail(hs, alert);
+        return brisk__hs_fail(hs, alert);
     }
-    th_add(hs, m, n);
+    brisk__hs_th_add(hs, m, n);
     hs->n_certs = 0;
     hs->in_base = 0; /* the Certificate message may now be overwritten */
     hs->state = BRISK__HS_WAIT_FIN;
@@ -768,7 +831,7 @@ static int hs_on_cv(brisk__tls13_hs *hs, const uint8_t *m, size_t n)
  * and empty extensions (4.5.1: client entry extensions only answer CR extensions, and we answer
  * none). Returns its length, written to out when non-NULL; 0 if the chain is not a sequence of
  * DER TLVs (refused at hs_init, so never at handshake time). */
-static size_t hs_chain_entries(const uint8_t *chain, size_t len, uint8_t *out)
+HS_SHARED size_t brisk__hs_chain_entries(const uint8_t *chain, size_t len, uint8_t *out, int ext)
 {
     brisk__der c;
     const uint8_t *tlv;
@@ -781,10 +844,12 @@ static size_t hs_chain_entries(const uint8_t *chain, size_t len, uint8_t *out)
         if (out != NULL) {
             brisk__store_be24(out + n, (uint32_t)tl);
             memcpy(out + n + 3, tlv, tl);
-            out[n + 3 + tl] = 0;
-            out[n + 4 + tl] = 0;
+            if (ext) {
+                out[n + 3 + tl] = 0;
+                out[n + 4 + tl] = 0;
+            }
         }
-        n += 3 + tl + 2;
+        n += 3 + tl + (ext ? 2u : 0u); /* TLS 1.2 entries carry no extensions (RFC 5246 7.4.2) */
     }
     return brisk__der_err(&c) == BRISK_OK ? n : 0;
 }
@@ -803,8 +868,8 @@ static int hs_client_auth(brisk__tls13_hs *hs)
     int rc;
 
     if (hs->cfg.client_chain != NULL && hs->cr_sig_ok) {
-        n = hs_chain_entries(hs->cfg.client_chain, hs->cfg.client_chain_len, NULL);
-        q = n != 0 ? hs_reserve(hs, BRISK__EPOCH_HANDSHAKE, 8 + n) : NULL;
+        n = brisk__hs_chain_entries(hs->cfg.client_chain, hs->cfg.client_chain_len, NULL, 1);
+        q = n != 0 ? brisk__hs_reserve(hs, BRISK__EPOCH_HANDSHAKE, 8 + n) : NULL;
         if (q == NULL) {
             return BRISK_E_ARG; /* the ClientHello was never pulled: see hs_cfg.client_chain */
         }
@@ -812,11 +877,11 @@ static int hs_client_auth(brisk__tls13_hs *hs)
         brisk__store_be24(q + 1, (uint32_t)(4 + n));
         q[4] = 0;
         brisk__store_be24(q + 5, (uint32_t)n);
-        hs_chain_entries(hs->cfg.client_chain, hs->cfg.client_chain_len, q + 8);
-        th_add(hs, q, 8 + n);
+        brisk__hs_chain_entries(hs->cfg.client_chain, hs->cfg.client_chain_len, q + 8, 1);
+        brisk__hs_th_add(hs, q, 8 + n);
         /* 4.5.2: ecdsa_secp256r1_sha256 over the client context string || TH(CH..Certificate) */
-        th_snap(hs, th);
-        tbs_len = brisk__tls13_cv_content(0, th, brisk_hash_len(hs_alg(hs->suite)), tbs);
+        brisk__hs_th_snap(hs, th);
+        tbs_len = brisk__tls13_cv_content(0, th, brisk_hash_len(brisk__hs_alg(hs->suite)), tbs);
         if (hs->cfg.client_key != NULL) {
             /* hedged RFC 6979 (3.6) with the caller's fresh k'; a BRISK_E_AUTH from the
              * fault self-check is fatal, never retried (a glitched signature leaks d) */
@@ -835,38 +900,38 @@ static int hs_client_auth(brisk__tls13_hs *hs)
             brisk__store_be24(cv + 1, (uint32_t)(4 + n));
             brisk__store_be16(cv + 4, 0x0403);
             brisk__store_be16(cv + 6, (uint32_t)n);
-            rc = hs_queue(hs, BRISK__EPOCH_HANDSHAKE, cv, 8 + n) ? BRISK_OK : BRISK_E_ARG;
+            rc = brisk__hs_queue(hs, BRISK__EPOCH_HANDSHAKE, cv, 8 + n) ? BRISK_OK : BRISK_E_ARG;
         }
         brisk__secure_zero(raw, sizeof raw);
         brisk__secure_zero(th, sizeof th);
         return rc;
     }
 #endif
-    return hs_queue(hs, BRISK__EPOCH_HANDSHAKE, EMPTY_CERT, sizeof EMPTY_CERT) ? BRISK_OK
-                                                                               : BRISK_E_ARG;
+    return brisk__hs_queue(hs, BRISK__EPOCH_HANDSHAKE, EMPTY_CERT, sizeof EMPTY_CERT) ? BRISK_OK
+                                                                                      : BRISK_E_ARG;
 }
 
 static int hs_on_fin(brisk__tls13_hs *hs, const uint8_t *m, size_t n)
 {
     uint8_t th[BRISK_HASH_MAX_LEN], mac[4 + BRISK_HASH_MAX_LEN];
     uint8_t c_ap[BRISK_HASH_MAX_LEN], s_ap[BRISK_HASH_MAX_LEN];
-    brisk_hash_alg alg = hs_alg(hs->suite);
+    brisk_hash_alg alg = brisk__hs_alg(hs->suite);
     size_t hl = brisk_hash_len(alg);
     int ok, rc;
 
     if (n - 4 != hl) {
-        return hs_fail(hs, BRISK__ALERT_DECODE_ERROR); /* 4.5.3: verify_data is HashLen */
+        return brisk__hs_fail(hs, BRISK__ALERT_DECODE_ERROR); /* 4.5.3: verify_data is HashLen */
     }
-    th_snap(hs, th);
+    brisk__hs_th_snap(hs, th);
     rc = brisk__tls_finished_mac(alg, hs->s_hs, th, mac);
     ok = rc == BRISK_OK && brisk__ct_memeq(mac, m + 4, hl);
     BRISK__CT_PUBLIC(&ok, sizeof ok); /* the verdict the alert reveals anyway */
     brisk__secure_zero(mac, sizeof mac);
     if (!ok) {
-        return hs_fail(hs, BRISK__ALERT_DECRYPT_ERROR);
+        return brisk__hs_fail(hs, BRISK__ALERT_DECRYPT_ERROR);
     }
-    th_add(hs, m, n);
-    th_snap(hs, th); /* TH(CH..server Finished): the application secrets (7.1) */
+    brisk__hs_th_add(hs, m, n);
+    brisk__hs_th_snap(hs, th); /* TH(CH..server Finished): the application secrets (7.1) */
     rc = brisk__tls_ks_derive_application(&hs->ks, th, c_ap, s_ap, hs->exp_ms);
 
     /* Client flight (4.5, A.1): Certificate [+ CertificateVerify] iff one was requested, then
@@ -875,18 +940,18 @@ static int hs_on_fin(brisk__tls13_hs *hs, const uint8_t *m, size_t n)
         rc = hs_client_auth(hs);
     }
     if (rc == BRISK_OK) {
-        th_snap(hs, th);
+        brisk__hs_th_snap(hs, th);
         mac[0] = HS_FINISHED;
         mac[1] = 0;
         mac[2] = 0;
         mac[3] = (uint8_t)hl;
         rc = brisk__tls_finished_mac(alg, hs->c_hs, th, mac + 4);
     }
-    if (rc == BRISK_OK && !hs_queue(hs, BRISK__EPOCH_HANDSHAKE, mac, 4 + hl)) {
+    if (rc == BRISK_OK && !brisk__hs_queue(hs, BRISK__EPOCH_HANDSHAKE, mac, 4 + hl)) {
         rc = BRISK_E_ARG;
     }
     if (rc == BRISK_OK) {
-        th_snap(hs, th);
+        brisk__hs_th_snap(hs, th);
         rc = brisk__tls_ks_derive_resumption(&hs->ks, th, hs->res_ms);
     }
     if (rc == BRISK_OK &&
@@ -897,7 +962,7 @@ static int hs_on_fin(brisk__tls13_hs *hs, const uint8_t *m, size_t n)
     brisk__secure_zero(c_ap, sizeof c_ap);
     brisk__secure_zero(s_ap, sizeof s_ap);
     if (rc != BRISK_OK) {
-        return hs_fail(hs, BRISK__ALERT_INTERNAL_ERROR);
+        return brisk__hs_fail(hs, BRISK__ALERT_INTERNAL_ERROR);
     }
     hs_wipe_secrets(hs); /* c_hs, s_hs and the master secret are done with */
     hs->in_epoch = BRISK__EPOCH_APP;
@@ -921,7 +986,7 @@ static int hs_on_nst(brisk__tls13_hs *hs, const uint8_t *m, size_t n)
     /* ticket_lifetime(4) ticket_age_add(4) ticket_nonce<0..255> ticket<1..2^16-1>
      * extensions<0..2^16-2>, every length checked against what remains before it is used */
     if (bl < 9 || bl - 9 < (size_t)b[8] + 2) {
-        return hs_fail(hs, BRISK__ALERT_DECODE_ERROR);
+        return brisk__hs_fail(hs, BRISK__ALERT_DECODE_ERROR);
     }
     tk.lifetime = brisk__load_be32(b);
     tk.age_add = brisk__load_be32(b + 4);
@@ -930,41 +995,41 @@ static int hs_on_nst(brisk__tls13_hs *hs, const uint8_t *m, size_t n)
     i = 9 + tk.nonce_len;
     tk.ticket_len = brisk__load_be16(b + i);
     if (tk.ticket_len == 0 || bl - i - 2 < tk.ticket_len + 2) {
-        return hs_fail(hs, BRISK__ALERT_DECODE_ERROR);
+        return brisk__hs_fail(hs, BRISK__ALERT_DECODE_ERROR);
     }
     tk.ticket = b + i + 2;
     i += 2 + tk.ticket_len;
     if (brisk__load_be16(b + i) != bl - i - 2) {
-        return hs_fail(hs, BRISK__ALERT_DECODE_ERROR); /* short, or trailing bytes */
+        return brisk__hs_fail(hs, BRISK__ALERT_DECODE_ERROR); /* short, or trailing bytes */
     }
     exts = p = b + i + 2;
     end = b + bl;
-    while ((r = hs_ext_next(&p, end, &type, &d, &dl)) == 1) {
+    while ((r = brisk__hs_ext_next(&p, end, &type, &d, &dl)) == 1) {
         /* 4.3: at most one of each type, known or not (the prefix already parsed cleanly) */
         if (hs_ext_find(exts, (size_t)(d - 4 - exts), type, &d2, &dl2) == 1) {
-            return hs_fail(hs, BRISK__ALERT_ILLEGAL_PARAMETER);
+            return brisk__hs_fail(hs, BRISK__ALERT_ILLEGAL_PARAMETER);
         }
         /* 4.3: a recognised extension not specified for NST (Table 1: only early_data) MUST
          * abort with illegal_parameter; unrecognised ones are ignored. No "offered" rule: NST
          * extensions are not responses. */
         r = hs_ext_index(type);
         if (r >= 0 && !(EXT_TABLE[r].where & IN_NST)) {
-            return hs_fail(hs, BRISK__ALERT_ILLEGAL_PARAMETER);
+            return brisk__hs_fail(hs, BRISK__ALERT_ILLEGAL_PARAMETER);
         }
         if (type == EXT_EARLY_DATA) { /* max_early_data_size */
             if (dl != 4) {
-                return hs_fail(hs, BRISK__ALERT_DECODE_ERROR);
+                return brisk__hs_fail(hs, BRISK__ALERT_DECODE_ERROR);
             }
             tk.max_early_data = brisk__load_be32(d);
             /* RFC 9001 4.6.1: over QUIC any value but 0xffffffff is PROTOCOL_VIOLATION; the
              * QUIC layer (M6) must map this alert to that error, not to CRYPTO_ERROR */
             if (hs->cfg.quic && tk.max_early_data != 0xffffffffu) {
-                return hs_fail(hs, BRISK__ALERT_ILLEGAL_PARAMETER);
+                return brisk__hs_fail(hs, BRISK__ALERT_ILLEGAL_PARAMETER);
             }
         }
     }
     if (r < 0) {
-        return hs_fail(hs, BRISK__ALERT_DECODE_ERROR);
+        return brisk__hs_fail(hs, BRISK__ALERT_DECODE_ERROR);
     }
     if (hs->cfg.on_ticket == NULL) {
         return BRISK_OK; /* 4.7.1: a client that does not resume silently ignores the ticket */
@@ -972,15 +1037,15 @@ static int hs_on_nst(brisk__tls13_hs *hs, const uint8_t *m, size_t n)
     /* 4.7.1: PSK = HKDF-Expand-Label(resumption_master_secret, "resumption", ticket_nonce,
      * HashLen), usable only under a suite of the same hash - hence the suite goes with it. */
     tk.suite = hs->suite;
-    tk.psk_len = brisk_hash_len(hs_alg(hs->suite));
-    r = brisk__hkdf_expand_label(hs_alg(hs->suite), hs->res_ms, tk.psk_len, "resumption", tk.nonce,
-                                 tk.nonce_len, tk.psk, tk.psk_len);
+    tk.psk_len = brisk_hash_len(brisk__hs_alg(hs->suite));
+    r = brisk__hkdf_expand_label(brisk__hs_alg(hs->suite), hs->res_ms, tk.psk_len, "resumption",
+                                 tk.nonce, tk.nonce_len, tk.psk, tk.psk_len);
     if (r == BRISK_OK) {
         r = hs->cfg.on_ticket(hs->cfg.ticket_ctx, &tk);
     }
     brisk__secure_zero(tk.psk, sizeof tk.psk);
     if (r != 0) {
-        return hs_fail(hs, BRISK__ALERT_INTERNAL_ERROR);
+        return brisk__hs_fail(hs, BRISK__ALERT_INTERNAL_ERROR);
     }
     return BRISK_OK;
 }
@@ -990,13 +1055,13 @@ static int hs_on_nst(brisk__tls13_hs *hs, const uint8_t *m, size_t n)
 static int hs_on_ku(brisk__tls13_hs *hs, const uint8_t *m, size_t n)
 {
     if (hs->cfg.quic) {
-        return hs_fail(hs, BRISK__ALERT_UNEXPECTED_MESSAGE); /* RFC 9001 6: error 0x010a */
+        return brisk__hs_fail(hs, BRISK__ALERT_UNEXPECTED_MESSAGE); /* RFC 9001 6: error 0x010a */
     }
     if (n != 5) {
-        return hs_fail(hs, BRISK__ALERT_DECODE_ERROR);
+        return brisk__hs_fail(hs, BRISK__ALERT_DECODE_ERROR);
     }
     if (m[4] > 1) {
-        return hs_fail(hs, BRISK__ALERT_ILLEGAL_PARAMETER);
+        return brisk__hs_fail(hs, BRISK__ALERT_ILLEGAL_PARAMETER);
     }
     hs->ku |= (uint8_t)(1 | (m[4] << 1));
     return BRISK_OK;
@@ -1004,6 +1069,11 @@ static int hs_on_ku(brisk__tls13_hs *hs, const uint8_t *m, size_t n)
 
 static int hs_dispatch(brisk__tls13_hs *hs, const uint8_t *m, size_t n)
 {
+#if BRISK_ENABLE_TLS12
+    if (hs->version == 0x0303) {
+        return brisk__tls12_dispatch(hs, m, n);
+    }
+#endif
     switch (hs->state) {
     case BRISK__HS_WAIT_SH:
         if (m[0] == HS_SERVER_HELLO) {
@@ -1047,7 +1117,7 @@ static int hs_dispatch(brisk__tls13_hs *hs, const uint8_t *m, size_t n)
     default:
         break;
     }
-    return hs_fail(hs, BRISK__ALERT_UNEXPECTED_MESSAGE); /* RFC 9846 4, Appendix A.1 */
+    return brisk__hs_fail(hs, BRISK__ALERT_UNEXPECTED_MESSAGE); /* RFC 9846 4, Appendix A.1 */
 }
 
 /* ------------------------------------------------------------------ public entry points ---- */
@@ -1069,7 +1139,7 @@ static int hs_client_cfg_ok(const brisk__tls13_hs_cfg *cfg)
     brisk__der c;
     const uint8_t *tlv;
     uint8_t pub[65];
-    size_t tl, n = hs_chain_entries(cfg->client_chain, cfg->client_chain_len, NULL);
+    size_t tl, n = brisk__hs_chain_entries(cfg->client_chain, cfg->client_chain_len, NULL, 1);
     int first = 1;
 
     if ((cfg->client_key != NULL) == (cfg->sign != NULL) ||
@@ -1145,7 +1215,7 @@ typedef struct {
     size_t cookie_len, alpn_len;
     size_t binder_len; /* 0 = no pre_shared_key; else the one binder's length, at the very end */
     uint16_t rsl;      /* our record_size_limit, 0 = not offered */
-    int tls13, share, modes;
+    int tls13, share, modes, tls12, n12; /* tls12: 0x0303 listed; n12: TLS 1.2 suites offered */
 } hs_offer;
 
 /* A uint16 list<2..> exactly filling `len` bytes at d (after its own length prefix of `pre`
@@ -1194,6 +1264,12 @@ static int hs_parse_ch(const uint8_t *ch, size_t ch_len, uint16_t share_group, i
         return 0;
     }
     for (k = 0; k < o->n_suites; k++) {
+#if BRISK_ENABLE_TLS12
+        if (brisk__tls12_suite(o->suites[k], NULL, NULL, NULL, NULL)) {
+            o->n12++; /* acceptable only with 0x0303 in supported_versions, checked below */
+            continue;
+        }
+#endif
         if (!hs_known_suite(o->suites[k])) {
             return 0; /* the server could pick it, and there is no key schedule for it */
         }
@@ -1206,9 +1282,9 @@ static int hs_parse_ch(const uint8_t *ch, size_t ch_len, uint16_t share_group, i
     p = b + i + 4;
     end = b + bl;
     while (p != end) {
-        if (hs_ext_next(&p, end, &t, &d, &dl) != 1 ||
-            !hs_in_list(CH_ALLOWED, sizeof CH_ALLOWED / sizeof CH_ALLOWED[0], t) ||
-            hs_in_list(o->ext, o->n_ext, t) || o->n_ext == BRISK__TLS13_MAX_OFFER_EXT) {
+        if (brisk__hs_ext_next(&p, end, &t, &d, &dl) != 1 ||
+            !brisk__hs_in_list(CH_ALLOWED, sizeof CH_ALLOWED / sizeof CH_ALLOWED[0], t) ||
+            brisk__hs_in_list(o->ext, o->n_ext, t) || o->n_ext == BRISK__TLS13_MAX_OFFER_EXT) {
             return 0;
         }
         o->ext[o->n_ext++] = t;
@@ -1224,11 +1300,31 @@ static int hs_parse_ch(const uint8_t *ch, size_t ch_len, uint16_t share_group, i
             }
             break;
         case EXT_SUPPORTED_VERSIONS:
-            if (!hs_u16_list(d, dl, 1, v, 4, &k) || !hs_in_list(v, k, 0x0304)) {
+            if (!hs_u16_list(d, dl, 1, v, 4, &k) || !brisk__hs_in_list(v, k, 0x0304)) {
                 return 0;
             }
             o->tls13 = 1;
+#if BRISK_ENABLE_TLS12
+            o->tls12 = brisk__hs_in_list(v, k, 0x0303);
+#endif
             break;
+#if BRISK_ENABLE_TLS12
+        case EXT_EMS: /* RFC 7627 5.1: empty */
+            if (dl != 0) {
+                return 0;
+            }
+            break;
+        case EXT_EC_POINT_FORMATS: /* RFC 8422 5.1.2: exactly [uncompressed] */
+            if (dl != 2 || d[0] != 1 || d[1] != 0) {
+                return 0;
+            }
+            break;
+        case EXT_RENEGOTIATION_INFO: /* RFC 5746 3.4: an initial handshake sends it empty */
+            if (dl != 1 || d[0] != 0) {
+                return 0;
+            }
+            break;
+#endif
         case EXT_KEY_SHARE:
             /* KeyShareClientHello with exactly one entry, the one the private key belongs to */
             if (dl < 6 || brisk__load_be16(d) != dl - 2 || brisk__load_be16(d + 2) != share_group ||
@@ -1295,9 +1391,17 @@ static int hs_parse_ch(const uint8_t *ch, size_t ch_len, uint16_t share_group, i
      * supported_groups with key_share for (EC)DHE (RFC 9846 9.2). RFC 9001 8.2: over QUIC the
      * client MUST send quic_transport_parameters, and MUST NOT send it over TCP. */
     /* 4.3.9: a PSK needs psk_key_exchange_modes. RFC 9001 8.1: over QUIC, ALPN is mandatory. */
+    /* RFC 9846 9.3: every parameter offered must be supported - a TLS 1.2 suite only with 0x0303
+     * in supported_versions, and never over QUIC (RFC 9001 4.2). A TLS12=0 build that is handed
+     * a CH listing 0x0303 answers a TLS 1.2 ServerHello with protocol_version. */
+#if BRISK_ENABLE_TLS12
+    if (o->n12 != 0 && (!o->tls12 || quic)) {
+        return 0;
+    }
+#endif
     return o->tls13 && o->share && o->n_sigs && o->n_groups &&
-           hs_in_list(o->groups, o->n_groups, share_group) &&
-           (quic != 0) == hs_in_list(o->ext, o->n_ext, EXT_QUIC_TP) &&
+           brisk__hs_in_list(o->groups, o->n_groups, share_group) &&
+           (quic != 0) == brisk__hs_in_list(o->ext, o->n_ext, EXT_QUIC_TP) &&
            (o->binder_len == 0 || o->modes) && (!quic || o->alpn != NULL);
 }
 
@@ -1306,7 +1410,7 @@ static int hs_parse_ch(const uint8_t *ch, size_t ch_len, uint16_t share_group, i
  * the binders list, whose length fields stay counted. */
 static int hs_binder(const brisk__tls13_hs *hs, const uint8_t *ch, size_t ch_len, uint8_t *out)
 {
-    brisk_hash_alg alg = hs_alg(hs->psk_suite);
+    brisk_hash_alg alg = brisk__hs_alg(hs->psk_suite);
     uint8_t th[BRISK_HASH_MAX_LEN];
     brisk_hash_ctx c;
     if (hs->state == BRISK__HS_START) {
@@ -1341,6 +1445,9 @@ int brisk__tls13_hs_client_hello(brisk__tls13_hs *hs, const uint8_t *ch, size_t 
             return BRISK_E_ARG; /* 4.3.2: never a cookie in an initial ClientHello */
         }
         hs->session_id_len = ch[4 + 34];
+#if BRISK_ENABLE_TLS12
+        memcpy(hs->crand, ch + 4 + 2, 32); /* the client_random of RFC 5246 7.4.3 / 6.3 */
+#endif
         memcpy(hs->session_id, ch + 4 + 35, hs->session_id_len);
     } else {
         /* 4.2.2: the same ClientHello, with key_share replaced by the HRR's group and the
@@ -1350,7 +1457,7 @@ int brisk__tls13_hs_client_hello(brisk__tls13_hs *hs, const uint8_t *ch, size_t 
             share_group != (hs->hrr_group ? hs->hrr_group : hs->share_group) ||
             o.cookie_len != hs->cookie_len ||
             (o.cookie_len && memcmp(o.cookie, hs->cookie, o.cookie_len) != 0) ||
-            !hs_in_list(o.suites, o.n_suites, hs->suite)) {
+            !brisk__hs_in_list(o.suites, o.n_suites, hs->suite)) {
             return BRISK_E_ARG;
         }
     }
@@ -1362,25 +1469,27 @@ int brisk__tls13_hs_client_hello(brisk__tls13_hs *hs, const uint8_t *ch, size_t 
             return BRISK_E_ARG;
         }
         for (k = 0; k < o.n_suites; k++) {
-            if (hs_alg(o.suites[k]) == hs_alg(hs->psk_suite)) {
+            if (brisk__hs_alg(o.suites[k]) == brisk__hs_alg(hs->psk_suite)) {
                 break;
             }
         }
         if (k == o.n_suites ||
-            (hs->state == BRISK__HS_WAIT_CH2 && hs_alg(hs->suite) != hs_alg(hs->psk_suite)) ||
+            (hs->state == BRISK__HS_WAIT_CH2 &&
+             brisk__hs_alg(hs->suite) != brisk__hs_alg(hs->psk_suite)) ||
             hs_binder(hs, ch, ch_len, binder) != BRISK_OK) {
             return BRISK_E_ARG;
         }
     } else {
         /* 4.2.2: CH2 may drop CH1's PSK only when the HRR's suite has another hash */
         if (hs->state == BRISK__HS_WAIT_CH2 && hs->psk_offered &&
-            hs_alg(hs->suite) == hs_alg(hs->psk_suite)) {
+            brisk__hs_alg(hs->suite) == brisk__hs_alg(hs->psk_suite)) {
             return BRISK_E_ARG;
         }
         brisk__secure_zero(hs->psk, sizeof hs->psk);
         hs->psk_len = 0;
     }
     hs->psk_offered = (uint8_t)(o.binder_len != 0);
+    hs->tls12_offered = (uint8_t)(BRISK_ENABLE_TLS12 && o.tls12 && o.n12 != 0);
     if (o.alpn_len != 0) {
         memcpy(hs->alpn, o.alpn, o.alpn_len);
     }
@@ -1396,13 +1505,13 @@ int brisk__tls13_hs_client_hello(brisk__tls13_hs *hs, const uint8_t *ch, size_t 
     hs->n_sigs = (uint8_t)o.n_sigs;
     hs->share_group = share_group;
     memcpy(hs->priv, share_priv, sizeof hs->priv);
-    q = hs_reserve(hs, BRISK__EPOCH_INITIAL, ch_len); /* room was checked above */
+    q = brisk__hs_reserve(hs, BRISK__EPOCH_INITIAL, ch_len); /* room was checked above */
     memcpy(q, ch, ch_len);
     if (hs->psk_offered) { /* the binder goes into OUR copy; the caller's bytes stay const */
         memcpy(q + ch_len - hs->psk_len, binder, hs->psk_len);
         brisk__secure_zero(binder, sizeof binder);
     }
-    th_add(hs, q, ch_len);
+    brisk__hs_th_add(hs, q, ch_len);
     hs->state = BRISK__HS_WAIT_SH;
     return BRISK_OK;
 }
@@ -1425,7 +1534,7 @@ int brisk__tls13_hs_feed(brisk__tls13_hs *hs, unsigned epoch, const uint8_t *in,
     /* RFC 9846 5.1: messages MUST NOT span a key change, and nothing is expected before the
      * ClientHello or between an HRR and CH2. After the handshake the epoch is APP (4.7). */
     if (epoch != hs->in_epoch || hs->state == BRISK__HS_START || hs->state == BRISK__HS_WAIT_CH2) {
-        return hs_fail(hs, BRISK__ALERT_UNEXPECTED_MESSAGE);
+        return brisk__hs_fail(hs, BRISK__ALERT_UNEXPECTED_MESSAGE);
     }
     while (len != 0) {
         m = hs->in + hs->in_base;
@@ -1443,7 +1552,7 @@ int brisk__tls13_hs_feed(brisk__tls13_hs *hs, unsigned epoch, const uint8_t *in,
              * same for "excessive message size"); the RFC names none. */
             body = brisk__load_be24(m + 1);
             if (body > BRISK_TLS_MAX_HS_MSG || body > hs->in_cap - hs->in_base - 4) {
-                return hs_fail(hs, BRISK__ALERT_ILLEGAL_PARAMETER);
+                return brisk__hs_fail(hs, BRISK__ALERT_ILLEGAL_PARAMETER);
             }
         }
         need = 4 + brisk__load_be24(m + 1) - hs->in_len;
@@ -1465,7 +1574,7 @@ int brisk__tls13_hs_feed(brisk__tls13_hs *hs, unsigned epoch, const uint8_t *in,
          * KeyUpdate - in the same record, which is what one hs_feed call is over TCP */
         if (len != 0 && (hs->in_epoch != epoch || hs->state == BRISK__HS_WAIT_CH2 ||
                          (hs->state == BRISK__HS_CONNECTED && m[0] == HS_KEY_UPDATE))) {
-            return hs_fail(hs, BRISK__ALERT_UNEXPECTED_MESSAGE);
+            return brisk__hs_fail(hs, BRISK__ALERT_UNEXPECTED_MESSAGE);
         }
     }
     return BRISK_OK;
@@ -1483,7 +1592,9 @@ size_t brisk__tls13_hs_pull(brisk__tls13_hs *hs, unsigned *epoch, uint8_t *out, 
         e = BRISK__EPOCH_INITIAL;
         avail = hs->out_split - hs->out_off;
     } else {
-        e = BRISK__EPOCH_HANDSHAKE;
+        /* TLS 1.2: the second run is the client Finished, which goes out under the new keys
+         * after the CCS - the APP keys of brisk__tls12 (RFC 5246 7.1, 7.4.9) */
+        e = hs->version == 0x0303 ? BRISK__EPOCH_APP : BRISK__EPOCH_HANDSHAKE;
         avail = hs->out_len - hs->out_off;
     }
     n = avail < cap ? avail : cap;
@@ -1501,16 +1612,17 @@ size_t brisk__tls13_hs_pull(brisk__tls13_hs *hs, unsigned *epoch, uint8_t *out, 
 int brisk__tls13_hs_exporter(const brisk__tls13_hs *hs, const char *label, const uint8_t *ctx,
                              size_t ctx_len, uint8_t *out, size_t out_len)
 {
-    if (hs == NULL || hs->state != BRISK__HS_CONNECTED) {
-        return BRISK_E_ARG;
+    if (hs == NULL || hs->state != BRISK__HS_CONNECTED || hs->version != 0x0304) {
+        return BRISK_E_ARG; /* no exporter over TLS 1.2 (RFC 5705 is not implemented) */
     }
-    return brisk__tls_ks_exporter(hs_alg(hs->suite), hs->exp_ms, label, ctx, ctx_len, out, out_len);
+    return brisk__tls_ks_exporter(brisk__hs_alg(hs->suite), hs->exp_ms, label, ctx, ctx_len, out,
+                                  out_len);
 }
 
 int brisk__tls13_hs_set_psk(brisk__tls13_hs *hs, const brisk__tls13_psk *psk)
 {
     if (hs == NULL || psk == NULL || hs->state != BRISK__HS_START || !hs_known_suite(psk->suite) ||
-        psk->psk_len != brisk_hash_len(hs_alg(psk->suite))) {
+        psk->psk_len != brisk_hash_len(brisk__hs_alg(psk->suite))) {
         return BRISK_E_ARG;
     }
     memcpy(hs->psk, psk->psk, psk->psk_len);
@@ -1533,6 +1645,29 @@ int brisk__tls13_hs_resumed(const brisk__tls13_hs *hs)
 {
     return hs != NULL && hs->psk_ok;
 }
+
+uint16_t brisk__tls13_hs_version(const brisk__tls13_hs *hs)
+{
+    return hs != NULL ? hs->version : 0;
+}
+
+#if BRISK_ENABLE_TLS12
+int brisk__tls13_hs_set_tls12_key(brisk__tls13_hs *hs, const uint8_t p256_d[32])
+{
+    int ok;
+    if (hs == NULL || p256_d == NULL || hs->state != BRISK__HS_START) {
+        return BRISK_E_ARG;
+    }
+    /* the range verdict is public, as in brisk__p256_keygen: the OS layer redraws a bad d */
+    ok = brisk__p256_scalar_valid(p256_d);
+    BRISK__CT_PUBLIC(&ok, sizeof ok);
+    if (!ok) {
+        return BRISK_E_ARG;
+    }
+    memcpy(hs->priv_p256, p256_d, sizeof hs->priv_p256);
+    return BRISK_OK;
+}
+#endif
 
 void brisk__tls13_hs_wipe(brisk__tls13_hs *hs)
 {
@@ -1678,9 +1813,19 @@ int brisk__tls13_ch_write(const brisk__tls13_ch_params *p, uint8_t *out, size_t 
     n_sigs = p->sig_schemes ? p->n_sig_schemes : sizeof DEF_SIGS / sizeof DEF_SIGS[0];
     /* 4.3.8: the share's group is one supported_groups lists; no empty lists (9.2). */
     if (n_suites == 0 || n_groups == 0 || n_sigs == 0 || n_suites > 64 || n_groups > 64 ||
-        n_sigs > 64 || !hs_in_list(groups, n_groups, p->share_group)) {
+        n_sigs > 64 || !brisk__hs_in_list(groups, n_groups, p->share_group)) {
         return BRISK_E_ARG;
     }
+    /* M5: TLS 1.2 only where it is compiled, and never over QUIC (RFC 9001 4.2) */
+#if BRISK_ENABLE_TLS12
+    if (p->tls12 && p->quic_tp != NULL) {
+        return BRISK_E_ARG;
+    }
+#else
+    if (p->tls12) {
+        return BRISK_E_ARG;
+    }
+#endif
 
     w.b = out;
     w.n = 0;
@@ -1696,6 +1841,11 @@ int brisk__tls13_ch_write(const brisk__tls13_ch_params *p, uint8_t *out, size_t 
     for (i = 0; i < n_suites; i++) {
         w_u16(&w, suites[i]);
     }
+#if BRISK_ENABLE_TLS12
+    for (i = 0; p->tls12 && i < sizeof DEF12_SUITES / sizeof DEF12_SUITES[0]; i++) {
+        w_u16(&w, DEF12_SUITES[i]);
+    }
+#endif
     w_close(&w, a, 2);
     w_u8(&w, 1); /* legacy_compression_methods = [null] */
     w_u8(&w, 0);
@@ -1722,10 +1872,33 @@ int brisk__tls13_ch_write(const brisk__tls13_ch_params *p, uint8_t *out, size_t 
         w_close(&w, b, 2);
         w_close(&w, a, 2);
     }
-    w_u16(&w, EXT_SUPPORTED_VERSIONS); /* 4.3.1: exactly TLS 1.3 */
+    /* 4.3.1: TLS 1.3, and TLS 1.2 when offered ("MUST be present as well", E.1). Never 0x0302 or
+     * below (E.5, RFC 8996), and never a retry with a lower version: no TLS_FALLBACK_SCSV. */
+    w_u16(&w, EXT_SUPPORTED_VERSIONS);
+#if BRISK_ENABLE_TLS12
+    w_u16(&w, p->tls12 ? 5u : 3u);
+    w_u8(&w, p->tls12 ? 4u : 2u);
+    w_u16(&w, 0x0304);
+    if (p->tls12) {
+        w_u16(&w, 0x0303);
+        /* RFC 8422 5.1: ec_point_formats [uncompressed]; RFC 7627 5.1 / RFC 9325 3.5:
+         * extended_main_secret, empty; RFC 5746 3.4 / RFC 9325 3.5: renegotiation_info with an
+         * empty renegotiated_connection (the extension, not the SCSV) */
+        w_u16(&w, EXT_EC_POINT_FORMATS);
+        w_u16(&w, 2);
+        w_u8(&w, 1);
+        w_u8(&w, 0);
+        w_u16(&w, EXT_EMS);
+        w_u16(&w, 0);
+        w_u16(&w, EXT_RENEGOTIATION_INFO);
+        w_u16(&w, 1);
+        w_u8(&w, 0);
+    }
+#else
     w_u16(&w, 3);
     w_u8(&w, 2);
     w_u16(&w, 0x0304);
+#endif
     if (p->cookie_len != 0) {
         w_u16(&w, EXT_COOKIE);
         a = w_open(&w, 2);
@@ -1823,13 +1996,37 @@ static unsigned cv_scheme(uint16_t scheme, brisk_hash_alg *alg, uint8_t *family)
     }
 }
 
-int brisk__tls13_cv_verify(const brisk__x509_cert *leaf, uint16_t scheme, const uint8_t *tbs,
-                           size_t tbs_len, const uint8_t *sig, size_t sig_len, uint8_t *alert)
+#if BRISK_ENABLE_TLS12
+/* The same for a TLS 1.2 ServerKeyExchange (RFC 9846 4.3.3 "Note that TLS 1.2 defines this
+ * extension differently"): rsa_pkcs1_* is a handshake scheme there, and the ECDSA curve is not
+ * bound to the hash - a client "MUST be prepared to accept a signature that uses any curve that
+ * they advertised", so 0x0503 with a P-256 key (leftmost 256 bits of SHA-384, FIPS 186-5 6.4).
+ * SHA-1 / SHA-224 are never returned. */
+static unsigned sig12_scheme(uint16_t scheme, unsigned leaf_key, brisk_hash_alg *alg,
+                             uint8_t *family)
+{
+    unsigned h = scheme >> 8;
+    if ((scheme & 0xff) == 0x01 && h >= 4 && h <= 6) { /* rsa_pkcs1_sha256 / 384 / 512 */
+        *alg = h == 4 ? BRISK_HASH_SHA256 : h == 5 ? BRISK_HASH_SHA384 : BRISK_HASH_SHA512;
+        *family = BRISK__X509_SIG_RSA_PKCS1;
+        return BRISK__X509_KEY_RSA;
+    }
+    if (scheme == 0x0503 && leaf_key == BRISK__X509_KEY_P256) {
+        *alg = BRISK_HASH_SHA384;
+        *family = BRISK__X509_SIG_ECDSA;
+        return BRISK__X509_KEY_P256;
+    }
+    return cv_scheme(scheme, alg, family);
+}
+#endif
+
+/* A handshake signature under `leaf` once the scheme has been mapped to (key, alg, family). */
+static int sig_check(const brisk__x509_cert *leaf, unsigned key, brisk_hash_alg alg, uint8_t family,
+                     const uint8_t *tbs, size_t tbs_len, const uint8_t *sig, size_t sig_len,
+                     uint8_t *alert)
 {
     brisk__x509_cert child;
-    uint8_t raw[96], family;
-    brisk_hash_alg alg = BRISK_HASH_SHA256;
-    unsigned key = cv_scheme(scheme, &alg, &family);
+    uint8_t raw[96];
     int rc;
 
     if (key == 0 || leaf == NULL || leaf->key_alg != key) {
@@ -1863,21 +2060,48 @@ int brisk__tls13_cv_verify(const brisk__x509_cert *leaf, uint16_t scheme, const 
     return rc == BRISK_E_AUTH ? BRISK_E_AUTH : BRISK_E_ARG;
 }
 
-int brisk__tls13_auth_x509(void *ctx, const brisk__x509_cert *certs, size_t n_certs,
-                           uint16_t scheme, const uint8_t *tbs, size_t tbs_len, const uint8_t *sig,
-                           size_t sig_len, uint8_t *alert)
+int brisk__tls13_cv_verify(const brisk__x509_cert *leaf, uint16_t scheme, const uint8_t *tbs,
+                           size_t tbs_len, const uint8_t *sig, size_t sig_len, uint8_t *alert)
+{
+    brisk_hash_alg alg = BRISK_HASH_SHA256;
+    uint8_t family = 0;
+    unsigned key = cv_scheme(scheme, &alg, &family);
+    return sig_check(leaf, key, alg, family, tbs, tbs_len, sig, sig_len, alert);
+}
+
+#if BRISK_ENABLE_TLS12
+int brisk__tls12_sig_verify(const brisk__x509_cert *leaf, uint16_t scheme, const uint8_t *tbs,
+                            size_t tbs_len, const uint8_t *sig, size_t sig_len, uint8_t *alert)
+{
+    brisk_hash_alg alg = BRISK_HASH_SHA256;
+    uint8_t family = 0;
+    unsigned key = sig12_scheme(scheme, leaf != NULL ? leaf->key_alg : 0u, &alg, &family);
+    return sig_check(leaf, key, alg, family, tbs, tbs_len, sig, sig_len, alert);
+}
+#endif
+
+int brisk__tls13_auth_x509(void *ctx, uint16_t version, const brisk__x509_cert *certs,
+                           size_t n_certs, uint16_t scheme, const uint8_t *tbs, size_t tbs_len,
+                           const uint8_t *sig, size_t sig_len, uint8_t *alert)
 {
     const brisk__tls13_auth_x509_ctx *a = (const brisk__tls13_auth_x509_ctx *)ctx;
     brisk_hash_alg alg;
     uint8_t family;
+    unsigned key;
     int rc;
 
-    if (a == NULL || certs == NULL || n_certs == 0) {
+    if (a == NULL || certs == NULL || n_certs == 0 || (version != 0x0304 && version != 0x0303) ||
+        (!BRISK_ENABLE_TLS12 && version != 0x0304)) {
         *alert = BRISK__ALERT_INTERNAL_ERROR;
         return BRISK_E_ARG;
     }
-    if (cv_scheme(scheme, &alg, &family) != certs[0].key_alg ||
-        cv_scheme(scheme, &alg, &family) == 0) {
+#if BRISK_ENABLE_TLS12
+    key = version == 0x0303 ? sig12_scheme(scheme, certs[0].key_alg, &alg, &family)
+                            : cv_scheme(scheme, &alg, &family);
+#else
+    key = cv_scheme(scheme, &alg, &family);
+#endif
+    if (key != certs[0].key_alg || key == 0) {
         *alert = BRISK__ALERT_ILLEGAL_PARAMETER; /* before any bignum work */
         return BRISK_E_ARG;
     }
@@ -1898,9 +2122,11 @@ int brisk__tls13_auth_x509(void *ctx, const brisk__x509_cert *certs, size_t n_ce
         *alert = BRISK__ALERT_UNSUPPORTED_CERTIFICATE;
         return BRISK_E_AUTH;
     }
-    return brisk__tls13_cv_verify(&certs[0], scheme, tbs, tbs_len, sig, sig_len, alert);
+    return sig_check(&certs[0], key, alg, family, tbs, tbs_len, sig, sig_len, alert);
 }
 
 #undef HS_CV_MAX
 #undef HS_IN_CAP
 #undef HS_CERT_ALIGN
+
+#undef HS_SHARED

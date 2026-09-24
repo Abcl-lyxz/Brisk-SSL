@@ -30,6 +30,16 @@
       }
     },
     {
+      "name": "dev-tls13",
+      "inherits": "base",
+      "displayName": "Host: native gcc, BRISK_ENABLE_TLS12=OFF (the TLS 1.3-only offer, M5)",
+      "cacheVariables": {
+        "CMAKE_C_COMPILER": "gcc",
+        "CMAKE_C_FLAGS": "-fsanitize=undefined -fsanitize-undefined-trap-on-error",
+        "BRISK_ENABLE_TLS12": "OFF"
+      }
+    },
+    {
       "name": "x86_64",
       "inherits": "base",
       "displayName": "Docker: x86_64 gcc, debug + UBSan (trap)",
@@ -139,6 +149,10 @@
       "configurePreset": "dev32"
     },
     {
+      "name": "dev-tls13",
+      "configurePreset": "dev-tls13"
+    },
+    {
       "name": "x86_64",
       "configurePreset": "x86_64"
     },
@@ -194,6 +208,13 @@
     {
       "name": "dev32",
       "configurePreset": "dev32",
+      "output": {
+        "outputOnFailure": true
+      }
+    },
+    {
+      "name": "dev-tls13",
+      "configurePreset": "dev-tls13",
       "output": {
         "outputOnFailure": true
       }
@@ -308,6 +329,23 @@
         {
           "type": "test",
           "name": "dev32"
+        }
+      ]
+    },
+    {
+      "name": "dev-tls13",
+      "steps": [
+        {
+          "type": "configure",
+          "name": "dev-tls13"
+        },
+        {
+          "type": "build",
+          "name": "dev-tls13"
+        },
+        {
+          "type": "test",
+          "name": "dev-tls13"
         }
       ]
     },

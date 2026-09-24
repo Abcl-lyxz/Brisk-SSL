@@ -1,4 +1,5 @@
-/* conn.c - the public TLS 1.3 client connection, sans-I/O (RFC 9846).
+/* conn.c - the public TLS client connection, sans-I/O (RFC 9846; TLS 1.2 with
+ * BRISK_ENABLE_TLS12, offered in the same ClientHello - see src/tls/tls12.c).
  *
  * Glue between the caller's brisk_cfg and the two engines underneath: brisk__tls13_hs (the
  * handshake) and brisk__tls13_conn (records, alerts, close_notify, KeyUpdate). What lives here
@@ -209,6 +210,7 @@ static int conn_hello(brisk_conn *c)
     p.sni_len = c->host_len;
     p.alpn = c->alpn_len != 0 ? c->alpn : NULL;
     p.alpn_len = c->alpn_len;
+    p.tls12 = BRISK_ENABLE_TLS12; /* one ClientHello for TLS 1.3 and 1.2 (RFC 9846 4.3.1) */
     if (ch2 && hs->cookie_len != 0) {
         p.cookie = hs->cookie;
         p.cookie_len = hs->cookie_len;
@@ -245,6 +247,12 @@ static int conn_hello(brisk_conn *c)
         if (rc == BRISK_OK && use_psk && !ch2) {
             rc = brisk__tls13_hs_set_psk(hs, &psk);
         }
+#if BRISK_ENABLE_TLS12
+        /* the P-256 d a TLS 1.2 ServerKeyExchange may pick (the x25519 d is the share's) */
+        if (rc == BRISK_OK && !ch2) {
+            rc = brisk__tls13_hs_set_tls12_key(hs, c->rnd + CONN_RND_P);
+        }
+#endif
         if (rc == BRISK_OK) {
             rc = brisk__tls13_hs_client_hello(hs, c->tc.in, n, g, priv);
         }
@@ -490,6 +498,14 @@ int brisk_alpn(const brisk_conn *c, const char **name, size_t *len)
 int brisk_resumed(const brisk_conn *c)
 {
     return c != NULL && brisk__tls13_hs_resumed(&c->hs);
+}
+
+int brisk_tls_version(const brisk_conn *c)
+{
+    if (c == NULL || c->hs.state != BRISK__HS_CONNECTED) {
+        return BRISK_E_ARG;
+    }
+    return brisk__tls13_hs_version(&c->hs);
 }
 
 void brisk_conn_wipe(brisk_conn *c)

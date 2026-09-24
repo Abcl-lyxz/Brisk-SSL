@@ -6,6 +6,10 @@ reference before emission. Differential vectors come from a fixed seed.
 
 | name | url | sha256 of download |
 |---|---|---|
+| acvp_tls12_ems_expected | https://raw.githubusercontent.com/usnistgov/ACVP-Server/f94e88b0e5672f0b0d44bdbbfe683ef1be2d5b42/gen-val/json-files/TLS-v1.2-KDF-RFC7627/expectedResults.json | `562c3d54150638f34420f37145881a437a6e0994d2d4d315b8a8ac41dd6b76b5` |
+| acvp_tls12_ems_prompt | https://raw.githubusercontent.com/usnistgov/ACVP-Server/f94e88b0e5672f0b0d44bdbbfe683ef1be2d5b42/gen-val/json-files/TLS-v1.2-KDF-RFC7627/prompt.json | `6f08197a1e9420340e0ef0bf472cd8fc1eef9bf425c5a4dd26e839499a5d7e9b` |
+| acvp_tls12_kdf_expected | https://raw.githubusercontent.com/usnistgov/ACVP-Server/f94e88b0e5672f0b0d44bdbbfe683ef1be2d5b42/gen-val/json-files/kdf-components-tls-1.0/expectedResults.json | `676c8f641c787599e407de9dd4ef17c8e6f65203f3e97ee52f6ef1fd33ecc583` |
+| acvp_tls12_kdf_prompt | https://raw.githubusercontent.com/usnistgov/ACVP-Server/f94e88b0e5672f0b0d44bdbbfe683ef1be2d5b42/gen-val/json-files/kdf-components-tls-1.0/prompt.json | `e2b4611425bdecb68b9b900e144e77d1d76b5a2e0dca9acabda01ab91a0c0e70` |
 | cavp_aes_kat | https://csrc.nist.gov/CSRC/media/Projects/Cryptographic-Algorithm-Validation-Program/documents/aes/KAT_AES.zip | `a203b16c9246b2ebae31dee5de21a606be80cf78ceabaca37150236fa098eb60` |
 | cavp_aes_mct | https://csrc.nist.gov/CSRC/media/Projects/Cryptographic-Algorithm-Validation-Program/documents/aes/aesmct.zip | `6a2a72c00b1daacb9a7d20ab92617d322fa1c5dee493968660990e3f4571426b` |
 | cavp_aes_mmt | https://csrc.nist.gov/CSRC/media/Projects/Cryptographic-Algorithm-Validation-Program/documents/aes/aesmmt.zip | `12d1616f7a713e807714055973f04efc402f46a14e3d81869717c7ace4ecbaf0` |
@@ -40,12 +44,19 @@ reference before emission. Differential vectors come from a fixed seed.
 | hpack_swift_nio_hpack_huffman_02 | https://raw.githubusercontent.com/http2jp/hpack-test-case/8a1406e7d14bfcb6c046021f13cc15cfb162726d/swift-nio-hpack-huffman/story_02.json | `fd74c184250bd9f2a718692bd3f622a6d00064562aaa38f5a7b95ce4e98831fb` |
 | hpack_swift_nio_hpack_huffman_08 | https://raw.githubusercontent.com/http2jp/hpack-test-case/8a1406e7d14bfcb6c046021f13cc15cfb162726d/swift-nio-hpack-huffman/story_08.json | `270863e03878eeb9bccb8e83ca1f22993f5a5fa9d5f81e51d05827f3f07559ba` |
 | rfc4231 | https://www.rfc-editor.org/rfc/rfc4231.txt | `72178527ce93500e730bc8eb182b857e583096d652b64ece0879c52ba1df973b` |
+| rfc5246 | https://www.rfc-editor.org/rfc/rfc5246.txt | `2ebe1b8e651696aeacc8ab3848bedb465505737901ea3b691acf40c392958feb` |
+| rfc5288 | https://www.rfc-editor.org/rfc/rfc5288.txt | `f68375c3f1948802240ca5b21f3aa44311ea02f877e4e240d1fc70927ecf1307` |
+| rfc5289 | https://www.rfc-editor.org/rfc/rfc5289.txt | `4bc7e5ae5b8a9e8c022a85530989593ba95bff2d2153aaf2aa5c017f2bd1410b` |
+| rfc5746 | https://www.rfc-editor.org/rfc/rfc5746.txt | `fb894a464bffd123ef7be802b63d7309b7af2bc34091683873c311556de2036d` |
 | rfc5869 | https://www.rfc-editor.org/rfc/rfc5869.txt | `7a40eb3835b35fc947eb12a2ed614db079d43b26e50dbc537c31fba16397089c` |
 | rfc5903 | https://www.rfc-editor.org/rfc/rfc5903.txt | `939fab548a6e6bb49a5b3c4dd24a3c5df54a46645447b2d6f4df4fd88ff2d69f` |
 | rfc6979 | https://www.rfc-editor.org/rfc/rfc6979.txt | `456e8f17558fdbd206f968b96fc6f1b4a71ea331ab30ad17f711ab3adaa7d701` |
 | rfc7541 | https://www.rfc-editor.org/rfc/rfc7541.txt | `2239d7f8fb839b69ae2e928e685559b11376888269f131512197a0e3bacf7f7a` |
+| rfc7627 | https://www.rfc-editor.org/rfc/rfc7627.txt | `3e908b1a511f5894b64b2c7867c5e0e8db43896add4d99a340fe67a07ee11a59` |
 | rfc7748 | https://www.rfc-editor.org/rfc/rfc7748.txt | `279ca0ecc5e92e2962e27b846986aeb74729d9dd34bd4a04a362f80dcb596ad3` |
+| rfc7905 | https://www.rfc-editor.org/rfc/rfc7905.txt | `afa1e233822c6bda1f1ced014d32e6d740454415b53130fa84630a9c5ad2fe69` |
 | rfc8017 | https://www.rfc-editor.org/rfc/rfc8017.txt | `1e72dc473d18df3fc5598cdc12795a9f18f36f1aef15abc23a55eb0d58151d11` |
+| rfc8422 | https://www.rfc-editor.org/rfc/rfc8422.txt | `cac45754399e5115342cf1d773a51ac5a77ad221e9336e43ceadd8f294712350` |
 | rfc8439 | https://www.rfc-editor.org/rfc/rfc8439.txt | `25bef70fbf7a07ff45c2fe4cb7c6ce954eac687413d8610603268b4e4415324c` |
 | rfc8448 | https://www.rfc-editor.org/rfc/rfc8448.txt | `6564d1376d1ec744fc7a9993da15ebc1b9be361908b166091f47ef605c537fba` |
 | rfc9001 | https://www.rfc-editor.org/rfc/rfc9001.txt | `3bbaecdf5afd278052a2c48348ce118c4ff8d0cf6b9915549858171b3f98a591` |
@@ -103,6 +114,9 @@ reference before emission. Differential vectors come from a fixed seed.
   TLS layer reading `KeyShareEntry.key_exchange`. The rule behind them, that a compressed
   point is rejected and never decompressed, is pinned instead by generated
   0x02/0x03/0x06/0x07 rows and by the all-256-first-bytes sweep in `tests/test_p256.c`.
+  Since M5 they ARE replayed at that layer: as the ECPoint of a TLS 1.2
+  ServerKeyExchange (`tls12_conn.inc`, illegal_parameter), with the 16 InvalidCurveAttack
+  rows and the x25519 ZeroSharedSecret points of `x25519_test.json`.
 - `ecdsa_secp256r1_sha256_p1363_test.json`: 21 of the 262 rows carry a signature that is
   not 64 bytes (2 to 82), all of them "invalid". `brisk__p256_ecdsa_verify` takes a fixed
   `uint8_t[64]`, so the width is settled by the caller that unwraps the DER
@@ -176,6 +190,23 @@ reference before emission. Differential vectors come from a fixed seed.
   are GENERATED on the `tls13_trace.inc` fixture keys with the same Python cascade that
   reproduces RFC 8448 byte for byte; CH2 is checked against CH1 (RFC 9846 4.2.2), both
   ECDHE directions against each other, the binder with the RFC 8448 sect 4 routine.
+  Two sets: the TLS 1.3 + 1.2 ClientHello of a BRISK_ENABLE_TLS12 build (TLS13_CONN_KAT,
+  and TLS13_CONNFX_KAT = every tls13_trace.inc fixture flow under it) and the pre-M5 TLS
+  1.3-only one (TLS13_CONN13_KAT), which a TLS12=0 build must still send byte for byte.
+- TLS 1.2 (M5). OFFICIAL: the PRF, the extended main secret and the key block - NIST ACVP
+  `TLS-v1.2-KDF-RFC7627` (all 120) and the v1.2 groups of `kdf-components-tls-1.0` (120),
+  commit-pinned above; the v1.0/1.1 groups (MD5/SHA-1 PRF) are skipped, out of scope
+  (RFC 9846 E.5). ACVP publishes no invalid KDF rows (a KDF has no reject path): the
+  argument errors are generated in tests/test_tls12_prf.c. NO official TLS 1.2 record or
+  handshake vector exists (RFC 8448 is TLS 1.3 only; Wycheproof and CAVP have no TLS 1.2
+  record suite), so `tls12_record.inc` and `tls12_conn.inc` are GENERATED with the Python
+  AES-GCM / ChaCha20-Poly1305 / X25519 / P-256 / RSA references that reproduce the
+  official M1/M2 vectors, and the RFC 5246 / 7627 / 5288 / 5289 / 7905 texts (fetched
+  above) are asserted to contain every label, layout and code point the code uses. A shared
+  misreading would pass these rows; the OpenSSL / nginx / Caddy interop runs
+  (`tools/dev.py interop`) are the independent oracle. tlsfuzzer's TLS 1.2 scripts
+  (extended-master-secret, downgrade-protection, ecdhe-padded-shared-secret,
+  invalid-compression-methods, ccs, renegotiation-disabled) were a case catalogue only.
 - There is no P-384 *keygen*, *ECDH* or *signing* vector set here, and there never will
   be: docs/ARCHITECTURE.md locks P-384 to verify only, so `KAS_ECC_CDH` `[P-384]`,
   `KeyPair.rsp` `[P-384]`, `SigGen.txt` `[P-384]` and `ecdh_secp384r1_*` are all out of

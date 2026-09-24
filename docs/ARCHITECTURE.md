@@ -87,6 +87,12 @@ sized by `brisk_h2_size()`. No push, no priority.
   "~26 KB" estimate ignored that the scratch must outlive the handshake (post-handshake
   NewSessionTicket/KeyUpdate go through the engine). Cheapest future cuts: a TINY profile with
   a smaller BRISK_TLS_MAX_HS_MSG, or sharing the PEM scratch with the output queue.
+- RE-MEASURED (M5, TLS 1.2 on): `brisk_conn_size()` grows by about 350 B - 43,024 B on a 64-bit
+  host, 42,200 B with -m32 (mingw gcc; Linux figures sit within ~80 B of these) - from the TLS
+  1.2 engine state (P-256 d, preliminary / main secret, randoms, our ECDHE share: ~210 B), the
+  receive key waiting for the server CCS (~48 B), 16 offered suites instead of 8, and 73 more
+  bytes of reassembly so a Certificate plus an RSA-4096 ServerKeyExchange fit together. A
+  BRISK_ENABLE_TLS12=0 build keeps the pre-M5 figure to within a few bytes.
 - Estimates until measured: + h2 ~35-40 KB, QUIC + h3 ~45 KB.
 
 ## Security defaults

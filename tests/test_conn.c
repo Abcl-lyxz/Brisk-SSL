@@ -11,7 +11,10 @@
  * here with brisk__tls_rec_seal, whose output test_tls13_rec.c pins against kat.py rows.
  *
  * The default offer includes ecdsa_secp384r1_sha384 only with BRISK_ENABLE_P384, so the replays
- * need it (every CI preset is DEFAULT). */
+ * need it (every CI preset is DEFAULT). It also offers TLS 1.2 with BRISK_ENABLE_TLS12 (M5), so
+ * the replays take the rows generated for that ClientHello (TLS13_CONNFX_KAT, TLS13_CONN_KAT);
+ * a BRISK_ENABLE_TLS12=0 build replays the pre-M5 ClientHello (the tls13_trace.inc fixture rows,
+ * TLS13_CONN13_KAT) byte for byte, which is what proves that offer unchanged. */
 #include <stdlib.h>
 #include <string.h>
 
@@ -86,8 +89,15 @@ struct tls13_hsmsg_kat {
 #include "kat/tls13_record.inc"
 #include "kat/tls13_trace.inc"
 
-#define NFLOW  (sizeof TLS13_FLOW_KAT / sizeof TLS13_FLOW_KAT[0])
-#define NCONN  (sizeof TLS13_CONN_KAT / sizeof TLS13_CONN_KAT[0])
+#if BRISK_ENABLE_TLS12
+#    define FX_KAT   TLS13_CONNFX_KAT
+#    define CONN_KAT TLS13_CONN_KAT
+#else
+#    define FX_KAT   TLS13_FLOW_KAT
+#    define CONN_KAT TLS13_CONN13_KAT
+#endif
+#define NFLOW  (sizeof FX_KAT / sizeof FX_KAT[0])
+#define NCONN  (sizeof CONN_KAT / sizeof CONN_KAT[0])
 #define HOST   "device.example.com"
 #define F_TIME 1 /* kat.py TLS13_F_TIME */
 
@@ -122,13 +132,13 @@ static const struct tls13_flow_kat *row(const char *prefix)
 {
     size_t i, n = strlen(prefix);
     for (i = 0; i < NFLOW; i++) {
-        if (strncmp(TLS13_FLOW_KAT[i].note, prefix, n) == 0) {
-            return &TLS13_FLOW_KAT[i];
+        if (strncmp(FX_KAT[i].note, prefix, n) == 0) {
+            return &FX_KAT[i];
         }
     }
     for (i = 0; i < NCONN; i++) {
-        if (strncmp(TLS13_CONN_KAT[i].note, prefix, n) == 0) {
-            return &TLS13_CONN_KAT[i];
+        if (strncmp(CONN_KAT[i].note, prefix, n) == 0) {
+            return &CONN_KAT[i];
         }
     }
     exit(2); /* a row the generator no longer emits: the harness is out of date */
@@ -489,11 +499,11 @@ static void conn_suites(void)
     /* every public-API row except mTLS (conn_mtls) and resumption (conn_psk_in) */
     for (i = 0; i < 3; i++) {
         arena_used = 0;
-        cfg = cfg_of(&TLS13_CONN_KAT[i]);
+        cfg = cfg_of(&CONN_KAT[i]);
         if (i == 2) {
             cfg.alpn = "mqtt,h2";
         }
-        CHECKI(happy(&TLS13_CONN_KAT[i], 1, 1 << 20, &cfg) == 0, 10 + i);
+        CHECKI(happy(&CONN_KAT[i], 1, 1 << 20, &cfg) == 0, 10 + i);
     }
 }
 
@@ -505,7 +515,7 @@ static void conn_negative_rows(void)
     int want;
 
     for (i = 0; i < NFLOW; i++) {
-        k = &TLS13_FLOW_KAT[i];
+        k = &FX_KAT[i];
         if (k->alert == 0 || strcmp(k->host, HOST) != 0) {
             continue;
         }
@@ -551,8 +561,8 @@ static void conn_split(void)
     /* HRR: CH2 is built in the receive buffer, whatever the split */
     for (chunk = 1; chunk <= 7; chunk += 3) {
         arena_used = 0;
-        cfg = cfg_of(&TLS13_CONN_KAT[0]);
-        CHECKI(happy(&TLS13_CONN_KAT[0], chunk & 3, chunk, &cfg) == 0, 100 + chunk);
+        cfg = cfg_of(&CONN_KAT[0]);
+        CHECKI(happy(&CONN_KAT[0], chunk & 3, chunk, &cfg) == 0, 100 + chunk);
     }
 }
 
@@ -626,7 +636,7 @@ static void conn_hrr(void)
 
     /* HRR + the server's compat CCS in one feed call */
     arena_used = 0;
-    k = &TLS13_CONN_KAT[0];
+    k = &CONN_KAT[0];
     cfg = cfg_of(k);
     CHECK(setup(k, 0, &cfg, now_of(k)) == BRISK_OK && pull_hello(k->ch1, 0x0301));
     n = plain(srv, k->hrr);
@@ -649,6 +659,14 @@ static void conn_hrr(void)
     memset(zero_p256 + 96, 0, 32);
     arena_used = 0;
     memset(g_mem, 0, g_size + 8);
+#    if BRISK_ENABLE_TLS12
+    /* ... and with TLS 1.2 offered the slice is the ServerKeyExchange's P-256 d from the start,
+     * so the fault is a setup error (BRISK_E_ARG, memory wiped) */
+    CHECK(brisk__conn_setup(g_mem, g_size, &cfg, HOST, now_of(k), zero_p256, NULL, &C) ==
+              BRISK_E_ARG &&
+          all_zero(g_mem, g_size + 8));
+    (void)used;
+#    else
     CHECK(brisk__conn_setup(g_mem, g_size, &cfg, HOST, now_of(k), zero_p256, NULL, &C) ==
               BRISK_OK &&
           pull_hello(k->ch1, 0x0301));
@@ -656,6 +674,7 @@ static void conn_hrr(void)
     CHECK(brisk_feed(C, srv, n, &used) == BRISK_E_ARG && brisk_status(C) == BRISK_E_ARG);
     CHECK(alert_is(NULL, 0, 80));
     brisk_conn_wipe(C);
+#    endif
 }
 
 static int tk_calls;
@@ -733,7 +752,7 @@ static void conn_ticket(void)
 
 static void conn_psk_in(void)
 {
-    const struct tls13_flow_kat *k = row("fixture: P-256 leaf"), *r = &TLS13_CONN_KAT[3];
+    const struct tls13_flow_kat *k = row("fixture: P-256 leaf"), *r = &CONN_KAT[3];
     static uint8_t big_ticket[1900], blob[BRISK_TICKET_MAX];
     brisk__tls13_ticket t;
     brisk_cfg cfg;
@@ -803,7 +822,7 @@ static size_t big_hrr(uint8_t *out)
 {
     static const uint8_t EXT[16] = {0, 43, 0, 2, 3, 4, 0, 51, 0, 2, 0, 0x17, 0, 44, 1, 2};
     size_t n;
-    const uint8_t *m = dec(TLS13_CONN_KAT[0].hrr, &n);
+    const uint8_t *m = dec(CONN_KAT[0].hrr, &n);
     uint8_t *p = out + 5;
     memcpy(p, m, 74); /* type | length | version | random | session_id(32) | suite | 0 */
     brisk__store_be16(p + 74, 16 + 2 + BRISK__TLS13_COOKIE_MAX);
@@ -825,7 +844,7 @@ static size_t big_hrr(uint8_t *out)
  * expired in between. A ticket so large that the worst CH2 would not fit is kept out of CH1. */
 static void conn_hrr_psk(void)
 {
-    const struct tls13_flow_kat *k = &TLS13_CONN_KAT[0];
+    const struct tls13_flow_kat *k = &CONN_KAT[0];
     static uint8_t ticket[2048], blob[BRISK_TICKET_MAX];
     const size_t L = strlen(k->ch1) / 2, TMAX = 2048 - 295 - 53 - L; /* CH1 + PSK = L+T+53 */
     const size_t T[4] = {100, 100, TMAX, TMAX + 1};
@@ -921,7 +940,7 @@ static int sign_calls;
 static int dev_sign(void *ctx, uint16_t scheme, const uint8_t *tbs, size_t tbs_len, uint8_t *sig,
                     size_t sig_cap, size_t *sig_len)
 {
-    const struct tls13_flow_kat *r = &TLS13_CONN_KAT[4];
+    const struct tls13_flow_kat *r = &CONN_KAT[4];
     uint8_t h[32], key[32], srand[32];
     size_t n;
     int rc;
@@ -946,7 +965,7 @@ static int dev_sign(void *ctx, uint16_t scheme, const uint8_t *tbs, size_t tbs_l
 static void conn_mtls(void)
 {
 #    if BRISK_ENABLE_MTLS
-    const struct tls13_flow_kat *r = &TLS13_CONN_KAT[4];
+    const struct tls13_flow_kat *r = &CONN_KAT[4];
     brisk_cfg cfg;
     size_t n;
     int i;
@@ -1026,8 +1045,8 @@ static void conn_args(void)
     cfg.client_key = KEY;
     CHECK(brisk__conn_setup(g_mem, g_size, &cfg, HOST, 0, RND, NULL, &C) == BRISK_E_ARG);
     cfg = z;
-    cfg.client_chain = dec(TLS13_CONN_KAT[4].cchain, &cfg.client_chain_len);
-    cfg.client_key = dec(TLS13_CONN_KAT[4].ckey, &n);
+    cfg.client_chain = dec(CONN_KAT[4].cchain, &cfg.client_chain_len);
+    cfg.client_key = dec(CONN_KAT[4].ckey, &n);
 #if BRISK_ENABLE_MTLS
     CHECK(brisk__conn_setup(g_mem, g_size, &cfg, HOST, 0, RND, NULL, &C) == BRISK_OK);
     brisk_conn_wipe(C);
@@ -1089,6 +1108,12 @@ void test_conn(void)
 {
     size_t n;
     (void)TLS13_RFC_KAT;
+#if BRISK_ENABLE_TLS12
+    (void)TLS13_CONN13_KAT;
+#else
+    (void)TLS13_CONNFX_KAT;
+    (void)TLS13_CONN_KAT;
+#endif
     (void)TLS13_CHW_KAT;
     (void)TLS13_MTLS_KAT;
     (void)TLS13_DER_KAT;

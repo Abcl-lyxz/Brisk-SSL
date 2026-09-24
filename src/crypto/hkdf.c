@@ -127,3 +127,53 @@ int brisk__hkdf_expand_label(brisk_hash_alg alg, const uint8_t *secret, size_t s
     brisk__secure_zero(info, n); /* context may be a transcript hash of secret-dependent data */
     return rc;
 }
+
+#if BRISK_ENABLE_TLS12
+int brisk__tls12_prf(brisk_hash_alg alg, const uint8_t *secret, size_t secret_len,
+                     const char *label, const uint8_t *seed1, size_t seed1_len,
+                     const uint8_t *seed2, size_t seed2_len, uint8_t *out, size_t out_len)
+{
+    /* RFC 5246 5: PRF(secret, label, seed) = P_<hash>(secret, label || seed), where
+     * A(0) = label || seed, A(i) = HMAC(secret, A(i-1)) and the output is
+     * HMAC(secret, A(1) || label || seed) || HMAC(secret, A(2) || label || seed) || ... cut to
+     * out_len. The label and both seed parts are streamed, never concatenated. The loop count
+     * depends only on out_len and the hash (public); every intermediate is wiped. */
+    brisk_hmac_ctx keyed, c;
+    uint8_t a[BRISK_HASH_MAX_LEN], t[BRISK_HASH_MAX_LEN];
+    size_t hl = brisk_hash_len(alg), ll, n;
+
+    if (hl == 0 || out == NULL || out_len == 0 || label == NULL || (secret == NULL && secret_len) ||
+        (seed1 == NULL && seed1_len) || (seed2 == NULL && seed2_len)) {
+        return BRISK_E_ARG;
+    }
+    ll = strlen(label);
+    brisk_hmac_init(&keyed, alg, secret, secret_len); /* secret is not read again */
+    c = keyed;                                        /* A(1) = HMAC(secret, label || seed) */
+    brisk_hmac_update(&c, label, ll);
+    brisk_hmac_update(&c, seed1, seed1_len);
+    brisk_hmac_update(&c, seed2, seed2_len);
+    brisk_hmac_final(&c, a);
+    for (;;) {
+        c = keyed;
+        brisk_hmac_update(&c, a, hl);
+        brisk_hmac_update(&c, label, ll);
+        brisk_hmac_update(&c, seed1, seed1_len);
+        brisk_hmac_update(&c, seed2, seed2_len);
+        brisk_hmac_final(&c, t);
+        n = out_len < hl ? out_len : hl;
+        memcpy(out, t, n);
+        out += n;
+        out_len -= n;
+        if (out_len == 0) {
+            break;
+        }
+        c = keyed; /* A(i+1) = HMAC(secret, A(i)) */
+        brisk_hmac_update(&c, a, hl);
+        brisk_hmac_final(&c, a);
+    }
+    brisk__secure_zero(&keyed, sizeof keyed);
+    brisk__secure_zero(a, sizeof a);
+    brisk__secure_zero(t, sizeof t);
+    return BRISK_OK;
+}
+#endif

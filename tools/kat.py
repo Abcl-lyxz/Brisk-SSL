@@ -74,6 +74,15 @@ SRC = {
     "x509_limbo": "https://raw.githubusercontent.com/C2SP/x509-limbo/main/limbo.json",
     "rfc7541": "https://www.rfc-editor.org/rfc/rfc7541.txt",
     "rfc9113": "https://www.rfc-editor.org/rfc/rfc9113.txt",
+    # TLS 1.2 (M5): the RFC texts are the audit trail for the labels and layouts tls12_rfc_checks
+    # asserts; the vectors are NIST ACVP, pinned by commit, cached under the SRC key (every file
+    # is called prompt.json / expectedResults.json).
+    **{f"rfc{n}": f"https://www.rfc-editor.org/rfc/rfc{n}.txt"
+       for n in (5246, 7627, 5288, 5289, 7905, 8422, 5746)},
+    **{f"acvp_tls12_{k}_{f}": "https://raw.githubusercontent.com/usnistgov/ACVP-Server/"
+       f"f94e88b0e5672f0b0d44bdbbfe683ef1be2d5b42/gen-val/json-files/{d}/{fn}.json"
+       for k, d in (("ems", "TLS-v1.2-KDF-RFC7627"), ("kdf", "kdf-components-tls-1.0"))
+       for f, fn in (("prompt", "prompt"), ("expected", "expectedResults"))},
     # http2jp/hpack-test-case, pinned by commit (never master): real captures from independent
     # encoders. The cache file is named after the SRC key (every story is called story_NN.json).
     **{f"hpack_{e.replace('-', '_')}_{s}": "https://raw.githubusercontent.com/http2jp/hpack-test-case/"
@@ -116,7 +125,7 @@ def fetch(name):
         PINS = pinned_sha256()
     url = SRC[name]
     path = CACHE / url.rsplit("/", 1)[1]
-    if name.startswith("hpack_"):  # story_NN.json repeats across encoders
+    if name.startswith(("hpack_", "acvp_")):  # story_NN.json / prompt.json repeat
         path = CACHE / f"{name}.json"
     if not path.exists():
         CACHE.mkdir(parents=True, exist_ok=True)
@@ -4758,6 +4767,12 @@ TLS13_F_TIME = 1  # the verdict depends on BRISK_X509_TIME_POLICY (INSECURE_NO_T
 TLS13_SUITES = [0x1303, 0x1301, 0x1302]
 TLS13_GROUPS = [0x001d, 0x0017]
 TLS13_SIGS = [0x0403, 0x0503, 0x0804, 0x0805, 0x0806, 0x0401, 0x0501, 0x0601]
+# RFC 7905 2 (ChaCha first, as for TLS 1.3), RFC 5289 3.2. ECDHE + AEAD only: no CBC, no static
+# RSA, no DHE (RFC 9846 E.5, RFC 9325 4.2). The order brisk__tls13_ch_write appends them in.
+TLS12_SUITES = [0xCCA9, 0xCCA8, 0xC02B, 0xC02F, 0xC02C, 0xC030]
+# suite -> (PRF hash bits, key length, fixed IV length, ECDSA?) - RFC 5288 3, RFC 5289 3.2, RFC 7905 2
+TLS12_SUITE = {0xCCA9: (256, 32, 12, 1), 0xCCA8: (256, 32, 12, 0), 0xC02B: (256, 16, 4, 1),
+               0xC02F: (256, 16, 4, 0), 0xC02C: (384, 32, 4, 1), 0xC030: (384, 32, 4, 0)}
 RFC9846 = {}
 FX = {}  # tls13_fixture's keys and helpers, reused by tls13_conn
 MT = {}  # tls13_psk's device identity (mTLS), reused by tls13_conn
@@ -4848,12 +4863,17 @@ def t_alpn(names):
 
 
 def t_ch(random, sid, suites, groups, sigs, share_group, share_pub, sni=b"", cookie=b"", alpn=b"",
-         modes=False, psk=None):
+         modes=False, psk=None, tls12=False):
     """The ClientHello brisk__tls13_ch_write produces, field for field and in the same extension
     order (RFC 9846 4.2.2), so the C builder is byte-compared against this, not only
     round-tripped through its own parser. psk = (identity, obfuscated_ticket_age, HashLen): the
     pre_shared_key extension goes LAST (4.3.11) with a binder of HashLen zero bytes, which
-    t_binder_fill (and the C engine) replace."""
+    t_binder_fill (and the C engine) replace. tls12: the combined offer of M5 - the six TLS 1.2
+    suites after the given ones, 0x0303 after 0x0304 in supported_versions (RFC 9846 4.3.1 /
+    E.1), then ec_point_formats [uncompressed] (RFC 8422 5.1), extended_main_secret (RFC 7627
+    5.1) and renegotiation_info {0x00} (RFC 5746 3.4)."""
+    if tls12:
+        suites = list(suites) + TLS12_SUITES
     exts = []
     if sni:
         exts.append((0, t_v16(b"\x00" + t_v16(sni))))  # RFC 6066 3: host_name(0)
@@ -4861,7 +4881,9 @@ def t_ch(random, sid, suites, groups, sigs, share_group, share_pub, sni=b"", coo
     exts.append((13, t_v16(b"".join(t_u16(s) for s in sigs))))
     if alpn:
         exts.append((16, t_v16(alpn)))  # RFC 7301 3.1
-    exts.append((43, t_v8(t_u16(0x0304))))
+    exts.append((43, t_v8(t_u16(0x0304) + (t_u16(0x0303) if tls12 else b""))))
+    if tls12:
+        exts += [(11, t_v8(b"\x00")), (23, b""), (0xff01, t_v8(b""))]
     if cookie:
         exts.append((44, t_v16(cookie)))
     if modes:
@@ -5097,7 +5119,7 @@ def tls13_fixture():
     rows = []
 
     def flight(note, alert, cert_der=None, anchor=root_c, scheme=0x0403, signer=leaf,
-               wrong_th=False, mangle=None, suite=0x1301, flags=0):
+               wrong_th=False, mangle=None, suite=0x1301, flags=0, ch=ch, rows=rows):
         cert_der = cert_der or leaf_cert()
         sh = t_msg(2, t_u16(0x0303) + seed(b"server random") + t_v8(sid) + t_u16(suite) + b"\x00"
                    + t_exts_build([(43, t_u16(0x0304)), (51, t_u16(0x001d) + t_v16(s_pub))]))
@@ -5114,33 +5136,40 @@ def tls13_fixture():
                           cv=cv, root=anchor, host="device.example.com", now=CHAIN_NOW,
                           flags=flags, alert=ALERT[alert] if alert else 0))
 
-    flight("fixture: P-256 leaf, ecdsa_secp256r1_sha256, TLS_AES_128_GCM_SHA256", None)
-    flight("fixture: TLS_AES_256_GCM_SHA384 (SHA-384 transcript)", None, suite=0x1302)
-    flight("fixture: TLS_CHACHA20_POLY1305_SHA256", None, suite=0x1303)
-    flight("fixture: RSA-2049 leaf, rsa_pss_rsae_sha256 (sLen = hLen)", None,
-           cert_der=leaf_cert(key=rsa_leaf), scheme=0x0804, signer=rsa_leaf)
-    flight("RFC 9525 6.3: the leaf names another host -> bad_certificate", "bad_certificate",
-           cert_der=leaf_cert(host="other.example.com"))
-    flight("RFC 9846 4.5.1.2: keyUsage without digitalSignature -> unsupported_certificate",
-           "unsupported_certificate", cert_der=leaf_cert(ku=4))
-    flight("RFC 5280 4.2.1.12: EKU clientAuth only -> unsupported_certificate",
-           "unsupported_certificate", cert_der=leaf_cert(eku="1.3.6.1.5.5.7.3.2"))
-    flight("RFC 5280 6.1.3: expired leaf -> bad_certificate", "bad_certificate",
-           cert_der=leaf_cert(naf="270101000000Z"), flags=TLS13_F_TIME)
-    flight("RFC 5280 6.1: the anchor shares the root's Name but not its key -> bad_certificate",
-           "bad_certificate", anchor=rogue_c)
-    flight("RFC 9846 4.5.2: CertificateVerify signed over the wrong transcript -> decrypt_error",
-           "decrypt_error", wrong_th=True)
-    flight("RFC 9846 4.5.2: one flipped signature bit -> decrypt_error", "decrypt_error",
-           mangle=lambda s: s[:-1] + bytes([s[-1] ^ 1]))
-    flight("RFC 9846 4.5.2: BER length in the ECDSA-Sig-Value -> decode_error", "decode_error",
-           mangle=lambda s: b"\x30\x81" + s[1:])
-    flight("RFC 9846 4.3.3: ecdsa_secp384r1_sha384 with a P-256 key -> illegal_parameter",
-           "illegal_parameter", scheme=0x0503)
-    flight("RFC 9846 4.3.3: rsa_pss_rsae_sha256 with a P-256 key -> illegal_parameter",
-           "illegal_parameter", scheme=0x0804)
-    flight("RFC 9846 4.3.3: rsa_pkcs1_sha256 is never valid in CertificateVerify",
-           "illegal_parameter", scheme=0x0401)
+    def all_flights(ch=ch, rows=rows):
+        """Every fixture flow under ClientHello `ch` - the TLS 1.3-only offer here, and the
+        default TLS 1.3 + 1.2 offer of the public connection in tls13_conn."""
+        kw = dict(ch=ch, rows=rows)
+        flight("fixture: P-256 leaf, ecdsa_secp256r1_sha256, TLS_AES_128_GCM_SHA256", None, **kw)
+        flight("fixture: TLS_AES_256_GCM_SHA384 (SHA-384 transcript)", None, suite=0x1302, **kw)
+        flight("fixture: TLS_CHACHA20_POLY1305_SHA256", None, suite=0x1303, **kw)
+        flight("fixture: RSA-2049 leaf, rsa_pss_rsae_sha256 (sLen = hLen)", None,
+               cert_der=leaf_cert(key=rsa_leaf), scheme=0x0804, signer=rsa_leaf, **kw)
+        flight("RFC 9525 6.3: the leaf names another host -> bad_certificate", "bad_certificate",
+               cert_der=leaf_cert(host="other.example.com"), **kw)
+        flight("RFC 9846 4.5.1.2: keyUsage without digitalSignature -> unsupported_certificate",
+               "unsupported_certificate", cert_der=leaf_cert(ku=4), **kw)
+        flight("RFC 5280 4.2.1.12: EKU clientAuth only -> unsupported_certificate",
+               "unsupported_certificate", cert_der=leaf_cert(eku="1.3.6.1.5.5.7.3.2"), **kw)
+        flight("RFC 5280 6.1.3: expired leaf -> bad_certificate", "bad_certificate",
+               cert_der=leaf_cert(naf="270101000000Z"), flags=TLS13_F_TIME, **kw)
+        flight("RFC 5280 6.1: the anchor shares the root's Name but not its key -> bad_certificate",
+               "bad_certificate", anchor=rogue_c, **kw)
+        flight("RFC 9846 4.5.2: CertificateVerify signed over the wrong transcript -> decrypt_error",
+               "decrypt_error", wrong_th=True, **kw)
+        flight("RFC 9846 4.5.2: one flipped signature bit -> decrypt_error", "decrypt_error",
+               mangle=lambda s: s[:-1] + bytes([s[-1] ^ 1]), **kw)
+        flight("RFC 9846 4.5.2: BER length in the ECDSA-Sig-Value -> decode_error", "decode_error",
+               mangle=lambda s: b"\x30\x81" + s[1:], **kw)
+        flight("RFC 9846 4.3.3: ecdsa_secp384r1_sha384 with a P-256 key -> illegal_parameter",
+               "illegal_parameter", scheme=0x0503, **kw)
+        flight("RFC 9846 4.3.3: rsa_pss_rsae_sha256 with a P-256 key -> illegal_parameter",
+               "illegal_parameter", scheme=0x0804, **kw)
+        flight("RFC 9846 4.3.3: rsa_pkcs1_sha256 is never valid in CertificateVerify",
+               "illegal_parameter", scheme=0x0401, **kw)
+
+    all_flights()
+    FX.update(all_flights=all_flights, rsa_leaf=rsa_leaf)
     FX.update(root_c=root_c, root=root, leaf=leaf, leaf_cert=leaf_cert, seed=seed, c_priv=c_priv,
               s_priv=s_priv, sid=sid, c_pub=c_pub, s_pub=s_pub, ch=ch)
     print(f"  tls13 fixture: {len(rows)} synthetic flows")
@@ -5178,6 +5207,8 @@ def t_mutations(parts):
         "RFC 9846 4.2.3: legacy_session_id_echo differs from what was sent")
     row(0, "sh", t_hello_build(sh, suite=t_u16(0x1304)), "illegal_parameter",
         "RFC 9846 4.2.3: cipher suite not offered")
+    row(0, "sh", t_hello_build(sh, suite=t_u16(0xC02B)), "illegal_parameter",
+        "RFC 9846 B.4: a 1.3 ServerHello picking an offered TLS 1.2 suite")
     row(0, "sh", t_hello_build(sh, comp=1), "illegal_parameter",
         "RFC 9846 4.2.3: legacy_compression_method != 0")
     row(0, "sh", t_hello_build(sh, exts=no_sv + [[43, t_u16(0x0303)]]), "illegal_parameter",
@@ -5290,6 +5321,8 @@ def t_mutations(parts):
         "RFC 9846 4.2.4: an HRR extension other than cookie that was never offered")
     row(1, "hrr", t_hello_build(hr, suite=t_u16(0x1304)), "illegal_parameter",
         "RFC 9846 4.2.4: HRR cipher suite not offered")
+    row(1, "hrr", t_hello_build(hr, suite=t_u16(0xC02C)), "illegal_parameter",
+        "RFC 9846 B.4: an HRR picking an offered TLS 1.2 suite")
     row(1, "hrr", t_hello_build(hr, ver=t_u16(0x0304)), "protocol_version",
         "RFC 9846 4.2.4: HRR legacy_version must be 0x0303")
     row(1, "hrr", t_hello_build(hr, exts=[e for e in hr["exts"] if e[0] != 43]), "protocol_version",
@@ -5692,7 +5725,7 @@ def tls13_psk(parts):
     return rows, chw, muts, mtls, [one]
 
 
-def tls13_conn():
+def tls13_conn(tls12):
     """M3 line 4: whole flows the PUBLIC API (src/tls/conn.c) replays byte for byte in
     tests/test_conn.c. Every flow starts from tls13_fixture's library-default ClientHello (host
     device.example.com, its random, session id and x25519 key), so brisk__conn_setup fed the 160
@@ -5702,10 +5735,19 @@ def tls13_conn():
     HelloRetryRequest (RFC 9846 4.1.4, 4.2.2 - same random and session id, the HRR's group, the
     cookie copied exactly), ALPN, a PSK offered from a ticket blob (4.2.11, binder 4.3.11.2) and a
     CertificateRequest answered with the device key (4.4.2, 4.5.1).
-    Returns (rows, rnd, root_pem, blob, now_ms, nst_long, fuzz_streams)."""
+    tls12: the default offer of a BRISK_ENABLE_TLS12 build (TLS 1.3 + 1.2 in one ClientHello, M5);
+    then every tls13_fixture flow is re-run under that ClientHello too (fx_rows), because the
+    public connection can only ever send its default one. tls12=False is the TLS 1.3-only offer
+    of a BRISK_ENABLE_TLS12=0 build, whose CH1 must stay the pre-M5 fixture ClientHello byte for
+    byte.
+    Returns (rows, fx_rows, rnd, root_pem, blob, now_ms, nst_long, fuzz_streams)."""
     f, seed = FX, FX["seed"]
     host = b"device.example.com"
-    rnd, sid, ch1 = seed(b"client random"), f["sid"], f["ch"]
+    rnd, sid = seed(b"client random"), f["sid"]
+    ch1 = t_ch(rnd, sid, TLS13_SUITES, TLS13_GROUPS, TLS13_SIGS, 0x001d, f["c_pub"], host,
+               tls12=tls12)
+    if not tls12 and ch1 != f["ch"]:
+        die("conn: the TLS 1.3-only ClientHello is not the pre-M5 fixture ClientHello")
     if ch1[6:38] != rnd or ch1[38] != 32 or ch1[39:71] != sid:
         die("conn: the fixture CH1 does not carry random/session_id at bytes 6/39")
     c_d = int.from_bytes(seed(b"client p256"), "big")
@@ -5723,7 +5765,7 @@ def tls13_conn():
 
     def ch_of(group=0x001d, pub=None, cookie=b"", alpn=b"", psk=None):
         return t_ch(rnd, sid, TLS13_SUITES, TLS13_GROUPS, TLS13_SIGS, group, pub or f["c_pub"],
-                    host, cookie=cookie, alpn=alpn, modes=psk is not None, psk=psk)
+                    host, cookie=cookie, alpn=alpn, modes=psk is not None, psk=psk, tls12=tls12)
 
     if ch_of() != ch1:
         die("conn: ch_of() does not rebuild the fixture ClientHello")
@@ -5807,8 +5849,12 @@ def tls13_conn():
     nst_long = rec_nst(7200, 1, b"\x00", long_ticket, [])
     if len(t_ticket_blob(0x1301, 0, 1, 1, psk, host, long_ticket)) <= 2048:
         die("conn: the long ticket must not fit BRISK_TICKET_MAX")
-    print(f"  tls13 conn: {len(rows)} public-API flows, {len(streams)} fuzz streams")
-    return rows, rnd160, pem_block(root), blob, now_ms, nst_long, streams
+    fx_rows = []
+    if tls12:
+        f["all_flights"](ch=ch1, rows=fx_rows)
+    print(f"  tls13 conn (tls12={int(tls12)}): {len(rows)} public-API flows, {len(fx_rows)} "
+          f"fixture flows, {len(streams)} fuzz streams")
+    return rows, fx_rows, rnd160, pem_block(root), blob, now_ms, nst_long, streams
 
 
 def rec_hs_plain(msg):
@@ -6173,6 +6219,448 @@ def tls13_records():
     print(f"  tls13 records: {len(rows)} rows ({n8448} RFC 8448), {len(nonces)} nonces, "
           f"{len(hsmsg)} post-handshake messages")
     return rows, nonces, hsmsg, seeds, s_ap
+
+
+# ---------------------------------------------------------------- TLS 1.2 (M5, RFC 5246 + RFC 9846)
+# Everything tests/test_tls12_*.c replays. Official: the PRF, the extended main secret and the key
+# block (NIST ACVP TLS-v1.2-KDF-RFC7627 and kdf-components-tls v1.2 groups, commit-pinned). No
+# TLS 1.2 handshake or record trace exists anywhere (RFC 8448 is TLS 1.3 only), so the record rows
+# and the flows are GENERATED here with the same Python AES-GCM / ChaCha20-Poly1305 / X25519 /
+# P-256 / RSA references that reproduce the official M1/M2 vectors, and the flows then face the
+# OpenSSL / nginx interop runs (tools/dev.py interop) as the independent oracle.
+TLS12_SENTINELS = (b"DOWNGRD\x01", b"DOWNGRD\x00")  # checked against RFC 9846 4.2.3 below
+
+
+def py_tls12_prf(bits, secret, label, seed, n):
+    """RFC 5246 5: PRF(secret, label, seed) = P_hash(secret, label || seed), A(0) = label || seed,
+    A(i) = HMAC(secret, A(i-1)), output HMAC(secret, A(i) || label || seed) until n bytes."""
+    H, ls = HASH[bits], label + seed
+    a, out = hmac.new(secret, ls, H).digest(), b""
+    while len(out) < n:
+        out += hmac.new(secret, a + ls, H).digest()
+        a = hmac.new(secret, a, H).digest()
+    return out[:n]
+
+
+def tls12_rfc_checks():
+    """The RFC texts behind the TLS 1.2 rows, fetched for the SOURCES.md audit trail. The labels
+    and constants the C code uses are asserted to appear verbatim, so none of them is typed from
+    memory: RFC 5246 5 / 6.3 / 7.4.9, RFC 7627 4, RFC 5746 3.4 and RFC 9846 4.2.3 (sentinels,
+    already parsed by rfc9846_constants)."""
+    t5246 = "\n".join(rfc_lines(fetch("rfc5246")))
+    for s in ('"master secret"', '"key expansion"', '"client finished"', '"server finished"',
+              "P_hash(secret, seed) = HMAC_hash(secret, A(1) + seed) +",
+              "server_write_MAC_key[SecurityParameters.mac_key_length]"):
+        if s not in t5246:
+            die(f"RFC 5246: '{s}' not found")
+    t7627 = "\n".join(rfc_lines(fetch("rfc7627")))
+    if '"extended master secret"' not in t7627:
+        die("RFC 7627: the extended master secret label is not in the text")
+    t5288 = "\n".join(rfc_lines(fetch("rfc5288")))
+    if not re.search(r"opaque salt\[4\];\s*opaque nonce_explicit\[8\];\s*\} GCMNonce;", t5288):
+        die("RFC 5288 3: GCMNonce layout not found")
+    # the six code points, parsed out of RFC 7905 2 and RFC 5289 3.2 rather than typed
+    names = {0xCCA9: "TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256",
+             0xCCA8: "TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256",
+             0xC02B: "TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256",
+             0xC02F: "TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256",
+             0xC02C: "TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384",
+             0xC030: "TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384"}
+    text = "\n".join(rfc_lines(fetch("rfc7905"))) + "\n".join(rfc_lines(fetch("rfc5289")))
+    for code, name in names.items():
+        m = re.search(name + r"\s*=\s*\{\s*0x([0-9A-Fa-f]{2}),\s*0x([0-9A-Fa-f]{2})\s*\}", text)
+        if not m or int(m.group(1) + m.group(2), 16) != code:
+            die(f"RFC 7905 / 5289: {name} is not {code:04x}")
+    if sorted(names) != sorted(TLS12_SUITES):
+        die("TLS12_SUITES and the RFC table disagree")
+    fetch("rfc8422")
+    fetch("rfc5746")
+    if (RFC9846["down1"], RFC9846["down0"]) != TLS12_SENTINELS:
+        die("RFC 9846 4.2.3: the sentinels differ from the ones the TLS 1.2 rows use")
+
+
+def tls12_prf_vectors():
+    """NIST ACVP rows for brisk__tls12_prf: TLS-v1.2-KDF-RFC7627 (the extended main secret from
+    sessionHash, then the key block) and the v1.2 groups of kdf-components-tls ('master secret'
+    over clientHelloRandom || serverHelloRandom). Each row is re-derived with py_tls12_prf and
+    compared before emission. The v1.0/1.1 groups (MD5/SHA-1 PRF) are skipped: out of scope
+    (RFC 9846 E.5)."""
+    bits_of = {"SHA2-256": 256, "SHA2-384": 384, "SHA2-512": 512}
+    rows = []
+    for kind in ("ems", "kdf"):
+        prompt = json.loads(fetch(f"acvp_tls12_{kind}_prompt"))
+        exp = {(g["tgId"], t["tcId"]): t for g in json.loads(fetch(f"acvp_tls12_{kind}_expected"))
+               ["testGroups"] for t in g["tests"]}
+        for g in prompt["testGroups"]:
+            if kind == "kdf" and g["tlsVersion"] != "v1.2":
+                continue
+            bits, kbl = bits_of[g["hashAlg"]], g["keyBlockLength"] // 8
+            for t in g["tests"]:
+                x = {k: bytes.fromhex(v) for k, v in t.items() if k != "tcId"}
+                want = exp[(g["tgId"], t["tcId"])]
+                ms_w, kb_w = bytes.fromhex(want["masterSecret"]), bytes.fromhex(want["keyBlock"])
+                if kind == "ems":
+                    lab, s1, s2 = b"extended master secret", x["sessionHash"], b""
+                else:
+                    lab, s1, s2 = b"master secret", x["clientHelloRandom"], x["serverHelloRandom"]
+                ms = py_tls12_prf(bits, x["preMasterSecret"], lab, s1 + s2, 48)
+                kb = py_tls12_prf(bits, ms, b"key expansion", x["serverRandom"] + x["clientRandom"],
+                                  kbl)
+                if ms != ms_w or kb != kb_w:
+                    die(f"ACVP {kind} tg{g['tgId']} tc{t['tcId']}: PRF mismatch")
+                note = f"ACVP {'RFC7627' if kind == 'ems' else 'kdf-tls v1.2'} tg{g['tgId']} tc{t['tcId']}"
+                rows.append((bits, x["preMasterSecret"].hex(), lab.decode(), s1.hex(), s2.hex(),
+                             ms.hex(), note + " main"))
+                rows.append((bits, ms.hex(), "key expansion", x["serverRandom"].hex(),
+                             x["clientRandom"].hex(), kb.hex(), note + " key block"))
+    if len(rows) != 2 * (120 + 120):
+        die(f"ACVP TLS 1.2: {len(rows)} rows, want 480")
+    print(f"  tls12 prf: {len(rows)} ACVP rows")
+    return rows
+
+
+def rec12_seal(suite, key, iv, seq, typ, pt, explicit=None):
+    """RFC 5246 6.2.3.3: header with the REAL type and 0x0303, AAD = seq(8) || type || 0x0303 ||
+    plaintext length. GCM (RFC 5288 3): nonce = salt(4) || nonce_explicit(8), the explicit part
+    on the wire and equal to seq unless a row says otherwise. ChaCha (RFC 7905 2): nonce = IV XOR
+    seq, nothing explicit."""
+    aad = seq.to_bytes(8, "big") + bytes([typ, 3, 3]) + len(pt).to_bytes(2, "big")
+    if TLS12_SUITE[suite][2] == 12:
+        ct, tag = py_aead_seal(key, rec_nonce(iv, seq), aad, pt)
+        body = ct + tag
+    else:
+        e = seq.to_bytes(8, "big") if explicit is None else explicit
+        ct, tag = py_gcm_seal(key, iv + e, aad, pt)
+        body = e + ct + tag
+    return bytes([typ, 3, 3]) + len(body).to_bytes(2, "big") + body
+
+
+def tls12_record_vectors():
+    """Sealed records per suite at seq 0, 1, 2^32 and 2^64-2 (the 32-bit halves of the AAD and
+    nonce), content types 21/22/23, lengths 0/1/2/37 and one 2^14 record (stored as a SHA-256:
+    the payload is the byte pattern i & 0xff), plus GCM records whose explicit nonce is NOT seq
+    (the receiver MUST take it from the wire, RFC 5288 3). Generated: no official TLS 1.2 record
+    vector exists; the AEADs underneath reproduce CAVP/Wycheproof/RFC 8439 in this file."""
+    rows = []
+    for suite in TLS12_SUITES:
+        bits, kl, ivl, _ = TLS12_SUITE[suite]
+        key = hashlib.sha512(b"brisk tls12 rec key" + t_u16(suite)).digest()[:kl]
+        iv = hashlib.sha512(b"brisk tls12 rec iv" + t_u16(suite)).digest()[:ivl]
+        for seq in (0, 1, 1 << 32, (1 << 64) - 2):
+            for typ, pt in ((21, b"\x01\x00"), (22, bytes(range(37))), (23, b""), (23, b"\x42")):
+                rec = rec12_seal(suite, key, iv, seq, typ, pt)
+                rows.append((f"{suite:04x} seq {seq} type {typ} len {len(pt)}", suite, key.hex(),
+                             iv.hex(), seq, typ, pt.hex(), rec.hex(), "", 0))
+        big = bytes(i & 0xff for i in range(1 << 14))
+        rec = rec12_seal(suite, key, iv, 1 << 32, 23, big)
+        rows.append((f"{suite:04x} 2^14 bytes", suite, key.hex(), iv.hex(), 1 << 32, 23, "", "",
+                     hashlib.sha256(rec).hexdigest(), 1))
+        if ivl == 4:
+            e = bytes.fromhex("0123456789abcdef")
+            rec = rec12_seal(suite, key, iv, 5, 23, b"explicit", explicit=e)
+            rows.append((f"{suite:04x} explicit nonce != seq", suite, key.hex(), iv.hex(), 5, 23,
+                         b"explicit".hex(), rec.hex(), "", 2))
+    print(f"  tls12 records: {len(rows)} rows")
+    return rows
+
+
+def tls12_flows():
+    """Whole TLS 1.2 handshakes against the public connection, from the client's default
+    ClientHello (the tls12=True offer of tls13_conn: same 160-byte rnd, host, keys). A server
+    flight (SH Certificate SKE [CR] SHD, RFC 5246 7.3), the exact client flight ([Certificate]
+    CKE [CV], CCS, Finished), the server Finished, and the RFC 5246 6.3 keys. Every secret comes
+    from py_tls12_prf, which reproduces the ACVP rows above. Negative rows carry one fault each
+    and the alert its section demands; fail_at 1 = on the server's first flight, 2 = on its
+    Finished. tlsfuzzer's scripts (test-extended-master-secret-extension, -downgrade-protection,
+    -ecdhe-padded-shared-secret, -invalid-compression-methods, -ccs, -renegotiation-disabled-*)
+    were the case catalogue; nothing is copied from them."""
+    f, seed = FX, FX["seed"]
+    host = b"device.example.com"
+    rnd, sid = seed(b"client random"), f["sid"]
+    c_d = int.from_bytes(seed(b"client p256"), "big")
+    s_d = int.from_bytes(seed(b"server p256"), "big")
+    c_p256, s_p256 = py_p256_keygen(c_d)[0], py_p256_keygen(s_d)[0]
+    leaf_d = 0x7153E002  # tls13_fixture's P-256 leaf
+    signers = {0x0403: f["leaf"], 0x0503: ec_issuer(P256, leaf_d, 384),
+               0x0804: f["rsa_leaf"], 0x0805: rsa_issuer(384, pss_salt=48),
+               0x0806: rsa_issuer(512, pss_salt=64), 0x0401: rsa_issuer(256),
+               0x0501: rsa_issuer(384), 0x0601: rsa_issuer(512)}
+    ec_leaf, rsa_leaf = f["leaf_cert"](), f["leaf_cert"](key=f["rsa_leaf"])
+    srand0, ssid = seed(b"tls12 server random"), seed(b"tls12 server session id")
+    rows, streams = [], []
+
+    def ch_of(alpn=b""):
+        return t_ch(rnd, sid, TLS13_SUITES, TLS13_GROUPS, TLS13_SIGS, 0x001d, f["c_pub"], host,
+                    alpn=alpn, tls12=True)
+
+    def sh_of(suite, srand=srand0, exts=None, ver=0x0303, sid_=None, comp=0, sel=b""):
+        e = [(0xff01, t_v8(b"")), (23, b""), (11, t_v8(b"\x00"))]
+        if sel:
+            e.append((16, t_v16(t_v8(sel))))
+        if exts is not None:
+            e = exts(e)
+        return t_msg(2, t_u16(ver) + srand + t_v8(ssid if sid_ is None else sid_) + t_u16(suite)
+                     + bytes([comp]) + t_exts_build(e))
+
+    def cert_of(der):
+        return t_msg(11, t_v24(t_v24(der)))  # RFC 5246 7.4.2: no context, no entry extensions
+
+    def ske_of(group, scheme, srand=srand0, point=None, ctype=3, tbs=None, sig_edit=None,
+               trail=b""):
+        pt = (f["s_pub"] if group == 0x001d else s_p256) if point is None else point
+        params = bytes([ctype]) + t_u16(group) + t_v8(pt)  # RFC 8422 5.4 ServerECDHParams
+        sig = signers[scheme]["sign"](tbs(params) if tbs else rnd + srand + params)
+        if sig_edit:
+            sig = sig_edit(sig)
+        return t_msg(12, params + t_u16(scheme) + t_v16(sig) + trail)
+
+    shd = t_msg(14, b"")
+    hreq = t_msg(0, b"")
+
+    def cr_of(types=b"\x40", sigs=(0x0403, 0x0804)):
+        return t_msg(13, t_v8(types) + t_v16(b"".join(t_u16(s) for s in sigs)) + t_v16(b""))
+
+    def row(note, s1, *, alert=0, fail_at=1, ch=None, alpn="", sel="", c1=b"", cfin=b"",
+            sfin=b"", suite=0, keys=(b"", b"", b"", b""), mtls=0, flags=0):
+        rows.append((note, ALERT.get(alert, alert) if alert else 0, fail_at, flags,
+                     (ch or ch_of()).hex(), b"".join(s1).hex(), c1.hex(), cfin.hex(), sfin.hex(),
+                     suite, keys[0].hex(), keys[1].hex(), keys[2].hex(), keys[3].hex(), alpn,
+                     sel, mtls))
+
+    def good(note, *, suite=0xC02B, group=0x001d, scheme=0x0403, cert=None, alpn=b"", sel=b"",
+             cr=None, mtls=False, srand=srand0, hr=False, sfin_edit=None, alert=0):
+        """cr = (certificate_types, supported_signature_algorithms) of a CertificateRequest;
+        mtls = the connection has the device chain + key. RFC 5246 7.4.6: the chain goes out
+        only when ecdsa_sign(64) and 0x0403 are both listed, else an empty Certificate."""
+        bits, kl, ivl, _ = TLS12_SUITE[suite]
+        ch = ch_of(alpn)
+        sh = sh_of(suite, srand=srand, sel=sel)
+        crt = cert or cert_of(ec_leaf if TLS12_SUITE[suite][3] else rsa_leaf)
+        ske = ske_of(group, scheme, srand=srand)
+        crm = cr_of(*cr) if cr else None
+        send = bool(cr) and mtls and 64 in cr[0] and 0x0403 in cr[1]
+        s1 = [sh, crt, ske] + ([hreq] if hr else []) + ([crm] if cr else []) + [shd]
+        hashed = [ch] + [m for m in s1 if m[0] != 0]  # RFC 5246 7.4.1.1: HelloRequest is not hashed
+        if group == 0x001d:
+            pre, pub = py_x25519(f["c_priv"], f["s_pub"]), f["c_pub"]
+        else:
+            pre, pub = py_p256_ecdh(c_d, s_p256), c_p256
+        c1 = []
+        if cr:
+            c1.append(cert_of_chain(MT["chain"]) if send else t_msg(11, t_v24(b"")))
+        c1.append(t_msg(16, t_v8(pub)))  # RFC 8422 5.7
+        H = HASH[bits]
+        ms = py_tls12_prf(bits, pre, b"extended master secret", H(b"".join(hashed + c1)).digest(),
+                          48)  # RFC 7627 4
+        if send:  # RFC 5246 7.4.8: ecdsa_secp256r1_sha256 over all messages CH..CKE
+            h = hashlib.sha256(b"".join(hashed + c1)).digest()
+            r, s_ = py_p256_sign(MT["dev_d"], h, 256, MT["srand"])
+            c1.append(t_msg(15, t_u16(0x0403) + t_v16(x_seq(x_int(r), x_int(s_)))))
+        kb = py_tls12_prf(bits, ms, b"key expansion", srand + rnd, 2 * (kl + ivl))  # RFC 5246 6.3
+        keys = (kb[:kl], kb[2 * kl:2 * kl + ivl], kb[kl:2 * kl], kb[2 * kl + ivl:])
+        cfin = t_msg(20, py_tls12_prf(bits, ms, b"client finished",
+                                      H(b"".join(hashed + c1)).digest(), 12))  # 7.4.9
+        sfin = t_msg(20, py_tls12_prf(bits, ms, b"server finished",
+                                      H(b"".join(hashed + c1 + [cfin])).digest(), 12))
+        if sfin_edit:
+            sfin = sfin_edit(sfin)
+        row(note, s1, ch=ch, alpn=",".join(n.decode() for n in t_alpn_names(alpn)),
+            sel=sel.decode(), c1=b"".join(c1), cfin=cfin, sfin=sfin, suite=suite, keys=keys,
+            mtls=int(mtls), alert=alert, fail_at=2 if alert else 1)
+        # the server's byte stream for fuzz/fuzz_conn.c: flight 1 in the clear, CCS, Finished
+        if not alert and not cr and not alpn:
+            streams.append((rec_hs_plain(b"".join(s1)) + bytes([20, 3, 3, 0, 1, 1])
+                            + rec12_seal(suite, keys[2], keys[3], 0, 22, sfin), note))
+        return s1
+
+    def cert_of_chain(chain):
+        return t_msg(11, t_v24(b"".join(t_v24(c) for c in chain)))
+
+    def t_alpn_names(enc):
+        out, i = [], 0
+        while i < len(enc):
+            out.append(enc[i + 1:i + 1 + enc[i]])
+            i += 1 + enc[i]
+        return out
+
+    # ---- positive flows (RFC 5246 7.3 full handshake, RFC 8422, RFC 7627, RFC 5288/5289/7905)
+    base = good("tls12: ECDHE-ECDSA-AES128-GCM-SHA256, x25519")
+    good("tls12: ECDHE-ECDSA-CHACHA20-POLY1305, x25519", suite=0xCCA9)
+    good("tls12: ECDHE-ECDSA-AES128-GCM-SHA256, secp256r1", group=0x0017)
+    good("tls12: ECDHE-ECDSA-AES256-GCM-SHA384, x25519", suite=0xC02C)
+    good("tls12: ECDHE-ECDSA-CHACHA20-POLY1305, secp256r1", suite=0xCCA9, group=0x0017)
+    good("tls12: ECDHE-RSA-CHACHA20-POLY1305, rsa_pss_rsae_sha256", suite=0xCCA8, scheme=0x0804)
+    good("tls12: ECDHE-RSA-AES128-GCM-SHA256, rsa_pkcs1_sha256", suite=0xC02F, scheme=0x0401)
+    good("tls12: ECDHE-RSA-AES256-GCM-SHA384, secp256r1, rsa_pkcs1_sha512", suite=0xC030,
+         group=0x0017, scheme=0x0601)
+    good("tls12: ECDHE-RSA-AES256-GCM-SHA384, rsa_pss_rsae_sha384", suite=0xC030, scheme=0x0805)
+    good("tls12: ECDHE-RSA-AES128-GCM-SHA256, rsa_pss_rsae_sha512 + rsa_pkcs1_sha384", suite=0xC02F,
+         scheme=0x0806)
+    good("tls12: ECDHE-RSA-AES128-GCM-SHA256, rsa_pkcs1_sha384", suite=0xC02F, scheme=0x0501)
+    good("tls12: RFC 9846 4.3.3: a P-256 key signing with ecdsa_secp384r1_sha384", scheme=0x0503)
+    good("tls12: RFC 7301: ALPN mqtt selected in the ServerHello", alpn=t_alpn([b"mqtt", b"h2"]),
+         sel=b"mqtt")
+    good("tls12: RFC 5246 7.4.8: mTLS on a SHA-384 suite (th256 kept for the CV)", suite=0xC02C,
+         cr=(bytes([64]), (0x0403, 0x0804)), mtls=True)
+    good("tls12: RFC 5246 7.4.6: a CR without 0x0403 gets an empty Certificate",
+         cr=(bytes([64]), (0x0804, 0x0401)), mtls=True)
+    good("tls12: RFC 5246 7.4.6: a CR without ecdsa_sign gets an empty Certificate",
+         cr=(bytes([1]), (0x0403,)), mtls=True)
+    good("tls12: RFC 5246 7.4.6: a CR and no device chain gets an empty Certificate",
+         cr=(bytes([64]), (0x0403,)))
+    good("tls12: RFC 5246 7.4.1.1: a HelloRequest in the flight is ignored and not hashed", hr=True)
+    good("tls12: RFC 9846 4.2.3: a random ending DOWNGRD 02 is no sentinel",
+         srand=srand0[:24] + b"DOWNGRD\x02")
+    good("tls12: RFC 5246 7.4.9: server verify_data flipped -> decrypt_error",
+         sfin_edit=lambda m: m[:-1] + bytes([m[-1] ^ 1]), alert="decrypt_error")
+    good("tls12: RFC 5246 7.4.9: a 13-byte server Finished -> decode_error",
+         sfin_edit=lambda m: t_msg(20, m[4:] + b"\x00"), alert="decode_error")
+    n_pos = len(rows)
+
+    # ---- single faults on the base flow (ECDSA, x25519, 0xC02B)
+    sh, crt, ske = base[0], base[1], base[2]
+    rest = base[1:]
+
+    def bad(note, alert, s1):
+        row(note, s1, alert=alert)
+
+    for tail, al in ((b"DOWNGRD\x01", "illegal_parameter"), (b"DOWNGRD\x00", "illegal_parameter")):
+        bad(f"RFC 9846 4.2.3: a 1.2 ServerHello random ending DOWNGRD {tail[-1]:02x} -> "
+            "illegal_parameter", al,
+            [sh_of(0xC02B, srand=srand0[:24] + tail)] + rest)
+    for v in (0x0302, 0x0301, 0x0300, 0x0304):
+        bad(f"RFC 9846 E.1/E.5: legacy_version {v:04x} without supported_versions -> "
+            "protocol_version", "protocol_version", [sh_of(0xC02B, ver=v)] + rest)
+    bad("RFC 9846 4.3.1: supported_versions 0x0303 -> illegal_parameter", "illegal_parameter",
+        [sh_of(0xC02B, exts=lambda e: e + [(43, t_u16(0x0303))])] + rest)
+    bad("RFC 9846 4.2.3: a 1.2 ServerHello with the HelloRetryRequest random -> illegal_parameter",
+        "illegal_parameter", [sh_of(0xC02B, srand=RFC9846["hrr"])] + rest)
+    for s, why in ((0x1301, "a TLS 1.3 suite"), (0xC013, "CBC"), (0x009C, "static RSA"),
+                   (0xCCAA, "DHE")):
+        bad(f"RFC 5246 7.4.1.3: {why} ({s:04x}) was never offered -> illegal_parameter",
+            "illegal_parameter", [sh_of(s)] + rest)
+    bad("RFC 5246 7.4.1.3 / RFC 9846 4.2.2: compression_method 1 -> illegal_parameter",
+        "illegal_parameter", [sh_of(0xC02B, comp=1)] + rest)
+    bad("RFC 7627 5.2 / RFC 9325 3.5: no extended_main_secret -> handshake_failure",
+        "handshake_failure", [sh_of(0xC02B, exts=lambda e: [x for x in e if x[0] != 23])] + rest)
+    bad("RFC 7627 5.1: a non-empty extended_main_secret -> decode_error", "decode_error",
+        [sh_of(0xC02B, exts=lambda e: [(t, b"\x00" if t == 23 else d) for t, d in e])] + rest)
+    bad("RFC 9325 3.5: no renegotiation_info -> handshake_failure", "handshake_failure",
+        [sh_of(0xC02B, exts=lambda e: [x for x in e if x[0] != 0xff01])] + rest)
+    bad("RFC 5746 3.4: renegotiated_connection not empty -> handshake_failure",
+        "handshake_failure",
+        [sh_of(0xC02B, exts=lambda e: [(t, b"\x01\x00" if t == 0xff01 else d) for t, d in e])]
+        + rest)
+    bad("RFC 5746 3.4: a malformed renegotiation_info length -> decode_error", "decode_error",
+        [sh_of(0xC02B, exts=lambda e: [(t, b"\x05" if t == 0xff01 else d) for t, d in e])] + rest)
+    bad("RFC 8422 5.2: ec_point_formats without uncompressed -> illegal_parameter",
+        "illegal_parameter",
+        [sh_of(0xC02B, exts=lambda e: [(t, b"\x01\x01" if t == 11 else d) for t, d in e])] + rest)
+    for t, d, why in ((35, b"", "session_ticket"), (5, b"", "status_request"),
+                      (0x1234, b"", "an unknown extension"), (51, t_u16(0x001d) + t_v16(bytes(32)),
+                                                              "key_share"),
+                      (41, t_u16(0), "pre_shared_key"), (28, t_u16(64), "record_size_limit")):
+        bad(f"RFC 5246 7.4.1.4: {why} was not offered for 1.2 -> unsupported_extension",
+            "unsupported_extension", [sh_of(0xC02B, exts=lambda e, t=t, d=d: e + [(t, d)])] + rest)
+    bad("RFC 5246 7.4.1.4: ALPN answered although none was offered -> unsupported_extension",
+        "unsupported_extension", [sh_of(0xC02B, sel=b"h2")] + rest)
+    bad("RFC 5246 7.4.1.4: a duplicate extension -> decode_error", "decode_error",
+        [sh_of(0xC02B, exts=lambda e: e + [(23, b"")])] + rest)
+    bad("RFC 5246 7.4.1.3: the SH echoes our session_id (resumption never offered) -> "
+        "illegal_parameter", "illegal_parameter", [sh_of(0xC02B, sid_=sid)] + rest)
+    # Certificate (RFC 5246 7.4.2)
+    bad("RFC 5246 7.4.2: an empty certificate_list -> decode_error", "decode_error",
+        [sh, t_msg(11, t_v24(b""))] + base[2:])
+    bad("RFC 5246 7.4.2: a zero-length ASN.1Cert -> decode_error", "decode_error",
+        [sh, t_msg(11, t_v24(t_v24(b"")))] + base[2:])
+    bad("RFC 5246 7.4.2: a trailing byte after the list -> decode_error", "decode_error",
+        [sh, t_msg(11, t_v24(t_v24(ec_leaf)) + b"\x00")] + base[2:])
+    bad("RFC 8422 5.3: an RSA leaf on ECDHE_ECDSA -> unsupported_certificate",
+        "unsupported_certificate", [sh, cert_of(rsa_leaf)] + base[2:])
+    bad("RFC 9525 6.3: the leaf names another host -> bad_certificate", "bad_certificate",
+        [sh, cert_of(f["leaf_cert"](host="other.example.com")), ske, shd])
+    row("RFC 5280 6.1.3: an expired leaf -> bad_certificate",
+        [sh, cert_of(f["leaf_cert"](naf="270101000000Z")), ske, shd], alert="bad_certificate",
+        flags=TLS13_F_TIME)
+    # ServerKeyExchange (RFC 8422 5.4, RFC 5246 7.4.3)
+    for ct in (1, 2):
+        bad(f"RFC 8422 5.4: curve_type {ct} (explicit curve) -> illegal_parameter",
+            "illegal_parameter", [sh, crt, ske_of(0x001d, 0x0403, ctype=ct), shd])
+    for g in (0x0018, 0x0019, 0x001e):
+        bad(f"RFC 8422 5.4: namedcurve {g:04x} was not offered -> illegal_parameter",
+            "illegal_parameter", [sh, crt, ske_of(g, 0x0403, point=bytes(65)), shd])
+    for pt, why in ((b"\x02" + s_p256[1:33], "compressed"), (b"\x06" + s_p256[1:], "hybrid"),
+                    (s_p256[:64], "short"), (s_p256 + b"\x00", "long"), (b"", "empty")):
+        bad(f"RFC 8422 5.4.1: a {why} secp256r1 ECPoint -> illegal_parameter", "illegal_parameter",
+            [sh, crt, ske_of(0x0017, 0x0403, point=pt), shd])
+    bad("RFC 8422 5.4.1: a hybrid point is refused before the (bad) signature is looked at",
+        "illegal_parameter", [sh, crt, ske_of(0x0017, 0x0403, point=bytes([6]) + s_p256[1:],
+                                              sig_edit=lambda s: s[:-1] + bytes([s[-1] ^ 1])),
+                              shd])
+    bad("RFC 7748 6.1: a 31-byte x25519 point -> illegal_parameter", "illegal_parameter",
+        [sh, crt, ske_of(0x001d, 0x0403, point=f["s_pub"][:31]), shd])
+    wp_seen = set()
+    for g in json.loads(fetch("wp_p256_ecdh"))["testGroups"]:
+        for t in g["tests"]:
+            pt = bytes.fromhex(t["public"])
+            if pt in wp_seen or not (len(pt) != 65 or "InvalidCurveAttack" in t["flags"]):
+                continue
+            wp_seen.add(pt)
+            if len(pt) == 65 and py_p256_ecdh(c_d, pt) is not None:
+                die("wycheproof ecpoint: an invalid-curve point is accepted by the reference")
+            bad(f"wycheproof ecdh_secp256r1_ecpoint tcId {t['tcId']} ({t['flags'][0]}) as the SKE "
+                "point -> illegal_parameter", "illegal_parameter",
+                [sh, crt, ske_of(0x0017, 0x0403, point=pt), shd])
+    for g in json.loads(fetch("wp_x25519"))["testGroups"]:
+        for t in g["tests"]:
+            pt = bytes.fromhex(t["public"])
+            if "ZeroSharedSecret" not in t["flags"] or pt in wp_seen:
+                continue
+            wp_seen.add(pt)
+            if py_x25519(f["c_priv"], pt) != bytes(32):
+                die("wycheproof x25519: a ZeroSharedSecret point gives a non-zero secret")
+            bad(f"wycheproof x25519 tcId {t['tcId']} (low order) as the SKE point, validly "
+                "signed -> illegal_parameter", "illegal_parameter",
+                [sh, crt, ske_of(0x001d, 0x0403, point=pt), shd])
+    for sch in (0x0201, 0x0203, 0x0603, 0x0807):
+        bad(f"RFC 9846 4.3.3: SKE scheme {sch:04x} was never offered -> illegal_parameter",
+            "illegal_parameter", [sh, crt, t_msg(12, ske[4:4 + 36] + t_u16(sch) + ske[4 + 38:]),
+                                  shd])
+    sh_rsa = sh_of(0xC02F)
+    bad("RFC 9846 4.3.3: ecdsa_secp256r1_sha256 with an RSA key -> illegal_parameter",
+        "illegal_parameter", [sh_rsa, cert_of(rsa_leaf), ske_of(0x001d, 0x0403), shd])
+    p384 = ec_issuer(P384, 0x7153E384, 384)
+    bad("RFC 9846 4.3.3: ecdsa_secp256r1_sha256 with a P-384 key -> illegal_parameter",
+        "illegal_parameter", [sh, cert_of(f["leaf_cert"](key=p384)), ske_of(0x001d, 0x0403), shd])
+    bad("RFC 5246 7.4.3: the SKE signed over swapped randoms -> decrypt_error", "decrypt_error",
+        [sh, crt, ske_of(0x001d, 0x0403, tbs=lambda p: srand0 + rnd + p), shd])
+    flip = bytearray(ske)
+    flip[4 + 4 + 5] ^= 1  # a byte of the x25519 point, after signing
+    bad("RFC 5246 7.4.3: one ServerECDHParams byte flipped after signing -> decrypt_error",
+        "decrypt_error", [sh, crt, bytes(flip), shd])
+    bad("RFC 5246 7.4.3: one signature bit flipped -> decrypt_error", "decrypt_error",
+        [sh, crt, ske_of(0x001d, 0x0403, sig_edit=lambda s: s[:-1] + bytes([s[-1] ^ 1])), shd])
+    bad("RFC 5246 7.4.3: a BER ECDSA-Sig-Value -> decode_error", "decode_error",
+        [sh, crt, ske_of(0x001d, 0x0403, sig_edit=lambda s: b"\x30\x81" + s[1:]), shd])
+    bad("RFC 5246 7.4.3: a trailing byte after the signature -> decode_error", "decode_error",
+        [sh, crt, t_msg(12, ske[4:] + b"\x00"), shd])
+    # message order (RFC 5246 7.3) and things never negotiated
+    bad("RFC 5246 7.3: no ServerKeyExchange -> unexpected_message", "unexpected_message",
+        [sh, crt, shd])
+    for typ, why in ((22, "CertificateStatus (never requested)"),
+                     (4, "NewSessionTicket (never offered)"), (8, "EncryptedExtensions"),
+                     (24, "KeyUpdate")):
+        bad(f"RFC 5246 7.3: {why} in the server flight -> unexpected_message",
+            "unexpected_message", [sh, crt, t_msg(typ, b"\x00" * 4), ske, shd])
+    bad("RFC 5246 7.4.1.1: a HelloRequest with a body -> decode_error", "decode_error",
+        [sh, crt, t_msg(0, b"\x00"), ske, shd])
+    bad("RFC 5246 7.4.5: a ServerHelloDone with a body -> decode_error", "decode_error",
+        [sh, crt, ske, t_msg(14, b"\x00")])
+    bad("RFC 5246 7.4.4: a CertificateRequest with a trailing byte -> decode_error",
+        "decode_error", [sh, crt, ske, t_msg(13, cr_of()[4:] + b"\x00"), shd])
+    print(f"  tls12 flows: {n_pos} full handshakes, {len(rows) - n_pos} single-fault rows, "
+          f"{len(streams)} fuzz streams")
+    return rows, streams
 
 
 # ---------------------------------------------------------------- HPACK (RFC 7541)
@@ -7906,7 +8394,12 @@ def main():
         tls13_mut.append((base + off, names.index(name), msg.hex(), ALERT[alert], note))
     tls13_der = tls13_ecdsa_der()
     rec_rows, rec_nonces, rec_hsmsg, rec_seeds, rec_fuzz_key = tls13_records()
-    conn_rows, conn_rnd, conn_pem, conn_blob, conn_now, conn_nst, conn_streams = tls13_conn()
+    conn_rows, conn_fx, conn_rnd, conn_pem, conn_blob, conn_now, conn_nst, conn_streams =         tls13_conn(True)
+    conn13_rows = tls13_conn(False)[0]
+    tls12_rfc_checks()
+    tls12_prf = tls12_prf_vectors()
+    tls12_rec = tls12_record_vectors()
+    tls12_rows, tls12_streams = tls12_flows()
 
     emit("sha2.inc", "struct hash_kat SHA2_KAT", cavp + dhash, lambda r: f"{r[0]}, {cstr(r[1])}, {cstr(r[2])}")
     emit("sha2_monte.inc", "struct monte_kat SHA2_MONTE", monte,
@@ -8028,6 +8521,10 @@ def main():
          flow_fmt)
     # tests/test_conn.c: the public-API flows and what the connection is configured with
     emit("tls13_conn.inc", "struct tls13_flow_kat TLS13_CONN_KAT", conn_rows, flow_fmt)
+    emit("tls13_conn.inc", "struct tls13_flow_kat TLS13_CONN13_KAT", conn13_rows, flow_fmt,
+         append=True)
+    emit("tls13_conn.inc", "struct tls13_flow_kat TLS13_CONNFX_KAT", conn_fx, flow_fmt,
+         append=True)
     with open(OUT / "tls13_conn.inc", "a", newline="\n") as fh:
         fh.write(f"static const char TLS13_CONN_RND[] = {cstr(conn_rnd.hex())};\n"
                  f"static const char TLS13_CONN_ROOT_PEM[] = {cpem(conn_pem)};\n"
@@ -8037,12 +8534,30 @@ def main():
     # Seeds for fuzz/fuzz_conn.c (tools/dev.py fuzz conn): chunk-size byte 0 (all at once) and
     # the server's record stream of every public-API flow.
     emit("tls13_conn_fuzz.inc", "struct tls13_fuzz_seed TLS13_CONN_FUZZ_SEED",
-         [((b"\x00" + st).hex(), note) for st, note in conn_streams],
+         [((b"\x00" + st).hex(), note) for st, note in conn_streams + tls12_streams],
          lambda r: f'{cstr(r[0])}, "{cesc(r[1])}"')
     with open(OUT / "tls13_conn_fuzz.inc", "a", newline="\n") as fh:
         fh.write(f"static const char TLS13_CONN_FUZZ_RND[] = {cstr(conn_rnd.hex())};\n"
                  f"static const char TLS13_CONN_FUZZ_ROOT[] = {cstr(FX['root_c'].hex())};\n"
                  f"static const long long TLS13_CONN_FUZZ_NOW_MS = {conn_now}LL;\n")
+    # tests/test_tls12_*.c (M5)
+    emit("tls12_prf.inc", "struct tls12_prf_kat TLS12_PRF_KAT", tls12_prf,
+         lambda r: f'{r[0]}, {cstr(r[1])}, "{r[2]}", {cstr(r[3])}, {cstr(r[4])}, {cstr(r[5])}, '
+                   f'"{r[6]}"')
+    emit("tls12_record.inc", "struct tls12_rec_kat TLS12_REC_KAT", tls12_rec,
+         lambda r: f'"{r[0]}", 0x{r[1]:04x}u, {cstr(r[2])}, {cstr(r[3])}, {r[4]}ULL, {r[5]}u, '
+                   f'{cstr(r[6])}, {cstr(r[7])}, {cstr(r[8])}, {r[9]}')
+    emit("tls12_conn.inc", "struct tls12_flow_kat TLS12_FLOW_KAT", tls12_rows,
+         lambda r: f'"{cesc(r[0])}", {r[1]}, {r[2]}, {r[3]}, '
+                   + ", ".join(cstr(x) for x in r[4:9]) + f", 0x{r[9]:04x}u, "
+                   + ", ".join(cstr(x) for x in r[10:14]) + f', "{r[14]}", "{r[15]}", {r[16]}')
+    with open(OUT / "tls12_conn.inc", "a", newline="\n") as fh:
+        fh.write(f"static const char TLS12_CONN_CCHAIN[] = {cstr(b''.join(MT['chain']).hex())};\n"
+                 f"static const char TLS12_CONN_DKEY[] = "
+                 f"{cstr(MT['dev_d'].to_bytes(32, 'big').hex())};\n"
+                 f"static const char TLS12_CONN_RND[] = {cstr(conn_rnd.hex())};\n"
+                 f"static const char TLS12_CONN_ROOT[] = {cstr(FX['root_c'].hex())};\n"
+                 f"static const long long TLS12_CONN_NOW_MS = {conn_now}LL;\n")
     emit("tls13_trace.inc", "struct tls13_rfc_kat TLS13_RFC_KAT", tls13_rfc,
          lambda r: ", ".join(cstr(x) for x in r), append=True)
     emit("tls13_trace.inc", "struct tls13_chw_kat TLS13_CHW_KAT", tls13_chw,
@@ -8148,6 +8663,9 @@ def main():
         "  TLS layer reading `KeyShareEntry.key_exchange`. The rule behind them, that a compressed\n"
         "  point is rejected and never decompressed, is pinned instead by generated\n"
         "  0x02/0x03/0x06/0x07 rows and by the all-256-first-bytes sweep in `tests/test_p256.c`.\n"
+        "  Since M5 they ARE replayed at that layer: as the ECPoint of a TLS 1.2\n"
+        "  ServerKeyExchange (`tls12_conn.inc`, illegal_parameter), with the 16 InvalidCurveAttack\n"
+        "  rows and the x25519 ZeroSharedSecret points of `x25519_test.json`.\n"
         "- `ecdsa_secp256r1_sha256_p1363_test.json`: 21 of the 262 rows carry a signature that is\n"
         "  not 64 bytes (2 to 82), all of them \"invalid\". `brisk__p256_ecdsa_verify` takes a fixed\n"
         "  `uint8_t[64]`, so the width is settled by the caller that unwraps the DER\n"
@@ -8221,6 +8739,23 @@ def main():
         "  are GENERATED on the `tls13_trace.inc` fixture keys with the same Python cascade that\n"
         "  reproduces RFC 8448 byte for byte; CH2 is checked against CH1 (RFC 9846 4.2.2), both\n"
         "  ECDHE directions against each other, the binder with the RFC 8448 sect 4 routine.\n"
+        "  Two sets: the TLS 1.3 + 1.2 ClientHello of a BRISK_ENABLE_TLS12 build (TLS13_CONN_KAT,\n"
+        "  and TLS13_CONNFX_KAT = every tls13_trace.inc fixture flow under it) and the pre-M5 TLS\n"
+        "  1.3-only one (TLS13_CONN13_KAT), which a TLS12=0 build must still send byte for byte.\n"
+        "- TLS 1.2 (M5). OFFICIAL: the PRF, the extended main secret and the key block - NIST ACVP\n"
+        "  `TLS-v1.2-KDF-RFC7627` (all 120) and the v1.2 groups of `kdf-components-tls-1.0` (120),\n"
+        "  commit-pinned above; the v1.0/1.1 groups (MD5/SHA-1 PRF) are skipped, out of scope\n"
+        "  (RFC 9846 E.5). ACVP publishes no invalid KDF rows (a KDF has no reject path): the\n"
+        "  argument errors are generated in tests/test_tls12_prf.c. NO official TLS 1.2 record or\n"
+        "  handshake vector exists (RFC 8448 is TLS 1.3 only; Wycheproof and CAVP have no TLS 1.2\n"
+        "  record suite), so `tls12_record.inc` and `tls12_conn.inc` are GENERATED with the Python\n"
+        "  AES-GCM / ChaCha20-Poly1305 / X25519 / P-256 / RSA references that reproduce the\n"
+        "  official M1/M2 vectors, and the RFC 5246 / 7627 / 5288 / 5289 / 7905 texts (fetched\n"
+        "  above) are asserted to contain every label, layout and code point the code uses. A shared\n"
+        "  misreading would pass these rows; the OpenSSL / nginx / Caddy interop runs\n"
+        "  (`tools/dev.py interop`) are the independent oracle. tlsfuzzer's TLS 1.2 scripts\n"
+        "  (extended-master-secret, downgrade-protection, ecdhe-padded-shared-secret,\n"
+        "  invalid-compression-methods, ccs, renegotiation-disabled) were a case catalogue only.\n"
         "- There is no P-384 *keygen*, *ECDH* or *signing* vector set here, and there never will\n"
         "  be: docs/ARCHITECTURE.md locks P-384 to verify only, so `KAS_ECC_CDH` `[P-384]`,\n"
         "  `KeyPair.rsp` `[P-384]`, `SigGen.txt` `[P-384]` and `ecdh_secp384r1_*` are all out of\n"

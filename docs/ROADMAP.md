@@ -78,10 +78,12 @@ Tick a box only when the work is green on **every** arch (`python tools/dev.py t
     untrusted CA -> E_AUTH, TLS 1.2-only server -> E_PEER_ALERT; nginx 1.26 and Caddy 2.6
     GET a known body. 18/18 pass (2026-09-23).
   - `python tools/dev.py badssl`: NO badssl.com host speaks TLS 1.3 (checked with
-    `openssl s_client -tls1_3`), so every badssl row fails with handshake_failure until M5 -
-    the bad-certificate rows prove nothing about certificate checks yet. revoked.badssl.com
-    must flip to "expected success" at M5: no CRL/OCSP by design. Positive controls
-    (www.cloudflare.com, www.google.com, system bundle) pass. 19/19 as expected.
+    `openssl s_client -tls1_3`). Since M5 they answer TLS 1.2, but WITHOUT extended master
+    secret (`openssl s_client -tls1_2`: "Extended master secret: no", 2026-09-24), which M5
+    requires - so every badssl row still fails (handshake_failure) and the bad-certificate rows
+    still prove nothing; revoked.badssl.com could not be flipped to success. The rows that do
+    mean something: TLS 1.0/1.1, CBC, 3DES, RC4, static RSA and DHE-only hosts are refused.
+    Positive controls (www.cloudflare.com, www.google.com, system bundle) pass. 26/26.
 - [x] Examples: AWS IoT HTTPS over raw TLS (ALPN x-amzn-http-ca), MQTT-over-TLS sketch
   - `examples/brisk_get.c` (generic CLI, the interop/badssl client), `aws_iot_https.c` (mTLS
     POST /topics on 443), `mqtt_tls.c` (MQTT 3.1.1 CONNECT/PUBLISH, ALPN x-amzn-mqtt-ca on 443).
@@ -118,8 +120,25 @@ Tick a box only when the work is green on **every** arch (`python tools/dev.py t
     ALPN -> brisk_h2_open E_ARG. 35/35 with the TLS rows (2026-09-24).
 
 ## M5 TLS 1.2 client
-- [ ] ECDHE-ECDSA/RSA x AES-GCM / ChaCha20-Poly1305, EMS required, renegotiation_info, PRF
-- [ ] Refuse CBC, RSA key exchange, SHA-1, compression, renegotiation; downgrade sentinel
+- [x] ECDHE-ECDSA/RSA x AES-GCM / ChaCha20-Poly1305, EMS required, renegotiation_info, PRF
+  - `src/tls/tls12.c` (the TLS 1.2 half of the engine), `brisk__tls12_prf` in hkdf.c, RFC 5246
+    6.2.3.3 AEAD framing + the CCS gate + the HelloRequest answer in record.c; one ClientHello
+    offers TLS 1.3 and 1.2 (supported_versions [0x0304, 0x0303], 6 suites, EMS,
+    renegotiation_info, ec_point_formats). Knob `BRISK_ENABLE_TLS12` (off in TINY; preset
+    `dev-tls13` builds it off). `brisk_tls_version()` added. mTLS over 1.2 with `client_key`;
+    a `sign` callback fails closed (internal_error) - the callback contract is raw tbs bytes
+    and TLS 1.2 signs the whole transcript: needs a public API decision (e.g. a digest scheme).
+  - Vectors: NIST ACVP TLS-v1.2-KDF-RFC7627 + kdf-components v1.2 (480 rows); generated
+    records (106) and flows (21 full handshakes, 104 single faults, incl. Wycheproof ecpoint /
+    x25519 low-order SKE points). Interop 57/57 (2026-09-24): openssl s_server -tls1_2 with every
+    suite x {ECDSA, RSA} x {X25519, P-256}, P-384 chain, ALPN, mTLS, CBC-only / no-EMS /
+    TLS 1.1 refused, HelloRequest; nginx and Caddy TLS 1.2 GET; h2 over TLS 1.2 on nginx.
+  - Known limit: a P-384 ECDSA leaf signing its SKE with 0x0403 (SHA-256) is refused - P-384
+    verify wants a >= 48-byte digest. secp384r1 is not in our groups, so per RFC 8422 5.1 a
+    server should not pick an ECDSA suite for that cert anyway. Fails closed.
+  - Manual review pass (workflow reviewers hit the session limit): rfc-auditor found a 1.3
+    SH/HRR picking an offered 1.2 suite was accepted (fixed, 2 kat rows); portability fixes.
+- [x] Refuse CBC, RSA key exchange, SHA-1, compression, renegotiation; downgrade sentinel
 
 ## M6 QUIC v1 client
 - [ ] Packets + header protection, CRYPTO frames on the TLS 1.3 engine, transport parameters

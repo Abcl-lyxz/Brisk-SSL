@@ -22,10 +22,11 @@ struct tls13_fuzz_seed {
 
 int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size);
 
-static int yes(void *ctx, const brisk__x509_cert *certs, size_t n_certs, uint16_t scheme,
-               const uint8_t *tbs, size_t tbs_len, const uint8_t *sig, size_t sig_len,
-               uint8_t *alert)
+static int yes(void *ctx, uint16_t version, const brisk__x509_cert *certs, size_t n_certs,
+               uint16_t scheme, const uint8_t *tbs, size_t tbs_len, const uint8_t *sig,
+               size_t sig_len, uint8_t *alert)
 {
+    (void)version;
     (void)ctx;
     (void)certs;
     (void)n_certs;

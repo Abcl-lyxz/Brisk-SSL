@@ -25,7 +25,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 IMAGE = "brisk-dev"
-HOST = ["dev", "dev32"]
+HOST = ["dev", "dev32", "dev-tls13"]  # dev-tls13: BRISK_ENABLE_TLS12=OFF (M5)
 CROSS = ["i686", "aarch64", "armv7hf", "armv5", "mips", "mipsel", "mips64", "riscv64", "ppc"]
 DOCKER = ["x86_64", "asan"] + CROSS
 SIZE_ARCHS = ["x86_64"] + CROSS
@@ -219,13 +219,13 @@ FUZZ = {"der": ("fuzz/fuzz_der.c src/x509/der.c", "tests/kat/der.inc"),
         "name": ("fuzz/fuzz_name.c src/x509/name.c src/x509/der.c",
                  "tests/kat/x509_name.inc"),
         # The engine links most of the library; its seeds are whole server flights (kat.py).
-        "tls13_hs": ("fuzz/fuzz_tls13_hs.c src/tls/handshake.c src/tls/keyschedule.c src/util.c "
+        "tls13_hs": ("fuzz/fuzz_tls13_hs.c src/tls/handshake.c src/tls/tls12.c src/tls/keyschedule.c src/util.c "
                      "src/crypto/sha2.c src/crypto/hkdf.c src/crypto/x25519.c src/crypto/p256.c "
                      "src/crypto/p384.c src/crypto/bn.c src/crypto/rsa.c src/x509/der.c "
                      "src/x509/cert.c src/x509/chain.c src/x509/name.c",
                      "tests/kat/tls13_fuzz.inc"),
         # The record layer over a CONNECTED engine; seeds are sect 3's post-handshake records.
-        "tls13_rec": ("fuzz/fuzz_tls13_rec.c src/tls/record.c src/tls/handshake.c "
+        "tls13_rec": ("fuzz/fuzz_tls13_rec.c src/tls/record.c src/tls/handshake.c src/tls/tls12.c "
                       "src/tls/keyschedule.c src/util.c src/crypto/sha2.c src/crypto/hkdf.c "
                       "src/crypto/chacha20_poly1305.c src/crypto/aes_ct.c src/crypto/aes_ct64.c "
                       "src/crypto/gcm.c src/crypto/x25519.c src/crypto/p256.c src/crypto/p384.c "
@@ -233,7 +233,7 @@ FUZZ = {"der": ("fuzz/fuzz_der.c src/x509/der.c", "tests/kat/der.inc"),
                       "src/x509/chain.c src/x509/name.c",
                       "tests/kat/tls13_rec_fuzz.inc"),
         # The public connection: whole server streams through brisk_feed (HRR/CH2, handshake).
-        "conn": ("fuzz/fuzz_conn.c src/tls/conn.c src/tls/record.c src/tls/handshake.c "
+        "conn": ("fuzz/fuzz_conn.c src/tls/conn.c src/tls/record.c src/tls/handshake.c src/tls/tls12.c "
                  "src/tls/keyschedule.c src/tls/ticket.c src/util.c src/crypto/sha2.c "
                  "src/crypto/hkdf.c src/crypto/chacha20_poly1305.c src/crypto/aes_ct.c "
                  "src/crypto/aes_ct64.c src/crypto/gcm.c src/crypto/x25519.c src/crypto/p256.c "
@@ -420,8 +420,39 @@ def interop_inside():
         ("wrong host name -> fail", ["-tls1_3"], "leaf-p256", ca, "127.0.0.1", ("fail", "E_AUTH")),
         ("untrusted CA -> fail", ["-tls1_3"], "leaf-p256", ["-c", pki("other.pem")], "localhost",
          ("fail", "E_AUTH")),
-        ("TLS 1.2-only server -> fail (until M5)", ["-tls1_2"], "leaf-p256", ca, "localhost",
+    ]
+    # TLS 1.2 (M5): every suite x {ECDSA P-256, RSA-2048} leaf x {X25519, P-256} ECDHE, the
+    # combined ClientHello answered by a TLS 1.2-only server; -keylogfile keeps the secrets of a
+    # failing run for comparison with tools/kat.py's cascade.
+    kl = ["-keylogfile", f"{IOP}/keylog12.txt"]
+    for suite, cert in (("ECDHE-ECDSA-AES128-GCM-SHA256", "leaf-p256"),
+                        ("ECDHE-ECDSA-AES256-GCM-SHA384", "leaf-p256"),
+                        ("ECDHE-ECDSA-CHACHA20-POLY1305", "leaf-p256"),
+                        ("ECDHE-RSA-AES128-GCM-SHA256", "leaf-rsa"),
+                        ("ECDHE-RSA-AES256-GCM-SHA384", "leaf-rsa"),
+                        ("ECDHE-RSA-CHACHA20-POLY1305", "leaf-rsa")):
+        for g in ("X25519", "P-256"):
+            S.append((f"TLS 1.2 {suite} {g}", ["-tls1_2", "-cipher", suite, "-groups", g, *kl],
+                      cert, ca, "localhost", ok(suite, "tls=0x0303")))
+    S += [
+        ("TLS 1.2 P-384 intermediate chain", ["-tls1_2", "-cert_chain", pki("inter-p384.pem")],
+         "leaf-via384", ca, "localhost", ok("TLSv1.2", "tls=0x0303")),
+        ("TLS 1.2 ALPN http/1.1", ["-tls1_2", "-alpn", "http/1.1"], "leaf-p256",
+         ca + ["-a", "h2,http/1.1"], "localhost", ok("TLSv1.2", "alpn=http/1.1 ")),
+        ("TLS 1.2 mTLS P-256 device cert", ["-tls1_2", "-Verify", "1", "-CAfile", pki("root.pem")],
+         "leaf-p256", ca + ["-C", pki("client.der"), "-K", pki("client.d")], "localhost",
+         ok("CN=client", "tls=0x0303")),
+        # TLS 1.2: the server judges our (empty) Certificate before its Finished
+        ("TLS 1.2 mTLS required, no cert -> fail",
+         ["-tls1_2", "-Verify", "1", "-CAfile", pki("root.pem")], "leaf-p256", ca, "localhost",
          ("fail", "E_PEER_ALERT")),
+        ("TLS 1.2 CBC-only server -> fail", ["-tls1_2", "-cipher", "ECDHE-RSA-AES128-SHA"],
+         "leaf-rsa", ca, "localhost", ("fail", "E_PEER_ALERT")),
+        # RFC 7627 / RFC 9325 3.5: extended_main_secret is required
+        ("TLS 1.2 server without EMS -> fail", ["-tls1_2", "-no_ems"], "leaf-p256", ca,
+         "localhost", ("fail", "E_PROTO")),
+        ("TLS 1.1-only server -> fail", ["-tls1_1", "-cipher", "DEFAULT@SECLEVEL=0"], "leaf-p256",
+         ca, "localhost", ("fail", "E_")),
     ]
     for name, sargs, cert, cargs, host, expect in S:
         srv = s_server(sargs, cert)
@@ -444,6 +475,7 @@ def interop_inside():
         srv.kill()
         srv.wait()
     rows.append(keyupdate(exe, ca))
+    rows.append(renegotiation(exe, ca))
 
     # nginx and Caddy: TLS 1.3, HTTP/1.1 GET of a known body
     Path(IOP, "nginx").mkdir(exist_ok=True)
@@ -452,7 +484,10 @@ pid /src/{IOP}/nginx/nginx.pid; error_log stderr; daemon off; events {{}}
 http {{ access_log off; client_body_temp_path /src/{IOP}/nginx;
   server {{ listen 127.0.0.1:8443 ssl; ssl_protocols TLSv1.3;
     ssl_certificate /src/{pki('leaf-p256.pem')}; ssl_certificate_key /src/{pki('leaf-p256.key')};
-    location / {{ return 200 "brisk-nginx-ok\\n"; }} }} }}
+    location / {{ return 200 "brisk-nginx-ok\\n"; }} }}
+  server {{ listen 127.0.0.1:8445 ssl; ssl_protocols TLSv1.2;
+    ssl_certificate /src/{pki('leaf-rsa.pem')}; ssl_certificate_key /src/{pki('leaf-rsa.key')};
+    location / {{ return 200 "brisk-nginx12-ok\\n"; }} }} }}
 """)
     Path(IOP, "Caddyfile").write_text(f"""{{
   admin off
@@ -461,6 +496,12 @@ http {{ access_log off; client_body_temp_path /src/{IOP}/nginx;
 https://localhost:8444 {{
   tls /src/{pki('leaf-p256.pem')} /src/{pki('leaf-p256.key')}
   respond "brisk-caddy-ok"
+}}
+https://localhost:8446 {{
+  tls /src/{pki('leaf-p256.pem')} /src/{pki('leaf-p256.key')} {{
+    protocols tls1.2 tls1.2
+  }}
+  respond "brisk-caddy12-ok"
 }}
 """)
     env = dict(os.environ, HOME=f"/src/{IOP}", XDG_DATA_HOME=f"/src/{IOP}/caddy",
@@ -474,6 +515,13 @@ https://localhost:8444 {{
         wait_port(port, srv)
         try:
             rows.append((name, *check(client(exe, ca, port=port), ok(body))))
+            if port == 8443:  # the same nginx: its TLS 1.2-only RSA server
+                rows.append(("nginx GET (TLS 1.2, RSA)",
+                             *check(client(exe, ca, port=8445), ok("brisk-nginx12-ok", "tls=0x0303"))))
+            else:
+                wait_port(8446, srv)
+                rows.append(("Caddy GET (TLS 1.2)",
+                             *check(client(exe, ca, port=8446), ok("brisk-caddy12-ok", "tls=0x0303"))))
         finally:
             srv.kill()
             srv.wait()
@@ -553,7 +601,9 @@ http {{ access_log off; client_body_temp_path /src/{IOP}/nginx-h2; proxy_temp_pa
   server {{ listen 127.0.0.1:8453 ssl; http2 on;
     location /echo {{ client_max_body_size 4m; proxy_pass http://127.0.0.1:9080; }} }}
   # one request per connection: nginx answers it, then sends GOAWAY (last stream 1)
-  server {{ listen 127.0.0.1:8454 ssl; http2 on; keepalive_requests 1; }} }}
+  server {{ listen 127.0.0.1:8454 ssl; http2 on; keepalive_requests 1; }}
+  # HTTP/2 over TLS 1.2 (RFC 9113 9.2: every suite offered is ECDHE + AEAD)
+  server {{ listen 127.0.0.1:8457 ssl; http2 on; ssl_protocols TLSv1.2; }} }}
 """)
     Path(IOP, "h2o").mkdir(exist_ok=True)
     Path(IOP, "h2o.conf").write_text(f"""
@@ -606,6 +656,9 @@ hosts:
     try:  # brisk.h: a request after GOAWAY, or above its last stream id, is BRISK_E_RETRY
         row("h2 nginx: GOAWAY after 1 request -> E_RETRY", run(["-r", "2"], 8454, "/small.txt"),
             lambda rc, o, e: rc == 2 and o == "brisk-h2-ok\n" and " 2: E_RETRY" in e)
+        wait_port(8457, srv)
+        row("h2 nginx over TLS 1.2: GET 1.5 MB", run(["-q"], 8457, "/big.bin"),
+            lambda rc, o, e: rc == 0 and o.strip() == big_line)
     finally:
         srv.kill()
         srv.wait()
@@ -651,6 +704,32 @@ def keyupdate(exe, ca):
     return "KeyUpdate (server-initiated, requested)", good, detail
 
 
+def renegotiation(exe, ca):
+    """TLS 1.2 s_server "R" = HelloRequest. We answer with one warning no_renegotiation (RFC 5746
+    4.2) and keep the connection; OpenSSL may then close it. Either way: a clean result (exit 0
+    or 2, never a signal) and no renegotiation."""
+    import time
+    srv = serve(["openssl", "s_server", "-accept", "4435", "-tls1_2", "-cert", pki("leaf-p256.pem"),
+                 "-key", pki("leaf-p256.key")], 4435, stdin=subprocess.PIPE)
+    cl = subprocess.Popen([exe, *ca, "-r", "hello\n", "localhost", "4435"], stdout=subprocess.PIPE,
+                          stderr=subprocess.PIPE, text=True)
+    try:
+        time.sleep(2)
+        for line in ("R\n", "after-hellorequest\n", "q\n"):
+            srv.stdin.write(line)
+            srv.stdin.flush()
+            time.sleep(0.5)
+        out, err = cl.communicate(timeout=30)
+    finally:
+        cl.kill()
+        srv.kill()
+        srv.wait()
+    log = srv.stdout.read().partition("hello")[2]
+    good = cl.returncode in (0, 2) and "tls=0x0303" in err and "SSL renegotiation" not in log
+    detail = err.strip().splitlines()[-1] if err.strip() else f"rc={cl.returncode}"
+    return "TLS 1.2 HelloRequest -> no_renegotiation", good, detail
+
+
 def report(rows):
     w = max(len(r[0]) for r in rows)
     for name, good, detail in rows:
@@ -660,18 +739,23 @@ def report(rows):
     return 1 if bad else 0
 
 
-# badssl.com, checked empirically on 2026-09-23 with `openssl s_client -tls1_3`: NO badssl.com
-# host negotiates TLS 1.3 (every one answers handshake_failure), so until M5 (TLS 1.2) every
-# badssl host must fail - and the "bad certificate" rows fail for that reason, not the
-# certificate. They are here so M5 only has to flip expectations. revoked.badssl.com will be
-# EXPECTED TO SUCCEED then: Brisk-SSL does no revocation checking (no CRL/OCSP, by design).
-# Two TLS 1.3 sites with public certificates are the positive control for the system bundle.
+# badssl.com speaks no TLS 1.3 (checked 2026-09-23 with `openssl s_client -tls1_3`), and since M5
+# it answers our TLS 1.2 offer - but WITHOUT extended_main_secret: `openssl s_client -tls1_2`
+# reports "Extended master secret: no" on every badssl host (re-checked 2026-09-24: sha256,
+# ecc384, revoked, mozilla-modern, tls-v1-2, ...). EMS is REQUIRED here (RFC 7627 5.2, RFC 9325
+# 3.5), so every badssl handshake ends in handshake_failure (E_PROTO) before any certificate is
+# looked at - the certificate rows (expired, wrong.host, revoked, ...) still prove nothing, and
+# revoked.badssl.com cannot show the "no revocation checking" success it would otherwise be.
+# What the table does pin: nothing below TLS 1.2, no CBC / 3DES / RC4 / static RSA / DHE suite
+# (the server's handshake_failure = E_PEER_ALERT), and the TLS 1.3 positive controls for the
+# system bundle. The certificate paths are covered by the interop run and the KAT suites.
 BADSSL = [(f"{h}.badssl.com", 443, "fail") for h in (
-    "sha256", "sha384", "sha512", "ecc256", "ecc384", "rsa2048", "rsa4096", "expired",
-    "wrong.host", "self-signed", "untrusted-root", "revoked", "incomplete-chain",
-    "mozilla-modern")] + [("badssl.com", 443, "fail"), ("tls-v1-2.badssl.com", 1012, "fail"),
-                          ("tls-v1-0.badssl.com", 1010, "fail"),
-                          ("www.cloudflare.com", 443, "ok"), ("www.google.com", 443, "ok")]
+    "sha256", "sha384", "sha512", "ecc256", "ecc384", "rsa2048", "rsa4096", "revoked",
+    "mozilla-modern", "expired", "wrong.host", "self-signed", "untrusted-root",
+    "incomplete-chain", "cbc", "3des", "rc4", "static-rsa", "dh2048", "rsa8192")] + [
+    ("badssl.com", 443, "fail"), ("tls-v1-2.badssl.com", 1012, "fail"),
+    ("tls-v1-1.badssl.com", 1011, "fail"), ("tls-v1-0.badssl.com", 1010, "fail"),
+    ("www.cloudflare.com", 443, "ok"), ("www.google.com", 443, "ok")]
 
 
 def badssl_inside():

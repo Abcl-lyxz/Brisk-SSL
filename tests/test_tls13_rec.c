@@ -358,10 +358,11 @@ static size_t g_scratch_len;
 static uint8_t app[1 << 16], wire[1 << 16], out2[1 << 16];
 static size_t app_len;
 
-static int yes(void *ctx, const brisk__x509_cert *certs, size_t n_certs, uint16_t scheme,
-               const uint8_t *tbs, size_t tbs_len, const uint8_t *sig, size_t sig_len,
-               uint8_t *alert)
+static int yes(void *ctx, uint16_t version, const brisk__x509_cert *certs, size_t n_certs,
+               uint16_t scheme, const uint8_t *tbs, size_t tbs_len, const uint8_t *sig,
+               size_t sig_len, uint8_t *alert)
 {
+    (void)version;
     (void)ctx;
     (void)certs;
     (void)n_certs;

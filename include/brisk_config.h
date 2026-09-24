@@ -45,6 +45,18 @@
  * SHA-256/384/512, HMAC and HKDF are always built: every TLS configuration needs them.
  */
 
+/* TLS 1.2 client (RFC 5246 mechanics, RFC 9846 downgrade and E rules; src/tls/tls12.c). The
+ * ClientHello then offers TLS 1.3 AND 1.2 (supported_versions [0x0304, 0x0303]) with the six
+ * ECDHE + AEAD suites (ECDSA/RSA x AES-128/256-GCM, ChaCha20-Poly1305), extended_main_secret
+ * REQUIRED (RFC 7627), renegotiation refused (RFC 5746), no CBC / static RSA / SHA-1 signature /
+ * compression / resumption. Off in TINY: that ClientHello stays TLS 1.3 only, byte for byte, and
+ * a TLS 1.2 ServerHello is protocol_version. A device that must be 1.3-only in a bigger profile
+ * builds with -DBRISK_ENABLE_TLS12=0 - there is no runtime version knob. Needs nothing forced:
+ * SHA-2, HMAC, AES-GCM, ChaCha20-Poly1305, X25519, P-256, RSA and X.509 are always linked. */
+#ifndef BRISK_ENABLE_TLS12
+#    define BRISK_ENABLE_TLS12 (BRISK_PROFILE >= BRISK_PROFILE_DEFAULT)
+#endif
+
 /* HTTP/2 (RFC 9113). An optional module the application calls explicitly over a TLS connection
  * whose ALPN it chose - never switched on by the core: HPACK (RFC 7541, src/http/hpack.c +
  * huffman.c) and frames, streams, flow control and the brisk_h2_* API (src/http/h2.c). Off in

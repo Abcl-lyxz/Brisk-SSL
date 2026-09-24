@@ -127,6 +127,16 @@ int brisk__hkdf_expand(brisk_hash_alg alg, const uint8_t *prk, size_t prk_len, c
 int brisk__hkdf_expand_label(brisk_hash_alg alg, const uint8_t *secret, size_t secret_len,
                              const char *label, const uint8_t *context, size_t context_len,
                              uint8_t *out, size_t out_len);
+#if BRISK_ENABLE_TLS12
+/* RFC 5246 5: PRF(secret, label, seed1 || seed2)[0..out_len), P_<alg> over HMAC, the label and
+ * seeds streamed (no concatenation buffer), any out_len. alg SHA-256/384 for TLS 1.2 (SHA-512
+ * is accepted for the ACVP rows). BRISK_E_ARG (out untouched) on an unknown alg, out == NULL,
+ * out_len == 0 or label == NULL; seed2 may be NULL/0. `out` must not overlap `secret`. Every
+ * intermediate A(i) and HMAC state is wiped; the loop count depends only on out_len. */
+int brisk__tls12_prf(brisk_hash_alg alg, const uint8_t *secret, size_t secret_len,
+                     const char *label, const uint8_t *seed1, size_t seed1_len,
+                     const uint8_t *seed2, size_t seed2_len, uint8_t *out, size_t out_len);
+#endif
 
 /* ---- crypto/chacha20_poly1305.c: ChaCha20, Poly1305, AEAD_CHACHA20_POLY1305 (RFC 8439) ----
  * Fixed sizes only (RFC 8439 2.8: K_LEN 32, nonce 12, tag 16). The per-record/per-packet nonce
@@ -1439,6 +1449,9 @@ int brisk__tls_psk_binder(brisk_hash_alg alg, const uint8_t *psk, size_t psk_len
  * ServerHello selected the offered PSK (hs_set_psk), WAIT_EE goes to WAIT_FIN (A.1): no
  * certificate is sent or checked on a resumed connection, so the ONLY binding to the original
  * server is the ticket's SNI match and its 7-day cap (ticket.c); SPKI pins are not re-checked.
+ * With BRISK_ENABLE_TLS12 the same engine also offers TLS 1.2 (ch_params.tls12) and, when the
+ * ServerHello has no supported_versions and passes the RFC 9846 4.2.3 sentinel test, hands the
+ * rest of the handshake to tls/tls12.c (hs->version 0x0303; see that block below).
  *
  * PSK (RFC 9846 4.3.11): resumption only, psk_dhe_ke only, never 0-RTT. The caller builds the
  * ClientHello with brisk__tls13_ch_write (binder = HashLen zeros); hs_client_hello computes the
@@ -1537,10 +1550,14 @@ typedef int (*brisk__tls13_secret_fn)(void *ctx, unsigned epoch, int is_send, ui
  * Production always passes brisk__tls13_auth_x509; only the RFC 8448 trace test, whose server
  * key is RSA-1024 with no anchor, passes its own. Return BRISK_OK or a negative code with *alert
  * set; an *alert left at 0 becomes decrypt_error for BRISK_E_AUTH and bad_certificate
- * otherwise. The certificate structs point into the engine's scratch and die with the call. */
-typedef int (*brisk__tls13_auth_fn)(void *ctx, const brisk__x509_cert *certs, size_t n_certs,
-                                    uint16_t scheme, const uint8_t *tbs, size_t tbs_len,
-                                    const uint8_t *sig, size_t sig_len, uint8_t *alert);
+ * otherwise. The certificate structs point into the engine's scratch and die with the call.
+ * `version` is the negotiated protocol: 0x0304 (the CertificateVerify above) or 0x0303 (a TLS
+ * 1.2 ServerKeyExchange: tbs = client_random || server_random || ServerECDHParams, RFC 8422
+ * 5.4, and the TLS 1.2 scheme rules of brisk__tls12_sig_verify). */
+typedef int (*brisk__tls13_auth_fn)(void *ctx, uint16_t version, const brisk__x509_cert *certs,
+                                    size_t n_certs, uint16_t scheme, const uint8_t *tbs,
+                                    size_t tbs_len, const uint8_t *sig, size_t sig_len,
+                                    uint8_t *alert);
 
 typedef struct {
     const char *host; /* RFC 9525 reference identity, host_len bytes, not NUL-terminated */
@@ -1556,10 +1573,11 @@ typedef struct {
  * unsupported_certificate), brisk__x509_match_host (bad_certificate), the leaf's keyUsage has
  * digitalSignature when present (RFC 9846 4.5.1.2) and its EKU includes serverAuth or
  * anyExtendedKeyUsage when present (RFC 5280 4.2.1.12) - chain.c checks neither -
- * (unsupported_certificate), then the signature through brisk__tls13_cv_verify. */
-int brisk__tls13_auth_x509(void *ctx, const brisk__x509_cert *certs, size_t n_certs,
-                           uint16_t scheme, const uint8_t *tbs, size_t tbs_len, const uint8_t *sig,
-                           size_t sig_len, uint8_t *alert);
+ * (unsupported_certificate), then the signature through brisk__tls13_cv_verify - or, for
+ * version 0x0303, brisk__tls12_sig_verify (the first check uses the same TLS 1.2 table). */
+int brisk__tls13_auth_x509(void *ctx, uint16_t version, const brisk__x509_cert *certs,
+                           size_t n_certs, uint16_t scheme, const uint8_t *tbs, size_t tbs_len,
+                           const uint8_t *sig, size_t sig_len, uint8_t *alert);
 
 /* The CertificateVerify signature alone (RFC 9846 4.5.2) against `leaf`'s key. Schemes: 0x0403
  * (P-256 key), 0x0503 (P-384 key, BRISK_ENABLE_P384), 0x0804/0805/0806 rsa_pss_rsae with
@@ -1570,6 +1588,16 @@ int brisk__tls13_auth_x509(void *ctx, const brisk__x509_cert *certs, size_t n_ce
  * BRISK_OK, or BRISK_E_AUTH / BRISK_E_ARG with *alert set. */
 int brisk__tls13_cv_verify(const brisk__x509_cert *leaf, uint16_t scheme, const uint8_t *tbs,
                            size_t tbs_len, const uint8_t *sig, size_t sig_len, uint8_t *alert);
+#if BRISK_ENABLE_TLS12
+/* A TLS 1.2 ServerKeyExchange signature (RFC 5246 7.4.3, RFC 8422 5.4) under RFC 9846 4.3.3's
+ * TLS 1.2 rules: the curve is not bound to the hash, so 0x0403 or 0x0503 with a P-256 key, 0x0503
+ * with a P-384 key (BRISK_ENABLE_P384); rsa_pss_rsae 0x0804-0x0806 (sLen = hLen) and
+ * rsa_pkcs1 0x0401/0x0501/0x0601 with an RSA key. Never SHA-1 / SHA-224 / MD5. 0x0403 with a
+ * P-384 key is refused (the digest is narrower than the field). Same alert split as
+ * brisk__tls13_cv_verify. */
+int brisk__tls12_sig_verify(const brisk__x509_cert *leaf, uint16_t scheme, const uint8_t *tbs,
+                            size_t tbs_len, const uint8_t *sig, size_t sig_len, uint8_t *alert);
+#endif
 
 /* RFC 9846 4.5.2 signed content: 64 x 0x20 || "TLS 1.3, server CertificateVerify" (or client)
  * || 0x00 || th. `out` needs 98 + hl bytes. Returns the length. */
@@ -1609,6 +1637,11 @@ typedef struct {
     /* NULL = no pre_shared_key. Else one identity + obf_age, and a binder of psk_len zero bytes
      * that hs_client_hello fills (4.3.11). The extension is written LAST, as 4.3.11 demands. */
     const brisk__tls13_psk *psk;
+    /* 1 = also offer TLS 1.2 (M5): 0x0303 after 0x0304 in supported_versions (RFC 9846 4.3.1),
+     * the six TLS 1.2 suites after `suites`, and ec_point_formats [uncompressed] (RFC 8422 5.1),
+     * extended_main_secret (RFC 7627 5.1) and renegotiation_info {0x00} (RFC 5746 3.4) right
+     * after supported_versions. BRISK_E_ARG with BRISK_ENABLE_TLS12 == 0 or over QUIC. */
+    uint8_t tls12;
 } brisk__tls13_ch_params;
 
 /* Serialise a ClientHello handshake message, header included. Extension order: server_name,
@@ -1685,14 +1718,26 @@ enum {
     BRISK__HS_WAIT_CERT,
     BRISK__HS_WAIT_CV,
     BRISK__HS_WAIT_FIN,
+    /* TLS 1.2 (tls12.c, RFC 5246 7.3): Certificate, ServerKeyExchange, [CertificateRequest]
+     * ServerHelloDone, then - the client flight queued - the server's CCS and Finished */
+    BRISK__HS_WAIT12_CERT,
+    BRISK__HS_WAIT12_SKE,
+    BRISK__HS_WAIT12_CR_SHD,
+    BRISK__HS_WAIT12_SHD,
+    BRISK__HS_WAIT12_CCS,
+    BRISK__HS_WAIT12_FIN,
     BRISK__HS_CONNECTED,
     BRISK__HS_FAILED
 };
 
 /* The offer, parsed from the ClientHello bytes the engine absorbed - what was sent is the only
  * source of truth for "did the client offer this" (RFC 9846 4.3 unsolicited extensions). */
-#define BRISK__TLS13_MAX_OFFER_EXT    16
-#define BRISK__TLS13_MAX_OFFER_SUITES 8
+#define BRISK__TLS13_MAX_OFFER_EXT 16
+#if BRISK_ENABLE_TLS12
+#    define BRISK__TLS13_MAX_OFFER_SUITES 16 /* 3 TLS 1.3 + 6 TLS 1.2 by default */
+#else
+#    define BRISK__TLS13_MAX_OFFER_SUITES 8
+#endif
 #define BRISK__TLS13_MAX_OFFER_GROUPS 16
 #define BRISK__TLS13_MAX_OFFER_SIGS   24
 
@@ -1727,6 +1772,18 @@ typedef struct {
     /* KeyUpdate received in CONNECTED (RFC 9846 4.7.3), for the record layer, which clears it:
      * bit0 rotate the receive key after this record, bit1 the peer set update_requested */
     uint8_t ku;
+    /* 0 until the ServerHello, then 0x0303 or 0x0304 (RFC 9846 4.3.1); tls12_offered: the
+     * absorbed ClientHello listed 0x0303 (BRISK_ENABLE_TLS12 builds only) */
+    uint16_t version;
+    uint8_t tls12_offered;
+#if BRISK_ENABLE_TLS12
+    /* TLS 1.2 (tls12.c). SECRET: priv_p256 (the P-256 d a ServerKeyExchange may pick; the x25519
+     * one is priv above), main (first the 32-byte ECDHE preliminary secret, then the 48-byte
+     * extended main secret, RFC 7627 4) - wiped as soon as they are used and by hs_fail. crand /
+     * srand are the hello randoms, kx_pub our ECDHE share for the ClientKeyExchange. */
+    uint8_t priv_p256[32], main[48], crand[32], srand[32], kx_pub[65];
+    uint8_t kx_pub_len, cr_send; /* cr_send: the CertificateRequest also lists ecdsa_sign(64) */
+#endif
     int err; /* the sticky return code once FAILED */
     /* scratch carve-up: [message reassembly | certificate array | output queue] */
     uint8_t *scratch, *in, *out;
@@ -1735,8 +1792,9 @@ typedef struct {
 } brisk__tls13_hs;
 
 /* Scratch bytes hs_init needs: BRISK_TLS_MAX_HS_MSG + 4 for the largest message (the
- * Certificate, kept while the CertificateVerify is reassembled after it, because the parsed
- * certificates point into it), a CertificateVerify, BRISK__X509_MAX_CHAIN certificate structs
+ * Certificate, kept while the CertificateVerify - or the TLS 1.2 ServerKeyExchange - is
+ * reassembled after it, because the parsed certificates point into it), a CertificateVerify or
+ * ServerKeyExchange at BRISK_RSA_MAX_BITS, BRISK__X509_MAX_CHAIN certificate structs
  * (sizeof-based, aligned in place), and BRISK__TLS13_OUT_MAX of output queue. */
 size_t brisk__tls13_hs_scratch_size(void);
 
@@ -1773,6 +1831,60 @@ int brisk__tls13_hs_alpn(const brisk__tls13_hs *hs, const uint8_t **name, size_t
 
 /* 1 if the ServerHello accepted the PSK: no certificate was checked on this connection. */
 int brisk__tls13_hs_resumed(const brisk__tls13_hs *hs);
+
+/* 0 before the ServerHello, then 0x0303 (TLS 1.2) or 0x0304 (TLS 1.3). */
+uint16_t brisk__tls13_hs_version(const brisk__tls13_hs *hs);
+
+#if BRISK_ENABLE_TLS12
+/* ---- tls/tls12.c: the TLS 1.2 client half of the engine (RFC 5246, RFC 9846 4.2.3 / 4.3.3 / E)
+ *
+ * Entered from hs_on_sh only when the ServerHello has no supported_versions AND passed the
+ * downgrade-sentinel test (RFC 9846 4.2.3). Full handshakes only (RFC 5246 7.3): SH ->
+ * Certificate -> ServerKeyExchange -> [CertificateRequest] -> ServerHelloDone, then the client
+ * flight [Certificate] ClientKeyExchange [CertificateVerify] at INITIAL (plaintext) and the
+ * Finished in the second output run (hs_pull tags it APP: it goes out under the new keys, after
+ * the record layer's mandatory CCS); then the server's CCS (brisk__tls12_on_ccs) and Finished.
+ * Keys go out through cfg.on_secret with epoch APP, suite = the TLS 1.2 code and secret =
+ * key || fixed_iv (RFC 5246 6.3). extended_main_secret and renegotiation_info are REQUIRED; no
+ * resumption, no renegotiation (a HelloRequest in CONNECTED sets hs->ku bit 2 for the record
+ * layer's one no_renegotiation warning), no exporter. Same sticky failure contract as the rest
+ * of the engine. */
+
+/* Before hs_client_hello for CH1 when the ClientHello offers TLS 1.2: the P-256 d a
+ * ServerKeyExchange may pick (the x25519 d is the key_share key). Copied; wiped at a HRR, a TLS
+ * 1.3 ServerHello, right after the ECDH, by hs_fail and hs_wipe. BRISK_E_ARG unless state START
+ * and brisk__p256_scalar_valid(d). */
+int brisk__tls13_hs_set_tls12_key(brisk__tls13_hs *hs, const uint8_t p256_d[32]);
+/* hs_on_sh after the sentinel test; m/n = the whole ServerHello, ext/ext_len its extensions. */
+int brisk__tls12_on_sh(brisk__tls13_hs *hs, const uint8_t *m, size_t n, const uint8_t *ext,
+                       size_t ext_len, int is_hrr);
+/* hs_dispatch forwards every message here once hs->version == 0x0303. */
+int brisk__tls12_dispatch(brisk__tls13_hs *hs, const uint8_t *m, size_t n);
+/* The record layer's server ChangeCipherSpec {0x01}: BRISK_OK (state WAIT12_FIN, receive epoch
+ * APP) only in WAIT12_CCS with no handshake fragment pending; else unexpected_message, sticky.
+ * RFC 5246 7.1 / 7.4.9, and the CCS-injection class (CVE-2014-0224). */
+int brisk__tls12_on_ccs(brisk__tls13_hs *hs);
+/* 0xC02B/0xC02F: SHA-256, key 16, iv 4; 0xC02C/0xC030: SHA-384, 32, 4; 0xCCA8/0xCCA9: SHA-256,
+ * 32, 12 (RFC 5288 3, RFC 5289 3.2, RFC 7905 2); *ecdsa = 1 for ECDHE_ECDSA. 0 for anything else
+ * (outputs untouched), 1 for a TLS 1.2 suite; any output pointer may be NULL. */
+int brisk__tls12_suite(uint16_t suite, brisk_hash_alg *prf, size_t *key_len, size_t *iv_len,
+                       uint8_t *ecdsa);
+
+/* handshake.c helpers shared with tls12.c (formerly static; see handshake.c for each) */
+brisk_hash_alg brisk__hs_alg(uint16_t suite);
+int brisk__hs_fail(brisk__tls13_hs *hs, uint8_t alert);
+void brisk__hs_th_add(brisk__tls13_hs *hs, const uint8_t *m, size_t n);
+void brisk__hs_th_snap(const brisk__tls13_hs *hs, uint8_t *out);
+uint8_t *brisk__hs_reserve(brisk__tls13_hs *hs, unsigned epoch, size_t n);
+int brisk__hs_queue(brisk__tls13_hs *hs, unsigned epoch, const uint8_t *m, size_t n);
+int brisk__hs_ext_next(const uint8_t **p, const uint8_t *end, uint16_t *type, const uint8_t **data,
+                       size_t *dlen);
+int brisk__hs_in_list(const uint16_t *list, size_t n, uint16_t v);
+uint8_t brisk__hs_alpn_check(brisk__tls13_hs *hs, const uint8_t *d, size_t dl);
+#    if BRISK_ENABLE_MTLS
+size_t brisk__hs_chain_entries(const uint8_t *chain, size_t len, uint8_t *out, int ext);
+#    endif
+#endif
 
 /* ---- tls/ticket.c: the resumption ticket blob, the ONE parser of caller-stored bytes
  * ------------- Blob v1, big-endian, byte-addressed (portable across archs): ver(1)=1 | suite(2) |
@@ -1859,6 +1971,16 @@ void brisk__tls_nonce(const uint8_t iv[12], uint64_t seq, uint8_t nonce[12]);
  * wrong len (d wiped). */
 int brisk__tls_dir_init(brisk__tls_dir *d, unsigned epoch, uint16_t suite, const uint8_t *secret,
                         size_t len);
+#if BRISK_ENABLE_TLS12
+/* RFC 5246 6.3 key and fixed IV straight from the key block (no HKDF): d wiped first, seq 0,
+ * epoch APP. BRISK_E_ARG (d wiped) unless `suite` is a TLS 1.2 suite and the lengths are its. A
+ * TLS 1.2 d makes brisk__tls_rec_seal / _open use RFC 5246 6.2.3.3 framing: the real content
+ * type in the header, AAD = seq(8) || type || 0x0303 || plaintext length, GCM nonce = iv(4) ||
+ * nonce_explicit(8) (= seq on seal, read from the wire on open, RFC 5288 3), ChaCha nonce = iv
+ * XOR seq (RFC 7905 2); no inner type, pad must be 0. */
+int brisk__tls12_dir_init(brisk__tls_dir *d, uint16_t suite, const uint8_t *key, size_t key_len,
+                          const uint8_t *iv, size_t iv_len);
+#endif
 /* 7.2: secret = Expand-Label(secret, "traffic upd", "", HashLen), then dir_init; n_updates + 1.
  * The old secret, key and iv are gone afterwards. BRISK_E_ARG unless d is an APP epoch. */
 int brisk__tls_dir_update(brisk__tls_dir *d);
@@ -1900,7 +2022,14 @@ typedef struct {
     uint8_t alert;      /* the fatal alert we send once failed */
     uint8_t alert_sent;
     uint8_t peer_alert; /* the peer's fatal alert (BRISK_E_PEER_ALERT) */
-    int err;            /* sticky once failed */
+#if BRISK_ENABLE_TLS12
+    /* TLS 1.2: the receive key || iv waits here for the server's CCS (RFC 5246 7.1); hr = 1 a
+     * no_renegotiation warning is owed for the first HelloRequest, 2 it was sent (RFC 5746 4.2) */
+    uint8_t rpend[32 + 12];
+    uint16_t rpend_suite;
+    uint8_t rpend_set, hr;
+#endif
+    int err; /* sticky once failed */
 } brisk__tls13_conn;
 
 /* BRISK_E_ARG if a pointer is NULL or cap < BRISK__TLS_REC_IN_MAX. */
@@ -1908,7 +2037,10 @@ int brisk__tls13_conn_init(brisk__tls13_conn *c, brisk__tls13_hs *hs, uint8_t *r
 /* The brisk__tls13_secret_fn conn_init installs (ctx = c). Receive secrets install at once (the
  * record in hand is already open, and the engine refuses bytes after SH / server Finished in
  * it); a send secret waits until every hs_pull byte of the earlier epoch has been sealed, so
- * c_ap protects only what follows the client Finished (RFC 9846 4, handshake.c contract). */
+ * c_ap protects only what follows the client Finished (RFC 9846 4, handshake.c contract).
+ * TLS 1.2 suites (secret = key || fixed_iv): the send key installs once the plaintext client
+ * flight is sealed (it protects the Finished, after the mandatory CCS); the receive key waits
+ * in rpend for the server's CCS (RFC 5246 7.1) - see brisk__tls12_on_ccs. */
 int brisk__tls13_conn_on_secret(void *ctx, unsigned epoch, int is_send, uint16_t suite,
                                 const uint8_t *secret, size_t len);
 /* Absorb wire bytes in any split; *used = bytes taken. Stops early (short *used) while
@@ -1992,7 +2124,7 @@ struct brisk_conn {
     uint16_t alpn_len;
     char host[256]; /* NUL-terminated copy of the caller's host */
     size_t host_len;
-    uint16_t port; /* brisk_connect's port (0 = unknown: sans-I/O / test fd) - the h2 :authority */
+    uint16_t port;  /* brisk_connect's port (0 = unknown: sans-I/O / test fd) - the h2 :authority */
     int64_t now_ms; /* wall clock: ticket age / stamp; auth.now holds the same in seconds */
     int64_t ch1_ms; /* now_ms when CH1 was built: CH2 re-imports its PSK at that time (4.2.2) */
     /* blocking layer (src/os/linux_net.c) only; fd = -1 and the rest 0 for sans-I/O */
@@ -2040,8 +2172,9 @@ int brisk__hpack_int_decode(const uint8_t *p, size_t len, unsigned n, uint32_t *
 int brisk__huff_decode(const uint8_t *in, size_t len, uint8_t *out, size_t cap, size_t *out_len);
 
 /* hpack.c */
-#    define BRISK__HPACK_NEVER_INDEXED 1u /* 6.2.3: decoder reports it; encoder input asks for it  \
-                                           */
+#    define BRISK__HPACK_NEVER_INDEXED                                                             \
+        1u /* 6.2.3: decoder reports it; encoder input asks for it                                 \
+            */
 
 typedef struct {
     const uint8_t *name;
@@ -2101,9 +2234,11 @@ int brisk__hpack_field_ok(const uint8_t *name, size_t nl, const uint8_t *value, 
  * A pure core (brisk__h2_feed / brisk__h2_pull: frames in, frames out, no I/O) under a thin
  * blocking layer (the public brisk_h2_*) that moves bytes through the two transport callbacks:
  * brisk_read / brisk_write in production (brisk_h2_open, os/linux_net.c), a fake in the tests. */
-#    define BRISK__H2_MAX_LIST 4096 /* our SETTINGS_MAX_HEADER_LIST_SIZE = block buffer = scratch */
-#    define BRISK__H2_TX       4096 /* outbound frames (control + HEADERS/CONTINUATION/DATA) */
-#    define BRISK__H2_RX       1024 /* staging for the transport's reads, fed frame by frame */
+#    define BRISK__H2_MAX_LIST                                                                     \
+        4096                  /* our SETTINGS_MAX_HEADER_LIST_SIZE = block buffer = scratch        \
+                               */
+#    define BRISK__H2_TX 4096 /* outbound frames (control + HEADERS/CONTINUATION/DATA) */
+#    define BRISK__H2_RX 1024 /* staging for the transport's reads, fed frame by frame */
 
 /* Same contracts as brisk_read / brisk_write (io = the brisk_conn). */
 typedef int (*brisk__h2_rd_fn)(void *io, void *buf, size_t cap);
@@ -2111,18 +2246,18 @@ typedef int (*brisk__h2_wr_fn)(void *io, const void *buf, size_t len);
 
 struct brisk_h2_stream {
     struct brisk_h2 *h;
-    uint8_t *ring;          /* BRISK_H2_STREAM_WINDOW + BRISK__H2_MAX_LIST octets: the parked
-                             * response fields [u16 nl][u16 vl][name][value]..., then DATA */
-    uint32_t id;            /* 0 = free slot */
-    int err;                /* this stream's error (BRISK_E_*), 0 = none */
-    int32_t swin, rwin;     /* send window (6.9.1, may go negative 6.9.2) / receive window left */
-    uint32_t pend;          /* receive credit owed (consumed or padding), not yet WINDOW_UPDATEd */
-    uint32_t rhead, rlen;   /* ring: oldest byte, bytes in use */
-    uint32_t hdr, ready;    /* parked field bytes at the front; DATA bytes of completed frames */
-    uint64_t cl, got;       /* content-length (8.1.1) and DATA octets received */
+    uint8_t *ring;        /* BRISK_H2_STREAM_WINDOW + BRISK__H2_MAX_LIST octets: the parked
+                           * response fields [u16 nl][u16 vl][name][value]..., then DATA */
+    uint32_t id;          /* 0 = free slot */
+    int err;              /* this stream's error (BRISK_E_*), 0 = none */
+    int32_t swin, rwin;   /* send window (6.9.1, may go negative 6.9.2) / receive window left */
+    uint32_t pend;        /* receive credit owed (consumed or padding), not yet WINDOW_UPDATEd */
+    uint32_t rhead, rlen; /* ring: oldest byte, bytes in use */
+    uint32_t hdr, ready;  /* parked field bytes at the front; DATA bytes of completed frames */
+    uint64_t cl, got;     /* content-length (8.1.1) and DATA octets received */
     uint16_t status;
-    uint8_t flags;          /* H2S_* in h2.c */
-    uint8_t n1xx;           /* interim (1xx) responses seen, capped (RFC 9113 10.5) */
+    uint8_t flags; /* H2S_* in h2.c */
+    uint8_t n1xx;  /* interim (1xx) responses seen, capped (RFC 9113 10.5) */
 };
 
 struct brisk_h2 {
@@ -2135,24 +2270,24 @@ struct brisk_h2 {
     brisk__hpack_enc enc;
     uint8_t *blk, *scratch, *tx, *rx;
     size_t blk_len, tx_len, rx_off, rx_len;
-    int err;                  /* sticky: connection error (GOAWAY sent) or failed write */
-    int eof;                  /* transport ended (brisk_read 0 / error): open streams fail */
-    int32_t cwin, crwin;      /* connection send / receive windows */
-    uint32_t cpend;           /* connection receive credit owed */
-    uint32_t next_id;         /* next client stream id (odd; > 2^31-1 = exhausted) */
-    uint32_t last_id;         /* lowest GOAWAY last_stream_id seen */
+    int err;             /* sticky: connection error (GOAWAY sent) or failed write */
+    int eof;             /* transport ended (brisk_read 0 / error): open streams fail */
+    int32_t cwin, crwin; /* connection send / receive windows */
+    uint32_t cpend;      /* connection receive credit owed */
+    uint32_t next_id;    /* next client stream id (odd; > 2^31-1 = exhausted) */
+    uint32_t last_id;    /* lowest GOAWAY last_stream_id seen */
     uint32_t p_conc, p_frame, p_list, p_win; /* the server's SETTINGS (6.5.2) */
-    uint32_t idle;            /* frames without progress in this call (flood guard) */
+    uint32_t idle; /* frames without progress in this call (flood guard) */
     uint32_t f_len, f_pos, f_end, f_sid, f_dat; /* frame being parsed; f_dat = DATA ringed */
-    struct brisk_h2_stream *f_s; /* DATA target (NULL = discard) */
-    struct brisk_h2_stream *b_s; /* field block target (NULL = decode only) */
+    struct brisk_h2_stream *f_s;                /* DATA target (NULL = discard) */
+    struct brisk_h2_stream *b_s;                /* field block target (NULL = decode only) */
     uint32_t b_sid, b_pre;
     uint64_t b_cl;
     uint16_t b_status, auth_len;
     uint8_t fh[9], fh_n, f_type, f_flags, f_pfx, pad, pb[8], set_n;
     uint8_t in_blk, b_es, b_cont, b_trailer, b_bad, b_seen, b_reg, b_park, b_has_cl;
     uint8_t got_settings, goaway, goaway_err;
-    char auth[264];           /* :authority */
+    char auth[264]; /* :authority */
     struct brisk_h2_stream s[BRISK_H2_MAX_STREAMS];
 };
 

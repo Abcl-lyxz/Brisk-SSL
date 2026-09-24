@@ -195,10 +195,11 @@ typedef struct {
 
 /* The RFC 8448 authenticator: checks the 4.5.2 content it is given against the one kat.py
  * rebuilt from the trace messages, then accepts. Production never gets here. */
-static int stub_auth(void *ctx, const brisk__x509_cert *certs, size_t n_certs, uint16_t scheme,
-                     const uint8_t *tbs, size_t tbs_len, const uint8_t *sig, size_t sig_len,
-                     uint8_t *alert)
+static int stub_auth(void *ctx, uint16_t version, const brisk__x509_cert *certs, size_t n_certs,
+                     uint16_t scheme, const uint8_t *tbs, size_t tbs_len, const uint8_t *sig,
+                     size_t sig_len, uint8_t *alert)
 {
+    (void)version;
     stub *s = (stub *)ctx;
     (void)scheme;
     (void)sig;
@@ -2066,8 +2067,8 @@ static void hs_mtls(void)
         case 3:
             cfg.sign_rand = NULL;
             break; /* soft key without k' */
-        case 4: /* the leaf repeated past BRISK_TLS_MAX_CLIENT_CHAIN */
-        case 5: /* ... and up to it: accepted, however far past the old 2 KB queue */
+        case 4:    /* the leaf repeated past BRISK_TLS_MAX_CLIENT_CHAIN */
+        case 5:    /* ... and up to it: accepted, however far past the old 2 KB queue */
             cl = 4 + brisk__load_be16(f.cchain + 2);
             for (n = 0; n + cl <= (i == 4 ? sizeof bigchain : BRISK_TLS_MAX_CLIENT_CHAIN);
                  n += cl) {

@@ -305,6 +305,7 @@ void test_ct(void)
 #endif
     ct_bn_rsa();
     ct_memeq();
-    tls13_hs_ct_run(); /* the handshake engine over RFC 8448 sect 3, ECDHE key secret */
+    tls13_hs_ct_run();  /* the handshake engine over RFC 8448 sect 3, ECDHE key secret */
     tls13_rec_ct_run(); /* record seal/open, dir_init/update with secret keys */
+    tls12_ct_run();     /* TLS 1.2: PRF, EMS, key block, CV, Finished, 1.2 records */
 }

@@ -11,8 +11,9 @@
  *     -r TEXT     request to send; "\n" in TEXT becomes CRLF, "" = handshake only.
  *                 Default: GET / HTTP/1.1 with Host and Connection: close
  *
- * Prints the reply to stdout and "brisk: alpn=... resumed=..." to stderr. Exit status 0 on a
- * clean close_notify or peer close after data, 1 on usage errors, 2 when the connection failed.
+ * Prints the reply to stdout and "brisk: tls=0x0304 alpn=... resumed=..." (0x0303 for TLS 1.2)
+ * to stderr. Exit status 0 on a clean close_notify or peer close after data, 1 on usage errors,
+ * 2 when the connection failed.
  *
  * SPDX-License-Identifier: Apache-2.0
  */
@@ -123,8 +124,8 @@ int main(int argc, char **argv)
     if (brisk_alpn(c, &alpn_name, &alpn_len) != BRISK_OK) {
         alpn_len = 0;
     }
-    fprintf(stderr, "brisk: alpn=%.*s resumed=%d\n", (int)alpn_len, alpn_len ? alpn_name : "",
-            brisk_resumed(c));
+    fprintf(stderr, "brisk: tls=0x%04x alpn=%.*s resumed=%d\n", (unsigned)brisk_tls_version(c),
+            (int)alpn_len, alpn_len ? alpn_name : "", brisk_resumed(c));
 
     rc = req_len > 0 ? brisk_write(c, req, req_len) : BRISK_OK;
     while (rc == BRISK_OK && req_len > 0 && (n = brisk_read(c, buf, sizeof buf)) != 0) {

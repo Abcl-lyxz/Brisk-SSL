@@ -9,6 +9,9 @@ set_property(CACHE BRISK_PROFILE PROPERTY STRINGS "" TINY DEFAULT FULL)
 set(BRISK_X509_TIME_POLICY "" CACHE STRING
     "X.509 validity: STRICT, FLOOR or INSECURE_NO_TIME; empty = header default")
 set_property(CACHE BRISK_X509_TIME_POLICY PROPERTY STRINGS "" STRICT FLOOR INSECURE_NO_TIME)
+# Explicit ON/OFF for BRISK_ENABLE_TLS12 (empty = the profile decides, brisk_config.h).
+set(BRISK_ENABLE_TLS12 "" CACHE STRING "TLS 1.2 client: ON, OFF or empty (profile default)")
+set_property(CACHE BRISK_ENABLE_TLS12 PROPERTY STRINGS "" ON OFF)
 option(BRISK_BUILD_TESTS "Build the test suite" ${PROJECT_IS_TOP_LEVEL})
 option(BRISK_BUILD_EXAMPLES "Build examples/ (Linux only)" ${PROJECT_IS_TOP_LEVEL})
 
@@ -33,6 +36,7 @@ add_library(brisk STATIC
     src/x509/bundle.c     # PEM certificates out of a byte stream, sans-I/O
     src/tls/keyschedule.c # TLS 1.3 key schedule (RFC 9846 sect 7.1) + Finished + exporter
     src/tls/handshake.c   # TLS 1.3 client handshake engine (RFC 9846 sect 4), sans-I/O
+    src/tls/tls12.c       # TLS 1.2 client half of the engine (empty TU without BRISK_ENABLE_TLS12)
     src/tls/record.c      # TLS 1.3 record layer over TCP (RFC 9846 sect 5) + connection driver
     src/tls/ticket.c      # the resumption ticket blob (RFC 9846 4.7.1): export / import
     src/tls/conn.c        # the public connection (brisk_conn): sans-I/O glue over hs + record
@@ -49,6 +53,13 @@ target_include_directories(brisk PUBLIC include PRIVATE src vendor)
 # PUBLIC: consumers see exactly the configuration the library was built with.
 if(BRISK_PROFILE)
     target_compile_definitions(brisk PUBLIC BRISK_PROFILE=BRISK_PROFILE_${BRISK_PROFILE})
+endif()
+if(NOT BRISK_ENABLE_TLS12 STREQUAL "")
+    if(BRISK_ENABLE_TLS12)
+        target_compile_definitions(brisk PUBLIC BRISK_ENABLE_TLS12=1)
+    else()
+        target_compile_definitions(brisk PUBLIC BRISK_ENABLE_TLS12=0)
+    endif()
 endif()
 if(BRISK_X509_TIME_POLICY)
     target_compile_definitions(brisk PUBLIC
@@ -78,6 +89,7 @@ if(BRISK_BUILD_TESTS)
                                tests/test_rsa.c tests/test_der.c tests/test_x509.c
                                tests/test_ct.c tests/test_tls13_ks.c
                                tests/test_tls13_hs.c tests/test_tls13_rec.c tests/test_conn.c
+                               tests/test_tls12_prf.c tests/test_tls12_rec.c tests/test_tls12_hs.c
                                tests/test_hpack.c tests/test_h2.c)
     set_target_properties(brisk_tests PROPERTIES C_STANDARD 99 C_EXTENSIONS OFF)
     target_link_libraries(brisk_tests PRIVATE brisk)
@@ -118,6 +130,12 @@ if(BRISK_BUILD_TESTS)
     set_tests_properties(tls13_rec PROPERTIES TIMEOUT 900)
     add_test(NAME conn COMMAND brisk_tests conn)
     set_tests_properties(conn PROPERTIES TIMEOUT 900)
+    add_test(NAME tls12_prf COMMAND brisk_tests tls12_prf)
+    set_tests_properties(tls12_prf PROPERTIES TIMEOUT 900)
+    add_test(NAME tls12_rec COMMAND brisk_tests tls12_rec)
+    set_tests_properties(tls12_rec PROPERTIES TIMEOUT 900)
+    add_test(NAME tls12_hs COMMAND brisk_tests tls12_hs)
+    set_tests_properties(tls12_hs PROPERTIES TIMEOUT 900)
     add_test(NAME hpack COMMAND brisk_tests hpack)
     set_tests_properties(hpack PROPERTIES TIMEOUT 900)
     add_test(NAME h2 COMMAND brisk_tests h2)

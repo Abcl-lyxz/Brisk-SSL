@@ -369,11 +369,21 @@ BRISK_API int brisk_alpn(const brisk_conn *c, const char **name, size_t *len);
  * connection: the ticket vouches for the server it was issued by), else 0. */
 BRISK_API int brisk_resumed(const brisk_conn *c);
 
+/* The protocol version once the handshake completed: 0x0304 (TLS 1.3) or 0x0303 (TLS 1.2, only
+ * in a build with BRISK_ENABLE_TLS12, when the server does not speak TLS 1.3). BRISK_E_ARG
+ * before. TLS 1.2 here is ECDHE + AEAD with the extended main secret, no resumption (so
+ * brisk_resumed() is 0) and no renegotiation: a server's HelloRequest gets one warning
+ * no_renegotiation alert and the connection goes on. As in TLS 1.3, answer the server's
+ * close_notify with brisk_close / brisk_close_notify (RFC 5246 7.2.1). mTLS over TLS 1.2 needs
+ * client_key: with a `sign` callback a TLS 1.2 server asking for the certificate fails the
+ * handshake with internal_error (the callback contract is raw to-be-signed bytes, and TLS 1.2
+ * signs the whole handshake transcript). */
+BRISK_API int brisk_tls_version(const brisk_conn *c);
+
 /* Wipe every key, secret and buffer of a sans-I/O connection; afterwards the memory given to
  * brisk_conn_init is all zero again (bar bytes it held before init that alignment skipped) and
  * may be freed or reused. NULL-safe. Closes nothing. */
 BRISK_API void brisk_conn_wipe(brisk_conn *c);
-
 
 /* ------------------------------------------------------------------------------------------------
  * HTTP/2 client (RFC 9113), BRISK_ENABLE_H2 (DEFAULT / FULL). Declared in every profile; a build
