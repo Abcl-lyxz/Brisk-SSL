@@ -1,42 +1,43 @@
-# Handoff - 2026-09-24 (session 19)
+# Handoff - 2026-09-25 (session 20)
 
-## Done - M6 item 1 (QUIC packets, CRYPTO, transport parameters)
-- 3f21602 **quic: packets + header protection, CRYPTO on the TLS 1.3 engine, transport
-  parameters**. src/quic/packet.c (varint, PN, headers, Initial secrets, seal/open + HP) and
-  src/quic/conn.c (TP codec, frames, CRYPTO reassembly per level, key discard,
-  CONNECTION_CLOSE). Internal brisk__quic_* only. Knob BRISK_ENABLE_QUIC = FULL only; dev/dev32
-  presets now build FULL, dev-tls13 builds DEFAULT (QUIC off, empty TUs).
-- Built with /implement-module wf_d050ee15-053; its 3 reviewers died on the session limit AGAIN,
-  so they were run by hand. Fixed: leftover CRYPTO at a key change -> PROTOCOL_VIOLATION (engine
-  pseudo-alert 255 at both epoch checks); MAX_STREAMS/STREAMS_BLOCKED > 2^60, RETIRE_CID,
-  NEW_CID to an empty DCID now close; open restores the protected header on AEAD failure; seal
-  refuses pn < next_pn (nonce reuse) and sets the PN-length bits; pn_decode checks nbits; the
-  32-bit CRYPTO-length test really hits the guard now. All guards mutation-tested.
-- 11 archs green, ct64/ct32/ct32m clean. Size DEFAULT +48..+100 B (armv7hf -20), baseline not
-  re-saved. QUIC in FULL costs 7.9-14.8 KB.
+## Done - M6 items 2 and 3
+- bc13c98 **quic: ACK, loss recovery, streams + flow control**. New src/quic/recovery.c (ACK
+  ranges, RTT, loss/PTO, integer NewReno) and src/quic/stream.c (stream table, flow control,
+  STREAM_STATE/LIMIT/FLOW_CONTROL/FINAL_SIZE). conn.c: coalescing builder, variable PN length,
+  NEW_CID limits + retire_prior_to, PATH_RESPONSE, idle, pacing, deadline/close. Review fixes:
+  last 2 sent records reserved for PTO probes; the anti-deadlock PTO stays armed after the
+  Initial space is dropped (a handshake stalled to idle); deadline() = now when a probe or a
+  PATH_RESPONSE is owed; the preferred_address CID is seq 1 in cids[1].
+- 7a7da6d **quic: Retry, VN, stateless reset, key update**. Review fixes: self-initiated key
+  update keeps the old rx keys until a new-phase packet (QC_KU_WAIT); next local update waits
+  3*PTO after the confirming ACK (ku_ack_at); reset token only for a CID we have sent on
+  (dcid_unsent); VN/Retry only as the first packet of a datagram.
+- Both: 11 archs green, ct clean, fuzz quic_pkt clean. DEFAULT size unchanged (QUIC is FULL
+  only; still the item-1 +48..+100 B vs baseline, not re-saved). FULL: recovery+stream
+  +8.5..18 KB, item 3 +3.6..4.5 KB; sizeof(brisk__quic_conn) 6.8 KB, scratch ~47 KB (x86_64).
 
 ## In progress
 - Nothing. Tree clean.
 
 ## Needs a user decision
+- **Public QUIC API shape** (blocks the interop harness): brisk_quic_connect/stream_open/
+  read/write/close over UDP in src/os + sans-I/O feed/pull, caller-owned memory via
+  brisk_quic_size(). Ask before writing include/brisk.h.
 - (still open) mTLS over TLS 1.2 with a `sign` callback fails closed; digest-scheme proposal
   postponed to M8.
 
 ## Next up
-- **M6 item 2**: ACK, loss detection / PTO, NewReno (integer), flow control, streams + the
-  public brisk_quic_* API. The ROADMAP line lists the stateful MUSTs rfc-auditor found (stream
-  state/limit/flow-control errors, NEW_CONNECTION_ID limit + retire_prior_to, ACK and
-  PATH_RESPONSE generation). Start it early in a session with /implement-module.
+- **M6 item 4**: quic-interop-runner harness (hq-interop), after the public API decision.
+  It needs the public brisk_quic_* API + a UDP driver in src/os/.
 
 ## Decisions / gotchas
-- conn.c pkt_finish hard-codes a 4-byte PN because brisk__quic_send / cc_build lay the payload
-  out at hl + 4. Once largest_acked exists, pass brisk__quic_pn_len's value through all three.
-- The engine wipes c_ap/s_ap right after on_secret: key update (item 3) must keep the app
-  secret in brisk__quic_conn.
-- brisk__quic_conn_init does not check that the caller's iscid TP equals its scid (server
-  rejects under 7.3) - fold into the public API in item 2.
-- Before M7 adds another FULL-only knob, drop BRISK_PROFILE=FULL from the `base` preset so
-  host x64 builds the shipped DEFAULT (TLS 1.2 on) again.
+- Contract: call brisk__quic_send after every recv (a Retry's resent ClientHello is not in
+  deadline()). Public API must hide this.
+- Deliberate: lost data is re-queued at once; RFC 9002 7.4 MAY not taken; 1-RTT PTO probe
+  sends new data or PING; next rx keys derived 3*PTO after promote (6.3 MAY, not ~1 PTO).
+- Untested defensive guard: qc_ku_opened refuses to promote when rx_ku.suite == 0.
+- Before M7 adds another FULL-only knob, drop BRISK_PROFILE=FULL from the `base` preset.
 - dev.py size keys modules by object basename: tls/conn.c and quic/conn.c share one row.
-- implement-module reviewers failing = no review. Run all 3 by hand; this time they found 1
-  test bug, 2 RFC MUST issues and 4 crypto hardening items.
+- /implement-module died on the session limit in BOTH runs (reviewers, then fix:r2). Hand-run
+  rfc-auditor found 3 real bugs in item 2. kat.py once hit Errno 22 writing hpack.inc (file
+  lock) - just rerun it.
