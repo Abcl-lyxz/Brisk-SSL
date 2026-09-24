@@ -397,13 +397,13 @@ static void mid_frame_close(void)
     int st;
     fake f;
 
-    n += frame(g_srv + n, 0, 4, 0, 0);                  /* SETTINGS */
-    n += frame(g_srv + n, 1, 1, 4, 1);                  /* HEADERS :status 200 (0x88) */
+    n += frame(g_srv + n, 0, 4, 0, 0); /* SETTINGS */
+    n += frame(g_srv + n, 1, 1, 4, 1); /* HEADERS :status 200 (0x88) */
     g_srv[n - 1] = 0x88;
     data_at = n;
-    n += frame(g_srv + n, 5000, 0, 0, 1);               /* DATA 5000, not ended */
+    n += frame(g_srv + n, 5000, 0, 0, 1); /* DATA 5000, not ended */
     memset(g_srv + data_at + 9, 0x61, 5000);
-    n += frame(g_srv + n, 1, 1, 4 | 1, 3);              /* HEADERS stream 3, END_STREAM */
+    n += frame(g_srv + n, 1, 1, 4 | 1, 3); /* HEADERS stream 3, END_STREAM */
     g_srv[n - 1] = 0x88;
     memset(&f, 0, sizeof f);
     f.srv = g_srv;
@@ -418,7 +418,7 @@ static void mid_frame_close(void)
     c0 = f.clen;
     brisk_h2_stream_close(s);
     frame(want, 4, 3, 0, 1);
-    brisk__store_be32(want + 9, 8);    /* RST_STREAM CANCEL */
+    brisk__store_be32(want + 9, 8); /* RST_STREAM CANCEL */
     frame(want + 13, 4, 8, 0, 0);
     brisk__store_be32(want + 22, 5000); /* WINDOW_UPDATE: all of the frame */
     CHECK(f.clen == c0 + 26 && memcmp(g_cli + c0, want, 26) == 0);
@@ -475,13 +475,13 @@ void test_h2(void)
     CHECK(brisk_h2_size() + 8 <= sizeof g_arena);
     misc();
 #    if BRISK_H2_STREAM_WINDOW == H2_KAT_W && BRISK_H2_MAX_STREAMS == H2_KAT_MAX &&                \
-        BRISK_H2_HEADER_TABLE_SIZE == 4096
+        BRISK_H2_HEADER_TABLE_SIZE == 4096 && BRISK_H2_MAX_HEADER_LIST == H2_KAT_L
     mid_frame_close(); /* its expected bytes assume the default window and stream count */
     padded_end_close();
     rows();
 #    else
-    printf("h2       rows skipped: they assume window %d, %d streams, table 4096\n", H2_KAT_W,
-           H2_KAT_MAX);
+    printf("h2       rows skipped: they assume window %d, %d streams, table 4096, list %d\n",
+           H2_KAT_W, H2_KAT_MAX, H2_KAT_L);
     (void)rows; /* built but not run with non-default knobs */
     (void)mid_frame_close;
 #    endif

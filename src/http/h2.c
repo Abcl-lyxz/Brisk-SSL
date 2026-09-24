@@ -8,12 +8,13 @@
  * the moment the condition holds makes every result and every client byte independent of how
  * the transport splits the input (tests/test_h2.c replays each row at many splits).
  *
- * MEMORY (caller's, brisk_h2_size): the struct, the HPACK table ring, a 4 KB field-block
- * assembly buffer (= our SETTINGS_MAX_HEADER_LIST_SIZE), a 4 KB scratch, tx 4 KB, rx 1 KB and one
- * ring per stream of W + 4096 octets (W = BRISK_H2_STREAM_WINDOW). A stream ring holds the final
- * response's decoded fields (parked until brisk_h2_response, [u16 nl][u16 vl][name][value] each,
- * n + v + 4 <= n + v + 32, so <= 4096) followed by DATA. We advertise W as the stream window and
- * credit only what the application consumed, so a ring can never overflow (6.9).
+ * MEMORY (caller's, brisk_h2_size): the struct, the HPACK table ring, an L-octet field-block
+ * assembly buffer (L = BRISK_H2_MAX_HEADER_LIST = our SETTINGS_MAX_HEADER_LIST_SIZE), an L-octet
+ * scratch, tx 4 KB, rx 1 KB and one ring per stream of W + L octets (W = BRISK_H2_STREAM_WINDOW).
+ * A stream ring holds the final response's decoded fields (parked until brisk_h2_response,
+ * [u16 nl][u16 vl][name][value] each, n + v + 4 <= n + v + 32, so <= L) followed by DATA. We
+ * advertise W as the stream window and credit only what the application consumed, so a ring can
+ * never overflow (6.9).
  *
  * WINDOWS. Receive: stream window W, credited (WINDOW_UPDATE) once W/2 octets are owed; the
  * connection window is max(65535, MAX_STREAMS * W) (a WINDOW_UPDATE after SETTINGS raises it,
@@ -259,8 +260,8 @@ static int h2_class(brisk_h2 *h, uint32_t sid, h2s **out)
     for (i = 0; i < BRISK_H2_MAX_STREAMS; i++) {
         if (h->s[i].id == sid) {
             /* reset, or closed both ways (5.1 closed: minimal processing, then dropped) */
-            if (!(h->s[i].flags & H2S_RST) && (h->s[i].flags & (H2S_SENT_END | H2S_RECV_END)) !=
-                                                    (H2S_SENT_END | H2S_RECV_END)) {
+            if (!(h->s[i].flags & H2S_RST) &&
+                (h->s[i].flags & (H2S_SENT_END | H2S_RECV_END)) != (H2S_SENT_END | H2S_RECV_END)) {
                 *out = &h->s[i];
                 return H2C_LIVE;
             }

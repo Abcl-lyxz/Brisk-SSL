@@ -7312,7 +7312,7 @@ def emit(name, decl, rows, fmt, append=False):
 # Invalid rows mirror summerwind/h2spec's case list (sect 3.5, 4.1-4.3, 5.1-5.5, 6.1-6.10, 8.1)
 # and the 2019 / 2024 flood advisories (Netflix 2019-002, CERT VU#421644); nothing is copied.
 
-H2_W, H2_L, H2_TX, H2_MAXS = 8192, 4096, 4096, 4  # BRISK_H2_STREAM_WINDOW / MAX_LIST / TX / MAX_STREAMS
+H2_W, H2_L, H2_TX, H2_MAXS = 8192, 8192, 4096, 4  # BRISK_H2_STREAM_WINDOW / MAX_LIST / TX / MAX_STREAMS
 H2_PREFACE = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n"
 H2E = {"ARG": -1, "PROTO": -4, "PEER": -5, "IO": -6, "RETRY": -9}
 (H2_NO_ERROR, H2_PROTOCOL, H2_INTERNAL, H2_FLOW, H2_SETTINGS_TIMEOUT, H2_STREAM_CLOSED,
@@ -7628,7 +7628,7 @@ def h2_lib_check(rows):
             normalize_inbound_headers=False))
         conn.initiate_connection()
         conn.update_settings({h2.settings.SettingCodes.ENABLE_PUSH: 0,
-                              h2.settings.SettingCodes.MAX_HEADER_LIST_SIZE: 4096})
+                              h2.settings.SettingCodes.MAX_HEADER_LIST_SIZE: H2_L})
         raised = None
         try:
             for ev in r.timeline:
@@ -7881,7 +7881,7 @@ def h2_rows():
         ("* with GET", "GET", "*", []), ("path with LF", "GET", "/a\nb", []),
         ("content-length != body_len", "POST", "/", [("content-length", "5")]),
         ("content-length not digits", "GET", "/", [("content-length", "0x0")]),
-        ("field over 4080 octets", "GET", "/", [("x-big", "v" * 4080)]),
+        (f"field over {H2_L - 16} octets", "GET", "/", [("x-big", "v" * (H2_L - 16))]),
     ]
     r = new("8.2 / 8.3 request builder refusals (BRISK_E_ARG)")
     r.start()
@@ -8158,7 +8158,8 @@ def h2_rows():
     cerr("6.2 other frame inside a field block", [h2fr(1, 0, 1, b"\x88"), h2_ping(bytes(8))], H2_PROTOCOL)
     cerr("5.5 unknown frame inside a field block", [h2fr(1, 0, 1, b"\x88"), h2fr(0xfa, 0, 0, b"")],
          H2_PROTOCOL)
-    cerr("4.3 field block over 4096 octets", [h2fr(1, 0, 1, bytes(4000)), h2fr(9, EH, 1, bytes(97))],
+    cerr(f"4.3 field block over {H2_L} octets", [h2fr(1, 0, 1, bytes(4000)), h2fr(9, 0, 1, bytes(4000)),
+                                                h2fr(9, EH, 1, bytes(H2_L - 7999))],
          H2_COMPRESSION)
     cerr("CONTINUATION flood: 33 empty CONTINUATIONs (VU#421644)",
          [h2fr(1, 0, 1, b"\x88")] + [h2fr(9, 0, 1, b"")] * 33, H2_CALM)
@@ -8635,7 +8636,7 @@ def main():
     emit("h2.inc", "struct h2_kat H2_KAT", h2rows,
          lambda r: f'"{cesc(r[0])}", {cstr(r[1])}, {cstr(r[2])}, {cstr(r[3])}, {note(r[4])}')
     with open(OUT / "h2.inc", "a", newline="\n") as fh:
-        fh.write(f"#define H2_KAT_W {H2_W}\n#define H2_KAT_MAX {H2_MAXS}\n"
+        fh.write(f"#define H2_KAT_W {H2_W}\n#define H2_KAT_MAX {H2_MAXS}\n#define H2_KAT_L {H2_L}\n"
                  f"static const char H2_KAT_PREFACE[] = {cstr(H2_PREFACE.hex())};\n")
     emit("h2_fuzz.inc", "struct h2_fuzz_seed H2_FUZZ_SEED", h2_fuzz_seeds(h2rows),
          lambda r: f'{cstr(r[0].hex())}, {note(r[1])}')

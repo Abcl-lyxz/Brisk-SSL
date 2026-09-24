@@ -415,9 +415,10 @@ BRISK_API void brisk_conn_wipe(brisk_conn *c);
  * again); from brisk_h2_request it cancels that request (RST_STREAM). A failed write is final for
  * the whole handle. BRISK_E_ARG is always a caller mistake (or a local limit named below).
  *
- * LIMITS (documented deviations): a response header section is limited to 4096 octets (our
- * SETTINGS_MAX_HEADER_LIST_SIZE; a larger one is a connection error, COMPRESSION_ERROR); one
- * request header field (name + value) must stay under 4080 octets; interim 1xx responses and
+ * LIMITS (documented deviations): a response header section is limited to
+ * BRISK_H2_MAX_HEADER_LIST octets (default 8192, our SETTINGS_MAX_HEADER_LIST_SIZE; a larger one
+ * is a connection error, COMPRESSION_ERROR); one request header field (name + value) must stay
+ * 16 octets under that limit; interim 1xx responses and
  * trailers are validated and discarded; frames for a stream you already closed are ignored.
  * Server push is disabled (SETTINGS_ENABLE_PUSH = 0), priority signals are ignored, CONNECT and
  * extended CONNECT are not supported. brisk_h2_open is Linux-only (blocking brisk_conn).

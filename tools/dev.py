@@ -765,6 +765,12 @@ def badssl_inside():
         res = client(exe, ["-r", f"HEAD / HTTP/1.1\nHost: {host}\nConnection: close\n\n"], host, port)
         rows.append((f"{host}:{port} expect {want}",
                      *check(res, ("ok", "HTTP/", "") if want == "ok" else ("fail", "brisk:"))))
+    # h2 against big real sites: their ~5.3 KB response headers need BRISK_H2_MAX_HEADER_LIST 8192
+    h2 = exe.replace("brisk_get", "h2_get")
+    for host in ("github.com", "www.cloudflare.com", "www.google.com"):
+        r = subprocess.run([h2, "-q", host, "443", "/"], capture_output=True, text=True, timeout=60)
+        rows.append((f"h2 {host} expect ok",
+                     *check((r.returncode, r.stdout, r.stderr), ("ok", "status ", ""))))
     return report(rows)
 
 

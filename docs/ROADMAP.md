@@ -127,7 +127,8 @@ Tick a box only when the work is green on **every** arch (`python tools/dev.py t
     renegotiation_info, ec_point_formats). Knob `BRISK_ENABLE_TLS12` (off in TINY; preset
     `dev-tls13` builds it off). `brisk_tls_version()` added. mTLS over 1.2 with `client_key`;
     a `sign` callback fails closed (internal_error) - the callback contract is raw tbs bytes
-    and TLS 1.2 signs the whole transcript: needs a public API decision (e.g. a digest scheme).
+    and TLS 1.2 signs the whole transcript. Decided 2026-09-24: postponed to M8 (a digest scheme
+    such as 0xFE03 is a public API change; wait for a real secure-element user).
   - Vectors: NIST ACVP TLS-v1.2-KDF-RFC7627 + kdf-components v1.2 (480 rows); generated
     records (106) and flows (21 full handshakes, 104 single faults, incl. Wycheproof ecpoint /
     x25519 low-order SKE points). Interop 57/57 (2026-09-24): openssl s_server -tls1_2 with every

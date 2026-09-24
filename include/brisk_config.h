@@ -78,8 +78,22 @@
 #    error "BRISK_H2_HEADER_TABLE_SIZE must be 0..65535"
 #endif
 
-/* HTTP/2 streams open at once (RFC 9113 5.1.2): each costs BRISK_H2_STREAM_WINDOW + 4096 octets
- * of brisk_h2_size(). The server's SETTINGS_MAX_CONCURRENT_STREAMS may lower it further. */
+/* The SETTINGS_MAX_HEADER_LIST_SIZE this client advertises (RFC 9113 6.5.2), in octets: the
+ * largest response header section (sum of name + value + 32 per field) it accepts; a bigger one
+ * is a connection error (COMPRESSION_ERROR). A RAM knob: it sizes the field-block buffer, the
+ * scratch and every stream's ring, so brisk_h2_size() grows by (2 + BRISK_H2_MAX_STREAMS) times
+ * it. 4096 is enough for most IoT backends, but big sites send more (github.com and
+ * www.cloudflare.com send ~5.3 KB, checked 2026-09-24), hence 8192. */
+#ifndef BRISK_H2_MAX_HEADER_LIST
+#    define BRISK_H2_MAX_HEADER_LIST 8192
+#endif
+#if BRISK_H2_MAX_HEADER_LIST < 4096 || BRISK_H2_MAX_HEADER_LIST > 65535
+#    error "BRISK_H2_MAX_HEADER_LIST must be 4096..65535"
+#endif
+
+/* HTTP/2 streams open at once (RFC 9113 5.1.2): each costs BRISK_H2_STREAM_WINDOW +
+ * BRISK_H2_MAX_HEADER_LIST octets of brisk_h2_size(). The server's
+ * SETTINGS_MAX_CONCURRENT_STREAMS may lower it further. */
 #ifndef BRISK_H2_MAX_STREAMS
 #    define BRISK_H2_MAX_STREAMS 4
 #endif

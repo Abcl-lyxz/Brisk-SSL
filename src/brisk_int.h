@@ -2234,11 +2234,9 @@ int brisk__hpack_field_ok(const uint8_t *name, size_t nl, const uint8_t *value, 
  * A pure core (brisk__h2_feed / brisk__h2_pull: frames in, frames out, no I/O) under a thin
  * blocking layer (the public brisk_h2_*) that moves bytes through the two transport callbacks:
  * brisk_read / brisk_write in production (brisk_h2_open, os/linux_net.c), a fake in the tests. */
-#    define BRISK__H2_MAX_LIST                                                                     \
-        4096                  /* our SETTINGS_MAX_HEADER_LIST_SIZE = block buffer = scratch        \
-                               */
-#    define BRISK__H2_TX 4096 /* outbound frames (control + HEADERS/CONTINUATION/DATA) */
-#    define BRISK__H2_RX 1024 /* staging for the transport's reads, fed frame by frame */
+#    define BRISK__H2_MAX_LIST BRISK_H2_MAX_HEADER_LIST /* = block buffer = scratch */
+#    define BRISK__H2_TX       4096 /* outbound frames (control + HEADERS/CONTINUATION/DATA) */
+#    define BRISK__H2_RX       1024 /* staging for the transport's reads, fed frame by frame */
 
 /* Same contracts as brisk_read / brisk_write (io = the brisk_conn). */
 typedef int (*brisk__h2_rd_fn)(void *io, void *buf, size_t cap);

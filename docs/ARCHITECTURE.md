@@ -99,6 +99,8 @@ sized by `brisk_h2_size()`. No push, no priority.
 - Verification always on (chain + RFC 9525 hostname, SAN only); `insecure` is explicit and logged.
 - TLS 1.3 suites: ChaCha20-Poly1305 first on CPUs without AES instructions, else AES-128-GCM;
   AES-256-GCM available. Groups: x25519, secp256r1 (P-384 is verify-only - no P-384 ECDHE).
+  Decided 2026-09-24 to keep it so: a server that accepts only secp384r1 key shares (seen:
+  pantip.com) fails closed with its handshake_failure alert. IoT backends accept X25519/P-256.
 - Signatures accepted: ECDSA P-256/P-384 (SHA-256/384), RSA-PSS and PKCS#1 v1.5 (certs) 2048-4096.
 - TLS 1.2 (M5): ECDHE + AEAD only, EMS required, renegotiation refused, downgrade sentinel checked.
 - No 0-RTT (telemetry POSTs are not replay-safe).
