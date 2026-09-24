@@ -1,8 +1,8 @@
 /* test_aes.c - AES-128/256 forward cipher (FIPS 197) and the inc32 counter mode (SP
  * 800-38D 6.2/6.5) against FIPS 197 C.1/C.3, NIST CAVP AESAVS (KAT, MMT, MCT), SP 800-38A F.5, RFC
  * 9001 A.2/A.3 and a seeded differential set; plus GHASH and AES-GCM (SP 800-38D) against CAVP
- * GCMVS, Wycheproof, the RFC 9001 A.2/A.3 Initial packets and a differential set
- * (tests/kat/SOURCES.md). One of aes_ct (32-bit) /
+ * GCMVS, Wycheproof and a differential set (tests/kat/SOURCES.md). The RFC 9001 A.2/A.3 Initial
+ * packets run through the QUIC module itself, in tests/test_quic.c. One of aes_ct (32-bit) /
  * aes_ct64 (64-bit) is linked per arch, so `dev.py test --arch all` covers both in both byte
  * orders. */
 #include <stdint.h>
@@ -31,11 +31,6 @@ struct gcm_kat {
 struct ghash_kat {
     const char *y, *h, *data, *out;
 };
-struct quic_gcm_kat {
-    const char *secret;
-    uint64_t pn;
-    const char *hdr, *pt, *packet;
-};
 
 #include "kat/aes_ecb.inc"
 #include "kat/aes_mct.inc"
@@ -43,7 +38,6 @@ struct quic_gcm_kat {
 #include "kat/aes_quic_hp.inc"
 #include "kat/aes_gcm.inc"
 #include "kat/ghash.inc"
-#include "kat/quic_gcm.inc"
 
 #define N(a)   (sizeof(a) / sizeof((a)[0]))
 #define BUF    320 /* largest vector: 300 bytes (differential); MMT is 160 */
@@ -499,87 +493,6 @@ static void test_gcm_limits(void)
     brisk__secure_zero(&gk, sizeof gk);
 }
 
-/* QUIC variable-length integer (RFC 9000 16) */
-static size_t quic_varint(const uint8_t *p, uint64_t *v)
-{
-    size_t n = (size_t)1 << (p[0] >> 6), i;
-    *v = p[0] & 0x3f;
-    for (i = 1; i < n; i++) {
-        *v = (*v << 8) | p[i];
-    }
-    return n;
-}
-
-/* RFC 9001 A.2 (client) / A.3 (server) Initial, receive side end to end: keys
- * from the Initial secret (5.1), header protection removed with AES-ECB(hp,
- * sample) (5.4.1-5.4.3), packet number recovered, nonce = iv ^ pn (5.3), AAD =
- * unprotected header, AES-128-GCM open; then re-seal and compare with the RFC
- * packet, and a one-byte flip must fail. */
-static void test_gcm_quic(void)
-{
-    size_t i;
-    for (i = 0; i < N(QUIC_GCM_KAT); i++) {
-        const struct quic_gcm_kat *v = &QUIC_GCM_KAT[i];
-        static uint8_t pkt[1300], orig[1300], hdr[64], pt[1300];
-        uint8_t secret[32], key[16], iv[12], hp[16], mask[16];
-        brisk__gcm_key gk;
-        brisk__aes_key hk;
-        uint64_t tl, ln, pn = 0;
-        size_t plen, hlen, want_hlen, p, pn_len, j, n;
-        t_unhex(v->secret, secret, 32);
-        plen = t_unhex(v->packet, pkt, sizeof pkt);
-        memcpy(orig, pkt, plen);
-        want_hlen = t_unhex(v->hdr, hdr, sizeof hdr);
-        CHECKI(brisk__hkdf_expand_label(BRISK_HASH_SHA256, secret, 32, "quic key", NULL, 0, key,
-                                        16) == BRISK_OK,
-               i);
-        CHECKI(brisk__hkdf_expand_label(BRISK_HASH_SHA256, secret, 32, "quic iv", NULL, 0, iv,
-                                        12) == BRISK_OK,
-               i);
-        CHECKI(brisk__hkdf_expand_label(BRISK_HASH_SHA256, secret, 32, "quic hp", NULL, 0, hp,
-                                        16) == BRISK_OK,
-               i);
-        /* long header: flags, version(4), dcid len + dcid, scid len + scid, token,
-         * length */
-        CHECKI(pkt[0] & 0x80, i);
-        p = 5;
-        p += 1 + pkt[p];
-        p += 1 + pkt[p];
-        p += quic_varint(pkt + p, &tl);
-        p += (size_t)tl;
-        p += quic_varint(pkt + p, &ln);
-        CHECKI(p + (size_t)ln == plen, i);
-        CHECK(brisk__aes_init(&hk, hp, 16) == BRISK_OK);
-        brisk__aes_encrypt(&hk, pkt + p + 4, mask); /* sample at pn_offset + 4 */
-        pkt[0] ^= mask[0] & 0x0f;
-        pn_len = (size_t)(pkt[0] & 3) + 1;
-        for (j = 0; j < pn_len; j++) {
-            pkt[p + j] ^= mask[1 + j];
-            pn = (pn << 8) | pkt[p + j];
-        }
-        hlen = p + pn_len;
-        CHECKI(hlen == want_hlen && memcmp(pkt, hdr, hlen) == 0 && pn == v->pn, i);
-        for (j = 0; j < 8; j++) {
-            iv[4 + j] ^= (uint8_t)(pn >> (56 - 8 * j));
-        }
-        n = plen - hlen - 16;
-        CHECKI(t_unhex(v->pt, GP, GBUF) == n, i);
-        CHECK(brisk__gcm_init(&gk, key, 16) == BRISK_OK);
-        CHECKI(brisk__gcm_open(&gk, iv, pkt, hlen, pkt + hlen, n, pt, pkt + hlen + n) == BRISK_OK,
-               i);
-        CHECKI(memcmp(pt, GP, n) == 0, i);
-        /* re-seal: ciphertext and tag equal the RFC packet */
-        memset(GWO, 0, n + 16);
-        CHECKI(brisk__gcm_seal(&gk, iv, hdr, hlen, pt, n, GWO, GWO + n) == BRISK_OK, i);
-        CHECKI(memcmp(GWO, orig + hlen, n + 16) == 0, i);
-        /* one flipped byte in the protected payload: E_AUTH, output wiped */
-        pkt[hlen + n / 2] ^= 1;
-        CHECKI(gcm_open_fails(&gk, iv, pkt, hlen, pkt + hlen, n, pkt + hlen + n), i);
-        brisk__secure_zero(&gk, sizeof gk);
-        brisk__secure_zero(&hk, sizeof hk);
-    }
-}
-
 void test_aes(void)
 {
     test_ecb();
@@ -592,5 +505,4 @@ void test_aes(void)
     test_gcm_vectors();
     test_gcm_tamper();
     test_gcm_limits();
-    test_gcm_quic();
 }

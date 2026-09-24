@@ -142,8 +142,19 @@ Tick a box only when the work is green on **every** arch (`python tools/dev.py t
 - [x] Refuse CBC, RSA key exchange, SHA-1, compression, renegotiation; downgrade sentinel
 
 ## M6 QUIC v1 client
-- [ ] Packets + header protection, CRYPTO frames on the TLS 1.3 engine, transport parameters
-- [ ] ACK, loss detection / PTO, NewReno (integer), flow control, streams
+- [x] Packets + header protection, CRYPTO frames on the TLS 1.3 engine, transport parameters
+- [ ] ACK, loss detection / PTO, NewReno (integer), flow control, streams. Also the stateful
+      1-RTT frame MUSTs that are only syntax-checked now (rfc-auditor, M6 item 1): STREAM /
+      STOP_SENDING / MAX_STREAM_DATA on a stream we never opened or a receive-only one
+      (STREAM_STATE_ERROR), server stream ids past our initial_max_streams (STREAM_LIMIT_ERROR),
+      data past our flow-control limits (FLOW_CONTROL_ERROR), NEW_CONNECTION_ID count vs our
+      active_connection_id_limit and retire_prior_to (RFC 9000 5.1.1, 19.15), ACK +
+      PATH_RESPONSE generation (13.2.1, 8.2.2). Keep brisk__quic_conn's own sent TPs for it.
+      conn.c pkt_finish hard-codes a 4-byte PN: pass brisk__quic_pn_len's value to the payload
+      layout in brisk__quic_send / cc_build once largest_acked is tracked. Keep the application
+      traffic secret for key update (the engine wipes it after on_secret). Before M7 adds
+      another FULL-only knob, take BRISK_PROFILE=FULL off the `base` preset so host x64 builds
+      the shipped DEFAULT (TLS 1.2 on) again.
 - [ ] Retry, version negotiation, stateless-reset detection, receive-side key update
 - [ ] quic-interop-runner harness (hq-interop)
 

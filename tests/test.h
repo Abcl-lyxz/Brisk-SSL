@@ -39,6 +39,8 @@ void tls12_ct_run(void);     /* its constant-time run, called from test_ct */
 void test_sock(void);        /* Linux only: the blocking API over loopback TCP */
 void test_hpack(void);       /* HPACK (RFC 7541); a no-op stub when BRISK_ENABLE_H2 is 0 */
 void test_h2(void);          /* HTTP/2 frames + brisk_h2_* (RFC 9113); same stub rule */
+void test_quic(void);        /* QUIC v1 (RFC 9000/9001); a stub when BRISK_ENABLE_QUIC is 0 */
+void quic_ct_run(void);      /* its constant-time run, called from test_ct */
 
 /* test_conn.c -> test_sock.c: the P-256 fixture flow as a server byte stream */
 typedef struct {

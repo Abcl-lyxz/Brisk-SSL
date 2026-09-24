@@ -7,7 +7,8 @@
       "generator": "Ninja",
       "binaryDir": "${sourceDir}/build/${presetName}",
       "cacheVariables": {
-        "CMAKE_BUILD_TYPE": "Debug"
+        "CMAKE_BUILD_TYPE": "Debug",
+        "BRISK_PROFILE": "FULL"
       }
     },
     {
@@ -32,8 +33,9 @@
     {
       "name": "dev-tls13",
       "inherits": "base",
-      "displayName": "Host: native gcc, BRISK_ENABLE_TLS12=OFF (the TLS 1.3-only offer, M5)",
+      "displayName": "Host: native gcc, DEFAULT profile, BRISK_ENABLE_TLS12=OFF (M5; QUIC off: empty TUs)",
       "cacheVariables": {
+        "BRISK_PROFILE": "",
         "CMAKE_C_COMPILER": "gcc",
         "CMAKE_C_FLAGS": "-fsanitize=undefined -fsanitize-undefined-trap-on-error",
         "BRISK_ENABLE_TLS12": "OFF"

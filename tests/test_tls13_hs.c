@@ -1183,6 +1183,9 @@ static void hs_quic_tp(void)
     rc = tp_run(&f, 1, ch, ch_len, ee, ee_len, &c);
     CHECK(rc == BRISK_OK && R.hs.state == BRISK__HS_WAIT_CERT_CR && c.calls == 1 &&
           c.len == sizeof TP && memcmp(c.got, TP, sizeof TP) == 0);
+    /* RFC 9001 4.1.3: bytes at the old level once the keys changed are PROTOCOL_VIOLATION */
+    CHECK(brisk__tls13_hs_feed(&R.hs, BRISK__EPOCH_INITIAL, TP, 1) != BRISK_OK &&
+          R.hs.alert == BRISK__ALERT_QUIC_PROTOCOL_VIOLATION);
     /* QUIC, the EE leaves it out: missing_extension (RFC 9001 8.2) */
     memset(&c, 0, sizeof c);
     rc = tp_run(&f, 1, ch, ch_len, f.m[1], f.n_m[1], &c);

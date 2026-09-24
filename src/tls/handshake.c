@@ -1021,10 +1021,10 @@ static int hs_on_nst(brisk__tls13_hs *hs, const uint8_t *m, size_t n)
                 return brisk__hs_fail(hs, BRISK__ALERT_DECODE_ERROR);
             }
             tk.max_early_data = brisk__load_be32(d);
-            /* RFC 9001 4.6.1: over QUIC any value but 0xffffffff is PROTOCOL_VIOLATION; the
-             * QUIC layer (M6) must map this alert to that error, not to CRYPTO_ERROR */
+            /* RFC 9001 4.6.1: over QUIC any value but 0xffffffff is PROTOCOL_VIOLATION, not a
+             * CRYPTO_ERROR: the pseudo alert tells src/quic/conn.c so */
             if (hs->cfg.quic && tk.max_early_data != 0xffffffffu) {
-                return brisk__hs_fail(hs, BRISK__ALERT_ILLEGAL_PARAMETER);
+                return brisk__hs_fail(hs, BRISK__ALERT_QUIC_PROTOCOL_VIOLATION);
             }
         }
     }
@@ -1534,7 +1534,10 @@ int brisk__tls13_hs_feed(brisk__tls13_hs *hs, unsigned epoch, const uint8_t *in,
     /* RFC 9846 5.1: messages MUST NOT span a key change, and nothing is expected before the
      * ClientHello or between an HRR and CH2. After the handshake the epoch is APP (4.7). */
     if (epoch != hs->in_epoch || hs->state == BRISK__HS_START || hs->state == BRISK__HS_WAIT_CH2) {
-        return brisk__hs_fail(hs, BRISK__ALERT_UNEXPECTED_MESSAGE);
+        /* RFC 9001 4.1.3 (MUST): over QUIC, data left at an older level is PROTOCOL_VIOLATION */
+        return brisk__hs_fail(hs, hs->cfg.quic && epoch != hs->in_epoch
+                                      ? BRISK__ALERT_QUIC_PROTOCOL_VIOLATION
+                                      : BRISK__ALERT_UNEXPECTED_MESSAGE);
     }
     while (len != 0) {
         m = hs->in + hs->in_base;
@@ -1574,7 +1577,9 @@ int brisk__tls13_hs_feed(brisk__tls13_hs *hs, unsigned epoch, const uint8_t *in,
          * KeyUpdate - in the same record, which is what one hs_feed call is over TCP */
         if (len != 0 && (hs->in_epoch != epoch || hs->state == BRISK__HS_WAIT_CH2 ||
                          (hs->state == BRISK__HS_CONNECTED && m[0] == HS_KEY_UPDATE))) {
-            return brisk__hs_fail(hs, BRISK__ALERT_UNEXPECTED_MESSAGE);
+            return brisk__hs_fail(hs, hs->cfg.quic && hs->in_epoch != epoch
+                                          ? BRISK__ALERT_QUIC_PROTOCOL_VIOLATION
+                                          : BRISK__ALERT_UNEXPECTED_MESSAGE);
         }
     }
     return BRISK_OK;

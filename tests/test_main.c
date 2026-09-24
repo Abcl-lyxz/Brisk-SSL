@@ -79,6 +79,7 @@ static const struct {
     {"tls12_hs", test_tls12_hs},
     {"hpack", test_hpack},
     {"h2", test_h2},
+    {"quic", test_quic},
 #ifdef __linux__
     {"rand", test_rand},
     {"sock", test_sock},

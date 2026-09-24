@@ -14,6 +14,7 @@ import hmac
 import io
 import ipaddress
 import json
+import math
 import random
 import re
 import ssl
@@ -37,6 +38,7 @@ SRC = {
     "rfc8448": "https://www.rfc-editor.org/rfc/rfc8448.txt",
     "rfc9846": "https://www.rfc-editor.org/rfc/rfc9846.txt",
     "rfc9001": "https://www.rfc-editor.org/rfc/rfc9001.txt",
+    "rfc9000": "https://www.rfc-editor.org/rfc/rfc9000.txt",
     "rfc8439": "https://www.rfc-editor.org/rfc/rfc8439.txt",
     "rfc7748": "https://www.rfc-editor.org/rfc/rfc7748.txt",
     "wp_x25519": f"{WP}x25519_test.json",
@@ -4863,7 +4865,7 @@ def t_alpn(names):
 
 
 def t_ch(random, sid, suites, groups, sigs, share_group, share_pub, sni=b"", cookie=b"", alpn=b"",
-         modes=False, psk=None, tls12=False):
+         modes=False, psk=None, tls12=False, quic_tp=None):
     """The ClientHello brisk__tls13_ch_write produces, field for field and in the same extension
     order (RFC 9846 4.2.2), so the C builder is byte-compared against this, not only
     round-tripped through its own parser. psk = (identity, obfuscated_ticket_age, HashLen): the
@@ -4889,6 +4891,8 @@ def t_ch(random, sid, suites, groups, sigs, share_group, share_pub, sni=b"", coo
     if modes:
         exts.append((45, t_v8(b"\x01")))  # RFC 9846 4.3.9: [psk_dhe_ke] only
     exts.append((51, t_v16(t_u16(share_group) + t_v16(share_pub))))
+    if quic_tp is not None:
+        exts.append((57, quic_tp))  # RFC 9001 8.2 quic_transport_parameters (raw TP block)
     if psk:
         ident, age, hl = psk
         exts.append((41, t_v16(t_v16(ident) + age.to_bytes(4, "big")) + t_v16(t_v8(bytes(hl)))))
@@ -8271,6 +8275,958 @@ def h2_fuzz_seeds(rows):
             if len(r[1]) // 2 <= 8000]
 
 
+# ------------------------------------------------------------------------------ QUIC v1 (M6)
+# RFC 9000 (transport) + RFC 9001 (QUIC-TLS). OFFICIAL: RFC 9001 A.1-A.3 and A.5 (verified by
+# rfc9001(), rfc9001_gcm(), rfc9001_chacha()) and the RFC 9000 A.1 varint samples and A.2 / A.3
+# packet number examples, parsed out of the RFC text. GENERATED, because no official source
+# exists: transport-parameter rows, frame rows, packet mutations and whole client handshakes.
+# Every generated verdict comes from the Python codecs below, written from the RFC text and not
+# from src/quic/ (a shared misreading would still pass: interop, M6 item 4, is the oracle).
+QUIC_SALT = bytes.fromhex("38762cf7f55934b34d179ae6a4c80cadccbb7f0a")  # RFC 9001 5.2
+QUIC_VMAX = (1 << 62) - 1
+QUIC_NONE = (1 << 64) - 1  # "no packet number yet": UINT64_MAX in C
+QSUITE = {0x1301: (256, 16), 0x1302: (384, 32), 0x1303: (256, 32)}  # hash bits, key/hp length
+QPV, QFEE, QTPE, QCBE, QALR = 0x0A, 0x07, 0x08, 0x0D, 0x0F  # RFC 9000 20.1
+QUIC_CONN_OPS = 16  # must match QC_OPS in tests/test_quic.c
+
+
+def qv(v, n=None):
+    """RFC 9000 16: a variable-length integer, minimal unless n (1/2/4/8) is given."""
+    if n is None:
+        n = 1 if v < 1 << 6 else 2 if v < 1 << 14 else 4 if v < 1 << 30 else 8
+    if not 0 <= v < 1 << (8 * n - 2):
+        die(f"qv: {v} does not fit {n} bytes")
+    return (v | ({1: 0, 2: 1, 4: 2, 8: 3}[n] << (8 * n - 2))).to_bytes(n, "big")
+
+
+def qv_get(b, i):
+    """RFC 9000 A.1 ReadVarint: (value, next index), or None when truncated."""
+    if i >= len(b):
+        return None
+    n = 1 << (b[i] >> 6)
+    if i + n > len(b):
+        return None
+    v = b[i] & 0x3F
+    for j in range(1, n):
+        v = (v << 8) + b[i + j]
+    return v, i + n
+
+
+def py_pn_decode(largest, truncated, nbits):
+    """RFC 9000 A.3 DecodePacketNumber, line for line (largest None = nothing received yet)."""
+    expected = (-1 if largest is None else largest) + 1
+    win = 1 << nbits
+    hwin = win // 2
+    cand = (expected & ~(win - 1)) | truncated
+    if cand <= expected - hwin and cand < (1 << 62) - win:
+        return cand + win
+    if cand > expected + hwin and cand >= win:
+        return cand - win
+    return cand
+
+
+def py_pn_len(pn, largest_acked):
+    """RFC 9000 A.2 EncodePacketNumber's byte count; the full 4 bytes until something is
+    acknowledged (17.1). log2(n) + 1 <= 8b  <=>  n <= 2^(8b-1), in integers."""
+    if largest_acked is None or pn <= largest_acked:
+        return 4
+    n = pn - largest_acked
+    for b in (1, 2, 3):
+        if n <= 1 << (8 * b - 1):
+            return b
+    return 4
+
+
+def rfc9000_varints():
+    """RFC 9000 A.1: the four samples and the non-minimal 0x4025, plus generated boundaries."""
+    text = re.sub(r"\s+", " ", "\n".join(rfc_lines(fetch("rfc9000"))))
+    a1 = text[text.rindex("A.1. Sample Variable-Length Integer Decoding"):
+              text.rindex("A.2. Sample Packet Number Encoding Algorithm")]
+    got = [(h, int(v.replace(",", ""))) for h, v in re.findall(
+        r"(?:sequence|byte) 0x([0-9a-f]+) decodes to (?:the decimal value )?([\d,]+)", a1)]
+    extra = re.search(r"as does the two-byte sequence 0x([0-9a-f]+)", a1).group(1)
+    got.append((extra, got[-1][1]))
+    if len(got) != 5 or [v for _, v in got] != [151288809941952652, 494878333, 15293, 37, 37]:
+        die(f"RFC 9000 A.1: parsed {got}")
+    rows = []
+    for h, v in got:
+        b = bytes.fromhex(h)
+        if qv_get(b, 0) != (v, len(b)):
+            die(f"RFC 9000 A.1: {h} does not decode to {v}")
+        rows.append((h, v, int(qv(v) == b), f"RFC 9000 A.1 0x{h}"))
+    for v in (0, 63, 64, 16383, 16384, (1 << 30) - 1, 1 << 30, QUIC_VMAX):
+        rows.append((qv(v).hex(), v, 1, f"boundary {v}"))
+    for v, n in ((0, 8), (1, 2), (63, 4), (16383, 8)):
+        rows.append((qv(v, n).hex(), v, 0, f"non-minimal {v} in {n} bytes"))
+    print(f"  quic varints: {len(rows)} rows")
+    return rows
+
+
+def rfc9000_pn():
+    """RFC 9000 A.2 / A.3 examples out of the text, and a seeded differential set against the
+    A.3 pseudocode: every width, largest near 0, near a window edge and near 2^62."""
+    text = re.sub(r"\s+", " ", "\n".join(rfc_lines(fetch("rfc9000"))))
+    a2 = text[text.rindex("A.2. Sample Packet Number Encoding Algorithm"):
+              text.rindex("A.3. Sample Packet Number Decoding Algorithm")]
+    a3 = text[text.rindex("A.3. Sample Packet Number Decoding Algorithm"):
+              text.rindex("A.4. Sample ECN Validation Algorithm")]
+    m = re.search(r"acknowledgment for packet 0x([0-9a-f]+) and is sending a packet with a number "
+                  r"of 0x([0-9a-f]+).*? (\d+) bits are required", a2)
+    m2 = re.search(r"sending a packet with a number of 0x([0-9a-f]+) uses the (\d+)-bit", a2)
+    m3 = re.search(r"packet number of 0x([0-9a-f]+), then a packet containing a (\d+)-bit value of "
+                   r"0x([0-9a-f]+) will be decoded as 0x([0-9a-f]+)", a3)
+    if not (m and m2 and m3):
+        die("RFC 9000 A.2/A.3: examples not found")
+    acked = int(m.group(1), 16)
+    lens = [(int(m.group(2), 16), acked, int(m.group(3)) // 8, "RFC 9000 A.2 example"),
+            (int(m2.group(1), 16), acked, int(m2.group(2)) // 8, "RFC 9000 A.2 second example")]
+    dec = [(int(m3.group(1), 16), int(m3.group(3), 16), int(m3.group(2)), int(m3.group(4), 16),
+            "RFC 9000 A.3 example")]
+    for pn, la, want, note in lens:
+        if py_pn_len(pn, la) != want or math.ceil((math.log2(pn - la) + 1) / 8) != want:
+            die(f"RFC 9000 A.2: {note}")
+    for la, tr, nb, want, note in dec:
+        if py_pn_decode(la, tr, nb) != want:
+            die(f"RFC 9000 A.3: {note}")
+    for n, want in ((1, 1), (128, 1), (129, 2), (1 << 15, 2), ((1 << 15) + 1, 3), (1 << 23, 3),
+                    ((1 << 23) + 1, 4), (1 << 40, 4)):
+        lens.append((1000 + n, 1000, want, f"range {n}"))
+    lens += [(0, None, 4, "nothing acknowledged"), (5, None, 4, "nothing acknowledged, pn 5"),
+             (7, 7, 4, "pn not above largest_acked")]
+    rng = random.Random(9000)
+    for _ in range(200):
+        la = rng.randrange(0, 1 << 40)
+        n = rng.randrange(1, 1 << rng.randrange(1, 34))
+        if abs(math.log2(n) + 1 - round(math.log2(n) + 1)) > 1e-9:  # float is exact enough here
+            want = min(4, math.ceil((math.log2(n) + 1) / 8))
+            if py_pn_len(la + n, la) != want:
+                die("pn_len: the integer rule disagrees with A.2's log formula")
+        lens.append((la + n, la, py_pn_len(la + n, la), "seeded"))
+    for nbits in (8, 16, 24, 32):
+        win, hwin = 1 << nbits, 1 << (nbits - 1)
+        bases = [None, 0, 1, hwin - 1, hwin, win - 2, win - 1, win, 3 * win + hwin,
+                 QUIC_VMAX - 1, QUIC_VMAX - hwin, QUIC_VMAX - win, (1 << 62) - win - 1]
+        bases += [rng.randrange(0, 1 << 62) for _ in range(12)]
+        for la in bases:
+            exp = 0 if la is None else la + 1
+            for d in (-hwin + 1, -1, 0, 1, hwin - 1, hwin, rng.randrange(-hwin + 1, hwin + 1)):
+                pn = exp + d
+                if not 0 <= pn <= QUIC_VMAX:
+                    continue
+                got = py_pn_decode(la, pn & (win - 1), nbits)
+                if got != pn:  # A.3's promise inside the window, away from the 2^62 bound
+                    die(f"A.3 port: pn {pn} largest {la} nbits {nbits} -> {got}")
+                dec.append((la, pn & (win - 1), nbits, got, "seeded, in window"))
+            for tr in (0, win - 1, rng.randrange(win)):  # any truncation: the pseudocode's answer
+                dec.append((la, tr, nbits, py_pn_decode(la, tr, nbits), "seeded, any value"))
+    print(f"  quic packet numbers: {len(dec)} decode, {len(lens)} length rows")
+    return dec, lens
+
+
+# ---- packet protection (RFC 9001 5)
+def q_keys(suite, secret):
+    bits, kl = QSUITE[suite]
+    if len(secret) != bits // 8:
+        die("q_keys: secret length")
+    return {"suite": suite, "key": py_expand_label(bits, secret, b"quic key", b"", kl),
+            "iv": py_expand_label(bits, secret, b"quic iv", b"", 12),
+            "hp": py_expand_label(bits, secret, b"quic hp", b"", kl)}
+
+
+def q_initial(dcid):
+    """RFC 9001 5.2: (client_initial_secret, server_initial_secret)."""
+    init = py_hkdf_extract(256, QUIC_SALT, dcid)
+    return (py_expand_label(256, init, b"client in", b"", 32),
+            py_expand_label(256, init, b"server in", b"", 32))
+
+
+def q_mask(k, sample):
+    if k["suite"] == 0x1303:  # 5.4.4: counter = LE32(sample[0..4]), nonce = sample[4..16]
+        return py_chacha20(k["hp"], int.from_bytes(sample[:4], "little"), sample[4:], bytes(5))
+    return py_aes_encrypt(k["hp"], sample)[:5]  # 5.4.3
+
+
+def q_nonce(k, pn):
+    return bytes(a ^ b for a, b in zip(k["iv"], pn.to_bytes(12, "big")))  # 5.3
+
+
+def q_aead(k, nonce, aad, pt):
+    ct, tag = (py_aead_seal if k["suite"] == 0x1303 else py_gcm_seal)(k["key"], nonce, aad, pt)
+    return ct + tag
+
+
+def q_unaead(k, nonce, aad, ct):
+    body, tag = ct[:-16], ct[-16:]
+    if k["suite"] == 0x1303:
+        pt = py_chacha20(k["key"], 1, nonce, body)
+    else:
+        pt = py_aes_ctr32(k["key"], nonce + b"\0\0\0\2", body)
+    return pt if q_aead(k, nonce, aad, pt)[-16:] == tag else None
+
+
+def q_protect(k, hdr, pn, pn_len, pt):
+    """hdr = the header up to the Packet Number (Length included, byte 0 with its PN length
+    bits). AEAD over hdr || truncated PN (5.3), then header protection (5.4.1)."""
+    if (hdr[0] & 3) != pn_len - 1 or pn_len + len(pt) < 4:
+        die("q_protect: bad PN length or no room for a sample")
+    trunc = (pn & ((1 << 8 * pn_len) - 1)).to_bytes(pn_len, "big")
+    ct = q_aead(k, q_nonce(k, pn), hdr + trunc, pt)
+    m = q_mask(k, ct[4 - pn_len:20 - pn_len])  # 5.4.2: sample at pn_offset + 4
+    first = hdr[0] ^ (m[0] & (0x0F if hdr[0] & 0x80 else 0x1F))
+    return bytes([first]) + hdr[1:] + bytes(a ^ b for a, b in zip(trunc, m[1:])) + ct
+
+
+def q_unprotect(k, pkt, pn_off, largest):
+    """("short",) | ("auth",) | ("ok", first, pn, header, plaintext)"""
+    if len(pkt) - pn_off < 20:
+        return ("short",)
+    m = q_mask(k, pkt[pn_off + 4:pn_off + 20])
+    first = pkt[0] ^ (m[0] & (0x0F if pkt[0] & 0x80 else 0x1F))
+    pl = (first & 3) + 1
+    tr = bytes(a ^ b for a, b in zip(pkt[pn_off:pn_off + pl], m[1:]))
+    pn = py_pn_decode(None if largest == QUIC_NONE else largest, int.from_bytes(tr, "big"), 8 * pl)
+    hdr = bytes([first]) + pkt[1:pn_off] + tr
+    pt = q_unaead(k, q_nonce(k, pn), hdr, pkt[pn_off + pl:])
+    return ("auth",) if pt is None else ("ok", first, pn, hdr, pt)
+
+
+def py_quic_hdr(d, short_len):
+    """RFC 9000 17.2 / 17.3 / RFC 8999: the header fields, or None = discard the datagram rest."""
+    if not d:
+        return None
+    if not d[0] & 0x80:
+        if not d[0] & 0x40 or len(d) < 1 + short_len + 20:
+            return None
+        return {"type": 4, "version": 1, "dcid": d[1:1 + short_len], "scid": b"", "token": b"",
+                "pn_off": 1 + short_len, "len": len(d)}
+    if len(d) < 7:
+        return None
+    ver = int.from_bytes(d[1:5], "big")
+    dl = d[5]
+    if (ver == 1 and dl > 20) or len(d) < 6 + dl + 1:
+        return None
+    i = 6 + dl
+    sl = d[i]
+    i += 1
+    if (ver == 1 and sl > 20) or len(d) < i + sl:
+        return None
+    h = {"version": ver, "dcid": d[6:6 + dl], "scid": d[i:i + sl], "token": b"", "len": len(d),
+         "pn_off": 0}
+    i += sl
+    if ver != 1:
+        h["type"] = 5 if ver == 0 else (d[0] >> 4) & 3
+        return h
+    if not d[0] & 0x40:
+        return None
+    h["type"] = (d[0] >> 4) & 3
+    if h["type"] == 3:
+        return h
+    if h["type"] == 0:
+        r = qv_get(d, i)
+        if r is None or r[0] > len(d) - r[1]:
+            return None
+        h["token"] = d[r[1]:r[1] + r[0]]
+        i = r[1] + r[0]
+    r = qv_get(d, i)
+    if r is None or r[0] > len(d) - r[1] or r[0] < 20:
+        return None
+    h["pn_off"], h["len"] = r[1], r[1] + r[0]
+    return h
+
+
+def quic_pkt_vectors():
+    """RFC 9001 A.2 / A.3 / A.5 packets, a generated AES-256-GCM one, and mutations of each whose
+    verdict py_quic_hdr + q_unprotect decide: 0 opens, 1 header discarded, 2 AEAD failure,
+    4 opens with reserved bits set (a PROTOCOL_VIOLATION for the connection), 5 another version."""
+    rows = []
+    for (secret, pn, hdr, pt, pkt), note in zip(rfc9001_gcm(), ("RFC 9001 A.2 client Initial",
+                                                                "RFC 9001 A.3 server Initial")):
+        rows.append([pkt, 0x1301, secret, hdr, pt, pn, QUIC_NONE, 0, 0, note])
+    secret, pn, hdr, pt, _, _, _, pkt = rfc9001_chacha()[0]
+    rows.append([pkt, 0x1303, secret, hdr, pt, pn, pn - 1, 0, 0, "RFC 9001 A.5 ChaCha20 short header"])
+    s384 = hashlib.sha384(b"brisk quic aes-256 handshake secret").digest()
+    k = q_keys(0x1302, s384)
+    dcid = bytes.fromhex("0102030405060708")
+    body = b"\x06\x00\x10" + bytes(range(16)) + b"\x01"
+    h = bytes([0xE1]) + (1).to_bytes(4, "big") + b"\x08" + dcid + b"\x00" + qv(2 + len(body) + 16, 2)
+    pkt = q_protect(k, h, 0x1234, 2, body)
+    rows.append([pkt, 0x1302, s384, h + (0x1234).to_bytes(2, "big"), body, 0x1234, 0x1200, 0, 0,
+                 "generated AES-256-GCM Handshake packet, 2-byte PN"])
+    for r in rows:  # the official ones re-derived here, the generated one round-tripped
+        k = q_keys(r[1], r[2])
+        pl = (r[3][0] & 3) + 1
+        if q_protect(k, r[3][:-pl], r[5], pl, r[4]) != r[0][:len(r[3]) + len(r[4]) + 16]:
+            die(f"quic pkt: {r[9]} does not re-seal")
+
+    def verdict(pkt, suite, secret, largest, short_len):
+        h = py_quic_hdr(pkt, short_len)
+        if h is None:
+            return 1, b"", b"", 0
+        if h["version"] != 1:
+            return 5, b"", b"", 0
+        r = q_unprotect(q_keys(suite, secret), pkt[:h["len"]], h["pn_off"], largest)
+        if r[0] != "ok":
+            return (3 if r[0] == "short" else 2), b"", b"", 0
+        return (4 if r[1] & (0x0C if pkt[0] & 0x80 else 0x18) else 0), r[3], r[4], r[2]
+
+    out = []
+    for pkt, suite, secret, hdr, pt, pn, largest, sl, _, note in rows:
+        if verdict(pkt, suite, secret, largest, sl) != (0, hdr, pt, pn):
+            die(f"quic pkt: {note} does not open")
+        out.append((pkt, suite, secret, hdr, pt, pn, largest, sl, 0, note))
+        pn_off = len(hdr) - ((hdr[0] & 3) + 1)
+        muts = [(0, 0x01, "byte 0 low bit"), (pn_off, 0x80, "first PN byte"),
+                (pn_off + 7, 0x01, "a sample byte"), (len(pkt) - 1, 0x01, "the last tag byte"),
+                (len(pkt) // 2, 0x10, "a payload byte")]
+        if pkt[0] & 0x80:
+            muts += [(6 + (pkt[5] == 0), 0x01, "a connection ID byte (AAD)"), (2, 0x01, "a version byte"),
+                     (0, 0x40, "the fixed bit"), (pn_off - 1, 0x01, "the Length field")]
+        for i, x, what in muts:
+            m = bytearray(pkt)
+            m[i] ^= x
+            v, mh, mp, mpn = verdict(bytes(m), suite, secret, largest, sl)
+            out.append((bytes(m), suite, secret, mh, mp, mpn, largest, sl, v, f"{note}: {what}"))
+        if largest != QUIC_NONE:  # the PN decodes a window away: the nonce is wrong
+            v = verdict(pkt, suite, secret, largest + (1 << 33), sl)
+            out.append((pkt, suite, secret, b"", b"", 0, largest + (1 << 33), sl, v[0],
+                        f"{note}: wrong largest PN"))
+    a2, a3 = rows[0], rows[1]
+    # 17.2: reserved bits set, sealed with them (they fail only after decryption, RFC 9001 9.5)
+    for bits in (0x04, 0x08):
+        k = q_keys(0x1301, a3[2])
+        h = bytes([a3[3][0] | bits]) + a3[3][1:-2]
+        pkt = q_protect(k, h, 1, 2, a3[4])
+        v = verdict(pkt, 0x1301, a3[2], QUIC_NONE, 0)
+        if v[0] != 4:
+            die("quic pkt: resealed reserved bits do not open")
+        out.append((pkt, 0x1301, a3[2], v[1], v[2], v[3], QUIC_NONE, 0, 4,
+                    f"RFC 9001 A.3 resealed with reserved bits {bits:#04x}"))
+        bad = pkt[:-1] + bytes([pkt[-1] ^ 1])
+        out.append((bad, 0x1301, a3[2], b"", b"", 0, QUIC_NONE, 0, 2,
+                    f"RFC 9001 A.3 reserved bits {bits:#04x} and a bad tag: dropped, no error"))
+    for ver, what in ((0xFF00001D, "draft-29 version"), (0, "Version Negotiation (version 0)")):
+        m = a2[0][:1] + ver.to_bytes(4, "big") + a2[0][5:]
+        out.append((m, 0x1301, a2[2], b"", b"", 0, QUIC_NONE, 0, 5, f"RFC 9001 A.2 as {what}"))
+    m = a2[0][:5] + bytes([21]) + a2[0][6:]
+    out.append((m, 0x1301, a2[2], b"", b"", 0, QUIC_NONE, 0, 1, "RFC 9001 A.2 with DCID length 21"))
+    pn_off = len(a3[3]) - 2
+    cut = a3[0][:pn_off - 2] + qv(19, 2) + a3[0][pn_off:pn_off + 19]
+    out.append((cut, 0x1301, a3[2], b"", b"", 0, QUIC_NONE, 0, 1,
+                "RFC 9001 A.3 cut to Length 19: one byte short of a sample"))
+    for r in out:
+        if verdict(r[0], r[1], r[2], r[6], r[7])[0] != r[8]:
+            die(f"quic pkt: {r[9]} verdict")
+    print(f"  quic packets: {len(out)} rows")
+    return [(r[0].hex(), r[1], r[2].hex(), r[3].hex(), r[4].hex(), r[5], r[6], r[7], r[8], r[9])
+            for r in out]
+
+
+# ---- transport parameters (RFC 9000 18)
+TP_INTS = {0x01: 0, 0x03: 1, 0x04: 2, 0x05: 3, 0x06: 4, 0x07: 5, 0x08: 6, 0x09: 7, 0x0A: 8,
+           0x0B: 9, 0x0E: 10}  # id -> position in the C struct's integer run
+TP_DEFAULTS = [0, 65527, 0, 0, 0, 0, 0, 0, 3, 25, 2]  # 18.2
+
+
+def tp_enc(items):
+    """[(id, value bytes)] -> the block; an item may be raw bytes to insert as they are."""
+    return b"".join(i if isinstance(i, bytes) else qv(i[0]) + qv(len(i[1])) + i[1] for i in items)
+
+
+def py_tp_parse(b):
+    """RFC 9000 18 / 18.2 / 7.4, independently: the decoded dict, or None (TRANSPORT_PARAMETER_ERROR)."""
+    ints, cids, flags, seen, i = list(TP_DEFAULTS), {}, 0, set(), 0
+    while i < len(b):
+        r = qv_get(b, i)
+        r2 = r and qv_get(b, r[1])
+        if not r2 or r2[0] > len(b) - r2[1]:
+            return None
+        tid, v, i = r[0], b[r2[1]:r2[1] + r2[0]], r2[1] + r2[0]
+        if tid > 0x10:
+            continue  # 18.1: unknown / GREASE
+        if tid in seen:
+            return None
+        seen.add(tid)
+        if tid in TP_INTS:
+            x = qv_get(v, 0)
+            if x is None or x[1] != len(v):
+                return None
+            ints[TP_INTS[tid]] = x[0]
+        elif tid in (0x00, 0x0F, 0x10):
+            if len(v) > 20:
+                return None
+            cids[tid] = v
+        elif tid == 0x02:
+            if len(v) != 16:
+                return None
+            cids[tid] = v
+        elif tid == 0x0C:
+            if v:
+                return None
+            flags |= 16
+        else:  # 0x0d preferred_address
+            if len(v) < 25 or not 1 <= v[24] <= 20 or len(v) != 41 + v[24]:
+                return None
+            flags |= 32
+    if (ints[1] < 1200 or ints[8] > 20 or ints[9] >= 1 << 14 or ints[10] < 2
+            or ints[6] > 1 << 60 or ints[7] > 1 << 60 or (flags & 32 and cids.get(0x0F) == b"")):
+        return None
+    flags |= sum(bit for tid, bit in ((0x00, 1), (0x0F, 2), (0x10, 4), (0x02, 8)) if tid in cids)
+    return {"ints": ints, "cids": cids, "flags": flags}
+
+
+def quic_tp_vectors(a2_payload):
+    """RFC 9001 A.2's ClientHello parameters (official) and generated valid / invalid blocks."""
+    ch = a2_payload[4:]  # CRYPTO frame 06 00 40 f1: offset 0, 2-byte length
+    ch = ch[:4 + int.from_bytes(ch[1:4], "big")]
+    tp = t_ext(t_ch_parse(ch)["exts"], 57)
+    a2 = py_tp_parse(tp)
+    if a2 is None or a2["ints"][2] != QUIC_VMAX or a2["cids"].get(0x0F) != bytes.fromhex("8394c8f03e515708"):
+        die("RFC 9001 A.2: the ClientHello transport parameters do not decode as expected")
+    cid8, tok = bytes(range(0xA0, 0xA8)), bytes(range(0x10, 0x20))
+    pref = bytes(4) + b"\x11\x51" + bytes(16) + b"\x11\x51" + b"\x08" + cid8 + tok
+    everything = [(0x00, cid8), (0x01, qv(30000)), (0x02, tok), (0x03, qv(1472)),
+                  (0x04, qv(QUIC_VMAX)), (0x05, qv(1 << 20)), (0x06, qv(65536)), (0x07, qv(4096)),
+                  (0x08, qv(1 << 60)), (0x09, qv(100)), (0x0A, qv(20)), (0x0B, qv((1 << 14) - 1)),
+                  (0x0C, b""), (0x0D, pref), (0x0E, qv(8)), (0x0F, cid8)]
+    ok = [(tp, "RFC 9001 A.2 ClientHello quic_transport_parameters"),
+          (b"", "empty: every default"),
+          (tp_enc(everything), "every server parameter, at the 18.2 limits"),
+          (tp_enc([(0x10, cid8)]), "retry_source_connection_id alone (7.3 is the connection's)"),
+          (tp_enc([(27, b"grease"), (58, b""), (31 * 1000 + 27, bytes(40)),
+                   (31 * (1 << 20) + 27, b"x"), (0x0F, cid8)]), "GREASE ids 31*N+27 skipped"),
+          (tp_enc([(0x11, b"\x00"), (0x20, bytes(3)), (0x3FFF, b"z"), (QUIC_VMAX, b"")]),
+           "unknown ids, the largest id"),
+          (qv(0x01, 2) + qv(8, 2) + qv(0, 8), "non-minimal id, length and value"),
+          (tp_enc([(0x00, b""), (0x0F, b"")]), "zero-length connection IDs"),
+          (tp_enc([(0x03, qv(1200)), (0x0E, qv(2)), (0x0A, qv(0)), (0x0B, qv(0))]),
+           "the lower limits exactly"),
+          (tp_enc([(0x0D, pref), (0x0F, cid8)]), "preferred_address with a non-empty SCID")]
+    bad = [(tp_enc([(0x01, qv(1)), (0x01, qv(2))]), "duplicate max_idle_timeout (7.4)"),
+           (tp_enc([(0x00, cid8), (0x00, cid8)]), "duplicate original_destination_connection_id"),
+           (b"\x01\x05\x00\x00\x00", "length past the block"),
+           (b"\x40", "truncated id varint"), (b"\x01", "id without a length"),
+           (b"\x01\x02\x05\x00", "value varint does not fill its length"),
+           (b"\x01\x01\x45", "value varint longer than its length"),
+           (b"\x01\x00", "integer parameter with an empty value"),
+           (tp_enc([(0x03, qv(1199))]), "max_udp_payload_size 1199"),
+           (tp_enc([(0x0A, qv(21))]), "ack_delay_exponent 21"),
+           (tp_enc([(0x0B, qv(1 << 14))]), "max_ack_delay 2^14"),
+           (tp_enc([(0x0E, qv(1))]), "active_connection_id_limit 1"),
+           (tp_enc([(0x0E, qv(0))]), "active_connection_id_limit 0"),
+           (tp_enc([(0x02, tok[:15])]), "stateless_reset_token 15 bytes"),
+           (tp_enc([(0x02, tok + b"\x00")]), "stateless_reset_token 17 bytes"),
+           (tp_enc([(0x0C, b"\x00")]), "disable_active_migration with a value"),
+           (tp_enc([(0x08, qv((1 << 60) + 1))]), "initial_max_streams_bidi 2^60+1"),
+           (tp_enc([(0x09, qv((1 << 60) + 1))]), "initial_max_streams_uni 2^60+1"),
+           (tp_enc([(0x00, bytes(21))]), "original_destination_connection_id 21 bytes"),
+           (tp_enc([(0x0F, bytes(21))]), "initial_source_connection_id 21 bytes"),
+           (tp_enc([(0x10, bytes(21))]), "retry_source_connection_id 21 bytes"),
+           (tp_enc([(0x0D, pref[:24] + b"\x00" + tok)]), "preferred_address zero-length CID"),
+           (tp_enc([(0x0D, pref[:24])]), "preferred_address truncated"),
+           (tp_enc([(0x0D, pref[:24] + b"\x15" + bytes(21) + tok)]), "preferred_address CID 21"),
+           (tp_enc([(0x0D, pref + b"\x00")]), "preferred_address trailing byte"),
+           (tp_enc([(0x0D, pref), (0x0F, b"")]), "preferred_address from a zero-length SCID")]
+    rows = []
+    for b, note in ok + bad:
+        d = py_tp_parse(b)
+        if (d is None) != ((b, note) in bad):
+            die(f"quic tp: {note}")
+        d = d or {"ints": [0] * 11, "cids": {}, "flags": 0}
+        c = d["cids"]
+        rows.append((b.hex(), int((b, note) in ok), d["ints"],
+                     c.get(0x00, b"").hex(), c.get(0x0F, b"").hex(), c.get(0x10, b"").hex(),
+                     c.get(0x02, b"").hex(), d["flags"], note))
+    print(f"  quic transport parameters: {len(ok)} valid, {len(bad)} invalid")
+    return rows, tp
+
+
+# ---- frames (RFC 9000 12.4, 19)
+def py_frames(level, b):
+    """0, or the QUIC error code: syntax (19) and the packet-type table (12.4 Table 3)."""
+    if not b:
+        return QPV
+    i = 0
+
+    def get():
+        nonlocal i
+        r = qv_get(b, i)
+        if r is None:
+            raise ValueError
+        i = r[1]
+        return r[0]
+
+    def skip(n):
+        nonlocal i
+        if n > len(b) - i:
+            raise ValueError
+        i += n
+
+    try:
+        while i < len(b):
+            start = i
+            t = get()
+            if t > 0x1E:
+                return QFEE
+            if i - start != len(qv(t)):
+                return QPV
+            if level != 2 and t not in (0, 1, 2, 3, 6, 0x1C):
+                return QPV
+            if t in (2, 3):
+                largest, _, count, first = get(), get(), get(), get()
+                if first > largest:
+                    return QFEE
+                small = largest - first
+                for _ in range(count):
+                    gap = get()
+                    if small - gap - 2 < 0:
+                        return QFEE
+                    ln = get()
+                    if small - gap - 2 - ln < 0:
+                        return QFEE
+                    small = small - gap - 2 - ln
+                if t == 3:
+                    get(), get(), get()
+            elif t == 6:
+                off, ln = get(), get()
+                if ln > len(b) - i or off + ln > QUIC_VMAX:
+                    return QFEE
+                skip(ln)
+            elif t == 7:
+                ln = get()
+                if ln == 0:
+                    return QFEE
+                skip(ln)
+            elif 8 <= t <= 0x0F:
+                get()
+                off = get() if t & 4 else 0
+                ln = get() if t & 2 else len(b) - i
+                if ln > len(b) - i or off + ln > QUIC_VMAX:
+                    return QFEE
+                skip(ln)
+            elif t == 0x18:
+                seq, retire = get(), get()
+                if retire > seq or i >= len(b) or not 1 <= b[i] <= 20:
+                    return QFEE
+                skip(1 + b[i] + 16)
+            elif t in (0x12, 0x13, 0x16, 0x17):
+                if get() > 1 << 60:  # 19.11 / 19.14
+                    return QFEE
+            elif t in (0x1A, 0x1B):
+                skip(8)
+            elif t in (0x1C, 0x1D):
+                get()
+                if t == 0x1C:
+                    get()
+                skip(get())
+            else:
+                for _ in range({4: 3, 5: 2, 0x11: 2, 0x15: 2}.get(t, 1 if t in (
+                        0x10, 0x12, 0x13, 0x14, 0x16, 0x17, 0x19) else 0)):
+                    get()
+    except ValueError:
+        return QFEE
+    return 0
+
+
+def quic_frame_vectors(a2_payload, a3_payload):
+    V = QUIC_VMAX
+    rows = [(0, a2_payload, 0, "RFC 9001 A.2 payload: CRYPTO + PADDING"),
+            (0, a3_payload, 0, "RFC 9001 A.3 payload: ACK + CRYPTO"),
+            (0, b"", QPV, "12.4: a packet without frames"),
+            (0, b"\x00\x00\x01", 0, "PADDING and PING"),
+            (1, b"\x08\x00\x01x", QPV, "12.4: STREAM in a Handshake packet"),
+            (0, b"\x0a\x00\x01x", QPV, "12.4: STREAM in an Initial packet"),
+            (1, b"\x1e", QPV, "19.20: HANDSHAKE_DONE in a Handshake packet"),
+            (0, b"\x1e", QPV, "19.20: HANDSHAKE_DONE in an Initial packet"),
+            (0, b"\x07\x01x", QPV, "12.4: NEW_TOKEN in an Initial packet"),
+            (0, b"\x1d\x00\x00", QPV, "12.4: CONNECTION_CLOSE 0x1d in an Initial packet"),
+            (1, b"\x1d\x00\x00", QPV, "12.4: CONNECTION_CLOSE 0x1d in a Handshake packet"),
+            (0, b"\x1c\x0a\x00\x03abc", 0, "CONNECTION_CLOSE 0x1c in an Initial packet"),
+            (0, b"\x1c\x0a\x00\x04abc", QFEE, "CONNECTION_CLOSE reason past the packet"),
+            (2, b"\x1d\x00\x02hi", 0, "CONNECTION_CLOSE 0x1d in 1-RTT"),
+            (2, b"\x21", QFEE, "12.4: unknown frame type 0x21"),
+            (0, b"\x21", QFEE, "12.4: unknown frame type 0x21 in an Initial packet"),
+            (2, qv(0x3FFF, 2), QFEE, "12.4: unknown frame type 0x3fff"),
+            (0, b"\x40\x06\x00\x01x", QPV, "12.4: non-minimal frame type 0x4006"),
+            (2, b"\x40\x00", QPV, "12.4: non-minimal PADDING type"),
+            (0, b"\x06\x00\x05abc", QFEE, "19.6: CRYPTO length past the packet"),
+            (0, b"\x06" + qv(V, 8) + b"\x01x", QFEE, "19.6: CRYPTO offset + length > 2^62-1"),
+            (0, b"\x06" + qv(V - 1, 8) + b"\x01x", 0, "19.6: CRYPTO ending at 2^62-1"),
+            (0, b"\x06\x00", QFEE, "CRYPTO truncated"),
+            (0, b"\x02\x05\x00\x00\x06", QFEE, "19.3.1: first ACK range below 0"),
+            (0, b"\x02\x0a\x00\x01\x02\x07\x00", QFEE, "19.3.1: a gap below 0"),
+            (0, b"\x02\x0a\x00\x01\x02\x04\x03", QFEE, "19.3.1: a range below 0"),
+            (0, b"\x02\x0a\x00\x01\x02\x04\x01", 0, "ACK with a second range"),
+            (1, b"\x03\x0a\x00\x00\x00\x01\x02\x03", 0, "ACK_ECN"),
+            (0, b"\x02\x0a\x00\x02\x02\x04\x01", QFEE, "ACK range count past the packet"),
+            (2, b"\x04\x01\x02\x03\x05\x04\x05\x10\x01", 0, "RESET_STREAM, STOP_SENDING, MAX_DATA"),
+            (2, b"\x07\x02ab", 0, "NEW_TOKEN in 1-RTT"),
+            (2, b"\x07\x00", QFEE, "19.7: an empty NEW_TOKEN"),
+            (2, b"\x08\x00hello", 0, "STREAM to the packet end"),
+            (2, b"\x0e\x04\x40\x10\x02hi\x0b\x00\x01z", 0, "STREAM with offset and length, FIN"),
+            (2, b"\x0e\x04" + qv(V, 8) + b"\x01z", QFEE, "19.8: STREAM offset + length > 2^62-1"),
+            (2, b"\x0a\x00\x05ab", QFEE, "STREAM length past the packet"),
+            (2, b"\x11\x01\x02\x12\x03\x13\x03\x14\x01\x15\x01\x02\x16\x01\x17\x01\x19\x00", 0,
+             "flow-control and stream-limit frames, RETIRE_CONNECTION_ID"),
+            (2, b"\x12" + qv(1 << 60, 8) + b"\x17" + qv(1 << 60, 8), 0,
+             "MAX_STREAMS, STREAMS_BLOCKED at 2^60"),
+            (2, b"\x12" + qv((1 << 60) + 1, 8), QFEE, "19.11: MAX_STREAMS bidi above 2^60"),
+            (2, b"\x13" + qv((1 << 60) + 1, 8), QFEE, "19.11: MAX_STREAMS uni above 2^60"),
+            (2, b"\x16" + qv((1 << 60) + 1, 8), QFEE, "19.14: STREAMS_BLOCKED bidi above 2^60"),
+            (2, b"\x17" + qv((1 << 60) + 1, 8), QFEE, "19.14: STREAMS_BLOCKED uni above 2^60"),
+            (2, b"\x18\x01\x00\x08" + bytes(8) + bytes(16), 0, "NEW_CONNECTION_ID"),
+            (2, b"\x18\x01\x02\x08" + bytes(8) + bytes(16), QFEE,
+             "19.15: Retire Prior To above the sequence number"),
+            (2, b"\x18\x01\x00\x00" + bytes(16), QFEE, "19.15: a zero-length connection ID"),
+            (2, b"\x18\x01\x00\x15" + bytes(21) + bytes(16), QFEE, "19.15: a 21-byte connection ID"),
+            (2, b"\x1a" + bytes(8) + b"\x1b" + bytes(8), 0, "PATH_CHALLENGE, PATH_RESPONSE"),
+            (2, b"\x1a" + bytes(7), QFEE, "PATH_CHALLENGE truncated"),
+            (2, b"\x1e\x01", 0, "HANDSHAKE_DONE in 1-RTT")]
+    for lvl, b, want, note in rows:
+        if py_frames(lvl, b) != want:
+            die(f"quic frames: {note}: {py_frames(lvl, b)}")
+    print(f"  quic frames: {len(rows)} rows")
+    return [(b.hex(), lvl, want, note) for lvl, b, want, note in rows]
+
+
+# ---- a whole client handshake (RFC 9001 4, RFC 9000 7, 12, 17)
+class QClient:
+    """What src/quic/conn.c sends, restated: one packet per datagram (CRYPTO, 4-byte PN, 2-byte
+    Length), a datagram with an Initial padded to 1200 (RFC 9000 14.1), the Initial keys dropped
+    at the first Handshake packet (RFC 9001 4.9.1), and on failure CONNECTION_CLOSE 0x1c at every
+    level it holds send keys for, coalesced, the last packet padded when an Initial is in it."""
+
+    def __init__(self, dcid, scid):
+        self.dcid, self.scid = dcid, scid
+        self.tx = {0: q_keys(0x1301, q_initial(dcid)[0])}
+        self.pn, self.stream, self.sent = [0, 0, 0], [b"", b""], [0, 0]
+
+    def hl(self, lvl):
+        return 1 + len(self.dcid) if lvl == 2 else 9 + len(self.dcid) + len(self.scid) + (lvl == 0)
+
+    def pkt(self, lvl, payload):
+        pn = self.pn[lvl]
+        self.pn[lvl] += 1
+        if lvl == 2:
+            hdr = b"\x43" + self.dcid
+        else:
+            hdr = (bytes([0xC3 | (0x20 if lvl else 0)]) + (1).to_bytes(4, "big") + bytes([len(self.dcid)])
+                   + self.dcid + bytes([len(self.scid)]) + self.scid + (b"" if lvl else b"\x00")
+                   + qv(4 + len(payload) + 16, 2))
+        return q_protect(self.tx[lvl], hdr, pn, 4, payload)
+
+    def send(self):
+        lvl = 0 if 0 in self.tx and self.sent[0] < len(self.stream[0]) else 1
+        if lvl not in self.tx or self.sent[lvl] >= len(self.stream[lvl]):
+            return b""
+        room, off = 1200 - self.hl(lvl) - 20, self.sent[lvl]
+        n = min(len(self.stream[lvl]) - off, room - (1 + len(qv(off)) + 2))
+        payload = b"\x06" + qv(off) + qv(n) + self.stream[lvl][off:off + n]
+        if lvl == 0:
+            payload += bytes(room - len(payload))
+        out = self.pkt(lvl, payload)
+        self.sent[lvl] += n
+        if lvl == 1 and 0 in self.tx:
+            del self.tx[0]
+        return out
+
+    def cc(self, code):
+        levels = [lv for lv in (0, 1, 2) if lv in self.tx]
+        out = b""
+        for lv in levels:
+            payload = b"\x1c" + qv(code) + b"\x00\x00"
+            used = len(out) + self.hl(lv) + 4 + len(payload) + 16
+            if lv == levels[-1] and 0 in self.tx and used < 1200:
+                payload += bytes(1200 - used)
+            out += self.pkt(lv, payload)
+        self.tx = {}
+        return out
+
+
+def q_long(k, typ, dcid, scid, pn, pn_len, payload, token=b""):
+    """A server long header packet (RFC 9000 17.2), minimal Length."""
+    hdr = (bytes([0xC0 | typ << 4 | (pn_len - 1)]) + (1).to_bytes(4, "big") + bytes([len(dcid)]) + dcid
+           + bytes([len(scid)]) + scid + (qv(len(token)) + token if typ == 0 else b"")
+           + qv(pn_len + len(payload) + 16))
+    return q_protect(k, hdr, pn, pn_len, payload)
+
+
+def q_short(k, dcid, pn, pn_len, payload):
+    return q_protect(k, bytes([0x40 | (pn_len - 1)]) + dcid, pn, pn_len, payload)
+
+
+def q_crypto(off, data):
+    return b"\x06" + qv(off) + qv(len(data)) + data
+
+
+def quic_conn_vectors():
+    """Client handshakes the C connection replays byte for byte (tests/test_quic.c), each a
+    script of ops: C<hex> = the next datagram brisk__quic_send must produce ("C" alone: none),
+    S<hex> = a server datagram brisk__quic_recv accepts, F<hex> = one that fails the
+    connection, E<code> = the QUIC error code, K / k = established or not, I / W = Initial /
+    Handshake keys discarded, O<n> = packets that passed the AEAD so far, H = build and absorb
+    ClientHello2, R<hex> = install a 1-RTT receive key directly, L = one short of the 6.6
+    integrity limit, A<n> = packets that failed the AEAD so far (0: dropped before it). The TLS side is tls13_fixture's server (the P-256 leaf for
+    device.example.com), wrapped in QUIC packets with the RFC 9001 A.1 DCID."""
+    f, seed = FX, FX["seed"]
+    host = b"device.example.com"
+    rnd = seed(b"quic client random")
+    dcid = bytes.fromhex("8394c8f03e515708")  # RFC 9001 A (the A.1 key rows pin it)
+    cscid, sscid = seed(b"quic client scid")[:8], seed(b"quic server scid")[:8]
+    c_d = int.from_bytes(seed(b"client p256"), "big")
+    s_d = int.from_bytes(seed(b"server p256"), "big")
+    c_p256, s_p256 = py_p256_keygen(c_d)[0], py_p256_keygen(s_d)[0]
+    ctp = tp_enc([(0x01, qv(30000)), (0x04, qv(1 << 20)), (0x08, qv(16)), (0x0F, cscid)])
+    alpn = t_alpn([b"h3"])
+
+    def ch_of(group, pub, cookie=b""):
+        return t_ch(rnd, b"", TLS13_SUITES, TLS13_GROUPS, TLS13_SIGS, group, pub, host,
+                    cookie=cookie, alpn=alpn, quic_tp=ctp)
+
+    ch1 = ch_of(0x001D, f["c_pub"])
+    reset = seed(b"quic reset token")[:16]
+    stp_ok = [(0x00, dcid), (0x01, qv(30000)), (0x02, reset), (0x04, qv(1 << 20)),
+              (0x08, qv(100)), (0x0E, qv(4)), (27, b"grease"), (0x0F, sscid)]
+    s_init = q_keys(0x1301, q_initial(dcid)[1])
+    good_cert = t_msg(11, b"\x00" + t_v24(t_v24(f["leaf_cert"]()) + t_v16(b"")))
+
+    def server(suite, pre, stp=stp_ok, ee_tp=True, cert=good_cert, group=0x001D):
+        bits = QSUITE[suite][0]
+        spub = f["s_pub"] if group == 0x001D else s_p256
+        dhe = py_x25519(f["c_priv"], f["s_pub"]) if group == 0x001D else py_p256_ecdh(c_d, s_p256)
+        sh = t_msg(2, t_u16(0x0303) + seed(b"quic server random") + t_v8(b"") + t_u16(suite)
+                   + b"\x00" + t_exts_build([(43, t_u16(0x0304)), (51, t_u16(group) + t_v16(spub))]))
+        exts = [(0, b""), (16, t_v16(t_v8(b"h3")))] + ([(57, tp_enc(stp))] if ee_tp else [])
+        ee = t_msg(8, t_exts_build(exts))
+        th = t_th(bits, pre + [sh, ee, cert])
+        cv = t_msg(15, t_u16(0x0403) + t_v16(f["leaf"]["sign"](t_cv_content(th))))
+        fl = t_flow(bits, dhe, pre, sh, ee, b"", cert, cv)
+        return {"suite": suite, "sh": sh, "flight": ee + cert + cv + fl["sf"], "cf": fl["cf"],
+                "hs_r": q_keys(suite, fl["s_hs"]), "hs_w": q_keys(suite, fl["c_hs"]),
+                "ap_r": q_keys(suite, fl["s_ap"]), "ap_w": q_keys(suite, fl["c_ap"]),
+                "s_ap": fl["s_ap"]}
+
+    ACK0 = b"\x02\x00\x00\x00\x00"  # the server acknowledges our Initial 0 (syntax only here)
+
+    def s_initial(pn, payload, dc=cscid, sc=sscid, token=b""):
+        return q_long(s_init, 0, dc, sc, pn, 2, payload, token)
+
+    rows = []
+
+    def start():
+        c = QClient(dcid, cscid)
+        c.stream[0] = ch1
+        return c, ["C" + c.send().hex()]
+
+    def after_sh(c, s):
+        """The client once the ServerHello is processed: new DCID (7.2), Handshake keys."""
+        c.dcid = sscid
+        c.tx[1] = s["hs_w"]
+
+    def connected(c, s):
+        c.tx[2] = s["ap_w"]
+        c.stream[1] = s["cf"]
+
+    def fail(c, ops, dgram, code):
+        ops += ["F" + dgram.hex(), f"E{code:x}", "C" + c.cc(code).hex(), "C"]
+
+    def row(note, suite, ops):
+        if len(ops) > QUIC_CONN_OPS:
+            die(f"quic conn: {note}: {len(ops)} ops")
+        rows.append((note, suite, ops))
+
+    def std(s):
+        return (s_initial(0, ACK0 + q_crypto(0, s["sh"]))
+                + q_long(s["hs_r"], 2, cscid, sscid, 0, 2, q_crypto(0, s["flight"])))
+
+    # 1. the full handshake per suite, Initial + Handshake coalesced (RFC 9000 12.2)
+    for suite in (0x1301, 0x1302, 0x1303):
+        c, ops = start()
+        s = server(suite, [ch1])
+        ops += ["S" + std(s).hex(), "O2", "K"]
+        after_sh(c, s)
+        connected(c, s)
+        ops += ["C" + c.send().hex(), "I"]
+        ops += ["S" + q_short(s["ap_r"], cscid, 0, 2, b"\x1e\x00").hex(), "W", "O3", "C"]
+        row(f"handshake {suite:#06x}: coalesced server flight, HANDSHAKE_DONE", suite, ops)
+    s = server(0x1301, [ch1])
+    # 2. separate datagrams; the Handshake packet decrypts only once the SH installed its keys
+    c, ops = start()
+    hs_pkt = q_long(s["hs_r"], 2, cscid, sscid, 0, 2, q_crypto(0, s["flight"]))
+    ops += ["S" + hs_pkt.hex(), "O0", "S" + s_initial(0, q_crypto(0, s["sh"])).hex(), "O1", "k",
+            "S" + hs_pkt.hex(), "O2", "K"]
+    after_sh(c, s)
+    connected(c, s)
+    ops += ["C" + c.send().hex(), "I", "C"]
+    row("separate datagrams; a Handshake packet before its keys is dropped", 0x1301, ops)
+    # 3. CRYPTO split, out of order, overlapping, over several coalesced packets
+    s3 = server(0x1303, [ch1])
+    fl, sh = s3["flight"], s3["sh"]
+    a, b = len(fl) // 3, 2 * len(fl) // 3
+    d = (s_initial(0, q_crypto(40, sh[40:]) + q_crypto(0, sh[:40]))
+         + q_long(s3["hs_r"], 2, cscid, sscid, 0, 1, q_crypto(b, fl[b:]))
+         + q_long(s3["hs_r"], 2, cscid, sscid, 1, 1, q_crypto(0, fl[:a]) + q_crypto(5, fl[5:a + 9]))
+         + q_long(s3["hs_r"], 2, cscid, sscid, 2, 1, q_crypto(a, fl[a:b])))
+    c, ops = start()
+    ops += ["S" + d.hex(), "O4", "K"]
+    after_sh(c, s3)
+    connected(c, s3)
+    ops += ["C" + c.send().hex(), "I"]
+    row("split CRYPTO: reversed, overlapping, over four coalesced packets", 0x1303, ops)
+    # 4. HelloRetryRequest to secp256r1 with a cookie; CH2 continues the Initial stream
+    cookie = seed(b"quic cookie") * 2
+    hrr = t_msg(2, t_u16(0x0303) + RFC9846["hrr"] + t_v8(b"") + t_u16(0x1301) + b"\x00"
+                + t_exts_build([(43, t_u16(0x0304)), (51, t_u16(0x0017)), (44, t_v16(cookie))]))
+    ch2 = ch_of(0x0017, c_p256, cookie)
+    sh4 = server(0x1301, [t_message_hash(256, ch1), hrr, ch2], group=0x0017)
+    c, ops = start()
+    ops += ["S" + s_initial(0, ACK0 + q_crypto(0, hrr)).hex(), "k", "H"]
+    c.dcid = sscid
+    c.stream[0] += ch2
+    ops.append("C" + c.send().hex())
+    ops.append("S" + (s_initial(1, q_crypto(len(hrr), sh4["sh"]))
+                      + q_long(sh4["hs_r"], 2, cscid, sscid, 0, 2, q_crypto(0, sh4["flight"]))).hex())
+    ops.append("K")
+    after_sh(c, sh4)
+    connected(c, sh4)
+    ops += ["C" + c.send().hex(), "I"]
+    row("HelloRetryRequest: CH2 at Initial offset len(CH1), secp256r1", 0x1301, ops)
+    # 5. duplicates are dropped after the AEAD (RFC 9000 12.3)
+    c, ops = start()
+    reuse = q_long(s["hs_r"], 2, cscid, sscid, 0, 2, b"\x21\x00\x00")  # an error if processed
+    ops += ["S" + std(s).hex(), "O2", "K", "S" + std(s).hex(), "O4", "K", "S" + reuse.hex(), "O5"]
+    after_sh(c, s)
+    connected(c, s)
+    ops += ["C" + c.send().hex(), "I"]
+    row("12.3: a datagram twice, then another packet reusing PN 0: opened, dropped as duplicates",
+        0x1301, ops)
+    # 6. RFC 9000 7.2 / 5.2.1 / 17.2.2 drops
+    c, ops = start()
+    tok = s_initial(0, q_crypto(0, s["sh"]), token=b"tok")
+    other = bytearray(s_initial(0, q_crypto(0, s["sh"])))
+    other[1:5] = (0xFF00001D).to_bytes(4, "big")  # 5.2.1: not the version in use
+    ops += ["S" + (tok + hs_pkt).hex(), "O0", "k", "S" + bytes(other).hex(), "A0",
+            "S" + s_initial(0, q_crypto(0, s["sh"]), dc=b"\x99" * 8).hex(), "O0", "k",
+            "S" + std(s).hex(), "O2", "K",
+            "S" + s_initial(1, b"\x01" + bytes(20), sc=b"\x77" * 8).hex(), "O2"]
+    after_sh(c, s)
+    connected(c, s)
+    ops += ["C" + c.send().hex()]
+    row("7.2/5.2.1/17.2.2: token, foreign DCID, new SCID later - all dropped", 0x1301, ops)
+    # 7. RFC 9001 5.7: 1-RTT before CONNECTED, even with its key in place
+    c, ops = start()
+    ops += ["S" + s_initial(0, q_crypto(0, s["sh"])).hex(), "O1", "R" + s["s_ap"].hex(),
+            "S" + q_short(s["ap_r"], cscid, 0, 2, b"\x01\x00").hex(), "O1", "k",
+            "S" + hs_pkt.hex(), "O2", "K"]
+    row("RFC 9001 5.7: a 1-RTT packet before the handshake completes is dropped", 0x1301, ops)
+    # 8. failures -> exactly one CONNECTION_CLOSE, then nothing
+    for note, sv, code in (
+            ("RFC 9001 8.2: EE without quic_transport_parameters -> 0x016d",
+             server(0x1301, [ch1], ee_tp=False), 0x16D),
+            ("bad certificate (another host) -> 0x012a",
+             server(0x1301, [ch1], cert=t_msg(11, b"\x00" + t_v24(t_v24(
+                 f["leaf_cert"](host="other.example.com")) + t_v16(b"")))), 0x12A),
+            ("18.2: a duplicate transport parameter at EE -> TRANSPORT_PARAMETER_ERROR",
+             server(0x1301, [ch1], stp=stp_ok + [(0x01, qv(5))]), QTPE)):
+        c, ops = start()
+        after_sh(c, sv)
+        fail(c, ops, std(sv), code)
+        row(note, 0x1301, ops)
+    for note, stp in (("7.3: original_destination_connection_id missing",
+                       [t for t in stp_ok if t[0] != 0x00]),
+                      ("7.3: original_destination_connection_id mismatch",
+                       [(0x00, b"\x01" * 8) if t[0] == 0x00 else t for t in stp_ok]),
+                      ("7.3: initial_source_connection_id missing",
+                       [t for t in stp_ok if t[0] != 0x0F]),
+                      ("7.3: initial_source_connection_id mismatch",
+                       [(0x0F, b"\x02" * 8) if t[0] == 0x0F else t for t in stp_ok]),
+                      ("7.3: retry_source_connection_id without a Retry",
+                       stp_ok + [(0x10, sscid)])):
+        sv = server(0x1301, [ch1], stp=stp)
+        c, ops = start()
+        after_sh(c, sv)
+        c.tx[2] = sv["ap_w"]
+        fail(c, ops, std(sv), QTPE)
+        row(note + " -> TRANSPORT_PARAMETER_ERROR at completion", 0x1301, ops)
+    # reserved bits: a PROTOCOL_VIOLATION only after the AEAD accepted them (RFC 9001 9.5)
+    k = s_init
+    body = ACK0 + q_crypto(0, s["sh"])
+    hdr = (bytes([0xC1 | 0x04]) + (1).to_bytes(4, "big") + b"\x08" + cscid + b"\x08" + sscid + b"\x00"
+           + qv(2 + len(body) + 16))
+    rsv = q_protect(k, hdr, 0, 2, body)
+    c, ops = start()
+    ops += ["S" + (rsv[:-1] + bytes([rsv[-1] ^ 1])).hex(), "O0", "k"]
+    fail(c, ops, rsv, QPV)
+    row("17.2: reserved bits set -> PROTOCOL_VIOLATION after decryption; with a bad tag dropped",
+        0x1301, ops)
+    # frames at the wrong level / unknown frames, once connected (every send key present)
+    for note, payload, code in (("19.20: HANDSHAKE_DONE in a Handshake packet", b"\x1e\x00\x00", QPV),
+                                ("12.4: unknown frame type in a Handshake packet", b"\x21\x00\x00", QFEE)):
+        c, ops = start()
+        ops += ["S" + std(s).hex(), "K"]
+        after_sh(c, s)
+        c.tx[2] = s["ap_w"]
+        fail(c, ops, q_long(s["hs_r"], 2, cscid, sscid, 1, 2, payload), code)
+        row(note, 0x1301, ops)
+    # post-handshake CRYPTO in 1-RTT (Initial keys gone, Handshake keys still here)
+    nst = rec_nst(7200, 1, b"\x00", seed(b"quic ticket"), [(42, b"\x00\x00\x00\x00")])
+    for note, msg, code in (("RFC 9001 4.6.1: NewSessionTicket early_data 0 -> PROTOCOL_VIOLATION",
+                             nst, QPV),
+                            ("RFC 9001 6: KeyUpdate -> 0x010a", t_msg(24, b"\x00"), 0x10A)):
+        c, ops = start()
+        ops += ["S" + std(s).hex(), "K"]
+        after_sh(c, s)
+        connected(c, s)
+        ops += ["C" + c.send().hex()]
+        fail(c, ops, q_short(s["ap_r"], cscid, 0, 2, q_crypto(0, msg)), code)
+        row(note, 0x1301, ops)
+    # 1-RTT connection-ID frames this client cannot accept (RFC 9000 19.15, 19.16)
+    c, ops = start()
+    ops += ["S" + std(s).hex(), "K"]
+    after_sh(c, s)
+    connected(c, s)
+    ops += ["C" + c.send().hex()]
+    fail(c, ops, q_short(s["ap_r"], cscid, 0, 2, b"\x19\x00"), QPV)
+    row("19.16: RETIRE_CONNECTION_ID of our only CID -> PROTOCOL_VIOLATION", 0x1301, ops)
+    se = server(0x1301, [ch1], stp=[(0x0F, b"") if t[0] == 0x0F else t for t in stp_ok])
+    c, ops = start()
+    ops += ["S" + (s_initial(0, ACK0 + q_crypto(0, se["sh"]), sc=b"")
+                   + q_long(se["hs_r"], 2, cscid, b"", 0, 2, q_crypto(0, se["flight"]))).hex(),
+            "K"]
+    after_sh(c, se)
+    c.dcid = b""
+    connected(c, se)
+    ops += ["C" + c.send().hex()]
+    fail(c, ops, q_short(se["ap_r"], cscid, 0, 2, b"\x18\x01\x00\x08" + bytes(8) + bytes(16)),
+         QPV)
+    row("19.15: NEW_CONNECTION_ID to a client sending an empty DCID -> PROTOCOL_VIOLATION",
+        0x1301, ops)
+    # RFC 9001 4.1.3 at the Initial level
+    c, ops = start()
+    after_sh(c, s)
+    fail(c, ops, s_initial(0, q_crypto(0, s["sh"] + b"\x08")), QPV)
+    row("RFC 9001 4.1.3: CRYPTO after the ServerHello in the same stream -> PROTOCOL_VIOLATION",
+        0x1301, ops)
+    c, ops = start()
+    c.dcid = sscid  # the engine refuses s_hs, so c_hs never arrives: Initial keys only
+    fail(c, ops, s_initial(0, q_crypto(len(s["sh"]) + 5, b"xy") + q_crypto(0, s["sh"])), QPV)
+    row("RFC 9001 4.1.3: unconsumed Initial CRYPTO when the Handshake keys arrive", 0x1301, ops)
+    # RFC 9001 6.6: the integrity limit
+    c, ops = start()
+    bad = s_initial(0, q_crypto(0, s["sh"]))
+    ops.append("L")
+    fail(c, ops, bad[:-1] + bytes([bad[-1] ^ 1]), QALR)
+    row("RFC 9001 6.6: one AEAD failure past the integrity limit -> AEAD_LIMIT_REACHED", 0x1301, ops)
+    # RFC 9000 10.2.2: the peer's CONNECTION_CLOSE - draining, nothing sent back
+    c, ops = start()
+    ops += ["F" + s_initial(0, b"\x1c\x0a\x00\x02no").hex(), "E0a", "C"]
+    row("10.2.2: the server's CONNECTION_CLOSE: draining, no close sent", 0x1301, ops)
+    print(f"  quic connection scripts: {len(rows)}")
+    glob = {"RND": rnd, "X25519": f["c_priv"], "P256": c_d.to_bytes(32, "big"), "DCID": dcid,
+            "SCID": cscid, "CTP": ctp, "ROOT": f["root_c"], "CH1": ch1, "SH": s["sh"],
+            "FLIGHT": s["flight"], "S_INIT": s_initial(0, q_crypto(0, s["sh"]))}
+    return rows, glob
+
+
 def main():
     OUT.mkdir(parents=True, exist_ok=True)
     print("fetching + verifying official vectors ...")
@@ -8401,6 +9357,13 @@ def main():
     tls12_prf = tls12_prf_vectors()
     tls12_rec = tls12_record_vectors()
     tls12_rows, tls12_streams = tls12_flows()
+    q_var = rfc9000_varints()
+    q_pn, q_pnlen = rfc9000_pn()
+    q_pkt = quic_pkt_vectors()
+    q_a2, q_a3 = gcm_quic[0][3], gcm_quic[1][3]
+    q_tp, _ = quic_tp_vectors(q_a2)
+    q_frames = quic_frame_vectors(q_a2, q_a3)
+    q_conn, q_glob = quic_conn_vectors()
 
     emit("sha2.inc", "struct hash_kat SHA2_KAT", cavp + dhash, lambda r: f"{r[0]}, {cstr(r[1])}, {cstr(r[2])}")
     emit("sha2_monte.inc", "struct monte_kat SHA2_MONTE", monte,
@@ -8608,6 +9571,33 @@ def main():
          lambda r: f'{cstr(r[0])}, "{cesc(r[1])}"')
     with open(OUT / "tls13_rec_fuzz.inc", "a", newline="\n") as fh:
         fh.write(f'static const char TLS13_REC_FUZZ_S_AP[] = "{rec_fuzz_key.hex()}";\n')
+
+    # tests/test_quic.c (M6)
+    u64 = lambda v: f"{v}ULL"
+    emit("quic_varint.inc", "struct quic_varint_kat QUIC_VARINT_KAT", q_var,
+         lambda r: f'{cstr(r[0])}, {u64(r[1])}, {r[2]}, "{r[3]}"')
+    emit("quic_pn.inc", "struct quic_pn_kat QUIC_PN_KAT", q_pn,
+         lambda r: f'{u64(QUIC_NONE if r[0] is None else r[0])}, {u64(r[1])}, {r[2]}u, '
+                   f'{u64(r[3])}, "{r[4]}"')
+    emit("quic_pn.inc", "struct quic_pnlen_kat QUIC_PNLEN_KAT", q_pnlen,
+         lambda r: f'{u64(r[0])}, {u64(QUIC_NONE if r[1] is None else r[1])}, {r[2]}u, "{r[3]}"',
+         append=True)
+    emit("quic_pkt.inc", "struct quic_pkt_kat QUIC_PKT_KAT", q_pkt,
+         lambda r: f'{cstr(r[0])}, 0x{r[1]:04x}u, {cstr(r[2])}, {cstr(r[3])}, {cstr(r[4])}, '
+                   f'{u64(r[5])}, {u64(r[6])}, {r[7]}u, {r[8]}, "{cesc(r[9])}"')
+    emit("quic_tp.inc", "struct quic_tp_kat QUIC_TP_KAT", q_tp,
+         lambda r: f'{cstr(r[0])}, {r[1]}, {{' + ", ".join(u64(v) for v in r[2]) + '}, '
+                   + ", ".join(cstr(x) for x in r[3:7]) + f', {r[7]}u, "{cesc(r[8])}"')
+    emit("quic_frames.inc", "struct quic_frame_kat QUIC_FRAME_KAT", q_frames,
+         lambda r: f'{cstr(r[0])}, {r[1]}u, 0x{r[2]:x}u, "{cesc(r[3])}"')
+    qop = lambda o: f'"{o[0]}" {cstr(o[1:])}' if len(o) > 1 and o[0] in "CSFR" else f'"{o}"'
+    emit("quic_conn.inc", "struct quic_conn_kat QUIC_CONN_KAT", q_conn,
+         lambda r: f'"{cesc(r[0])}", 0x{r[1]:04x}u, {{' + ", ".join(
+             [qop(o) for o in r[2]] + ["NULL"] * (QUIC_CONN_OPS - len(r[2]))) + "}")
+    with open(OUT / "quic_conn.inc", "a", newline="\n") as fh:
+        for k, v in q_glob.items():
+            fh.write(f"static const char QUIC_CONN_{k}[] = {cstr(v.hex())};\n")
+        fh.write(f"static const long long QUIC_CONN_NOW = {CHAIN_NOW}LL;\n")
 
     rfc7541_static()
     huff_counts, huff_syms = rfc7541_huffman()
@@ -8859,6 +9849,21 @@ def main():
         "  must be accepted / rejected exactly as by brisk (generation time only). The invalid\n"
         "  rows follow summerwind/h2spec's case list and the Netflix 2019-002 / CERT VU#421644\n"
         "  flood classes; nothing is copied from either.\n\n"
+        "- **QUIC v1 (M6, `quic_*.inc`).** OFFICIAL: RFC 9001 A.1 (Initial secrets and keys, in\n"
+        "  `expand_label.inc`), A.2 / A.3 (AES-128-GCM Initial packets) and A.5 (ChaCha20-Poly1305\n"
+        "  short header), each re-derived in Python before emission; RFC 9000 A.1 (the varint\n"
+        "  samples, including the non-minimal 0x4025) and the A.2 / A.3 packet number examples,\n"
+        "  parsed out of the RFC text. A.4 (Retry integrity tag) belongs to M6 item 3. Wycheproof\n"
+        "  and NIST publish no QUIC suite; the AEADs underneath are covered by `aes_gcm.inc` and\n"
+        "  `chacha20_poly1305.inc`. GENERATED, 'RFC-derived', by the Python codecs in tools/kat.py\n"
+        "  (written from the RFC text, not from src/quic/): the seeded differential set against the\n"
+        "  A.3 pseudocode, every packet mutation (verdict from an independent header parser and\n"
+        "  opener), the transport-parameter blocks (`quic_tp.inc`, valid and invalid per RFC 9000\n"
+        "  18.2 - no official vector exists beyond the A.2 ClientHello's), the frame rows (12.4\n"
+        "  Table 3, 19), and the client handshakes of `quic_conn.inc`: tls13_fixture's server\n"
+        "  wrapped in QUIC packets for 0x1301/0x1302/0x1303, an HRR, split CRYPTO and every failure\n"
+        "  path, the client's datagrams byte for byte. A shared misreading passes them;\n"
+        "  quic-interop-runner (M6 item 4) is the independent oracle.\n\n"
         "## x509-limbo skip tally\n\n"
         f"limbo.json carries {len(x509_limbo) + sum(x509_limbo_skipped.values())} testcases and this "
         f"library exercises {len(x509_limbo)} of them.\n"

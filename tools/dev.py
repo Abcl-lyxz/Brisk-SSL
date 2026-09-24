@@ -4,10 +4,10 @@
   python tools/dev.py test                       host presets (dev, dev32), natively
   python tools/dev.py test --arch all            every Docker preset (x86_64, asan, 9 cross archs)
   python tools/dev.py test --arch mips ppc       selected Docker presets
-  python tools/dev.py size [--arch all|mipsel..] [--md] [--save] [--check]
+  python tools/dev.py size [--arch all|mipsel..] [--md] [--save] [--check] [--profile FULL]
                                                  per-module flash/RAM from the linker map (-Os, static)
   python tools/dev.py ct                         constant-time check: the ct suite under valgrind
-  python tools/dev.py fuzz [der|name|tls13_hs|tls13_rec|ticket|conn|hpack|h2] [--seconds N]  libFuzzer over a parser, seeded from its .inc
+  python tools/dev.py fuzz [der|name|tls13_hs|tls13_rec|ticket|conn|hpack|h2|quic_pkt|quic_tp] [--seconds N]  libFuzzer over a parser, seeded from its .inc
   python tools/dev.py interop                    brisk_get vs s_server/nginx/Caddy; h2_get vs nginx/h2o/nghttpd
   python tools/dev.py badssl                     brisk_get vs badssl.com (needs internet)
   python tools/dev.py image                      (re)build the brisk-dev Docker image
@@ -83,7 +83,10 @@ def cmd_test(archs, jobs):
 # let valgrind report any branch/index/division that depends on one. Native x86_64 only - valgrind
 # does not run under qemu-user - so both AES/GHASH variants are built here instead: the 32-bit code
 # is the same C either way, and what differs per arch (multiplier timing, cache) is beyond valgrind.
-CT_VARIANTS = [("ct64", ""), ("ct32", " -DBRISK__AES_CT64=0 -DBRISK__FIAT_64=0")]
+# ct32m: the multiply-free GHASH of armv5 / MIPS32 (BRISK_GHASH_MULFREE) under the same AEAD calls.
+# FULL profile, so the QUIC packet protection (tests/test_quic.c quic_ct_run) is in the run too.
+CT_VARIANTS = [("ct64", ""), ("ct32", " -DBRISK__AES_CT64=0 -DBRISK__FIAT_64=0"),
+               ("ct32m", " -DBRISK__AES_CT64=0 -DBRISK__FIAT_64=0 -DBRISK_GHASH_MULFREE=1")]
 
 
 def cmd_ct():
@@ -91,7 +94,7 @@ def cmd_ct():
     for name, extra in CT_VARIANTS:
         bdir = f"build/ct-{name}"
         cfg = ["cmake", "-S", ".", "-B", bdir, "-G", "Ninja", "-DCMAKE_BUILD_TYPE=Debug",
-               "-DCMAKE_C_FLAGS=-O1 -g -DBRISK_CT_CHECK" + extra]
+               "-DBRISK_PROFILE=FULL", "-DCMAKE_C_FLAGS=-O1 -g -DBRISK_CT_CHECK" + extra]
         rc, out = run(docker_cmd(cfg), True)
         if not rc:
             rc, out = run(docker_cmd(["cmake", "--build", bdir, "--target", "brisk_tests"]), True)
@@ -135,13 +138,14 @@ def parse_map(text):
     return mods
 
 
-def measure_inside(arch):
+def measure_inside(arch, profile=""):
     """Runs inside the container: -Os static build of the size probe, prints one JSON line."""
-    bdir = f"build/size-{arch}"
+    bdir = f"build/size-{arch}" + (f"-{profile.lower()}" if profile else "")
     tc = [] if arch == "x86_64" else [f"-DCMAKE_TOOLCHAIN_FILE=cmake/toolchains/{arch}.cmake"]
     flags = "-fno-asynchronous-unwind-tables -fno-unwind-tables -fno-ident"
     for cmd in (["cmake", "-S", ".", "-B", bdir, "-G", "Ninja", "-DCMAKE_BUILD_TYPE=MinSizeRel",
-                 "-DBRISK_BUILD_TESTS=OFF", "-DBRISK_SIZE_PROBE=ON", f"-DCMAKE_C_FLAGS={flags}", *tc],
+                 "-DBRISK_BUILD_TESTS=OFF", "-DBRISK_SIZE_PROBE=ON", f"-DCMAKE_C_FLAGS={flags}",
+                 f"-DBRISK_PROFILE={profile}", *tc],
                 ["cmake", "--build", bdir, "--target", "brisk_size_probe"]):
         rc, out = run(cmd, True)
         if rc:
@@ -158,11 +162,12 @@ def flash(m):
     return m["text"] + m["rodata"] + m["data"]
 
 
-def cmd_size(archs, md, save, check, jobs):
+def cmd_size(archs, md, save, check, jobs, profile=""):
     archs = SIZE_ARCHS if not archs or archs == ["all"] else archs
+    key = (lambda a: a) if not profile else (lambda a: f"{a}:{profile}")  # baseline row per profile
 
     def one(a):
-        rc, out = run(docker_cmd(["python3", "tools/dev.py", "_measure", a]), True)
+        rc, out = run(docker_cmd(["python3", "tools/dev.py", "_measure", a, "--profile", profile]), True)
         if rc:
             sys.exit(f"size {a} failed:\n{out}")
         return json.loads(out.strip().splitlines()[-1])
@@ -183,14 +188,14 @@ def cmd_size(archs, md, save, check, jobs):
                 v = sum(x["data"] + x["bss"] for x in ms.values())
             else:
                 v = flash(ms[m]) if m in ms else 0
-            old = base.get(a, {}).get(m)
+            old = base.get(key(a), {}).get(m)
             cell = f"{v}"
             if old is not None and old != v:
                 cell += f" ({v - old:+d})"
                 if m.startswith("TOTAL") and v - old > max(old // 100, 256):
                     grew.append(f"{a} {m}: {old} -> {v}")
             cells.append(cell)
-            base.setdefault("_new", {}).setdefault(a, {})[m] = v
+            base.setdefault("_new", {}).setdefault(key(a), {})[m] = v
         lines.append(f"| {m} | " + " | ".join(cells) + " |")
     table = "\n".join(lines)
     print(table if md else table.replace("|", " ").replace("---", "   "))
@@ -250,7 +255,24 @@ FUZZ = {"der": ("fuzz/fuzz_der.c src/x509/der.c", "tests/kat/der.inc"),
         # HTTP/2 frames + streams (RFC 9113): server byte streams through brisk__h2_feed, then the
         # blocking calls over the same handle. Seeds are the h2.inc scenario streams.
         "h2": ("fuzz/fuzz_h2.c src/http/h2.c src/http/hpack.c src/http/huffman.c src/util.c",
-               "tests/kat/h2_fuzz.inc")}
+               "tests/kat/h2_fuzz.inc"),
+        # QUIC (M6): datagrams through the header parser, Initial-key open and the frame parser;
+        # seeds are every quic_pkt.inc packet. The -D rides in the source list: QUIC is FULL only.
+        "quic_pkt": ("-DBRISK_ENABLE_QUIC=1 fuzz/fuzz_quic_pkt.c src/quic/packet.c src/quic/conn.c "
+                     "src/tls/handshake.c src/tls/tls12.c src/tls/keyschedule.c src/util.c "
+                     "src/crypto/sha2.c src/crypto/hkdf.c src/crypto/chacha20_poly1305.c "
+                     "src/crypto/aes_ct.c src/crypto/aes_ct64.c src/crypto/gcm.c src/crypto/x25519.c "
+                     "src/crypto/p256.c src/crypto/p384.c src/crypto/bn.c src/crypto/rsa.c "
+                     "src/x509/der.c src/x509/cert.c src/x509/chain.c src/x509/name.c",
+                     "tests/kat/quic_pkt.inc"),
+        # QUIC transport parameters (RFC 9000 18): parse, and write-back of what parsed.
+        "quic_tp": ("-DBRISK_ENABLE_QUIC=1 fuzz/fuzz_quic_tp.c src/quic/packet.c src/quic/conn.c "
+                    "src/tls/handshake.c src/tls/tls12.c src/tls/keyschedule.c src/util.c "
+                    "src/crypto/sha2.c src/crypto/hkdf.c src/crypto/chacha20_poly1305.c "
+                    "src/crypto/aes_ct.c src/crypto/aes_ct64.c src/crypto/gcm.c src/crypto/x25519.c "
+                    "src/crypto/p256.c src/crypto/p384.c src/crypto/bn.c src/crypto/rsa.c "
+                    "src/x509/der.c src/x509/cert.c src/x509/chain.c src/x509/name.c",
+                    "tests/kat/quic_tp.inc")}
 
 
 def fuzz_corpus(inc, out):
@@ -785,6 +807,8 @@ def main():
     s.add_argument("--md", action="store_true", help="markdown table")
     s.add_argument("--save", action="store_true", help="write size/baseline.json")
     s.add_argument("--check", action="store_true", help="exit 1 if a total grew > max(1%%, 256 B)")
+    s.add_argument("--profile", default="", choices=["", "TINY", "DEFAULT", "FULL"],
+                   help="build profile (default: the header's); FULL adds QUIC")
     s.add_argument("-j", "--jobs", type=int, default=max(1, (os.cpu_count() or 2) // 2))
     sub.add_parser("ct")
     f = sub.add_parser("fuzz")
@@ -797,11 +821,12 @@ def main():
     sub.add_parser("image")
     m = sub.add_parser("_measure")
     m.add_argument("arch")
+    m.add_argument("--profile", default="")
     a = ap.parse_args()
     if a.cmd == "test":
         return cmd_test(a.arch, a.jobs)
     if a.cmd == "size":
-        return cmd_size(a.arch, a.md, a.save, a.check, a.jobs)
+        return cmd_size(a.arch, a.md, a.save, a.check, a.jobs, a.profile)
     if a.cmd == "ct":
         return cmd_ct()
     if a.cmd == "fuzz":
@@ -815,7 +840,7 @@ def main():
     if a.cmd == "image":
         return run(["docker", "build", "-t", IMAGE, "docker/"], False)[0]
     if a.cmd == "_measure":
-        return measure_inside(a.arch)
+        return measure_inside(a.arch, a.profile)
 
 
 if __name__ == "__main__":

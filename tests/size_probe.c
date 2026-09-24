@@ -238,6 +238,45 @@ int main(int argc, char **argv)
         }
 #endif
     }
+#if BRISK_ENABLE_QUIC
+    {
+        /* QUIC v1 (M6): packets + the client connection; the scratch is the probe's BSS */
+        static uint8_t qscr[8192 + 2048 + BRISK_QUIC_CRYPTO_BUF + BRISK_TLS_MAX_CLIENT_CHAIN];
+        static uint8_t hscr[4 + BRISK_TLS_MAX_HS_MSG + 8192 + BRISK_TLS_MAX_CLIENT_CHAIN];
+        static brisk__tls13_hs qhs;
+        static brisk__quic_conn qc;
+        static brisk__quic_keys qk;
+        brisk__tls13_auth_x509_ctx qax = {"a.example", 9, NULL, 0};
+        brisk__tls13_hs_cfg qcfg = {NULL, NULL, brisk__tls13_auth_x509, &qax, 1, NULL, NULL,
+                                    NULL, NULL};
+        brisk__quic_hdr qh;
+        brisk__quic_tp tp;
+        const uint8_t *qp = out;
+        uint64_t qv;
+        size_t qo, ql;
+        uint8_t qf;
+        brisk__quic_varint_put(out, 8, (uint64_t)argc);
+        brisk__quic_varint_get(&qp, out + 8, &qv);
+        out[0] = (uint8_t)(brisk__quic_pn_decode(qv, 3, 8) + brisk__quic_pn_len(qv, 1));
+        brisk__quic_initial_secrets(out, 8, out, out + 32);
+        brisk__quic_keys_init(&qk, 0x1301, out, 32);
+        brisk__quic_hdr_parse(out, sizeof out, 8, &qh);
+        brisk__quic_seal(&qk, out, 8, 4, 1, 20);
+        brisk__quic_open(&qk, out, 8, sizeof out, 0, &qf, &qv, &qo, &ql);
+        brisk__quic_keys_wipe(&qk);
+        brisk__quic_tp_default(&tp);
+        brisk__quic_tp_parse(out, 16, &tp);
+        brisk__quic_tp_write(&tp, out, sizeof out, &qo);
+        brisk__tls13_hs_init(&qhs, &qcfg, hscr, sizeof hscr);
+        if (brisk__quic_scratch_size() <= sizeof qscr &&
+            brisk__quic_conn_init(&qc, &qhs, out, 8, out, 8, qscr, sizeof qscr) == BRISK_OK) {
+            brisk__quic_recv(&qc, out, sizeof out, 0);
+            brisk__quic_send(&qc, out, sizeof out, 0);
+            out[1] = (uint8_t)brisk__quic_established(&qc);
+            out[2] = (uint8_t)brisk__quic_frames(&qc, 0, out, 8);
+        }
+    }
+#endif
 #if BRISK_ENABLE_H2
     {
         /* HPACK: the ring and scratch are the probe's BSS, not the library's RAM */

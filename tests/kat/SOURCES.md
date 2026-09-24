@@ -59,6 +59,7 @@ reference before emission. Differential vectors come from a fixed seed.
 | rfc8422 | https://www.rfc-editor.org/rfc/rfc8422.txt | `cac45754399e5115342cf1d773a51ac5a77ad221e9336e43ceadd8f294712350` |
 | rfc8439 | https://www.rfc-editor.org/rfc/rfc8439.txt | `25bef70fbf7a07ff45c2fe4cb7c6ce954eac687413d8610603268b4e4415324c` |
 | rfc8448 | https://www.rfc-editor.org/rfc/rfc8448.txt | `6564d1376d1ec744fc7a9993da15ebc1b9be361908b166091f47ef605c537fba` |
+| rfc9000 | https://www.rfc-editor.org/rfc/rfc9000.txt | `f88aae47f8b18e102024916e975e919201d8dde689cba79b01079eaedd402e22` |
 | rfc9001 | https://www.rfc-editor.org/rfc/rfc9001.txt | `3bbaecdf5afd278052a2c48348ce118c4ff8d0cf6b9915549858171b3f98a591` |
 | rfc9113 | https://www.rfc-editor.org/rfc/rfc9113.txt | `a00ef91b64e111a282e77ec66980f5242e77c0bb5e33e0927e3b6757080506de` |
 | rfc9846 | https://www.rfc-editor.org/rfc/rfc9846.txt | `b1bee06a814f92ca4677c85b97519be53869b2bf8edc79ade955fb51c0402b17` |
@@ -311,6 +312,22 @@ reference before emission. Differential vectors come from a fixed seed.
   must be accepted / rejected exactly as by brisk (generation time only). The invalid
   rows follow summerwind/h2spec's case list and the Netflix 2019-002 / CERT VU#421644
   flood classes; nothing is copied from either.
+
+- **QUIC v1 (M6, `quic_*.inc`).** OFFICIAL: RFC 9001 A.1 (Initial secrets and keys, in
+  `expand_label.inc`), A.2 / A.3 (AES-128-GCM Initial packets) and A.5 (ChaCha20-Poly1305
+  short header), each re-derived in Python before emission; RFC 9000 A.1 (the varint
+  samples, including the non-minimal 0x4025) and the A.2 / A.3 packet number examples,
+  parsed out of the RFC text. A.4 (Retry integrity tag) belongs to M6 item 3. Wycheproof
+  and NIST publish no QUIC suite; the AEADs underneath are covered by `aes_gcm.inc` and
+  `chacha20_poly1305.inc`. GENERATED, 'RFC-derived', by the Python codecs in tools/kat.py
+  (written from the RFC text, not from src/quic/): the seeded differential set against the
+  A.3 pseudocode, every packet mutation (verdict from an independent header parser and
+  opener), the transport-parameter blocks (`quic_tp.inc`, valid and invalid per RFC 9000
+  18.2 - no official vector exists beyond the A.2 ClientHello's), the frame rows (12.4
+  Table 3, 19), and the client handshakes of `quic_conn.inc`: tls13_fixture's server
+  wrapped in QUIC packets for 0x1301/0x1302/0x1303, an HRR, split CRYPTO and every failure
+  path, the client's datagrams byte for byte. A shared misreading passes them;
+  quic-interop-runner (M6 item 4) is the independent oracle.
 
 ## x509-limbo skip tally
 

@@ -65,6 +65,25 @@
 #    define BRISK_ENABLE_H2 (BRISK_PROFILE >= BRISK_PROFILE_DEFAULT)
 #endif
 
+/* QUIC v1 client transport (RFC 9000 + RFC 9001; src/quic/). Packets and header protection,
+ * CRYPTO frames on the one TLS 1.3 engine, transport parameters. On in FULL only; with it off
+ * both src/quic files compile to empty translation units. Needs nothing forced: AES-128/256-GCM,
+ * ChaCha20-Poly1305, HKDF and the TLS 1.3 engine are always built. */
+#ifndef BRISK_ENABLE_QUIC
+#    define BRISK_ENABLE_QUIC (BRISK_PROFILE >= BRISK_PROFILE_FULL)
+#endif
+
+/* Out-of-order CRYPTO bytes a QUIC connection buffers at the current receive level (RFC 9000
+ * 7.5 sets 4096 as the floor). A RAM knob: brisk__quic_scratch_size() grows by it plus 1/8 for
+ * the bitmap. Data beyond it during the handshake closes with CRYPTO_BUFFER_EXCEEDED. No public
+ * struct size depends on it. */
+#ifndef BRISK_QUIC_CRYPTO_BUF
+#    define BRISK_QUIC_CRYPTO_BUF 4096
+#endif
+#if BRISK_QUIC_CRYPTO_BUF < 4096 || BRISK_QUIC_CRYPTO_BUF > 65536
+#    error "BRISK_QUIC_CRYPTO_BUF must be 4096..65536"
+#endif
+
 /* The SETTINGS_HEADER_TABLE_SIZE this client advertises, in octets: the largest HPACK dynamic
  * table the peer may make us keep, and exactly the ring memory the caller hands the decoder. A
  * RAM knob. RFC 9113 4.3.1 makes 4096 the initial value, and a smaller one forces every peer to

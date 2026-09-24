@@ -924,7 +924,8 @@ static void conn_post_hs(void)
     /* RFC 9001 4.6.1: over QUIC early_data must be 0xffffffff (test hook, as above) */
     CHECK(connect3(0) == 0);
     C.hs.cfg.quic = 1;
-    CHECK(feed_row("8448s3 server 2") == BRISK_E_PROTO && C.c.alert == 47 && C.tk_calls == 0);
+    CHECK(feed_row("8448s3 server 2") == BRISK_E_PROTO &&
+          C.c.alert == BRISK__ALERT_QUIC_PROTOCOL_VIOLATION && C.tk_calls == 0);
     for (i = 0; i < 2; i++) {
         CHECKI(connect3(0) == 0, i);
         C.hs.cfg.quic = 1;

@@ -252,7 +252,7 @@ static void test_limits(void)
 }
 
 /* RFC 9001 A.5: key schedule, packet nonce (5.3), AEAD, header protection with ChaCha20 (5.4.4). */
-static void test_quic(void)
+static void test_quic_a5(void)
 {
     const struct quic_chacha_kat *v = &QUIC_CHACHA_KAT[0];
     uint8_t secret[32], key[32], iv[12], hp[32], hdr[4], pt[1], ct[1 + 16], want[64], sample[16],
@@ -297,5 +297,5 @@ void test_aead(void)
     test_aead_vectors();
     test_tamper();
     test_limits();
-    test_quic();
+    test_quic_a5();
 }

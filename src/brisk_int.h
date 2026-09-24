@@ -1508,7 +1508,10 @@ enum {
     BRISK__ALERT_MISSING_EXTENSION = 109,
     BRISK__ALERT_UNSUPPORTED_EXTENSION = 110,
     BRISK__ALERT_CERTIFICATE_REQUIRED = 116,   /* 4.5.1.3 / 6.2: only ever received */
-    BRISK__ALERT_NO_APPLICATION_PROTOCOL = 120 /* RFC 7301 3.2; RFC 9001 8.1 over QUIC */
+    BRISK__ALERT_NO_APPLICATION_PROTOCOL = 120, /* RFC 7301 3.2; RFC 9001 8.1 over QUIC */
+    /* never on the wire: over QUIC only, a violation RFC 9001 maps to PROTOCOL_VIOLATION rather
+     * than CRYPTO_ERROR (4.6.1: NewSessionTicket early_data other than 0xffffffff) */
+    BRISK__ALERT_QUIC_PROTOCOL_VIOLATION = 255
 };
 
 /* Local cap on the encoded ALPN ProtocolNameList body we offer (RFC 7301 3.1 allows 2^16-1). */
@@ -2150,6 +2153,179 @@ int brisk__conn_anchor(void *ctx, const uint8_t *dn, size_t dn_len, size_t index
 /* "h2,http/1.1" -> RFC 7301 ProtocolName entries (u8 length + name each, no outer length).
  * BRISK_E_ARG on an empty name or more than cap bytes. NULL list = *out_len 0. */
 int brisk__alpn_encode(const char *list, uint8_t *out, size_t cap, size_t *out_len);
+
+#if BRISK_ENABLE_QUIC
+/* ---- quic/packet.c: QUIC v1 packets and packet/header protection (RFC 9000 17, RFC 9001 5) ----
+ * Stateless codecs: varints, packet numbers, header parsing, Initial secrets, per-level
+ * key/iv/hp and seal/open. Internal only; the public brisk_quic_* surface comes with streams. */
+#    define BRISK__QUIC_V1          0x00000001u
+#    define BRISK__QUIC_MAX_CID     20   /* RFC 9000 17.2 */
+#    define BRISK__QUIC_MIN_INITIAL 1200 /* RFC 9000 14.1 */
+#    define BRISK__QUIC_VARINT_MAX  (((uint64_t)1 << 62) - 1)
+enum {
+    BRISK__QPKT_INITIAL = 0,
+    BRISK__QPKT_0RTT = 1,
+    BRISK__QPKT_HANDSHAKE = 2,
+    BRISK__QPKT_RETRY = 3,
+    BRISK__QPKT_1RTT = 4,
+    BRISK__QPKT_VN = 5
+};
+/* QUIC transport error codes (RFC 9000 20.1) + the CRYPTO_ERROR base (RFC 9001 4.8) */
+enum {
+    BRISK__QERR_INTERNAL = 0x01,
+    BRISK__QERR_FRAME_ENCODING = 0x07,
+    BRISK__QERR_TRANSPORT_PARAMETER = 0x08,
+    BRISK__QERR_PROTOCOL_VIOLATION = 0x0a,
+    BRISK__QERR_CRYPTO_BUFFER_EXCEEDED = 0x0d,
+    BRISK__QERR_AEAD_LIMIT_REACHED = 0x0f,
+    BRISK__QERR_CRYPTO = 0x0100
+};
+
+/* RFC 9000 16. put: minimal encoding, returns 1/2/4/8, or 0 if v > 2^62-1 or cap is too small.
+ * get: 1 and advances *p, or 0 (truncated, *p unchanged). Never reads past end. */
+size_t brisk__quic_varint_put(uint8_t *p, size_t cap, uint64_t v);
+int brisk__quic_varint_get(const uint8_t **p, const uint8_t *end, uint64_t *v);
+
+/* RFC 9000 A.3: the full PN from `truncated` of nbits (8/16/24/32) given the largest
+ * authenticated PN (UINT64_MAX = none yet -> expected 0). Masks and compares only, no branch. */
+uint64_t brisk__quic_pn_decode(uint64_t largest, uint64_t truncated, unsigned nbits);
+/* RFC 9000 A.2 / 17.1: bytes (1..4) for `pn` given largest_acked (UINT64_MAX = nothing acked
+ * -> 4, the full width until the space is acknowledged). */
+unsigned brisk__quic_pn_len(uint64_t pn, uint64_t largest_acked);
+
+/* One direction at one encryption level (RFC 9001 5.1). The hp key is its own member: it never
+ * changes on a key update (5.4). */
+typedef struct {
+    union {
+        brisk__gcm_key gcm;
+        uint8_t chacha[32];
+    } k;
+    union {
+        brisk__aes_key aes;
+        uint8_t chacha[32];
+    } hp;
+    uint8_t iv[12];
+    uint16_t suite;    /* 0x1301/0x1302/0x1303; 0 = not installed */
+    uint64_t n_sealed; /* RFC 9001 6.6 confidentiality counter */
+    uint64_t next_pn;  /* seal refuses a lower PN: a nonce is never reused (5.3) */
+} brisk__quic_keys;
+/* RFC 9001 5.2: both Initial secrets (32 B each) from the client's first DCID (1..20 bytes). */
+int brisk__quic_initial_secrets(const uint8_t *dcid, size_t dcid_len, uint8_t client[32],
+                                uint8_t server[32]);
+/* quic key/iv/hp (5.1) from a traffic secret of HashLen(suite) bytes. BRISK_E_ARG, nothing
+ * written, on an unknown suite or a wrong length. */
+int brisk__quic_keys_init(brisk__quic_keys *k, uint16_t suite, const uint8_t *secret, size_t len);
+void brisk__quic_keys_wipe(brisk__quic_keys *k); /* safe on NULL */
+
+/* Header parse, no crypto (RFC 9000 17.2 / 17.3). `short_dcid_len` = our SCID length. BRISK_OK
+ * with h filled and h->pkt_len = bytes of this packet (coalesced: the next one starts there), or
+ * BRISK_E_PROTO = discard this packet and the rest of the datagram (never a connection error).
+ * A version other than 1 (0 = Version Negotiation) parses only the invariant fields (RFC 8999)
+ * and takes the whole datagram; a v1 long header needs Length >= 20 (a full sample, RFC 9001
+ * 5.4.2). */
+typedef struct {
+    uint8_t type, first; /* first = byte 0, still HP-masked */
+    uint32_t version;
+    const uint8_t *dcid, *scid, *token;
+    uint8_t dcid_len, scid_len;
+    size_t token_len, pn_off, pkt_len;
+} brisk__quic_hdr;
+int brisk__quic_hdr_parse(const uint8_t *d, size_t len, size_t short_dcid_len, brisk__quic_hdr *h);
+
+/* Seal in place: pkt[0..pn_off) is the header (Length already set for long headers),
+ * pkt[pn_off..pn_off+pn_len) gets the truncated PN, the payload_len bytes after it are plaintext
+ * and the 16 bytes after that take the tag. AEAD first, then HP (RFC 9001 5.4.1). BRISK_E_ARG if
+ * pn_len + payload_len < 4 (no full sample, the caller pads), pn > 2^62-1, pn_len is not 1..4,
+ * no key is installed, or the key reached its 6.6 limit. */
+int brisk__quic_seal(brisk__quic_keys *k, uint8_t *pkt, size_t pn_off, unsigned pn_len, uint64_t pn,
+                     size_t payload_len);
+/* Open in place: remove HP, decode the PN against `largest`, AEAD open. BRISK_OK -> *pn,
+ * *payload_off, *payload_len, and *first = unmasked byte 0 (reserved bits are the caller's
+ * protocol check). BRISK_E_AUTH = drop (the payload is wiped). BRISK_E_PROTO = too short for a
+ * sample, drop. RFC 9001 9.5: no branch on the PN or its length before the AEAD verdict. */
+int brisk__quic_open(const brisk__quic_keys *k, uint8_t *pkt, size_t pn_off, size_t pkt_len,
+                     uint64_t largest, uint8_t *first, uint64_t *pn, size_t *payload_off,
+                     size_t *payload_len);
+
+/* ---- quic/conn.c: transport parameters, frames, CRYPTO streams, the client connection -------
+ *
+ * The client side of RFC 9000/9001 up to a confirmed handshake: Initial/Handshake/1-RTT packet
+ * spaces, CRYPTO reassembly per level feeding the TLS 1.3 engine (cfg.quic = 1), transport
+ * parameters, CONNECTION_CLOSE. Sans-I/O, no malloc, no clock. NOT yet here (M6 items 2-3):
+ * ACK generation, loss recovery and timers, streams, Retry, Version Negotiation, key update -
+ * VN/Retry/unknown versions are dropped, a key-phase flip is dropped. */
+typedef struct {
+    uint64_t max_idle_timeout, max_udp_payload_size, initial_max_data,
+        initial_max_stream_data_bidi_local, initial_max_stream_data_bidi_remote,
+        initial_max_stream_data_uni, initial_max_streams_bidi, initial_max_streams_uni,
+        ack_delay_exponent, max_ack_delay, active_connection_id_limit;
+    uint8_t odcid[20], iscid[20], retry_scid[20], reset_token[16];
+    uint8_t odcid_len, iscid_len, retry_scid_len;
+    /* preferred_address is validated, then ignored: the client never migrates */
+    uint8_t has_odcid, has_iscid, has_retry_scid, has_reset_token, disable_active_migration,
+        has_pref_addr;
+} brisk__quic_tp;
+/* Zero, then the RFC 9000 18.2 defaults (max_udp_payload_size 65527, ack_delay_exponent 3,
+ * max_ack_delay 25, active_connection_id_limit 2). */
+void brisk__quic_tp_default(brisk__quic_tp *tp);
+/* Client TPs (18.2): every integer that differs from its default, disable_active_migration when
+ * set, always initial_source_connection_id (iscid, 7.3), in id order. BRISK_E_ARG with *out_len
+ * 0 when a server-only TP is set, a value breaks 18.2, or cap is too small. */
+int brisk__quic_tp_write(const brisk__quic_tp *tp, uint8_t *out, size_t cap, size_t *out_len);
+/* Server TPs: defaults first, unknown and GREASE ids skipped, every 18.2 rule checked.
+ * BRISK_OK or BRISK_E_PROTO (= TRANSPORT_PARAMETER_ERROR) with tp zeroed. */
+int brisk__quic_tp_parse(const uint8_t *in, size_t len, brisk__quic_tp *tp);
+
+/* Levels = packet number spaces: 0 Initial, 1 Handshake, 2 Application (1-RTT). */
+struct brisk__quic_conn {
+    brisk__tls13_hs *hs;
+    brisk__quic_keys rx[3], tx[3];
+    brisk__quic_tp peer_tp;
+    uint64_t rx_largest[3]; /* largest authenticated PN, UINT64_MAX = none */
+    uint64_t rx_seen[3];    /* bit i: largest - i was received (duplicates, RFC 9000 12.3) */
+    uint64_t tx_pn[3];      /* next PN to send */
+    uint64_t crx[3];        /* CRYPTO bytes delivered to TLS per level */
+    uint64_t auth_fail;     /* RFC 9001 6.6: packets that failed authentication */
+    uint64_t n_opened;      /* packets that passed the AEAD (tests) */
+    uint64_t err_code;      /* the QUIC error code once failed (the peer's on a peer close) */
+    uint64_t pend_err;      /* set by a callback that refused, read when the engine fails */
+    /* scratch carve-up: [CRYPTO ring | its bitmap | Initial CRYPTO out | Handshake CRYPTO out].
+     * The out areas keep every byte sent (retransmission is M6 item 2); after a failure the
+     * Initial one holds the CONNECTION_CLOSE datagram. */
+    uint8_t *ring, *bits, *ret[2];
+    size_t ring_pos, ret_cap[2], ret_len[2], ret_sent[2], cc_len;
+    int err;
+    uint8_t dcid[20], scid[20], odcid[20];
+    uint8_t dcid_len, scid_len, odcid_len;
+    uint8_t rx_level;    /* level whose CRYPTO stream the ring holds */
+    uint8_t got_initial; /* the first server Initial switched dcid (RFC 9000 7.2) */
+    uint8_t tp_seen, established, confirmed;
+    uint8_t cc_state; /* 1 a CONNECTION_CLOSE waits in ret[0], 2 sent */
+};
+typedef struct brisk__quic_conn brisk__quic_conn;
+/* CRYPTO reassembly (BRISK_QUIC_CRYPTO_BUF + bitmap) + send retention. */
+size_t brisk__quic_scratch_size(void);
+/* Takes over hs->cfg.on_secret / on_peer_tp. hs must be hs_init'ed with cfg.quic = 1. dcid:
+ * 8..20 unpredictable bytes (RFC 9000 7.2); scid 0..20 bytes. BRISK_E_ARG otherwise. Caller order:
+ * brisk__quic_tp_write -> brisk__tls13_ch_write(quic_tp, session_id_len 0, tls12 0) ->
+ * brisk__tls13_hs_client_hello -> brisk__quic_send. After an HRR (hs->state WAIT_CH2) the caller
+ * builds and absorbs CH2 the same way. */
+int brisk__quic_conn_init(brisk__quic_conn *q, brisk__tls13_hs *hs, const uint8_t *dcid,
+                          size_t dcid_len, const uint8_t *scid, size_t scid_len, uint8_t *scratch,
+                          size_t scratch_len);
+/* One received UDP datagram, decrypted in place, coalesced packets one by one (RFC 9000 12.2).
+ * BRISK_OK (dropped packets are not errors), or the sticky BRISK_E_PROTO / E_AUTH / E_ARG
+ * (q->err_code = the QUIC error code) or BRISK_E_PEER_ALERT (the peer's CONNECTION_CLOSE). */
+int brisk__quic_recv(brisk__quic_conn *q, uint8_t *dgram, size_t len, int64_t now_ms);
+/* The next datagram (at most 1200 bytes; one carrying an Initial is padded to 1200), 0 = none
+ * or cap < 1200. After a failure: one CONNECTION_CLOSE 0x1c datagram, then 0. */
+size_t brisk__quic_send(brisk__quic_conn *q, uint8_t *out, size_t cap, int64_t now_ms);
+/* 1 once the engine is CONNECTED and the 7.3 CID checks passed; the TPs are in q->peer_tp. */
+int brisk__quic_established(const brisk__quic_conn *q);
+/* The frames of one decrypted payload at `level` (RFC 9000 12.4, 19). q == NULL checks syntax
+ * and Table 3 only (tests, fuzzing). 0 or the QUIC error code. */
+uint64_t brisk__quic_frames(brisk__quic_conn *q, unsigned level, const uint8_t *p, size_t len);
+#endif /* BRISK_ENABLE_QUIC */
 
 #if BRISK_ENABLE_H2
 /* ---- http/huffman.c + http/hpack.c: HTTP/2 HPACK (RFC 7541) ----------------------------------
