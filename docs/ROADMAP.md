@@ -204,6 +204,6 @@ Tick a box only when the work is green on **every** arch (`python tools/dev.py t
       lib + headers staged via the new CMake `install()` rules - and `brisk-get`; profile from
       menuconfig). Built with the official SDK (openwrt/sdk:x86-64-24.10.2, musl, 2026-09-25,
       `USE_SOURCE_DIR`); the .ipk's brisk_get / h2_get reach google / cloudflare from Alpine.
-      `PKG_MIRROR_HASH:=skip` until the tag exists.
-- [ ] v0.1.0 release: tag `v0.1.0`, GitHub release with `dist/brisk.{c,h}` attached, then the
-      OpenWrt Makefile's PKG_MIRROR_HASH (needs the user)
+- [x] v0.1.0 released 2026-09-25: tag `v0.1.0` (7ad5731) after CI green (all archs, amalg,
+      size budgets) and interop 14/14; GitHub release with `dist/brisk.{c,h}`. OpenWrt Makefile
+      pinned to the commit + PKG_MIRROR_HASH; SDK download verifies and builds from the tag.

@@ -17,12 +17,10 @@ PKG_RELEASE:=1
 
 PKG_SOURCE_PROTO:=git
 PKG_SOURCE_URL:=https://github.com/Abcl-lyxz/Brisk-SSL.git
-# RELEASE STEP (not done yet: the v0.1.0 tag does not exist): replace both lines below with the
-# tag's full 40-hex commit SHA and the hash `make package/brisk-ssl/download V=s` prints, so a
-# moved tag or a tampered mirror fails the build. Until then this Makefile is for local testing
-# only (make ... USE_SOURCE_DIR=/path/to/Brisk-SSL).
-PKG_SOURCE_VERSION:=v$(PKG_VERSION)
-PKG_MIRROR_HASH:=skip
+# Pinned to the v0.1.0 tag's commit (a moved tag cannot change what builds) and the hash of
+# the source tarball OpenWrt makes from it (`make package/brisk-ssl/check FIXUP=1`).
+PKG_SOURCE_VERSION:=7ad57319102fec0489844ee58d7f66567689b8ce
+PKG_MIRROR_HASH:=8647fa38806933b3edcfe180ede5f07307e89d3218f4d57ddc6d57307b3b2ccd
 
 PKG_LICENSE:=Apache-2.0
 PKG_LICENSE_FILES:=LICENSE NOTICE
