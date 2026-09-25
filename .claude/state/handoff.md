@@ -1,43 +1,42 @@
-# Handoff - 2026-09-25 (session 20)
+# Handoff - 2026-09-25 (session 21)
 
-## Done - M6 items 2 and 3
-- bc13c98 **quic: ACK, loss recovery, streams + flow control**. New src/quic/recovery.c (ACK
-  ranges, RTT, loss/PTO, integer NewReno) and src/quic/stream.c (stream table, flow control,
-  STREAM_STATE/LIMIT/FLOW_CONTROL/FINAL_SIZE). conn.c: coalescing builder, variable PN length,
-  NEW_CID limits + retire_prior_to, PATH_RESPONSE, idle, pacing, deadline/close. Review fixes:
-  last 2 sent records reserved for PTO probes; the anti-deadlock PTO stays armed after the
-  Initial space is dropped (a handshake stalled to idle); deadline() = now when a probe or a
-  PATH_RESPONSE is owed; the preferred_address CID is seq 1 in cids[1].
-- 7a7da6d **quic: Retry, VN, stateless reset, key update**. Review fixes: self-initiated key
-  update keeps the old rx keys until a new-phase packet (QC_KU_WAIT); next local update waits
-  3*PTO after the confirming ACK (ku_ack_at); reset token only for a CID we have sent on
-  (dcid_unsent); VN/Retry only as the first packet of a datagram.
-- Both: 11 archs green, ct clean, fuzz quic_pkt clean. DEFAULT size unchanged (QUIC is FULL
-  only; still the item-1 +48..+100 B vs baseline, not re-saved). FULL: recovery+stream
-  +8.5..18 KB, item 3 +3.6..4.5 KB; sizeof(brisk__quic_conn) 6.8 KB, scratch ~47 KB (x86_64).
+## Done - M6 item 4 (M6 complete)
+- 3244654 **quic: public brisk_quic_* API + hq-interop harness**. include/brisk.h QUIC section:
+  sans-I/O brisk_quic_size/init/feed/pull/deadline/status/wipe (src/quic/api.c), blocking
+  brisk_quic_connect/close over one UDP socket (src/os/linux_udp.c), streams by uint64_t id
+  (stream_open/write/read/accept). Reuses brisk_cfg; empty alpn -> BRISK_E_ARG (RFC 9001 8.1).
+  feed/pull hide the engine's send-after-recv contract. Symbols only with BRISK_ENABLE_QUIC.
+- Review fixes: ICMP PMTU/EMSGSIZE not fatal; udp_drain bounded; idle timeout reported;
+  stream_open waits for a slot; QUIC CH1 keeps the PSK only if CH1 + worst-case CH2 fit the
+  2048 B Initial retention (QC_RET0 must stay == CONN_CH_MAX); brisk_hq parse_url overflow.
+- Verified by hand: 11 archs green; tools/interop/run_direct.sh 14/14 (7 cases x quic-go,
+  ngtcp2) on a freshly rebuilt brisk-interop:local. DEFAULT flash -2..+244 B vs baseline
+  (includes item 1's unsaved +48..+100 B; baseline still not re-saved).
 
 ## In progress
 - Nothing. Tree clean.
 
 ## Needs a user decision
-- **Public QUIC API shape** (blocks the interop harness): brisk_quic_connect/stream_open/
-  read/write/close over UDP in src/os + sans-I/O feed/pull, caller-owned memory via
-  brisk_quic_size(). Ask before writing include/brisk.h.
+- **M7: raise FULL's BRISK_QUIC_MAX_STREAMS 4 -> 8?** h3 needs initial_max_streams_uni 3
+  (control + 2 QPACK); with 4 only one request slot is left. Recommended 8 (scratch roughly
+  47 -> ~80 KB on x86_64, estimate, not measured). Changing it means regenerating the
+  quic_api CH vectors (tools/kat.py). Asked, not answered yet.
 - (still open) mTLS over TLS 1.2 with a `sign` callback fails closed; digest-scheme proposal
   postponed to M8.
 
 ## Next up
-- **M6 item 4**: quic-interop-runner harness (hq-interop), after the public API decision.
-  It needs the public brisk_quic_* API + a UDP driver in src/os/.
+- **M7 HTTP/3**: QPACK static-only (capacity 0) + Huffman (reuse src/http huffman), control
+  stream + SETTINGS, `brisk_h3_*` over brisk_quic_*. Settle the MAX_STREAMS question first.
+  Before adding another FULL-only knob, drop BRISK_PROFILE=FULL from the `base` preset.
 
 ## Decisions / gotchas
-- Contract: call brisk__quic_send after every recv (a Retry's resent ClientHello is not in
-  deadline()). Public API must hide this.
-- Deliberate: lost data is re-queued at once; RFC 9002 7.4 MAY not taken; 1-RTT PTO probe
-  sends new data or PING; next rx keys derived 3*PTO after promote (6.3 MAY, not ~1 PTO).
-- Untested defensive guard: qc_ku_opened refuses to promote when rx_ku.suite == 0.
-- Before M7 adds another FULL-only knob, drop BRISK_PROFILE=FULL from the `base` preset.
+- Interop lives in WSL2's Docker (images + runner at ~/brisk-interop/quic-interop-runner),
+  not Docker Desktop's Windows context. Run: `wsl -e bash -c 'cd /mnt/d/.../TLS && docker
+  build -f tools/interop/Dockerfile -t brisk-interop:local . && tools/interop/run_direct.sh
+  ~/brisk-interop/quic-interop-runner <server image>'`. Rebuild the image after C changes.
+- ns-3 simulator (run_local.sh) BLOCKED on WSL2 (no UDP forwarded even quic-go<->quic-go):
+  loss/reordering interop still needs a native Linux run.
+- Harness image knobs: STREAM_BUF 65536, MAX_STREAMS 16, CRYPTO_BUF 16384 (defaults crawl).
+- Client never sends *_BLOCKED frames: deliberate policy (stream.c header), reviewers refuted.
+- `dev.py test --arch all` takes >10 min now: run it in the background.
 - dev.py size keys modules by object basename: tls/conn.c and quic/conn.c share one row.
-- /implement-module died on the session limit in BOTH runs (reviewers, then fix:r2). Hand-run
-  rfc-auditor found 3 real bugs in item 2. kat.py once hit Errno 22 writing hpack.inc (file
-  lock) - just rerun it.
