@@ -237,10 +237,10 @@ int main(void)
     if (klp != NULL && *klp != '\0') {
         kl = fopen(klp, "a");
     }
+    /* the runner names its multiplexing case "transfer" on the client (thousands of small files
+     * under a 60 s limit): every case keeps all stream slots in flight */
     if (strcmp(testcase, "handshake") == 0 || strcmp(testcase, "transfer") == 0 ||
-        strcmp(testcase, "retry") == 0) {
-        rc = run(NULL, 0, 0, n_req, 1, 0, 0, kl);
-    } else if (strcmp(testcase, "multiplexing") == 0) {
+        strcmp(testcase, "retry") == 0 || strcmp(testcase, "multiplexing") == 0) {
         rc = run(NULL, 0, 0, n_req, BRISK_QUIC_MAX_STREAMS, 0, 0, kl);
     } else if (strcmp(testcase, "chacha20") == 0) {
         rc = run(CHACHA, 1, 0, n_req, 1, 0, 0, kl);
