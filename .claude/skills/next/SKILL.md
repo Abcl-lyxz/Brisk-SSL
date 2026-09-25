@@ -7,6 +7,8 @@ argument-hint: "[task or milestone, optional]"
 1. Read `.claude/state/handoff.md` and `docs/ROADMAP.md`. The task is `$ARGUMENTS` if given,
    otherwise the first unchecked `- [ ]` item. Say in one line what you are starting (reply in
    Thai when the user writes Thai). Only ask the user when a real design decision is open.
+   No unchecked item left: propose the next milestone from `## Backlog` (options +
+   recommendation), and once the user picks, add it as `## Mx` with `- [ ]` tasks, then start.
 2. Understand before coding: read the RFC sections with the `rfc` MCP tools (`rfc_get`,
    `rfc_search`) - cite RFC 9846 for TLS 1.3, not 8446 - and the existing code it touches.
 3. Test-first:

@@ -5,7 +5,10 @@ description: End-of-session handoff - update ROADMAP checkboxes, rewrite .claude
 
 1. `git status` and `git log --oneline -15` to see what this session did.
 2. Tick `docs/ROADMAP.md` boxes only for work verified green on **all** archs
-   (`python tools/dev.py test --arch all`).
+   (`python tools/dev.py test --arch all`). If this session agreed on a new plan or milestone
+   with the user, write it into ROADMAP first as `## Mx <name>` with one `- [ ]` line per task
+   (ideas not yet agreed go under `## Backlog` as plain `- ` lines). ROADMAP is the only place
+   `/next` and the SessionStart hook look, so a plan that is not there is forgotten.
 3. Rewrite `.claude/state/handoff.md` (max 40 lines, it is injected into the next session):
    - **Done** this session (commits)
    - **In progress** (file:line and exactly what is left)

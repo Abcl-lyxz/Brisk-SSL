@@ -20,12 +20,12 @@
 ## In progress
 - Nothing. The tree is clean and every ROADMAP milestone (M1-M8) is ticked.
 
-## Next up (post-1.0 backlog - ask the user which one; ROADMAP has no open item)
-1. The mTLS `sign` callback over TLS 1.2: today it fails closed (E_ARG). It needs a digest-scheme
-   or a pre-hashed callback variant (brisk.h:389). This is the only documented functional gap.
-2. A runtime X.509 time floor from device storage (ARCHITECTURE "Clock policy").
-3. Add ROADMAP "M9 / 0.2" once the user picks. Candidates: shared lib (.so), revocation
-   (OCSP stapling), SPKI pins.
+## Next up - ROADMAP M9 "Open API (0.2)" (agreed with the user 2026-09-25, session 24)
+1. First M9 box: key/chain formats (`cfg.client_key_len`, SEC1/PKCS#8/PEM, PEM client_chain).
+   Then the custom transport, public crypto API, compile-time knobs and runtime cfg, in order.
+2. Full plan with rationale: ROADMAP M9 section. wolfSSL was the reference for the knob list.
+   The runtime time floor and SPKI pins are now M9 items. The TLS 1.2 sign callback, PSK and
+   the .so build are in ROADMAP `## Backlog`.
 
 ## Decisions / gotchas
 - EMS stays required (user, 2026-09-25): an old server gets a clear E_INSECURE, not an opt-in knob.
