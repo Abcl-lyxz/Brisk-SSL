@@ -5,9 +5,11 @@
   python tools/dev.py test --arch all            every Docker preset (x86_64, asan, 9 cross archs)
   python tools/dev.py test --arch mips ppc       selected Docker presets
   python tools/dev.py size [--arch all|mipsel..] [--md] [--save] [--check] [--profile FULL]
+  python tools/dev.py size --profiles [--doc]    TINY/DEFAULT/FULL totals vs size/budget.json
                                                  per-module flash/RAM from the linker map (-Os, static)
   python tools/dev.py ct                         constant-time check: the ct suite under valgrind
-  python tools/dev.py fuzz [der|name|tls13_hs|tls13_rec|ticket|conn|hpack|h2|quic_pkt|quic_tp|qpack|h3] [--seconds N]  libFuzzer over a parser, seeded from its .inc
+  python tools/dev.py fuzz [der|name|pem|tls13_hs|tls13_rec|ticket|conn|hpack|h2|quic_pkt|quic_tp|qpack|h3] [--seconds N]  libFuzzer over a parser, seeded from its .inc
+  python tools/dev.py amalg                      dist/brisk.c: -Werror per profile (gcc, clang) + tests
   python tools/dev.py interop                    brisk_get vs s_server/nginx/Caddy; h2_get vs nginx/h2o/nghttpd
   python tools/dev.py badssl                     brisk_get vs badssl.com (needs internet)
   python tools/dev.py image                      (re)build the brisk-dev Docker image
@@ -15,6 +17,7 @@
 Docker builds live in the named volume `brisk-build` (fast, and never collide with host builds).
 """
 import argparse
+import ast
 import concurrent.futures as cf
 import json
 import os
@@ -215,6 +218,60 @@ def cmd_size(archs, md, save, check, jobs, profile=""):
     return 1 if bad or (check and grew) else 0
 
 
+# Per-profile totals (M8): every profile on every arch, against size/budget.json - the most flash
+# a profile may take on ANY arch, in bytes - and, with --doc, written into docs/CONFIG.md between
+# the size-table markers. CI prints the table and fails a busted budget; the budgets move only
+# deliberately, with the reason in the commit message (like the baseline).
+PROFILES = ["TINY", "DEFAULT", "FULL"]
+BUDGET = ROOT / "size" / "budget.json"
+DOC_BEGIN = "<!-- size-table:begin (tools/dev.py size --profiles --doc) -->"
+DOC_END = "<!-- size-table:end -->"
+
+
+def cmd_size_profiles(archs, doc, jobs):
+    archs = SIZE_ARCHS if not archs or archs == ["all"] else archs
+
+    def one(job):
+        a, p = job
+        rc, out = run(docker_cmd(["python3", "tools/dev.py", "_measure", a, "--profile", p]), True)
+        if rc:
+            sys.exit(f"size {a} {p} failed:\n{out}")
+        ms = json.loads(out.strip().splitlines()[-1])["modules"]
+        return job, (sum(flash(x) for x in ms.values()),
+                     sum(x["data"] + x["bss"] for x in ms.values()))
+
+    with cf.ThreadPoolExecutor(max_workers=jobs) as ex:
+        res = dict(ex.map(one, [(a, p) for p in PROFILES for a in archs]))
+    budget = json.loads(BUDGET.read_text()) if BUDGET.exists() else {}
+    lines = ["| profile | budget | " + " | ".join(archs) + " |", "|---" * (len(archs) + 2) + "|"]
+    over = []
+    for p in PROFILES:
+        b = budget.get(p)
+        cells = []
+        for a in archs:
+            fl = res[(a, p)][0]
+            cells.append(f"{fl / 1024:.1f}")
+            if b is not None and fl > b:
+                over.append(f"{p} {a}: {fl} > {b}")
+        lines.append(f"| {p} | {b / 1024:.0f} | " if b else f"| {p} | - | ")
+        lines[-1] += " | ".join(cells) + " |"
+    ram = max(r[1] for r in res.values())
+    table = "\n".join(lines) + (
+        "\n\nKB of flash (text + rodata + data, -Os, static link map, libc excluded); budget = the "
+        f"most any arch may take (size/budget.json). Static RAM is at most {ram} B on any arch and "
+        "profile - every context is caller-owned.")
+    print(table)
+    if doc:
+        cfg = ROOT / "docs" / "CONFIG.md"
+        text = cfg.read_text(encoding="utf-8")
+        i, j = text.index(DOC_BEGIN) + len(DOC_BEGIN), text.index(DOC_END)
+        cfg.write_text(text[:i] + "\n" + table + "\n" + text[j:], encoding="utf-8", newline="\n")
+        print(f"written: {cfg.relative_to(ROOT)}")
+    if over:
+        print("OVER BUDGET:", "; ".join(over))
+    return 1 if over else 0
+
+
 # ------------------------------------------------------------------------------------------- fuzz
 # One .c file and one entry point, so this drives clang directly instead of teaching CMake about
 # a build type nothing else uses. The seed corpus is not committed: tests/kat/der.inc already
@@ -246,6 +303,9 @@ FUZZ = {"der": ("fuzz/fuzz_der.c src/x509/der.c", "tests/kat/der.inc"),
                  "src/x509/cert.c src/x509/chain.c src/x509/name.c src/x509/bundle.c",
                  "tests/kat/tls13_conn_fuzz.inc"),
         # The resumption ticket blob: the one parser of caller-stored bytes (src/tls/ticket.c).
+        # The streaming PEM reader; seeds are the bundle rows' PEM text (not hex, see fuzz_corpus).
+        "pem": ("fuzz/fuzz_pem.c src/x509/bundle.c src/x509/der.c src/util.c",
+                "tests/kat/x509_bundle.inc"),
         "ticket": ("fuzz/fuzz_ticket.c src/tls/ticket.c src/util.c",
                    "tests/kat/tls13_ticket_fuzz.inc"),
         # HPACK (RFC 7541): block sequences through one decoder + Huffman + encoder round trip.
@@ -287,7 +347,16 @@ def fuzz_corpus(inc, out):
     out.mkdir(parents=True, exist_ok=True)
     for f in out.glob("*.der"):
         f.unlink()
-    rows = re.findall(r'^\s*\{((?:"[0-9a-f]*"\s*)+),', (ROOT / inc).read_text(), re.M)
+    text = (ROOT / inc).read_text()
+    if inc.endswith("x509_bundle.inc"):
+        # first column: PEM as adjacent C string literals; seed = 1 chunk-seed byte + the text
+        lit = r'"((?:[^"\\]|\\.)*)"'
+        rows = re.findall(r'^\s*\{((?:' + lit + r'\s*)+),', text, re.M)
+        for i, row in enumerate(rows):
+            pem = "".join(ast.literal_eval(f'"{s}"') for s in re.findall(lit, row[0]))
+            (out / f"{i:04d}.der").write_bytes(bytes([i & 0xFF]) + pem.encode("latin-1"))
+        return len(rows)
+    rows = re.findall(r'^\s*\{((?:"[0-9a-f]*"\s*)+),', text, re.M)
     for i, row in enumerate(rows):
         (out / f"{i:04d}.der").write_bytes(bytes.fromhex("".join(re.findall(r'"([0-9a-f]*)"', row))))
     return len(rows)
@@ -311,6 +380,53 @@ def cmd_fuzz(target, seconds):
     print("\n".join(out.splitlines()[-18:]))
     print(f"fuzz {target}: {'ok' if rc == 0 else 'FAILED'} ({n} seeds, {seconds}s)")
     return rc
+
+
+# ------------------------------------------------------------------------------------------ amalg
+# dist/brisk.c + dist/brisk.h (tools/amalg.py): every profile must compile warning-free as ONE
+# translation unit under gcc and clang (a file-local name used twice, a feature macro set too
+# late, a macro leaking into the next file all show up here only), and the whole test suite must
+# pass linked against it - including the 32-bit AES/fiat variants, which the x86_64 CMake build
+# never compiles. Runs inside the container (`_amalg`).
+AMALG_WARN = ["-std=c99", "-Wall", "-Wextra", "-Wpedantic", "-Wshadow", "-Wcast-align",
+              "-Wstrict-prototypes", "-Wundef", "-Wvla", "-Werror"]
+AMALG_VARIANTS = [("TINY", ""), ("DEFAULT", ""), ("FULL", ""),
+                  ("FULL", "-DBRISK__AES_CT64=0 -DBRISK__FIAT_64=0")]
+
+
+def amalg_inside():
+    sh(["python3", "tools/amalg.py"])
+    cm = (ROOT / "CMakeLists.txt").read_text(encoding="utf-8")
+    block = cm[cm.index("add_executable(brisk_tests"):]
+    tests = re.findall(r"tests/test_\w+\.c", block[:block.index(")")])
+    # the Linux-only suites and their fault injection, as CMakeLists.txt adds them
+    tests += ["tests/test_rand.c", "tests/test_sock.c",
+              "-Wl,--wrap=syscall,--wrap=poll,--wrap=uname,--wrap=personality"]
+    bad = []
+    for profile, extra in AMALG_VARIANTS:
+        defs = [f"-DBRISK_PROFILE=BRISK_PROFILE_{profile}", *extra.split()]
+        name = f"{profile}{' 32-bit variants' if extra else ''}"
+        for cc in ("gcc", "clang"):
+            r = subprocess.run([cc, *AMALG_WARN, "-Os", *defs, "-c", "dist/brisk.c", "-o",
+                                f"build/amalg-{cc}.o"], cwd=ROOT, capture_output=True, text=True)
+            print(f"{name:<24} {cc:<6} {'ok' if r.returncode == 0 else 'FAILED'}", flush=True)
+            if r.returncode:
+                bad.append(f"{name} {cc}")
+                print("\n".join((r.stdout + r.stderr).splitlines()[:40]))
+        if profile == "TINY":
+            continue  # the suite targets DEFAULT / FULL builds
+        exe = "build/amalg-tests"
+        r = subprocess.run(["gcc", "-std=c99", "-O1", *defs, "-Idist", "-Isrc", "-Itests",
+                            "-Wno-overlength-strings", *tests, "dist/brisk.c", "-o", exe],
+                           cwd=ROOT, capture_output=True, text=True)
+        if r.returncode == 0:
+            r = subprocess.run([f"./{exe}"], cwd=ROOT, capture_output=True, text=True)
+        print(f"{name:<24} tests  {'ok' if r.returncode == 0 else 'FAILED'}", flush=True)
+        if r.returncode:
+            bad.append(f"{name} tests")
+            print("\n".join((r.stdout + r.stderr).splitlines()[-30:]))
+    print("amalg:", "ALL PASSED" if not bad else "FAILED: " + ", ".join(bad))
+    return 1 if bad else 0
 
 
 # ---------------------------------------------------------------------------------------- interop
@@ -480,7 +596,7 @@ def interop_inside():
          "leaf-rsa", ca, "localhost", ("fail", "E_PEER_ALERT")),
         # RFC 7627 / RFC 9325 3.5: extended_main_secret is required
         ("TLS 1.2 server without EMS -> fail", ["-tls1_2", "-no_ems"], "leaf-p256", ca,
-         "localhost", ("fail", "E_PROTO")),
+         "localhost", ("fail", "E_INSECURE")),
         ("TLS 1.1-only server -> fail", ["-tls1_1", "-cipher", "DEFAULT@SECLEVEL=0"], "leaf-p256",
          ca, "localhost", ("fail", "E_")),
     ]
@@ -773,7 +889,7 @@ def report(rows):
 # it answers our TLS 1.2 offer - but WITHOUT extended_main_secret: `openssl s_client -tls1_2`
 # reports "Extended master secret: no" on every badssl host (re-checked 2026-09-24: sha256,
 # ecc384, revoked, mozilla-modern, tls-v1-2, ...). EMS is REQUIRED here (RFC 7627 5.2, RFC 9325
-# 3.5), so every badssl handshake ends in handshake_failure (E_PROTO) before any certificate is
+# 3.5), so every badssl handshake ends in handshake_failure (E_INSECURE) before any certificate is
 # looked at - the certificate rows (expired, wrong.host, revoked, ...) still prove nothing, and
 # revoked.badssl.com cannot show the "no revocation checking" success it would otherwise be.
 # What the table does pin: nothing below TLS 1.2, no CBC / 3DES / RC4 / static RSA / DHE suite
@@ -817,11 +933,16 @@ def main():
     s.add_argument("--check", action="store_true", help="exit 1 if a total grew > max(1%%, 256 B)")
     s.add_argument("--profile", default="", choices=["", "TINY", "DEFAULT", "FULL"],
                    help="build profile (default: the header's); FULL adds QUIC")
+    s.add_argument("--profiles", action="store_true",
+                   help="TINY/DEFAULT/FULL totals vs size/budget.json (exit 1 if over)")
+    s.add_argument("--doc", action="store_true", help="with --profiles: update docs/CONFIG.md")
     s.add_argument("-j", "--jobs", type=int, default=max(1, (os.cpu_count() or 2) // 2))
     sub.add_parser("ct")
     f = sub.add_parser("fuzz")
     f.add_argument("target", nargs="?", default="der", choices=sorted(FUZZ))
     f.add_argument("--seconds", type=int, default=60)
+    sub.add_parser("amalg")
+    sub.add_parser("_amalg")
     sub.add_parser("interop")
     sub.add_parser("badssl")
     sub.add_parser("_interop")
@@ -833,18 +954,22 @@ def main():
     a = ap.parse_args()
     if a.cmd == "test":
         return cmd_test(a.arch, a.jobs)
+    if a.cmd == "size" and a.profiles:
+        return cmd_size_profiles(a.arch, a.doc, a.jobs)
     if a.cmd == "size":
         return cmd_size(a.arch, a.md, a.save, a.check, a.jobs, a.profile)
     if a.cmd == "ct":
         return cmd_ct()
     if a.cmd == "fuzz":
         return cmd_fuzz(a.target, a.seconds)
-    if a.cmd in ("interop", "badssl"):
+    if a.cmd in ("interop", "badssl", "amalg"):
         return run(docker_cmd(["python3", "tools/dev.py", "_" + a.cmd]), False)[0]
     if a.cmd == "_interop":
         return interop_inside()
     if a.cmd == "_badssl":
         return badssl_inside()
+    if a.cmd == "_amalg":
+        return amalg_inside()
     if a.cmd == "image":
         return run(["docker", "build", "-t", IMAGE, "docker/"], False)[0]
     if a.cmd == "_measure":

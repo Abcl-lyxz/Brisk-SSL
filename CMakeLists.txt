@@ -188,3 +188,13 @@ if(BRISK_BUILD_EXAMPLES AND CMAKE_SYSTEM_NAME STREQUAL "Linux") # the blocking A
         endif()
     endforeach()
 endif()
+
+# `cmake --install`: the static library and the two public headers (OpenWrt: openwrt/brisk-ssl,
+# which also ships brisk_get). The profile is baked into libbrisk.a; brisk.h declares the same
+# API in every profile, so consumers need no matching -D.
+include(GNUInstallDirs)
+install(TARGETS brisk ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR})
+install(FILES include/brisk.h include/brisk_config.h DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
+if(BRISK_BUILD_EXAMPLES AND CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    install(TARGETS brisk_get h2_get h3_get RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
+endif()

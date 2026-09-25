@@ -2090,8 +2090,8 @@ int brisk__tls13_auth_x509(void *ctx, uint16_t version, const brisk__x509_cert *
                            const uint8_t *sig, size_t sig_len, uint8_t *alert)
 {
     const brisk__tls13_auth_x509_ctx *a = (const brisk__tls13_auth_x509_ctx *)ctx;
-    brisk_hash_alg alg;
-    uint8_t family;
+    brisk_hash_alg alg = BRISK_HASH_SHA256; /* unread when key == 0; gcc cannot see that */
+    uint8_t family = 0;
     unsigned key;
     int rc;
 
