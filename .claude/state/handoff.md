@@ -1,48 +1,41 @@
-# Handoff - 2026-09-25 (session 22)
+# Handoff - 2026-09-25 (session 23)
 
-## Done - M7 complete + interop green
-- 714bd29 **build:** BRISK_QUIC_MAX_STREAMS 4 -> 8 (user OK'd; h3 needs 3 server uni streams),
-  quic_api.inc regenerated, quic_api SOURCES.md paragraph moved into kat.py. `dev` host preset
-  now builds DEFAULT; dev32 + every Docker preset stay FULL.
-- eed1e9c **http: HTTP/3 + static-only QPACK, brisk_h3_*** (via /implement-module; round-3
-  rfc-auditor + portability reviewers re-run by hand after the session limit killed them).
-  Round-3 fixes: `te` in a response/trailer is malformed (h3 4.2 and h2 8.2.2); request serves
-  the control stream before the GOAWAY check (5.2). Both mutation-tested (row fails on revert).
-- 11 archs green. DEFAULT flash +244..+492 B (h2.c helpers now shared/non-static), baseline
-  not re-saved.
+## Done - live testing, M8 complete, v0.1.0 released
+- 1249a9a **tls:** first found by live testing. Tickets never arrived from real servers because
+  CH1 carried psk_key_exchange_modes only alongside a PSK. It now sends them whenever
+  cfg.on_ticket is set. cloudflare/google resume; github/facebook don't resume with OpenSSL either.
+- 9badc3e **tls:** new public `BRISK_E_INSECURE` (-10) for TLS 1.2 without EMS/RI and for
+  TLS <= 1.1 (the alert is unchanged). CH2 keeps psk modes when the HRR drops the PSK.
+  rfc-auditor: clean.
+- e54a699 **build:** fuzz_pem, tools/amalg.py plus `dev.py amalg` (every profile, gcc+clang
+  -Werror, suite against dist/), size budgets (`size/budget.json`, `dev.py size --profiles`),
+  CMake install(), openwrt/brisk-ssl.
+- ce03993 / 7ad5731 **docs:** API.md is generated (tools/apidoc.py). Added TROUBLESHOOTING.md.
+  README, SECURITY, ARCHITECTURE, CONFIG and CLAUDE.md now match the code. Version is "0.1.0".
+- **v0.1.0 tagged at 7ad5731**, and the GitHub release has dist/brisk.{c,h} attached. CI was
+  green (all archs, amalg, size budgets) and interop was 14/14 on the same commit.
+- e2fdc8f **build:** the OpenWrt Makefile is pinned to the commit and PKG_MIRROR_HASH. The SDK
+  (openwrt/sdk:x86-64-24.10.2) downloads, verifies and builds from the tag.
 
 ## In progress
-- Nothing. Tree clean.
+- Nothing. The tree is clean and every ROADMAP milestone (M1-M8) is ticked.
 
-## Interop (after the M7 commits)
-- h3 vs real servers: examples/h3_get.c from Docker -> cloudflare-quic, google, nginx,
-  facebook, cloudflare all complete; -n 4 parallel OK. No VPS needed (WSL2 UDP to internet works).
-- ns-3 run moved to GitHub Actions: `.github/workflows/interop.yml` (manual:
-  `gh workflow run interop.yml`), 14/14 vs quic-go + ngtcp2 (run 36124650949). Fixes on the way:
-  scripts +x in git, Docker upgrade (runner needs >= 28.1), job fails on any non-success,
-  brisk_hq full stream window for "transfer" (the runner's multiplexing uses that name).
-
-## Needs the user
-- (still open) mTLS over TLS 1.2 with a `sign` callback fails closed; digest-scheme proposal
-  postponed to M8.
-
-## Next up
-- **M8 item 1**: `fuzz/fuzz_pem.c` for brisk__x509_pem_feed (random chunk sizes, assert
-  der_len <= sizeof der) + a second corpus extractor in tools/dev.py fuzz_corpus() (the .inc's
-  first column is PEM text, not hex). Then amalgamation (tools/amalg.py).
+## Next up (post-1.0 backlog - ask the user which one; ROADMAP has no open item)
+1. The mTLS `sign` callback over TLS 1.2: today it fails closed (E_ARG). It needs a digest-scheme
+   or a pre-hashed callback variant (brisk.h:389). This is the only documented functional gap.
+2. A runtime X.509 time floor from device storage (ARCHITECTURE "Clock policy").
+3. Add ROADMAP "M9 / 0.2" once the user picks. Candidates: shared lib (.so), revocation
+   (OCSP stapling), SPKI pins.
 
 ## Decisions / gotchas
-- WSL vs Docker: on Windows Docker runs inside the WSL2 VM; ns-3's internal bridge drops UDP
-  there. Use the GitHub Actions interop job instead (retry failures after a timed-out case are
-  collateral: the old server container keeps its IP).
-- Server uni-stream credit (3) is granted ONLY when cfg.alpn offers "h3" (api.c qa_offers_h3);
-  hq-interop / other ALPNs keep byte-identical TPs. Concurrent h3 requests = MAX_STREAMS - 4.
-- BRISK_ENABLE_H3 forces QUIC + H2 (qpack reuses huffman.c + h2.c field checks).
-- test_h3 fake io delivers one event chunk per wait(); op `P` pumps pending events between
-  calls (models data a blocking wait left unparsed in the rings).
-- python-hyper h2 accepts `te` in responses: listed in kat.py's h2 `known` deviations.
-- sizeof(brisk__quic_conn) ~8.4 KB x86_64, quic scratch 82432 B at defaults (CONFIG.md).
-- `dev.py test --arch all` > 10 min: run in background. A stale empty .git/index.lock appeared
-  once after a background run; check no git process, then remove.
-- Interop image: WSL2 Docker, ~/brisk-interop/quic-interop-runner, run_direct.sh; knobs
-  STREAM_BUF 65536, MAX_STREAMS 16, CRYPTO_BUF 16384.
+- EMS stays required (user, 2026-09-25): an old server gets a clear E_INSECURE, not an opt-in knob.
+- Live-run findings are in docs/TROUBLESHOOTING.md.
+  - E_INSECURE: badssl.com and broker.hivemq.com.
+  - Unreachable: mqtt.eclipseprojects.io:8883.
+  - Private CA: test.mosquitto.org, so E_AUTH unless you pass ca_file.
+- OpenWrt-built binaries need libgcc_s: a weak __register_frame_info from the toolchain's
+  crtbegin. It's in default images, so this isn't a Brisk bug.
+- The Bash tool heredoc eats backslashes ("\\n" becomes a real newline). Write Python snippets
+  with the Write tool, or use chr(92).
+- Low memory on this PC reaps background watchers. Poll CI with a foreground loop instead
+  (`gh run view ID --json status,conclusion`, sleep 60, 9 min per call).
