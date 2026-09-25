@@ -1,42 +1,43 @@
-# Handoff - 2026-09-25 (session 21)
+# Handoff - 2026-09-25 (session 22)
 
-## Done - M6 item 4 (M6 complete)
-- 3244654 **quic: public brisk_quic_* API + hq-interop harness**. include/brisk.h QUIC section:
-  sans-I/O brisk_quic_size/init/feed/pull/deadline/status/wipe (src/quic/api.c), blocking
-  brisk_quic_connect/close over one UDP socket (src/os/linux_udp.c), streams by uint64_t id
-  (stream_open/write/read/accept). Reuses brisk_cfg; empty alpn -> BRISK_E_ARG (RFC 9001 8.1).
-  feed/pull hide the engine's send-after-recv contract. Symbols only with BRISK_ENABLE_QUIC.
-- Review fixes: ICMP PMTU/EMSGSIZE not fatal; udp_drain bounded; idle timeout reported;
-  stream_open waits for a slot; QUIC CH1 keeps the PSK only if CH1 + worst-case CH2 fit the
-  2048 B Initial retention (QC_RET0 must stay == CONN_CH_MAX); brisk_hq parse_url overflow.
-- Verified by hand: 11 archs green; tools/interop/run_direct.sh 14/14 (7 cases x quic-go,
-  ngtcp2) on a freshly rebuilt brisk-interop:local. DEFAULT flash -2..+244 B vs baseline
-  (includes item 1's unsaved +48..+100 B; baseline still not re-saved).
+## Done - M7 complete
+- 714bd29 **build:** BRISK_QUIC_MAX_STREAMS 4 -> 8 (user OK'd; h3 needs 3 server uni streams),
+  quic_api.inc regenerated, quic_api SOURCES.md paragraph moved into kat.py. `dev` host preset
+  now builds DEFAULT; dev32 + every Docker preset stay FULL.
+- eed1e9c **http: HTTP/3 + static-only QPACK, brisk_h3_*** (via /implement-module; round-3
+  rfc-auditor + portability reviewers re-run by hand after the session limit killed them).
+  Round-3 fixes: `te` in a response/trailer is malformed (h3 4.2 and h2 8.2.2); request serves
+  the control stream before the GOAWAY check (5.2). Both mutation-tested (row fails on revert).
+- 11 archs green. DEFAULT flash +244..+492 B (h2.c helpers now shared/non-static), baseline
+  not re-saved.
 
 ## In progress
 - Nothing. Tree clean.
 
-## Needs a user decision
-- **M7: raise FULL's BRISK_QUIC_MAX_STREAMS 4 -> 8?** h3 needs initial_max_streams_uni 3
-  (control + 2 QPACK); with 4 only one request slot is left. Recommended 8 (scratch roughly
-  47 -> ~80 KB on x86_64, estimate, not measured). Changing it means regenerating the
-  quic_api CH vectors (tools/kat.py). Asked, not answered yet.
+## Needs the user
+- Run ns-3 interop on their Linux VPS (Docker natively, IPv6 on in daemon.json):
+  `tools/interop/run_local.sh` -> send build/interop/result.json.
+- h3 interop vs real servers not done: examples/h3_get.c exists, never run against quic-go /
+  ngtcp2 / nginx-quic. Good to do on the same VPS.
 - (still open) mTLS over TLS 1.2 with a `sign` callback fails closed; digest-scheme proposal
   postponed to M8.
 
 ## Next up
-- **M7 HTTP/3**: QPACK static-only (capacity 0) + Huffman (reuse src/http huffman), control
-  stream + SETTINGS, `brisk_h3_*` over brisk_quic_*. Settle the MAX_STREAMS question first.
-  Before adding another FULL-only knob, drop BRISK_PROFILE=FULL from the `base` preset.
+- **M8 item 1**: `fuzz/fuzz_pem.c` for brisk__x509_pem_feed (random chunk sizes, assert
+  der_len <= sizeof der) + a second corpus extractor in tools/dev.py fuzz_corpus() (the .inc's
+  first column is PEM text, not hex). Then amalgamation (tools/amalg.py).
 
 ## Decisions / gotchas
-- Interop lives in WSL2's Docker (images + runner at ~/brisk-interop/quic-interop-runner),
-  not Docker Desktop's Windows context. Run: `wsl -e bash -c 'cd /mnt/d/.../TLS && docker
-  build -f tools/interop/Dockerfile -t brisk-interop:local . && tools/interop/run_direct.sh
-  ~/brisk-interop/quic-interop-runner <server image>'`. Rebuild the image after C changes.
-- ns-3 simulator (run_local.sh) BLOCKED on WSL2 (no UDP forwarded even quic-go<->quic-go):
-  loss/reordering interop still needs a native Linux run.
-- Harness image knobs: STREAM_BUF 65536, MAX_STREAMS 16, CRYPTO_BUF 16384 (defaults crawl).
-- Client never sends *_BLOCKED frames: deliberate policy (stream.c header), reviewers refuted.
-- `dev.py test --arch all` takes >10 min now: run it in the background.
-- dev.py size keys modules by object basename: tls/conn.c and quic/conn.c share one row.
+- WSL vs Docker: on Windows Docker always runs inside the WSL2 VM; ns-3 fails because WSL2's
+  network doesn't forward the sim's UDP, not because of Docker. Native Linux + Docker fixes it.
+- Server uni-stream credit (3) is granted ONLY when cfg.alpn offers "h3" (api.c qa_offers_h3);
+  hq-interop / other ALPNs keep byte-identical TPs. Concurrent h3 requests = MAX_STREAMS - 4.
+- BRISK_ENABLE_H3 forces QUIC + H2 (qpack reuses huffman.c + h2.c field checks).
+- test_h3 fake io delivers one event chunk per wait(); op `P` pumps pending events between
+  calls (models data a blocking wait left unparsed in the rings).
+- python-hyper h2 accepts `te` in responses: listed in kat.py's h2 `known` deviations.
+- sizeof(brisk__quic_conn) ~8.4 KB x86_64, quic scratch 82432 B at defaults (CONFIG.md).
+- `dev.py test --arch all` > 10 min: run in background. A stale empty .git/index.lock appeared
+  once after a background run; check no git process, then remove.
+- Interop image: WSL2 Docker, ~/brisk-interop/quic-interop-runner, run_direct.sh; knobs
+  STREAM_BUF 65536, MAX_STREAMS 16, CRYPTO_BUF 16384.
