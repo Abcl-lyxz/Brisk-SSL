@@ -158,8 +158,8 @@ Tick a box only when the work is green on **every** arch (`python tools/dev.py t
 - [x] quic-interop-runner harness (hq-interop) + the public `brisk_quic_*` API (sans-I/O and
       blocking over one UDP socket, streams by id). tools/interop/: all 7 cases pass against
       quic-go and ngtcp2 on a plain Docker bridge (`run_direct.sh`); the ns-3 simulator run
-      (`run_local.sh`) is BLOCKED on this WSL2 box (it forwards no UDP even quic-go <-> quic-go) -
-      rerun on native Linux for loss / reordering. Our TP defaults: max_idle_timeout 30000,
+      (`run_local.sh`) is blocked on WSL2 but passes 14/14 on GitHub Actions
+      (`.github/workflows/interop.yml`, manual trigger). Our TP defaults: max_idle_timeout 30000,
       max_udp_payload_size 1472 (the UDP driver's buffer), initial_max_data = MAX_STREAMS *
       STREAM_BUF, bidi_local = STREAM_BUF, no peer streams (bidi / uni 0). BRISK_QUIC_MAX_STREAMS
       default 4 -> 8 for M7 (h3 needs 3 uni streams: control + 2 QPACK). DEFAULT size: conn.c grew ~60-260 B (conn_hello takes its buffer; the shared
@@ -176,8 +176,9 @@ Tick a box only when the work is green on **every** arch (`python tools/dev.py t
     a local abort (RESET_STREAM / STOP_SENDING with an app code).
   - Vectors: RFC 9204 static table + Appendix B where static-only applies, a Python QPACK
     encoder/decoder, 104 h3 scenario rows, fuzz seeds (fuzz_qpack, fuzz_h3). 3 review rounds.
-  - Not yet: interop against real h3 servers (quic-go / ngtcp2 / nginx-quic) -
-    `examples/h3_get.c` exists; run it on the VPS with the ns-3 interop run.
+  - Interop (2026-09-25, `examples/h3_get.c` from Docker): cloudflare-quic.com, www.google.com,
+    quic.nginx.org, www.facebook.com, cloudflare.com all complete; `-n 4` parallel requests on
+    one connection to cloudflare-quic.com identical.
 
 ## M8 Hardening + release
 - [ ] Fuzzers (libFuzzer/AFL++) for every parser, seed corpora. Still missing: `fuzz_pem`

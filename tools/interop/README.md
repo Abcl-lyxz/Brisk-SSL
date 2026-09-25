@@ -20,9 +20,17 @@ Build knobs of the harness image (brisk_config.h knobs only): `BRISK_QUIC_STREAM
 `BRISK_QUIC_MAX_STREAMS=16`, `BRISK_QUIC_CRYPTO_BUF=16384` - the default 4 x 4 KB windows would
 crawl through the transfer case's megabytes at the simulator's 30 ms RTT.
 
-## Results (2026-09-25, Windows 11 + WSL2 Ubuntu, Docker 29.7.2, tshark 4.2.2)
+## Results
 
-**ns-3 simulator (`run_local.sh`): BLOCKED by the environment.** The runner, the simulator and
+**ns-3 simulator on GitHub Actions (2026-09-25, `.github/workflows/interop.yml`, ubuntu-24.04,
+Docker upgraded to current): 14 / 14** - all 7 cases x quic-go and ngtcp2 under
+`simple-p2p --delay=15ms --bandwidth=10Mbps --queue=25`. Run it with `gh workflow run
+interop.yml` (inputs `servers`, `tests`); the job fails unless every case succeeded, and the
+logs + pcaps are the `interop` artifact. Gotcha found there: the runner passes
+`TESTCASE=transfer` to the client in its multiplexing test, so brisk_hq keeps every stream slot
+in flight for all transfer-family cases (one request per RTT missed the 60 s limit).
+
+**ns-3 simulator on WSL2 (Windows 11, Docker 29.7.2, tshark 4.2.2): BLOCKED by the environment.** The runner, the simulator and
 all three containers start; `handshake` against quic-go fails with a timeout, and so does
 **quic-go client vs quic-go server** - the simulator's pcaps show no UDP at all while the
 client's own capture shows its 1200-byte Initials leaving `eth0` (checksums OK, DF set). The

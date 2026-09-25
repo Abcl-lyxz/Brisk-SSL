@@ -1,6 +1,6 @@
 # Handoff - 2026-09-25 (session 22)
 
-## Done - M7 complete
+## Done - M7 complete + interop green
 - 714bd29 **build:** BRISK_QUIC_MAX_STREAMS 4 -> 8 (user OK'd; h3 needs 3 server uni streams),
   quic_api.inc regenerated, quic_api SOURCES.md paragraph moved into kat.py. `dev` host preset
   now builds DEFAULT; dev32 + every Docker preset stay FULL.
@@ -14,11 +14,15 @@
 ## In progress
 - Nothing. Tree clean.
 
+## Interop (after the M7 commits)
+- h3 vs real servers: examples/h3_get.c from Docker -> cloudflare-quic, google, nginx,
+  facebook, cloudflare all complete; -n 4 parallel OK. No VPS needed (WSL2 UDP to internet works).
+- ns-3 run moved to GitHub Actions: `.github/workflows/interop.yml` (manual:
+  `gh workflow run interop.yml`), 14/14 vs quic-go + ngtcp2 (run 36124650949). Fixes on the way:
+  scripts +x in git, Docker upgrade (runner needs >= 28.1), job fails on any non-success,
+  brisk_hq full stream window for "transfer" (the runner's multiplexing uses that name).
+
 ## Needs the user
-- Run ns-3 interop on their Linux VPS (Docker natively, IPv6 on in daemon.json):
-  `tools/interop/run_local.sh` -> send build/interop/result.json.
-- h3 interop vs real servers not done: examples/h3_get.c exists, never run against quic-go /
-  ngtcp2 / nginx-quic. Good to do on the same VPS.
 - (still open) mTLS over TLS 1.2 with a `sign` callback fails closed; digest-scheme proposal
   postponed to M8.
 
@@ -28,8 +32,9 @@
   first column is PEM text, not hex). Then amalgamation (tools/amalg.py).
 
 ## Decisions / gotchas
-- WSL vs Docker: on Windows Docker always runs inside the WSL2 VM; ns-3 fails because WSL2's
-  network doesn't forward the sim's UDP, not because of Docker. Native Linux + Docker fixes it.
+- WSL vs Docker: on Windows Docker runs inside the WSL2 VM; ns-3's internal bridge drops UDP
+  there. Use the GitHub Actions interop job instead (retry failures after a timed-out case are
+  collateral: the old server container keeps its IP).
 - Server uni-stream credit (3) is granted ONLY when cfg.alpn offers "h3" (api.c qa_offers_h3);
   hq-interop / other ALPNs keep byte-identical TPs. Concurrent h3 requests = MAX_STREAMS - 4.
 - BRISK_ENABLE_H3 forces QUIC + H2 (qpack reuses huffman.c + h2.c field checks).
