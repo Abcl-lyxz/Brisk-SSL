@@ -2136,6 +2136,16 @@ struct brisk_conn {
     uint32_t timeout_ms;
     uint8_t *heap, *tx, *rx;
     size_t heap_len, rx_off, rx_len;
+#if BRISK_ENABLE_QUIC
+    /* QUIC mode (src/quic/api.c): no record layer (tc unused), the ClientHello is built with
+     * no session id (RFC 9001 8.4), no TLS 1.2 offer (4.2) and these transport parameters
+     * (8.2); suites NULL = the engine's default list */
+    const uint8_t *quic_tp;
+    size_t quic_tp_len;
+    const uint16_t *suites;
+    size_t n_suites;
+    uint8_t quic;
+#endif
 };
 
 /* brisk_conn_init without the OS: `rnd` as above, `now_ms` the wall clock in ms since the epoch
@@ -2144,6 +2154,9 @@ struct brisk_conn {
 int brisk__conn_setup(void *mem, size_t mem_len, const brisk_cfg *cfg, const char *host,
                       int64_t now_ms, const uint8_t rnd[BRISK__CONN_RAND],
                       brisk__x509_anchor_fn sys_anchor, brisk_conn **out);
+/* The per-connection randomness of brisk_conn_init: BRISK__CONN_RAND bytes, the P-256 slice
+ * redrawn until valid. BRISK_OK or BRISK_E_RNG (rnd wiped). Linux (src/os/linux_net.c). */
+int brisk__conn_rand(uint8_t rnd[BRISK__CONN_RAND]);
 /* Refresh the wall clock (ms) used for the certificate check and ticket stamps. */
 void brisk__conn_set_time(brisk_conn *c, int64_t now_ms);
 /* The connection's brisk__x509_anchor_fn (ctx = the brisk_conn): cfg.ca_mem's certificates
@@ -2436,6 +2449,8 @@ typedef struct {
     uint8_t state; /* 0 free, 1 to send, 2 in flight in packet pn */
 } brisk__quic_retire;
 
+typedef void (*brisk__quic_keylog_fn)(void *ctx, const uint8_t *client_random, unsigned epoch,
+                                      int is_send, const uint8_t *secret, size_t len);
 struct brisk__quic_conn {
     brisk__tls13_hs *hs;
     brisk__quic_keys rx[3], tx[3];
@@ -2496,6 +2511,11 @@ struct brisk__quic_conn {
     uint8_t retry_scid[20], retry_scid_len, retry_done; /* 7.3: checked against the TP */
     uint8_t key_phase; /* RFC 9001 6: the phase we send (and currently receive) */
     uint8_t dcid_unsent; /* RFC 9000 10.3.1: switched to a new server CID, nothing sent on it */
+    /* test / interop-harness seam, NULL by default and never reachable from brisk.h: every
+     * Handshake and 1-RTT secret as the engine exports it (NSS SSLKEYLOGFILE lines) */
+    brisk__quic_keylog_fn keylog;
+    void *keylog_ctx;
+    const uint8_t *keylog_random; /* the 32-byte client random passed to keylog */
 };
 typedef struct brisk__quic_conn brisk__quic_conn;
 /* CRYPTO reassembly (BRISK_QUIC_CRYPTO_BUF + bitmap) + send retention + the stream rings
@@ -2517,7 +2537,8 @@ int brisk__quic_conn_init(brisk__quic_conn *q, brisk__tls13_hs *hs, const brisk_
  * Due timers run first. BRISK_OK (dropped packets are not errors), or the sticky BRISK_E_PROTO /
  * E_AUTH / E_ARG (q->err_code = the QUIC error code), BRISK_E_PEER_ALERT (the peer's
  * CONNECTION_CLOSE; a stateless reset, 10.3, err_code 0; a Version Negotiation without v1,
- * 6.2, err_code 0x11) or BRISK_E_TIMEOUT (idle timeout, RFC 9000 10.1: closed silently).
+ * 6.2, err_code 0x11) or BRISK_E_IO (idle timeout, RFC 9000 10.1: closed silently - never
+ * BRISK_E_TIMEOUT, which the blocking API uses for a harmless stall).
  * Call brisk__quic_send after every recv: data owed at once (a Retry's resent ClientHello, an
  * ACK) is not reported by brisk__quic_deadline. */
 int brisk__quic_recv(brisk__quic_conn *q, uint8_t *dgram, size_t len, int64_t now_ms);
@@ -2535,6 +2556,10 @@ int64_t brisk__quic_deadline(const brisk__quic_conn *q);
 int brisk__quic_close(brisk__quic_conn *q, uint64_t app_err);
 /* 1 once the engine is CONNECTED and the 7.3 CID checks passed; the TPs are in q->peer_tp. */
 int brisk__quic_established(const brisk__quic_conn *q);
+/* Interop seam (keyupdate case): initiate a key update when RFC 9001 6.1 / 6.5 allow it -
+ * confirmed, the next receive keys ready (the previous ones dropped), an ACK for a packet of
+ * the current phase, 3 * PTO after it - else BRISK_E_WANT. BRISK_OK, or the sticky error. */
+int brisk__quic_key_update(brisk__quic_conn *q);
 /* The frames of one decrypted payload at `level` (RFC 9000 12.4, 19). q == NULL checks syntax
  * and Table 3 only (tests, fuzzing). 0 or the QUIC error code. */
 uint64_t brisk__quic_frames(brisk__quic_conn *q, unsigned level, const uint8_t *p, size_t len);
@@ -2544,8 +2569,9 @@ uint64_t brisk__quic_frames(brisk__quic_conn *q, unsigned level, const uint8_t *
  * to be opened, so the implicit opening of lower ids (3.2) always finds one. The public
  * brisk_quic_* comes with the item-4 interop harness / M7, as an opaque handle. */
 void brisk__quic_streams_init(brisk__quic_conn *q); /* at establishment: limits from both TPs */
-/* id >= 0; BRISK_E_WANT = the peer's MAX_STREAMS reached; BRISK_E_ARG = not established, no slot
- * free outside the peer's reservation, or closed. */
+/* id >= 0; BRISK_E_WANT = the peer's MAX_STREAMS reached, or no slot free outside the peer's
+ * reservation yet (one frees once a finished stream's FIN is ACKed / its data read); BRISK_E_ARG
+ * = not established, or closed. */
 int64_t brisk__quic_stream_open(brisk__quic_conn *q, int bidi);
 /* Bytes copied into the send ring (0..n, less when full); fin once all n are taken. BRISK_E_ARG
  * on a receive-only / unknown / finished stream or a closed connection; BRISK_E_PEER_ALERT after
@@ -2576,7 +2602,68 @@ size_t brisk__quic_stream_out(brisk__quic_conn *q, uint8_t *out, size_t room, in
 /* A record rec_on_ack / rec_on_timeout marked ACKED or LOST (RFC 9000 13.3). */
 void brisk__quic_stream_record(brisk__quic_conn *q, const brisk__quic_sent *s);
 void brisk__quic_streams_wipe(brisk__quic_conn *q); /* every ring and slot */
-#endif                                              /* BRISK_ENABLE_QUIC */
+
+/* ---- tls/conn.c, shared with quic/api.c (QUIC builds only; static otherwise) ---------- */
+/* The front half both transports share: `c` (already aligned) is zeroed and filled from cfg /
+ * host / rnd - trust store, X.509 authenticator, ALPN, ticket hooks - and its engine initialised
+ * over hs_scratch (brisk__tls13_hs_scratch_size() bytes), with cfg.quic = quic. BRISK_E_ARG on a
+ * bad host, ca_mem / client_chain mismatch or an ALPN list that does not encode. */
+int brisk__conn_core(brisk_conn *c, const brisk_cfg *cfg, const char *host, int64_t now_ms,
+                     const uint8_t rnd[BRISK__CONN_RAND], brisk__x509_anchor_fn sys_anchor,
+                     int quic, uint8_t *hs_scratch);
+/* The ClientHello the engine's state asks for (CH1 in START, CH2 in WAIT_CH2, RFC 9846 4.1.4),
+ * built in buf (2048 bytes) and absorbed; then, once CH2 is queued or the ServerHello is in,
+ * the two ECDHE private keys in c->rnd are wiped (4.3.8). BRISK_OK when nothing is owed. */
+int brisk__conn_next_hello(brisk_conn *c, uint8_t *buf);
+
+/* ---- quic/api.c: the public brisk_quic (sans-I/O glue) ---------------------------------------
+ * [align slack | struct brisk_quic | hs scratch | quic scratch]: the TLS front half of
+ * brisk_conn (cfg, host, ALPN, trust store, authenticator, tickets) without its record layer,
+ * plus the transport. RANDOMNESS: BRISK__QUIC_RAND = the 160 bytes of brisk_conn (the session id
+ * slice unused over QUIC) + the first DCID 8 + our SCID 8 (RFC 9000 7.2 / 7.3). */
+#    define BRISK__QUIC_RAND   (BRISK__CONN_RAND + 16)
+#    define BRISK__QUIC_RX_MAX 1472 /* the UDP receive buffer = our max_udp_payload_size TP */
+#    if BRISK__QUIC_RX_MAX < 1200 || BRISK__QUIC_RX_MAX > 65527
+#        error "BRISK__QUIC_RX_MAX: RFC 9000 18.2 max_udp_payload_size is 1200..65527"
+#    endif
+struct brisk_quic {
+    brisk_conn c; /* c.tc unused; c.fd / heap / tx / rx / timeout_ms / io_err: blocking only */
+    brisk__quic_conn q;
+    /* blocking driver (src/os/linux_udp.c); NULL = sans-I/O. op: BRISK__QIO_* */
+    int (*io)(struct brisk_quic *q, int op);
+    int64_t last_now; /* the latest now_ms the caller passed */
+    int64_t stall;    /* blocking: monotonic ms at which a wait without progress ends */
+    uint8_t tp[64];   /* our encoded transport parameters, CH1 and CH2 */
+    uint8_t owe;      /* datagrams may be owed now: brisk_quic_deadline says "now" */
+};
+enum { BRISK__QIO_START = 0, BRISK__QIO_WAIT = 1, BRISK__QIO_FREE = 2, BRISK__QIO_FLUSH = 3 };
+/* brisk_quic_init without the OS: rnd as above, wall_ms the wall clock, sys_anchor the file /
+ * system store (NULL: cfg.ca_mem only), suites = the TLS 1.3 suites offered (NULL = the
+ * engine's default; the interop chacha20 case offers {0x1303}). BRISK_E_ARG (mem wiped). */
+int brisk__quic_setup(void *mem, size_t mem_len, const brisk_cfg *cfg, const char *host,
+                      int64_t wall_ms, const uint8_t rnd[BRISK__QUIC_RAND],
+                      brisk__x509_anchor_fn sys_anchor, const uint16_t *suites, size_t n_suites,
+                      brisk_quic **out);
+
+/* ---- os/linux_udp.c: the blocking QUIC driver ------------------------------------------------ */
+/* Resolve (first getaddrinfo address), open a non-blocking UDP socket with DF set where the
+ * kernel allows it (RFC 9000 14; IP(V6)_PMTUDISC_PROBE: the PMTU cache is ignored) and
+ * connect() it. BRISK_OK and *fd, or BRISK_E_IO. */
+int brisk__os_udp_connect(const char *host, uint16_t port, int *fd);
+/* 1 if a send()/recv() errno means the socket itself is broken (BRISK_E_IO); 0 = only that
+ * datagram is lost - ICMP-born errors included (RFC 9000 14.2.1, 21: unauthenticated). */
+int brisk__os_udp_fatal(int err);
+/* brisk_quic_connect with the seams: fd >= 0 = an already connected datagram socket (consumed:
+ * closed on failure), rnd NULL = the kernel's, wall_ms < 0 = the clock, suites as in setup,
+ * keylog (may be NULL) installed before the first datagram. */
+int brisk__quic_connect_ex(const brisk_cfg *cfg, const char *host, uint16_t port, int fd,
+                           const uint8_t *rnd, int64_t wall_ms, const uint16_t *suites,
+                           size_t n_suites, brisk__quic_keylog_fn keylog, void *keylog_ctx,
+                           brisk_quic **out);
+/* Tests: the handshake over a connected socket (socketpair). */
+int brisk__quic_connect_fd(const brisk_cfg *cfg, const char *host, int fd, const uint8_t *rnd,
+                           int64_t wall_ms, brisk_quic **out);
+#endif /* BRISK_ENABLE_QUIC */
 
 #if BRISK_ENABLE_H2
 /* ---- http/huffman.c + http/hpack.c: HTTP/2 HPACK (RFC 7541) ----------------------------------

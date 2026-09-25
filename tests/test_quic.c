@@ -1217,7 +1217,7 @@ static void test_conn_timers(void)
     t = brisk__quic_deadline(&R.q);
     CHECK(t == R.q.idle_start + 30000);
     CHECK(brisk__quic_recv(&R.q, d, 0, t - 1) == BRISK_OK);
-    CHECK(brisk__quic_recv(&R.q, d, 0, t) == BRISK_E_TIMEOUT && R.q.err_code == 0 && all_wiped() &&
+    CHECK(brisk__quic_recv(&R.q, d, 0, t) == BRISK_E_IO && R.q.err_code == 0 && all_wiped() &&
           brisk__quic_send(&R.q, g_buf, BUF, t) == 0 && brisk__quic_deadline(&R.q) == INT64_MAX);
     brisk__tls13_hs_wipe(&R.hs);
     /* 10.1 (MUST): never below 3 * PTO */

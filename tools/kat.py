@@ -11111,6 +11111,171 @@ def quic_conn_vectors():
     return rows + srows, glob
 
 
+def quic_api_vectors():
+    """The public QUIC API (src/quic/api.c, M6 item 4): brisk__quic_setup fed QUIC_API_RND (the
+    176 bytes brisk_quic_init draws: the 160 of the TLS connection - random | unused session id
+    slice | x25519 d | P-256 d | sign_rand - then the first DCID 8 and our SCID 8, RFC 9000 7.2)
+    must emit these datagrams byte for byte. Our transport parameters are the internal defaults
+    of a default FULL build (max_idle_timeout 30000, max_udp_payload_size 1472 = the UDP driver's
+    receive buffer, initial_max_data 4 * 4096, initial_max_stream_data_bidi_local 4096, no peer
+    streams), ALPN "hq-interop", the engine's default suites, no session id (RFC 9001 8.4) and no
+    TLS 1.2 offer (RFC 9001 4.2). The server side is tls13_fixture's, as in quic_conn_vectors;
+    the client side is PyQConn. Returns ({name: bytes}, the wall clock in ms)."""
+    f, seed = FX, FX["seed"]
+    host = b"device.example.com"
+    c_d = int.from_bytes(seed(b"client p256"), "big")
+    s_d = int.from_bytes(seed(b"server p256"), "big")
+    c_p256, s_p256 = py_p256_keygen(c_d)[0], py_p256_keygen(s_d)[0]
+    rnd = seed(b"quic api random")
+    dcid, cscid = seed(b"quic api dcid")[:8], seed(b"quic api scid")[:8]
+    sscid = seed(b"quic api server scid")[:8]
+    rnd176 = (rnd + seed(b"quic api unused") + f["c_priv"] + c_d.to_bytes(32, "big")
+              + seed(b"quic api sign") + dcid + cscid)
+    if len(rnd176) != 176:
+        die("quic api: rnd must be BRISK__QUIC_RAND = 176 bytes")
+    MY = {"exp": 3, "mad": 25, "idle": 30000, "max_data": 16384, "sd_bidi_local": 4096,
+          "sd_bidi_remote": 0, "sd_uni": 0, "streams_bidi": 0, "streams_uni": 0, "cid_limit": 2}
+    # RFC 9000 18.2: every integer that differs from its default, in id order, then iscid (7.3)
+    ctp = tp_enc([(0x01, qv(30000)), (0x03, qv(1472)), (0x04, qv(16384)), (0x05, qv(4096)),
+                  (0x0F, cscid)])
+    alpn = t_alpn([b"hq-interop"])
+
+    def ch_of(group=0x001D, pub=None, cookie=b"", psk=None):
+        return t_ch(rnd, b"", TLS13_SUITES, TLS13_GROUPS, TLS13_SIGS, group, pub or f["c_pub"],
+                    host, cookie=cookie, alpn=alpn, quic_tp=ctp, modes=psk is not None, psk=psk)
+
+    ch1 = ch_of()
+    p1 = t_ch_parse(ch1)
+    if p1["sid"] != b"" or p1["suites"] != b"".join(t_u16(x) for x in TLS13_SUITES) or p1["exts"][-1][0] != 57:
+        die("quic api: CH1 needs an empty session id (RFC 9001 8.4), TLS 1.3 suites only (4.2) "
+            "and quic_transport_parameters (8.2)")
+    reset = seed(b"quic api reset")[:16]
+    stp_ok = [(0x00, dcid), (0x01, qv(30000)), (0x02, reset), (0x04, qv(1 << 20)),
+              (0x05, qv(65536)), (0x06, qv(65536)), (0x07, qv(65536)), (0x08, qv(2)),
+              (0x0F, sscid)]
+    PEER = {"max_data": 1 << 20, "sd_bidi_remote": 65536, "idle": 30000, "exp": 3, "mad": 25,
+            "streams_bidi": 2, "streams_uni": 0}
+    s_init = q_keys(0x1301, q_initial(dcid)[1])
+    cert = t_msg(11, b"\x00" + t_v24(t_v24(f["leaf_cert"]()) + t_v16(b"")))
+
+    def server(suite, pre, stp=stp_ok, alpn_sel=b"hq-interop", group=0x001D, psk=None):
+        bits = QSUITE[suite][0]
+        spub = f["s_pub"] if group == 0x001D else s_p256
+        dhe = py_x25519(f["c_priv"], f["s_pub"]) if group == 0x001D else py_p256_ecdh(c_d, s_p256)
+        sh = t_msg(2, t_u16(0x0303) + seed(b"quic api server random") + t_v8(b"") + t_u16(suite)
+                   + b"\x00" + t_exts_build(([(41, t_u16(0))] if psk else [])
+                                            + [(43, t_u16(0x0304)), (51, t_u16(group) + t_v16(spub))]))
+        exts = [(0, b"")] + ([(16, t_v16(t_v8(alpn_sel)))] if alpn_sel else []) + [(57, tp_enc(stp))]
+        ee = t_msg(8, t_exts_build(exts))
+        crt = cv = b""
+        if not psk:
+            crt = cert
+            th = t_th(bits, pre + [sh, ee, cert])
+            cv = t_msg(15, t_u16(0x0403) + t_v16(f["leaf"]["sign"](t_cv_content(th))))
+        fl = t_flow(bits, dhe, pre, sh, ee, b"", crt, cv, psk=psk)
+        return {"sh": sh, "flight": ee + crt + cv + fl["sf"], "cf": fl["cf"],
+                "hs_r": q_keys(suite, fl["s_hs"]), "hs_w": q_keys(suite, fl["c_hs"]),
+                "ap_w": q_keys(suite, fl["c_ap"]), "s_ap": fl["s_ap"], "c_ap": fl["c_ap"]}
+
+    ACK0 = q_ackf(0)
+
+    def s_initial(pn, payload, keys=s_init):
+        return q_long(keys, 0, cscid, sscid, pn, 2, payload)
+
+    def s_hs(s, pn=0):
+        return q_long(s["hs_r"], 2, cscid, sscid, pn, 2, q_crypto(0, s["flight"]))
+
+    def start(ch=ch1):
+        c = PyQConn(dcid, cscid, MY)
+        c.crypto(0, ch)
+        return c, c.send()
+
+    def finish(c, s, sh_payload, pn0=0):
+        """The server's Initial (pn0) and Handshake (0) processed; our Initial ACK + Finished."""
+        c.dcid = sscid
+        c.packet(0, pn0, sh_payload)
+        c.keys(1, s["hs_w"])
+        c.packet(1, 0, q_crypto(0, s["flight"]))
+        c.keys(2, s["ap_w"])
+        c.c_ap = s["c_ap"]
+        c.crypto(1, s["cf"])
+        c.established(PEER)
+        return c.send()
+
+    out = {"RND": rnd176, "CTP": ctp, "CH1": ch1, "ROOT": f["root_c"]}
+    # 1. the full handshake: CH1, the server's Initial + Handshake, our Initial ACK + Finished
+    s = server(0x1301, [ch1])
+    c, out["INIT1"] = start()
+    if len(out["INIT1"]) != 1200:
+        die("quic api: the first Initial must be padded to 1200 (RFC 9000 14.1)")
+    out["S_INIT"], out["S_HS"] = s_initial(0, ACK0 + q_crypto(0, s["sh"])), s_hs(s)
+    out["FIN1"] = finish(c, s, ACK0 + q_crypto(0, s["sh"]))
+    out["S_AP"], out["C_AP"], out["SSCID"], out["RESET"] = s["s_ap"], s["c_ap"], sscid, reset
+    if len(out["S_INIT"]) + len(out["S_HS"]) + 16 >= 1472:
+        die("quic api: the server flight must fit one datagram below BRISK__QUIC_RX_MAX")
+    # 2. HelloRetryRequest to secp256r1 with a cookie: CH2 continues the Initial CRYPTO stream
+    #    with the same quic_transport_parameters (RFC 9846 4.1.4, 4.2.2)
+    cookie = seed(b"quic api cookie") * 2
+    hrr = t_msg(2, t_u16(0x0303) + RFC9846["hrr"] + t_v8(b"") + t_u16(0x1301) + b"\x00"
+                + t_exts_build([(43, t_u16(0x0304)), (51, t_u16(0x0017)), (44, t_v16(cookie))]))
+    ch2 = ch_of(0x0017, c_p256, cookie)
+    if t_ch_parse(ch2)["exts"][-1] != p1["exts"][-1]:
+        die("quic api: CH2 must carry CH1's quic_transport_parameters")
+    sh2 = server(0x1301, [t_message_hash(256, ch1), hrr, ch2], group=0x0017)
+    c, _ = start()
+    out["S_HRR"] = s_initial(0, ACK0 + q_crypto(0, hrr))
+    c.dcid = sscid
+    c.packet(0, 0, ACK0 + q_crypto(0, hrr))
+    c.crypto(0, ch2)
+    out["CH2DG"] = c.send()
+    out["S_HRR_FL"] = s_initial(1, q_crypto(len(hrr), sh2["sh"])) + s_hs(sh2)
+    c.packet(0, 1, q_crypto(len(hrr), sh2["sh"]))
+    c.keys(1, sh2["hs_w"])
+    c.packet(1, 0, q_crypto(0, sh2["flight"]))
+    c.keys(2, sh2["ap_w"])
+    c.crypto(1, sh2["cf"])
+    c.established(PEER)
+    out["HRR_FIN"] = c.send()
+    # 3. Retry (RFC 9000 17.2.5, RFC 9001 5.8): the same CH again, with the token
+    s2, rtok = seed(b"quic api retry scid")[:8], seed(b"quic api retry token")[:24]
+    body = bytes([0xF0]) + (1).to_bytes(4, "big") + b"\x08" + cscid + b"\x08" + s2 + rtok
+    out["S_RETRY"] = body + py_retry_tag(dcid, body)
+    sr = server(0x1301, [ch1], stp=stp_ok + [(0x10, s2)])
+    c, _ = start()
+    c.retry(s2, rtok)
+    out["RETRY_INIT"] = c.send()
+    si = q_keys(0x1301, q_initial(s2)[1])
+    out["S_RETRY_FL"] = s_initial(0, q_ackf(1) + q_crypto(0, sr["sh"]), si) + s_hs(sr)
+    out["RETRY_FIN"] = finish(c, sr, q_ackf(1) + q_crypto(0, sr["sh"]))
+    # 4. RFC 9001 8.1: no ALPN in EE / one we never offered -> no_application_protocol 0x0178
+    for name, sel in (("NOALPN", b""), ("BADALPN", b"h3")):
+        sv = server(0x1301, [ch1], alpn_sel=sel)
+        c, _ = start()
+        c.dcid = sscid
+        c.packet(0, 0, ACK0 + q_crypto(0, sv["sh"]))
+        c.keys(1, sv["hs_w"])
+        out["S_" + name] = s_initial(0, ACK0 + q_crypto(0, sv["sh"])) + s_hs(sv)
+        out["CC_" + name] = c.cc(0x178)
+    # 5. resumption from a ticket blob (RFC 9846 4.2.11, 4.3.11; RFC 9001 4.5), no 0-RTT
+    now_ms = CHAIN_NOW * 1000
+    psk, ticket = seed(b"quic api psk"), seed(b"quic api ticket") * 3
+    lifetime, age_add, issued = 7200, 0x9E3779B9, now_ms - 5000
+    out["BLOB"] = t_ticket_blob(0x1301, issued, lifetime, age_add, psk, host, ticket)
+    out["BLOB_OTHER"] = t_ticket_blob(0x1301, issued, lifetime, age_add, psk,
+                                      b"other.example.com", ticket)
+    obf = (now_ms - issued + age_add) & 0xFFFFFFFF
+    psk_ch = t_binder_fill(256, psk, [], ch_of(psk=(ticket, obf, 32)))
+    if t_ch_parse(psk_ch)["exts"][-1][0] != 41:
+        die("quic api: pre_shared_key must be the last extension (RFC 9846 4.2.11)")
+    sp = server(0x1301, [psk_ch], psk=psk)
+    c, out["PSK_INIT"] = start(psk_ch)
+    out["S_PSK"] = s_initial(0, ACK0 + q_crypto(0, sp["sh"])) + s_hs(sp)
+    out["PSK_FIN"] = finish(c, sp, ACK0 + q_crypto(0, sp["sh"]))
+    # a NewSessionTicket for the 1-RTT CRYPTO stream (RFC 9001 4.5); the C test seals it
+    out["NST"] = rec_nst(7200, 0x01020304, b"\x00", seed(b"quic api nst"), [])
+    return out, now_ms
+
+
 def main():
     OUT.mkdir(parents=True, exist_ok=True)
     print("fetching + verifying official vectors ...")
@@ -11249,6 +11414,7 @@ def main():
     q_frames = quic_frame_vectors(q_a2, q_a3)
     q_conn, q_glob = quic_conn_vectors()
     q_rec, q_rx = quic_rec_vectors(q_a3)
+    q_api, q_api_now = quic_api_vectors()
 
     emit("sha2.inc", "struct hash_kat SHA2_KAT", cavp + dhash, lambda r: f"{r[0]}, {cstr(r[1])}, {cstr(r[2])}")
     emit("sha2_monte.inc", "struct monte_kat SHA2_MONTE", monte,
@@ -11503,6 +11669,12 @@ def main():
         for k, v in q_glob.items():
             fh.write(f"static const char QUIC_CONN_{k}[] = {cstr(v.hex())};\n")
         fh.write(f"static const long long QUIC_CONN_NOW = {CHAIN_NOW}LL;\n")
+    with open(OUT / "quic_api.inc", "w", newline="\n") as fh:
+        fh.write("/* generated by tools/kat.py - do not edit; sources in tests/kat/SOURCES.md */\n")
+        for k, v in q_api.items():
+            fh.write(f"static const char QUIC_API_{k}[] = {cstr(v.hex())};\n")
+        fh.write(f"static const long long QUIC_API_NOW = {q_api_now}LL;\n")
+    print(f"  quic_api.inc: {len(q_api)} blobs")
 
     rfc7541_static()
     huff_counts, huff_syms = rfc7541_huffman()

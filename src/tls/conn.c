@@ -30,6 +30,13 @@ struct conn_align_probe {
     struct brisk_conn x;
 };
 #define CONN_ALIGN offsetof(struct conn_align_probe, x)
+/* the front half is shared with src/quic/api.c only in a QUIC build; otherwise it stays static
+ * (inlined: no size cost for TINY / DEFAULT) */
+#if BRISK_ENABLE_QUIC
+#    define CONN_SHARED
+#else
+#    define CONN_SHARED static
+#endif
 
 size_t brisk_conn_size(void)
 {
@@ -180,13 +187,13 @@ static int conn_on_ticket(void *ctx, const brisk__tls13_ticket *t)
  * suite has another hash (4.2.2 "removing any PSKs which are incompatible"); the engine
  * enforces both directions. A CH1 that does not fit with the PSK (room for the worst CH2
  * included) is rebuilt without it; one that does not fit without it is BRISK_E_ARG. */
-static int conn_hello(brisk_conn *c)
+static int conn_hello(brisk_conn *c, uint8_t *buf)
 {
     brisk__tls13_hs *hs = &c->hs;
     brisk__tls13_ch_params p;
     brisk__tls13_psk psk;
     uint8_t pub[65];
-    int ch2 = hs->state == BRISK__HS_WAIT_CH2, use_psk = 0, rc;
+    int ch2 = hs->state == BRISK__HS_WAIT_CH2, use_psk = 0, rc, quic = 0;
     uint16_t g = ch2 && hs->hrr_group != 0 ? hs->hrr_group : CONN_X25519;
     const uint8_t *priv = c->rnd + (g == CONN_P256 ? CONN_RND_P : CONN_RND_X);
     size_t n = 0;
@@ -211,6 +218,17 @@ static int conn_hello(brisk_conn *c)
     p.alpn = c->alpn_len != 0 ? c->alpn : NULL;
     p.alpn_len = c->alpn_len;
     p.tls12 = BRISK_ENABLE_TLS12; /* one ClientHello for TLS 1.3 and 1.2 (RFC 9846 4.3.1) */
+#if BRISK_ENABLE_QUIC
+    quic = c->quic;
+    if (quic) {
+        p.session_id_len = 0; /* RFC 9001 8.4 (MUST NOT): no compatibility mode */
+        p.tls12 = 0;          /* RFC 9001 4.2 (MUST NOT): TLS 1.3 only */
+        p.quic_tp = c->quic_tp; /* 8.2 (MUST) */
+        p.quic_tp_len = c->quic_tp_len;
+        p.suites = c->suites;
+        p.n_suites = c->n_suites;
+    }
+#endif
     if (ch2 && hs->cookie_len != 0) {
         p.cookie = hs->cookie;
         p.cookie_len = hs->cookie_len;
@@ -237,11 +255,13 @@ static int conn_hello(brisk_conn *c)
     for (;;) {
         p.psk = use_psk ? &psk : NULL;
         p.psk_modes = (uint8_t)use_psk; /* 4.3.9: psk_dhe_ke, only alongside a PSK */
-        rc = brisk__tls13_ch_write(&p, c->tc.in, CONN_CH_MAX, &n);
+        rc = brisk__tls13_ch_write(&p, buf, CONN_CH_MAX, &n);
         /* CH1 offers the PSK only if CH2 is sure to fit too: at most a cookie extension and a
-         * P-256 share instead of x25519 more (4.2.2 forbids dropping it there). */
+         * P-256 share instead of x25519 more (4.2.2 forbids dropping it there). QUIC keeps CH1
+         * AND CH2 in one Initial CRYPTO retention buffer (quic/conn.c QC_RET0 == CONN_CH_MAX),
+         * so there the pair must fit together. */
         if (rc == BRISK_OK && use_psk && !ch2 &&
-            n + BRISK__TLS13_COOKIE_MAX + 6 + (65 - 32) > CONN_CH_MAX) {
+            (quic ? n : 0) + n + BRISK__TLS13_COOKIE_MAX + 6 + (65 - 32) > CONN_CH_MAX) {
             rc = BRISK_E_ARG;
         }
         if (rc == BRISK_OK && use_psk && !ch2) {
@@ -249,12 +269,12 @@ static int conn_hello(brisk_conn *c)
         }
 #if BRISK_ENABLE_TLS12
         /* the P-256 d a TLS 1.2 ServerKeyExchange may pick (the x25519 d is the share's) */
-        if (rc == BRISK_OK && !ch2) {
+        if (rc == BRISK_OK && !ch2 && !quic) {
             rc = brisk__tls13_hs_set_tls12_key(hs, c->rnd + CONN_RND_P);
         }
 #endif
         if (rc == BRISK_OK) {
-            rc = brisk__tls13_hs_client_hello(hs, c->tc.in, n, g, priv);
+            rc = brisk__tls13_hs_client_hello(hs, buf, n, g, priv);
         }
         if (rc == BRISK_OK || !use_psk || ch2) {
             break;
@@ -262,8 +282,28 @@ static int conn_hello(brisk_conn *c)
         use_psk = 0;
     }
     brisk__secure_zero(&psk, sizeof psk);
+    (void)quic;
     return rc == BRISK_OK ? BRISK_OK : BRISK_E_ARG;
 }
+
+/* 4.3.8: both ECDHE private keys die once CH2 is queued or the ServerHello is in */
+static void conn_drop_keys(brisk_conn *c)
+{
+    if (c->hs.state != BRISK__HS_WAIT_SH || c->hs.hrr_seen) {
+        brisk__secure_zero(c->rnd + CONN_RND_X, CONN_RND_S - CONN_RND_X);
+    }
+}
+
+#if BRISK_ENABLE_QUIC
+int brisk__conn_next_hello(brisk_conn *c, uint8_t *buf)
+{
+    int rc = c->hs.state == BRISK__HS_START || c->hs.state == BRISK__HS_WAIT_CH2
+                 ? conn_hello(c, buf)
+                 : BRISK_OK;
+    conn_drop_keys(c);
+    return rc;
+}
+#endif
 
 /* ------------------------------------------------------------------ setup ------------------- */
 
@@ -286,29 +326,18 @@ static int conn_host_ok(const char *host, size_t *len)
     return brisk__x509_match_host(&none, host, n) != BRISK_E_ARG;
 }
 
-int brisk__conn_setup(void *mem, size_t mem_len, const brisk_cfg *cfg, const char *host,
-                      int64_t now_ms, const uint8_t rnd[BRISK__CONN_RAND],
-                      brisk__x509_anchor_fn sys_anchor, brisk_conn **out)
+CONN_SHARED int brisk__conn_core(brisk_conn *c, const brisk_cfg *cfg, const char *host, int64_t now_ms,
+                     const uint8_t rnd[BRISK__CONN_RAND], brisk__x509_anchor_fn sys_anchor,
+                     int quic, uint8_t *hs_scratch)
 {
     brisk__tls13_hs_cfg hc;
-    brisk_conn *c;
-    uint8_t *m = (uint8_t *)mem, *rec_in;
     size_t host_len = 0, n = 0;
     int rc;
 
-    if (out != NULL) {
-        *out = NULL;
-    }
-    if (mem == NULL || cfg == NULL || host == NULL || rnd == NULL || out == NULL ||
-        mem_len < brisk_conn_size() || !conn_host_ok(host, &host_len) ||
-        (cfg->ca_mem == NULL) != (cfg->ca_mem_len == 0) ||
+    if (!conn_host_ok(host, &host_len) || (cfg->ca_mem == NULL) != (cfg->ca_mem_len == 0) ||
         (cfg->client_chain == NULL && cfg->client_chain_len != 0)) {
         return BRISK_E_ARG;
     }
-    /* any caller alignment: round up in place (handshake.c HS_CERT_ALIGN idiom) */
-    m += (CONN_ALIGN - ((uintptr_t)m & (CONN_ALIGN - 1))) & (CONN_ALIGN - 1);
-    c = (brisk_conn *)(void *)m;
-    rec_in = m + sizeof *c;
     memset(c, 0, sizeof *c);
     c->fd = -1;
     c->cfg = *cfg;
@@ -338,15 +367,41 @@ int brisk__conn_setup(void *mem, size_t mem_len, const brisk_cfg *cfg, const cha
     hc.sign_rand = c->rnd + CONN_RND_S;
     hc.sign = cfg->sign;
     hc.sign_ctx = cfg->sign_ctx;
+    hc.quic = (uint8_t)quic;
+#if BRISK_ENABLE_QUIC
+    c->quic = (uint8_t)quic;
+#endif
     if (rc == BRISK_OK) {
-        rc = brisk__tls13_hs_init(&c->hs, &hc, rec_in + BRISK__TLS_REC_IN_MAX,
-                                  brisk__tls13_hs_scratch_size());
+        rc = brisk__tls13_hs_init(&c->hs, &hc, hs_scratch, brisk__tls13_hs_scratch_size());
     }
+    return rc == BRISK_OK ? BRISK_OK : BRISK_E_ARG;
+}
+
+int brisk__conn_setup(void *mem, size_t mem_len, const brisk_cfg *cfg, const char *host,
+                      int64_t now_ms, const uint8_t rnd[BRISK__CONN_RAND],
+                      brisk__x509_anchor_fn sys_anchor, brisk_conn **out)
+{
+    brisk_conn *c;
+    uint8_t *m = (uint8_t *)mem, *rec_in;
+    int rc;
+
+    if (out != NULL) {
+        *out = NULL;
+    }
+    if (mem == NULL || cfg == NULL || host == NULL || rnd == NULL || out == NULL ||
+        mem_len < brisk_conn_size()) {
+        return BRISK_E_ARG;
+    }
+    /* any caller alignment: round up in place (handshake.c HS_CERT_ALIGN idiom) */
+    m += (CONN_ALIGN - ((uintptr_t)m & (CONN_ALIGN - 1))) & (CONN_ALIGN - 1);
+    c = (brisk_conn *)(void *)m;
+    rec_in = m + sizeof *c;
+    rc = brisk__conn_core(c, cfg, host, now_ms, rnd, sys_anchor, 0, rec_in + BRISK__TLS_REC_IN_MAX);
     if (rc == BRISK_OK) {
         rc = brisk__tls13_conn_init(&c->tc, &c->hs, rec_in, BRISK__TLS_REC_IN_MAX);
     }
     if (rc == BRISK_OK) {
-        rc = conn_hello(c);
+        rc = conn_hello(c, c->tc.in);
     }
     if (rc != BRISK_OK) {
         brisk__secure_zero(mem, brisk_conn_size()); /* every setup failure is a caller bug */
@@ -393,15 +448,13 @@ int brisk_feed(brisk_conn *c, const void *in, size_t len, size_t *used)
         }
         rc = brisk__tls13_conn_feed(&c->tc, p + *used, k, &u);
         *used += u;
-        if (rc == BRISK_OK && c->hs.state == BRISK__HS_WAIT_CH2 && conn_hello(c) != BRISK_OK) {
+        if (rc == BRISK_OK && c->hs.state == BRISK__HS_WAIT_CH2 &&
+            conn_hello(c, c->tc.in) != BRISK_OK) {
             /* our own fault, not the peer's: internal_error, never BRISK_E_PROTO (6.2) */
             rc = brisk__tls13_conn_abort(&c->tc, BRISK__ALERT_INTERNAL_ERROR, BRISK_E_ARG);
         }
     } while (rc == BRISK_OK && u != 0 && *used < len);
-    /* 4.3.8: both ECDHE private keys die once CH2 is queued or the ServerHello is in */
-    if (c->hs.state != BRISK__HS_WAIT_SH || c->hs.hrr_seen) {
-        brisk__secure_zero(c->rnd + CONN_RND_X, CONN_RND_S - CONN_RND_X);
-    }
+    conn_drop_keys(c);
     return rc;
 }
 
@@ -524,3 +577,4 @@ void brisk_conn_wipe(brisk_conn *c)
 #undef CONN_RND_P
 #undef CONN_RND_S
 #undef CONN_ALIGN
+#undef CONN_SHARED

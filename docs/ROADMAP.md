@@ -156,7 +156,17 @@ Tick a box only when the work is green on **every** arch (`python tools/dev.py t
       another FULL-only knob, take BRISK_PROFILE=FULL off the `base` preset so host x64 builds
       the shipped DEFAULT (TLS 1.2 on) again.
 - [x] Retry, version negotiation, stateless-reset detection, receive-side key update
-- [ ] quic-interop-runner harness (hq-interop)
+- [x] quic-interop-runner harness (hq-interop) + the public `brisk_quic_*` API (sans-I/O and
+      blocking over one UDP socket, streams by id). tools/interop/: all 7 cases pass against
+      quic-go and ngtcp2 on a plain Docker bridge (`run_direct.sh`); the ns-3 simulator run
+      (`run_local.sh`) is BLOCKED on this WSL2 box (it forwards no UDP even quic-go <-> quic-go) -
+      rerun on native Linux for loss / reordering. Our TP defaults: max_idle_timeout 30000,
+      max_udp_payload_size 1472 (the UDP driver's buffer), initial_max_data = MAX_STREAMS *
+      STREAM_BUF, bidi_local = STREAM_BUF, no peer streams (bidi / uni 0). OPEN for M7: h3 needs
+      initial_max_streams_uni 3 (control + 2 QPACK) - with FULL's MAX_STREAMS 4 that leaves one
+      request slot, so raise the FULL MAX_STREAMS default there and regenerate the quic_api CH
+      vectors. DEFAULT size: conn.c grew ~60-260 B (conn_hello takes its buffer; the shared
+      front half is static outside QUIC builds).
 
 ## M7 HTTP/3
 - [ ] QPACK static-only (capacity 0) + Huffman; control stream + SETTINGS; `brisk_h3_*`

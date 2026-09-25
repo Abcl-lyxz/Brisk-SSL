@@ -285,6 +285,34 @@ int main(int argc, char **argv)
             brisk__quic_close(&qc, 0);
         }
     }
+#    ifdef __linux__
+    {
+        /* the public QUIC API (M6 item 4): blocking connect + streams, sans-I/O feed/pull */
+        static uint8_t qbig[1 << 17]; /* the probe's BSS: brisk_quic_size() */
+        brisk_cfg qcfg2 = BRISK_DEFAULTS;
+        brisk_quic *qq = NULL;
+        uint64_t qe2;
+        qcfg2.alpn = "hq-interop";
+        if (brisk_quic_connect(&qcfg2, "a.example", 443, &qq) == BRISK_OK) {
+            int64_t sid = brisk_quic_stream_open(qq, 1);
+            brisk_quic_stream_write(qq, (uint64_t)sid, out, 8, 1);
+            brisk_quic_stream_read(qq, (uint64_t)sid, out, sizeof out, &qe2);
+            brisk_quic_stream_accept(qq, &qe2);
+            brisk_quic_poll(qq, 10);
+            out[0] = (uint8_t)brisk_quic_resumed(qq) + (uint8_t)brisk_quic_error(qq);
+            brisk_quic_close(qq, 0);
+        }
+        if (brisk_quic_init(qbig, sizeof qbig, &qcfg2, "a.example", &qq) == BRISK_OK) {
+            const char *an;
+            size_t al;
+            brisk_quic_feed(qq, out, sizeof out, 0);
+            brisk_quic_pull(qq, out, sizeof out, 0);
+            out[1] = (uint8_t)brisk_quic_deadline(qq) + (uint8_t)brisk_quic_status(qq) +
+                     (uint8_t)brisk_quic_alpn(qq, &an, &al);
+            brisk_quic_wipe(qq);
+        }
+    }
+#    endif
 #endif
 #if BRISK_ENABLE_H2
     {

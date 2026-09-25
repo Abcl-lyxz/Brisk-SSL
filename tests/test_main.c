@@ -80,6 +80,7 @@ static const struct {
     {"hpack", test_hpack},
     {"h2", test_h2},
     {"quic", test_quic},
+    {"quic_api", test_quic_api},
 #ifdef __linux__
     {"rand", test_rand},
     {"sock", test_sock},

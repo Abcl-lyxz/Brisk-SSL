@@ -41,6 +41,7 @@ void test_hpack(void);       /* HPACK (RFC 7541); a no-op stub when BRISK_ENABLE
 void test_h2(void);          /* HTTP/2 frames + brisk_h2_* (RFC 9113); same stub rule */
 void test_quic(void);        /* QUIC v1 (RFC 9000/9001); a stub when BRISK_ENABLE_QUIC is 0 */
 void quic_ct_run(void);      /* its constant-time run, called from test_ct */
+void test_quic_api(void);    /* brisk_quic_* (src/quic/api.c, src/os/linux_udp.c); same stub rule */
 
 /* test_conn.c -> test_sock.c: the P-256 fixture flow as a server byte stream */
 typedef struct {

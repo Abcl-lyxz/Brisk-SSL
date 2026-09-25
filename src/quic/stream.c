@@ -202,12 +202,14 @@ int64_t brisk__quic_stream_open(brisk__quic_conn *q, int bidi)
     if (q->next_local[d] >= q->peer_max_streams[d]) {
         return BRISK_E_WANT; /* 4.6 (MUST NOT): past the peer's stream limit */
     }
+    /* every slot busy (a finished stream waits for the ACK of its FIN, or unread data) or
+     * promised to the peer: one frees as the connection progresses - wait, not a caller bug */
     if ((uint64_t)free_slots(q) <= reserved(q)) {
-        return BRISK_E_ARG; /* every free slot is promised to the peer */
+        return BRISK_E_WANT;
     }
     id = (q->next_local[d] << 2) | (bidi ? 0 : 2);
     if (alloc(q, id) < 0) {
-        return BRISK_E_ARG;
+        return BRISK_E_WANT;
     }
     q->next_local[d]++;
     return (int64_t)id;

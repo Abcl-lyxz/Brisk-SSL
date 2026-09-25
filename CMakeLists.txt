@@ -47,9 +47,11 @@ add_library(brisk STATIC
     src/quic/conn.c       # QUIC v1 client: TPs, frames, CRYPTO on the TLS 1.3 engine (same rule)
     src/quic/recovery.c   # QUIC ACK ranges, RTT, loss / PTO, NewReno (same rule)
     src/quic/stream.c     # QUIC streams + flow control (same rule)
+    src/quic/api.c        # the public brisk_quic_* (sans-I/O glue; same rule)
 )
 if(CMAKE_SYSTEM_NAME STREQUAL "Linux") # src/os/ is Linux-only; the mingw host skips it
-    target_sources(brisk PRIVATE src/os/linux_rand.c src/os/linux_ca.c src/os/linux_net.c)
+    target_sources(brisk PRIVATE src/os/linux_rand.c src/os/linux_ca.c src/os/linux_net.c
+                                 src/os/linux_udp.c)
 endif()
 set_target_properties(brisk PROPERTIES C_STANDARD 99 C_STANDARD_REQUIRED ON C_EXTENSIONS OFF
                                        C_VISIBILITY_PRESET hidden)
@@ -94,7 +96,8 @@ if(BRISK_BUILD_TESTS)
                                tests/test_ct.c tests/test_tls13_ks.c
                                tests/test_tls13_hs.c tests/test_tls13_rec.c tests/test_conn.c
                                tests/test_tls12_prf.c tests/test_tls12_rec.c tests/test_tls12_hs.c
-                               tests/test_hpack.c tests/test_h2.c tests/test_quic.c)
+                               tests/test_hpack.c tests/test_h2.c tests/test_quic.c
+                               tests/test_quic_api.c)
     set_target_properties(brisk_tests PROPERTIES C_STANDARD 99 C_EXTENSIONS OFF)
     target_link_libraries(brisk_tests PRIVATE brisk)
     target_include_directories(brisk_tests PRIVATE src tests)
@@ -146,6 +149,8 @@ if(BRISK_BUILD_TESTS)
     set_tests_properties(h2 PROPERTIES TIMEOUT 900)
     add_test(NAME quic COMMAND brisk_tests quic)
     set_tests_properties(quic PROPERTIES TIMEOUT 900)
+    add_test(NAME quic_api COMMAND brisk_tests quic_api)
+    set_tests_properties(quic_api PROPERTIES TIMEOUT 900)
     if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
         target_sources(brisk_tests PRIVATE tests/test_rand.c tests/test_sock.c)
         # fault injection for src/os/linux_rand.c (getrandom, /dev/random wait, kernel version)

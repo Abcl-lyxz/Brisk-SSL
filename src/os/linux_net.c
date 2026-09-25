@@ -223,7 +223,7 @@ int brisk__os_tcp_connect(const char *host, uint16_t port, uint32_t timeout_ms, 
 /* The 160 per-connection random bytes (layout in brisk_int.h); the P-256 slice is redrawn until
  * it is a valid scalar (1 <= d < n fails with probability ~2^-32, so the bound only stops a
  * broken source). */
-static int net_rand(uint8_t rnd[BRISK__CONN_RAND])
+int brisk__conn_rand(uint8_t rnd[BRISK__CONN_RAND])
 {
     int i;
     if (brisk__os_random(rnd, BRISK__CONN_RAND) != BRISK_OK) {
@@ -249,7 +249,7 @@ int brisk_conn_init(void *mem, size_t mem_len, const brisk_cfg *cfg, const char 
     if (out != NULL) {
         *out = NULL;
     }
-    rc = net_rand(rnd);
+    rc = brisk__conn_rand(rnd);
     if (rc == BRISK_OK) {
         rc = brisk__conn_setup(mem, mem_len, cfg, host, brisk__os_wall_ms(), rnd,
                                brisk__os_ca_anchor, out);
@@ -342,7 +342,7 @@ static int net_connect(const brisk_cfg *cfg, const char *host, int fd, const uin
         }
         return BRISK_E_IO;
     }
-    rc = rnd != NULL ? BRISK_OK : net_rand(own);
+    rc = rnd != NULL ? BRISK_OK : brisk__conn_rand(own);
     if (rc == BRISK_OK) {
         rc = brisk__conn_setup(heap, size, cfg, host, now_ms >= 0 ? now_ms : brisk__os_wall_ms(),
                                rnd != NULL ? rnd : own, brisk__os_ca_anchor, &c);

@@ -57,7 +57,8 @@
 
 #    define QC_RING  BRISK_QUIC_CRYPTO_BUF
 #    define QC_BITS  ((BRISK_QUIC_CRYPTO_BUF + 7) / 8)
-#    define QC_RET0  2048 /* Initial CRYPTO sent: CH1 + CH2 after an HRR, and later the close */
+#    define QC_RET0  2048 /* Initial CRYPTO sent: CH1 + CH2 after an HRR, and later the close;
+                           * == tls/conn.c CONN_CH_MAX, which bounds the pair's PSK */
 #    define QC_RET1  BRISK__TLS13_OUT_MAX /* Handshake CRYPTO sent: the client flight */
 #    define QC_DGRAM BRISK__QUIC_MIN_INITIAL
 #    define QC_NONE  UINT64_MAX
@@ -348,6 +349,9 @@ static int on_secret(void *ctx, unsigned epoch, int is_send, uint16_t suite, con
     size_t i;
     if (lvl == 0 || len > sizeof q->ap_secret[0]) {
         return -1; /* the engine never exports Initial secrets; they come from the DCID */
+    }
+    if (q->keylog != NULL) {
+        q->keylog(q->keylog_ctx, q->keylog_random, epoch, is_send, secret, len); /* seam */
     }
     if (lvl == 2) {
         /* RFC 9001 6: key update derives from the 1-RTT secrets, which the engine wipes right
@@ -1180,8 +1184,9 @@ static void run_timers(brisk__quic_conn *q)
         return;
     }
     if (idle_deadline(q) <= q->now) {
-        /* 10.1 / 10.2.1: silently closed - no CONNECTION_CLOSE, all state discarded */
-        q_end(q, BRISK__QERR_NO_ERROR, BRISK_E_TIMEOUT, 0);
+        /* 10.1 / 10.2.1: silently closed - no CONNECTION_CLOSE, all state discarded. E_IO (the
+         * path is gone), not E_TIMEOUT: that one means "harmless, call again" to a caller */
+        q_end(q, BRISK__QERR_NO_ERROR, BRISK_E_IO, 0);
         return;
     }
     if (q->ku_until <= q->now) {
@@ -1790,6 +1795,28 @@ size_t brisk__quic_send(brisk__quic_conn *q, uint8_t *out, size_t cap, int64_t n
 int brisk__quic_established(const brisk__quic_conn *q)
 {
     return q != NULL && q->err == 0 && q->established;
+}
+
+int brisk__quic_key_update(brisk__quic_conn *q)
+{
+    if (q == NULL) {
+        return BRISK_E_ARG;
+    }
+    if (q->err != 0) {
+        return q->err;
+    }
+    /* RFC 9001 6.1 (MUST NOT): not before the handshake is confirmed, nor before a packet of
+     * the current phase is acknowledged; 6.5: the previous receive keys are gone (next ready)
+     * and 3 * PTO passed since that ACK - the qc_tx_limit conditions */
+    if (!q->confirmed || q->ku_until != INT64_MAX || q->rx_ku.suite == 0 ||
+        q->rec.largest_acked[2] == QC_NONE || q->rec.largest_acked[2] < q->ku_tx_first ||
+        q->now < q->ku_ack_at) {
+        return BRISK_E_WANT;
+    }
+    if (qc_ku_promote(q, QC_NONE) != 0) {
+        return q_fail(q, BRISK__QERR_INTERNAL, BRISK_E_ARG, 1);
+    }
+    return BRISK_OK;
 }
 
 #    undef QC_BIT

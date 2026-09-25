@@ -64,7 +64,8 @@ enum {
     BRISK_E_IO = -6,         /* the network failed (blocking API only): DNS, socket or connect
                               * error, a send/recv error, the peer's TCP FIN before its
                               * close_notify (a truncation, RFC 9846 6.1 - never reported as a clean
-                              * EOF), or the connection's one malloc failing. */
+                              * EOF), or the connection's one malloc failing. QUIC, both modes: the
+                              * idle timeout closed the connection (RFC 9000 10.1) - final. */
     BRISK_E_TIMEOUT = -7,    /* a blocking call waited cfg.timeout_ms without progress. From
                               * brisk_read it is harmless - nothing is lost, call it again. From
                               * brisk_connect the attempt failed and *out is NULL (nothing to
@@ -486,6 +487,145 @@ BRISK_API void brisk_h2_stream_close(brisk_h2_stream *s);
 /* Send GOAWAY (NO_ERROR, best effort) and wipe all of mem. Does NOT close the brisk_conn: call
  * brisk_close yourself. Every stream handle becomes invalid. NULL-safe. */
 BRISK_API void brisk_h2_close(brisk_h2 *h);
+
+/* ------------------------------------------------------------------------------------------------
+ * QUIC v1 client (RFC 9000, RFC 9001, RFC 9002), BRISK_ENABLE_QUIC (FULL profile only).
+ *
+ * DECLARED IN EVERY PROFILE, DEFINED ONLY IN FULL: a TINY or DEFAULT build that calls brisk_quic_*
+ * fails at LINK time. That is deliberate (one header for every build), not a bug.
+ *
+ * A QUIC connection carries numbered streams instead of one byte stream; what you send on them
+ * (hq-interop, HTTP/3 via a later module, your own protocol) is yours. It shares brisk_cfg with
+ * TLS: ca_file / ca_mem, client_chain / client_key / sign, ticket / on_ticket and timeout_ms
+ * mean the same. Two QUIC rules on top:
+ *   - alpn is MANDATORY (RFC 9001 8.1): NULL or "" is BRISK_E_ARG, and a server that selects
+ *     none of the names fails the handshake (QUIC error 0x0178, no_application_protocol).
+ *   - no 0-RTT, ever. Tickets resume the handshake only. Keep QUIC tickets and TCP tickets apart:
+ *     a TCP ticket offered over QUIC is simply refused by the server (full handshake,
+ *     brisk_quic_resumed() == 0). Delete a ticket once offered (RFC 9001 4.5).
+ * Our transport parameters are internal: 30 s idle timeout, 1472-byte datagrams in, flow-control
+ * windows equal to the stream buffers (BRISK_QUIC_STREAM_BUF per stream, BRISK_QUIC_MAX_STREAMS
+ * of them in total), and no server-initiated streams.
+ *
+ * Errors: BRISK_E_AUTH (certificate), BRISK_E_PROTO (the server broke the protocol),
+ * BRISK_E_PEER_ALERT (the server closed the connection - brisk_quic_error() holds its code -
+ * or sent a stateless reset, code 0), BRISK_E_IO (the idle timeout closed it, RFC 9000 10.1; or,
+ * blocking, the socket failed), BRISK_E_ARG (a caller mistake, or the connection was closed
+ * locally). All of these are sticky: brisk_quic_status() returns the same code. BRISK_E_TIMEOUT
+ * is never sticky: a blocking call made no progress for cfg.timeout_ms - harmless, call again.
+ */
+#define BRISK_QUIC_DGRAM_MAX 1200 /* brisk_quic_pull never returns more; cap must be >= this */
+
+typedef struct brisk_quic brisk_quic; /* opaque: in your memory (sans-I/O) or one malloc */
+
+/* ---- sans-I/O: your event loop, your UDP socket --------------------------------------------
+ * Every call takes a MONOTONIC now_ms (your clock; it never goes backwards for the connection).
+ * The whole contract is this loop - nothing else is owed behind your back:
+ *   brisk_quic_init(mem, sizeof mem, &cfg, host, &q);
+ *   for (;;) {
+ *       while ((n = brisk_quic_pull(q, buf, sizeof buf, now)) != 0) send(buf, n);
+ *       wait for a datagram or until brisk_quic_deadline(q);
+ *       if (a datagram arrived) brisk_quic_feed(q, dgram, len, now);
+ *       use the stream calls; check brisk_quic_status(q);
+ *   }
+ */
+
+/* Bytes of memory brisk_quic_init needs (any alignment). A function: it depends on the
+ * brisk_config.h knobs, the header does not. */
+BRISK_API size_t brisk_quic_size(void);
+
+/* Set up a connection in mem[0..mem_len) and queue the first Initial. Draws randomness from the
+ * kernel and reads the wall clock ONCE (certificate check, ticket stamps - see brisk_conn_init).
+ * `host` rules as brisk_connect. BRISK_OK and *out (pointing into mem), else *out = NULL and
+ * BRISK_E_ARG (bad cfg / host, alpn empty, mem too small; mem is then wiped) or BRISK_E_RNG.
+ * Linux only. */
+BRISK_API int brisk_quic_init(void *mem, size_t mem_len, const brisk_cfg *cfg, const char *host,
+                              brisk_quic **out);
+
+/* One whole received UDP datagram (0..65527 bytes). It is DECRYPTED IN PLACE, so the buffer is
+ * modified. Datagrams that do not belong to the connection or fail to decrypt are dropped and
+ * still return BRISK_OK (RFC 9000 5.2, 12.2). Else the sticky error. */
+BRISK_API int brisk_quic_feed(brisk_quic *q, void *dgram, size_t len, int64_t now_ms);
+
+/* The next datagram to send, at most BRISK_QUIC_DGRAM_MAX bytes; 0 = nothing now (also when cap
+ * < BRISK_QUIC_DGRAM_MAX). Call it until it returns 0 after every other call. After a failure or
+ * brisk_quic_close it yields the one CONNECTION_CLOSE, then 0. */
+BRISK_API size_t brisk_quic_pull(brisk_quic *q, void *out, size_t cap, int64_t now_ms);
+
+/* When to call brisk_quic_pull again at the latest: absolute monotonic ms, INT64_MAX = no timer.
+ * A value <= now means "pull now". */
+BRISK_API int64_t brisk_quic_deadline(const brisk_quic *q);
+
+/* BRISK_OK once the handshake completed, BRISK_E_WANT while it runs, else the sticky error. */
+BRISK_API int brisk_quic_status(const brisk_quic *q);
+
+/* The QUIC error code that ended the connection (RFC 9000 20; 0x0100 + a TLS alert for TLS
+ * failures, RFC 9001 4.8; the server's code on its close), 0 while alive. */
+BRISK_API uint64_t brisk_quic_error(const brisk_quic *q);
+
+/* As brisk_alpn / brisk_resumed, once established (BRISK_E_ARG / 0 before). */
+BRISK_API int brisk_quic_alpn(const brisk_quic *q, const char **name, size_t *len);
+BRISK_API int brisk_quic_resumed(const brisk_quic *q);
+
+/* Wipe every key, secret and buffer; the memory is all zero afterwards (bar alignment slack).
+ * NULL-safe. Sans-I/O handles only (blocking ones: brisk_quic_close). */
+BRISK_API void brisk_quic_wipe(brisk_quic *q);
+
+/* ---- blocking (Linux): one malloc of brisk_quic_size() + 2.6 KB, a connected UDP socket ------
+ * Resolve host (first address only), send from a socket with Don't Fragment set (RFC 9000 14),
+ * and complete the handshake within cfg.timeout_ms (0 = 10000): returns once the server is
+ * authenticated and our Finished is sent. BRISK_OK and *out, else *out = NULL and the errors
+ * above (BRISK_E_IO for DNS / socket failures). ICMP errors are ignored (unauthenticated). */
+BRISK_API int brisk_quic_connect(const brisk_cfg *cfg, const char *host, uint16_t port,
+                                 brisk_quic **out);
+
+/* Close immediately with an application error code (RFC 9000 10.2; before the handshake
+ * completed the code is replaced by APPLICATION_ERROR, 10.2.3). Blocking handle: send the
+ * CONNECTION_CLOSE once, close the socket, wipe and free - the handle is gone. Sans-I/O: the
+ * datagram is queued for brisk_quic_pull; brisk_quic_wipe afterwards. BRISK_OK, the sticky error
+ * of an already failed connection, or BRISK_E_ARG for app_err > 2^62-1 (nothing done). NULL is a
+ * no-op. */
+BRISK_API int brisk_quic_close(brisk_quic *q, uint64_t app_err);
+
+/* Blocking handle: drive the connection for ms milliseconds - send what is owed, receive, run
+ * the timers - with no stream call pending; e.g. to collect a NewSessionTicket (cfg.on_ticket)
+ * that arrives after the data. BRISK_OK once ms passed, or the sticky error. Sans-I/O handle:
+ * BRISK_E_WANT (your loop does this), or the sticky error. */
+BRISK_API int brisk_quic_poll(brisk_quic *q, uint32_t ms);
+
+/* ---- streams (RFC 9000 2-4): the same calls in both modes -----------------------------------
+ * On a brisk_quic_connect handle they block (up to cfg.timeout_ms without progress, then
+ * BRISK_E_TIMEOUT) and drive I/O for EVERY stream while they wait - ACKs, flow control, key
+ * updates, timers. On a sans-I/O handle they never wait: BRISK_E_WANT means "feed me first".
+ * Received data is buffered per stream up to BRISK_QUIC_STREAM_BUF: a server that will not send
+ * on stream A until you read stream B deadlocks only if you never read B.
+ * Stream ids are RFC 9000 2.1 ids: ours bidi 0, 4, 8 ...; finished slots are recycled. */
+
+/* Open a stream (bidi != 0: bidirectional; else unidirectional, send-only). The id >= 0, or
+ * BRISK_E_WANT (the server's MAX_STREAMS reached, or all BRISK_QUIC_MAX_STREAMS slots busy - a
+ * finished stream's slot frees once its data is read and the server ACKed our FIN; blocking:
+ * waits, then BRISK_E_TIMEOUT), BRISK_E_ARG (not established) or the sticky error. */
+BRISK_API int64_t brisk_quic_stream_open(brisk_quic *q, int bidi);
+
+/* Queue buf[0..n) on stream id; fin = end the stream once all n bytes are taken. Returns the
+ * bytes taken (sans-I/O: may be short - the stream buffer is full; blocking: all n, or fewer
+ * if cfg.timeout_ms passed without progress after some were taken), BRISK_E_TIMEOUT (blocking,
+ * nothing taken), BRISK_E_PEER_ALERT (the server sent STOP_SENDING), BRISK_E_ARG (unknown,
+ * receive-only or finished stream). At most INT_MAX bytes per call. */
+BRISK_API int brisk_quic_stream_write(brisk_quic *q, uint64_t id, const void *buf, size_t n,
+                                      int fin);
+
+/* Up to min(cap, INT_MAX) bytes of stream id: > 0 bytes, 0 = the server's FIN (the slot is freed
+ * once both directions are done; later calls are BRISK_E_ARG), BRISK_E_WANT (sans-I/O: nothing
+ * yet), BRISK_E_TIMEOUT (blocking: no data for cfg.timeout_ms - harmless, call again; a dead
+ * connection returns its sticky code instead), BRISK_E_PEER_ALERT (RESET_STREAM;
+ * *app_err = its code; app_err may be NULL), BRISK_E_ARG. */
+BRISK_API int brisk_quic_stream_read(brisk_quic *q, uint64_t id, void *buf, size_t cap,
+                                     uint64_t *app_err);
+
+/* The next stream the server opened: BRISK_OK and *id, BRISK_E_WANT / BRISK_E_TIMEOUT, or the
+ * sticky error. (Our transport parameters allow the server no streams today.) */
+BRISK_API int brisk_quic_stream_accept(brisk_quic *q, uint64_t *id);
 
 #ifdef __cplusplus
 }
