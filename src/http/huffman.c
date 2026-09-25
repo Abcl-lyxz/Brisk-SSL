@@ -84,7 +84,8 @@ static const uint8_t huff_sym[256] = {
     0x15, 0x17, 0x18, 0x19, 0x1a, 0x1b, 0x1c, 0x1d, 0x1e, 0x1f, 0x7f, 0xdc, 0xf9, 0x0a, 0x0d, 0x16,
 };
 
-int brisk__huff_decode(const uint8_t *in, size_t len, uint8_t *out, size_t cap, size_t *out_len)
+/* out == NULL: count only (brisk__huff_len), no cap */
+static int huff_walk(const uint8_t *in, size_t len, uint8_t *out, size_t cap, size_t *out_len)
 {
     /* Canonical decode: after L bits, the codes of length L are first .. first + count - 1, and
      * their symbols start at huff_sym[index]. `code` and `first` stay below 2^30. */
@@ -93,10 +94,6 @@ int brisk__huff_decode(const uint8_t *in, size_t len, uint8_t *out, size_t cap, 
     size_t i, n = 0;
     int b;
 
-    if ((!in && len) || (!out && cap) || !out_len) {
-        return BRISK_E_ARG;
-    }
-    *out_len = 0;
     for (i = 0; i < len; i++) {
         for (b = 7; b >= 0; b--) {
             uint32_t bit = (uint32_t)(in[i] >> b) & 1u;
@@ -110,10 +107,13 @@ int brisk__huff_decode(const uint8_t *in, size_t len, uint8_t *out, size_t cap, 
                      * MUST be treated as a decoding error." */
                     return BRISK_E_PROTO;
                 }
-                if (n == cap) {
-                    return BRISK_E_PROTO; /* local limit: the caller's buffer */
+                if (out != NULL) {
+                    if (n == cap) {
+                        return BRISK_E_PROTO; /* local limit: the caller's buffer */
+                    }
+                    out[n] = huff_sym[index];
                 }
-                out[n++] = huff_sym[index];
+                n++;
                 code = first = index = 0;
                 bits = 0;
                 ones = 1;
@@ -135,6 +135,27 @@ int brisk__huff_decode(const uint8_t *in, size_t len, uint8_t *out, size_t cap, 
     }
     *out_len = n;
     return BRISK_OK;
+}
+
+int brisk__huff_decode(const uint8_t *in, size_t len, uint8_t *out, size_t cap, size_t *out_len)
+{
+    if ((!in && len) || (!out && cap) || !out_len) {
+        return BRISK_E_ARG;
+    }
+    *out_len = 0;
+    if (!out) {
+        return len ? BRISK_E_PROTO : BRISK_OK; /* cap 0: any symbol overflows it */
+    }
+    return huff_walk(in, len, out, cap, out_len);
+}
+
+int brisk__huff_len(const uint8_t *in, size_t len, size_t *out_len)
+{
+    if ((!in && len) || !out_len) {
+        return BRISK_E_ARG;
+    }
+    *out_len = 0;
+    return huff_walk(in, len, NULL, 0, out_len);
 }
 
 #endif /* BRISK_ENABLE_H2 */

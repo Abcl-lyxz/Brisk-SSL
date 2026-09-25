@@ -23,7 +23,11 @@
  *     the send-only case; 20.1 defines the error as "a frame for a stream that was not in a
  *     state that permitted that frame");
  *   - after STOP_SENDING the stream is reset even in "Data Sent" (3.5 MAY defer - not taken),
- *     with final size = the highest offset sent.
+ *     with final size = the highest offset sent;
+ *   - a local abort (brisk__quic_stream_abort, for HTTP/3 cancellation) resets the same way and
+ *     sends STOP_SENDING (3.5) while the final size is not reached; data that still arrives on
+ *     an aborted receiving part is counted for flow control, then dropped, and its connection
+ *     credit handed back at once (3.5: "discard ... but still account for flow control").
  *
  * SPDX-License-Identifier: Apache-2.0
  */
@@ -48,7 +52,9 @@ enum {
     ST_STOP = 0x0100,     /* STOP_SENDING received: we reset */
     ST_RST_PEND = 0x0200,
     ST_RST_ACKED = 0x0400,
-    ST_MSD_PEND = 0x0800
+    ST_MSD_PEND = 0x0800,
+    ST_RX_ABORT = 0x1000, /* we aborted reading (brisk__quic_stream_abort): data is dropped */
+    ST_SS_PEND = 0x2000   /* STOP_SENDING owed (19.5) */
 };
 
 static uint8_t *rx_ring(brisk__quic_conn *q, unsigned i)
@@ -161,7 +167,7 @@ static int alloc(brisk__quic_conn *q, uint64_t id)
     s->id = id;
     /* 2.1: client uni (2) is send-only, server uni (3) receive-only */
     s->flags = (uint16_t)(ST_USED | ((id & 3) != 2 ? ST_RX : 0) | ((id & 3) != 3 ? ST_TX : 0));
-    s->rx_final = s->reset_pn = s->msd_pn = QS_NONE;
+    s->rx_final = s->reset_pn = s->msd_pn = s->ss_pn = QS_NONE;
     s->rx_max = rx_window(q, id);
     s->tx_max = tx_limit(q, id);
     return (int)i;
@@ -303,6 +309,22 @@ static void credit(brisk__quic_conn *q, brisk__quic_stream *s)
     }
 }
 
+/* An aborted receiving part: everything received so far counts as consumed (the connection
+ * credit comes back, 3.5), and it is done once the final size is reached. May free slot i. */
+static void rx_drop(brisk__quic_conn *q, unsigned i)
+{
+    brisk__quic_stream *s = &q->st[i];
+    if (s->rx_hi > s->rx_read) {
+        q->consumed += s->rx_hi - s->rx_read;
+        s->rx_read = s->rx_hi;
+        credit(q, NULL);
+    }
+    if (s->rx_final != QS_NONE && s->rx_read == s->rx_final) {
+        s->flags = (uint16_t)((s->flags | ST_RX_DONE) & ~ST_SS_PEND); /* nothing left to stop */
+        maybe_free(q, i);
+    }
+}
+
 uint64_t brisk__quic_stream_frame(brisk__quic_conn *q, uint64_t id, uint64_t off, const uint8_t *d,
                                   size_t n, int fin)
 {
@@ -329,6 +351,12 @@ uint64_t brisk__quic_stream_frame(brisk__quic_conn *q, uint64_t id, uint64_t off
     }
     if (fin) {
         s->rx_final = end;
+    }
+    if (s->flags & ST_RX_ABORT) {
+        if (!(s->flags & ST_RX_DONE)) {
+            rx_drop(q, (unsigned)i);
+        }
+        return 0;
     }
     if ((s->flags & (ST_RX_RESET | ST_RX_DONE)) || end <= s->rx_read) {
         return 0; /* reset or already consumed: a retransmission */
@@ -382,6 +410,11 @@ uint64_t brisk__quic_stream_ctl(brisk__quic_conn *q, uint64_t type, uint64_t id,
             q->consumed += b - s->rx_read;
             s->rx_read = b;
             credit(q, NULL);
+            if (s->flags & ST_RX_ABORT) {
+                /* our STOP_SENDING answered: nobody reads this part, it is done */
+                s->flags = (uint16_t)((s->flags | ST_RX_DONE) & ~ST_SS_PEND);
+                maybe_free(q, (unsigned)i);
+            }
         }
         break;
     case 0x05: /* STOP_SENDING (19.5): 3.5 (MUST) answer with RESET_STREAM */
@@ -461,6 +494,9 @@ int brisk__quic_stream_read(brisk__quic_conn *q, uint64_t id, uint8_t *out, size
         return BRISK_E_ARG;
     }
     s = &q->st[i];
+    if (s->flags & ST_RX_ABORT) {
+        return BRISK_E_ARG; /* we aborted reading it */
+    }
     if (s->flags & ST_RX_RESET) {
         *app_err = s->rx_err; /* 19.4: the peer abandoned the stream */
         s->flags |= ST_RX_DONE;
@@ -494,6 +530,41 @@ int brisk__quic_stream_read(brisk__quic_conn *q, uint64_t id, uint8_t *out, size
     return (int)n;
 }
 
+int brisk__quic_stream_abort(brisk__quic_conn *q, uint64_t id, uint64_t app_err, unsigned dirs)
+{
+    brisk__quic_stream *s;
+    int i;
+    if (q == NULL || app_err > BRISK__QUIC_VARINT_MAX || (i = find(q, id)) < 0) {
+        return BRISK_E_ARG;
+    }
+    s = &q->st[i];
+    /* 3.3: Ready / Send / Data Sent -> Reset Sent; nothing once every byte and the FIN are
+     * acknowledged (Data Recvd), or when the sending part is already being reset */
+    if ((dirs & 1) && (s->flags & ST_TX) && !(s->flags & (ST_STOP | ST_FIN_ACKED))) {
+        s->flags |= ST_STOP | ST_RST_PEND; /* writes now fail; stream_out sends RESET_STREAM */
+        s->tx_err = app_err;
+    }
+    /* 3.5: STOP_SENDING while the peer may still send - not once the final size is reached or
+     * the peer reset the stream (19.5 MUST NOT is only for "Reset Recvd"/"Data Recvd" parts) */
+    if ((dirs & 2) && (s->flags & ST_RX) && !(s->flags & (ST_RX_ABORT | ST_RX_DONE))) {
+        s->flags |= ST_RX_ABORT;
+        s->rx_err = app_err; /* the STOP_SENDING code (rx_err is unused once aborted) */
+        brisk__secure_zero(rx_ring(q, (unsigned)i), QS_BUF + QS_BUF / 8);
+        if (!(s->flags & ST_RX_RESET) && !(s->rx_final != QS_NONE && s->rx_hi == s->rx_final)) {
+            s->flags |= ST_SS_PEND;
+        }
+        if (s->flags & ST_RX_RESET) {
+            s->flags |= ST_RX_DONE; /* the reset is taken as read */
+            maybe_free(q, (unsigned)i);
+            return BRISK_OK;
+        }
+        rx_drop(q, (unsigned)i); /* may free the slot */
+        return BRISK_OK;
+    }
+    maybe_free(q, (unsigned)i);
+    return BRISK_OK;
+}
+
 /* ------------------------------------------------------------------ sending --------------- */
 
 size_t brisk__quic_stream_out(brisk__quic_conn *q, uint8_t *out, size_t room, int ctl_only,
@@ -522,6 +593,22 @@ size_t brisk__quic_stream_out(brisk__quic_conn *q, uint8_t *out, size_t room, in
         s->reset_pn = r->pn;
         r->flags |= BRISK__QS_RESET;
     }
+    for (i = 0; i < QS_N; i++) { /* STOP_SENDING (19.5) */
+        s = &q->st[i];
+        if (!(s->flags & ST_SS_PEND)) {
+            continue;
+        }
+        need = 1 + qs_vlen(s->id) + qs_vlen(s->rx_err);
+        if (need > room - w) {
+            continue;
+        }
+        out[w++] = 0x05;
+        w += brisk__quic_varint_put(out + w, 8, s->id);
+        w += brisk__quic_varint_put(out + w, 8, s->rx_err);
+        s->flags &= (uint16_t)~ST_SS_PEND;
+        s->ss_pn = r->pn;
+        r->flags |= BRISK__QS_STOP;
+    }
     if (q->md_pend && 1 + qs_vlen(q->max_data_rx) <= room - w) { /* MAX_DATA (19.9) */
         out[w++] = 0x10;
         w += brisk__quic_varint_put(out + w, 8, q->max_data_rx);
@@ -534,8 +621,8 @@ size_t brisk__quic_stream_out(brisk__quic_conn *q, uint8_t *out, size_t room, in
         if (!(s->flags & ST_MSD_PEND)) {
             continue;
         }
-        if (s->rx_final != QS_NONE || (s->flags & (ST_RX_RESET | ST_RX_DONE))) {
-            s->flags &= (uint16_t)~ST_MSD_PEND; /* nothing more will come */
+        if (s->rx_final != QS_NONE || (s->flags & (ST_RX_RESET | ST_RX_DONE | ST_RX_ABORT))) {
+            s->flags &= (uint16_t)~ST_MSD_PEND; /* nothing more will come, or nobody reads */
             continue;
         }
         need = 1 + qs_vlen(s->id) + qs_vlen(s->rx_max);
@@ -705,6 +792,16 @@ void brisk__quic_stream_record(brisk__quic_conn *q, const brisk__quic_sent *r)
         for (i = 0; i < QS_N; i++) {
             if ((q->st[i].flags & ST_USED) && q->st[i].msd_pn == r->pn) {
                 q->st[i].flags |= ST_MSD_PEND;
+            }
+        }
+    }
+    if (r->flags & BRISK__QS_STOP) { /* 13.3: until the final size arrives */
+        for (i = 0; i < QS_N; i++) {
+            s = &q->st[i];
+            if ((s->flags & ST_USED) && s->ss_pn == r->pn &&
+                (s->flags & (ST_RX_ABORT | ST_RX_DONE | ST_RX_RESET)) == ST_RX_ABORT &&
+                !(s->rx_final != QS_NONE && s->rx_hi == s->rx_final)) {
+                s->flags |= ST_SS_PEND;
             }
         }
     }

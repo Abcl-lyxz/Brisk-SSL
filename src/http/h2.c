@@ -281,8 +281,9 @@ static int h2_recv_end(brisk_h2 *h, h2s *s)
     return BRISK_OK;
 }
 
-/* 8.1.1 / RFC 9110 8.6: 1*DIGIT, 19 digits at most (no overflow; no 64-bit multiply). */
-static int h2_cl_parse(const uint8_t *v, size_t n, uint64_t *out)
+/* 8.1.1 / RFC 9110 8.6: 1*DIGIT, 19 digits at most (no overflow; no 64-bit multiply). Shared
+ * with h3.c (RFC 9114 4.1.2). */
+int brisk__http_cl_parse(const uint8_t *v, size_t n, uint64_t *out)
 {
     uint64_t x = 0;
     size_t i;
@@ -304,12 +305,26 @@ static int h2_is(const uint8_t *n, size_t nl, const char *lit)
     return strlen(lit) == nl && memcmp(n, lit, nl) == 0;
 }
 
-/* 8.2.2: connection-specific fields never appear in HTTP/2 */
-static int h2_conn_specific(const uint8_t *n, size_t nl)
+/* 8.2.2: connection-specific fields never appear in HTTP/2 (RFC 9114 4.2: nor in HTTP/3, and
+ * 4.1: transfer-encoding MUST NOT be used). Shared with h3.c. */
+int brisk__http_conn_specific(const uint8_t *n, size_t nl)
 {
     return h2_is(n, nl, "connection") || h2_is(n, nl, "proxy-connection") ||
            h2_is(n, nl, "keep-alive") || h2_is(n, nl, "transfer-encoding") ||
            h2_is(n, nl, "upgrade");
+}
+
+/* 8.3.2 / RFC 9114 4.3.2: a :status value is exactly 3 digits (RFC 9110 15: 100..599); 101 is
+ * removed in both (RFC 9113 8.6, RFC 9114 4.5). The code, or 0 when malformed. */
+unsigned brisk__http_status(const uint8_t *v, size_t n)
+{
+    unsigned st;
+    if (n != 3 || v[0] < '1' || v[0] > '5' || v[1] < '0' || v[1] > '9' || v[2] < '0' ||
+        v[2] > '9') {
+        return 0;
+    }
+    st = (unsigned)((v[0] - '0') * 100 + (v[1] - '0') * 10 + (v[2] - '0'));
+    return st == 101 ? 0 : st;
 }
 
 /* The HPACK decode callback: RFC 9113 8.2 / 8.3 checks on every field of a block for a live
@@ -331,22 +346,19 @@ static int h2_on_field(void *ctx, const uint8_t *name, size_t nl, const uint8_t 
     if (name[0] == ':') {
         /* 8.3: a response carries exactly one :status, before every regular field; trailers
          * carry none (8.1); every other pseudo-header is malformed (8.3.2) */
-        if (h->b_trailer || h->b_seen || h->b_reg || !h2_is(name, nl, ":status") || vl != 3 ||
-            value[0] < '1' || value[0] > '5' || value[1] < '0' || value[1] > '9' ||
-            value[2] < '0' || value[2] > '9') {
+        if (h->b_trailer || h->b_seen || h->b_reg || !h2_is(name, nl, ":status") ||
+            brisk__http_status(value, vl) == 0) { /* incl. 101 (8.6: HTTP/2 removes it) */
             h->b_bad = 1;
             return 0;
         }
         h->b_seen = 1;
-        h->b_status = (uint16_t)((value[0] - '0') * 100 + (value[1] - '0') * 10 + (value[2] - '0'));
-        if (h->b_status == 101) {
-            h->b_bad = 1; /* 8.6: HTTP/2 removes 101 */
-        }
+        h->b_status = (uint16_t)brisk__http_status(value, vl);
         h->b_park = h->b_status >= 200;
         return 0;
     }
-    if ((!h->b_trailer && !h->b_seen) || h2_conn_specific(name, nl)) {
-        h->b_bad = 1; /* pseudo-headers first (8.3); 8.2.2 */
+    if ((!h->b_trailer && !h->b_seen) || brisk__http_conn_specific(name, nl) ||
+        h2_is(name, nl, "te")) {
+        h->b_bad = 1; /* pseudo-headers first (8.3); 8.2.2 (te: requests only) */
         return 0;
     }
     h->b_reg = 1;
@@ -355,7 +367,7 @@ static int h2_on_field(void *ctx, const uint8_t *name, size_t nl, const uint8_t 
     }
     if (h2_is(name, nl, "content-length")) {
         uint64_t v;
-        if (!h2_cl_parse(value, vl, &v) || (h->b_has_cl && v != h->b_cl)) {
+        if (!brisk__http_cl_parse(value, vl, &v) || (h->b_has_cl && v != h->b_cl)) {
             h->b_bad = 1; /* 8.1.1 / RFC 9110 8.6: identical duplicates only */
             return 0;
         }
@@ -1082,11 +1094,89 @@ static int h2_is_c(const char *s, const char *lit)
     return strcmp(s, lit) == 0;
 }
 
+int brisk__http_req_check(const char *method, const char *path, const brisk_h2_header *hdrs,
+                          size_t n, size_t body_len, size_t auth_len, size_t max_field,
+                          uint64_t *list)
+{
+    size_t i, ml, pl;
+    uint64_t cl;
+    /* 8.3.1 pseudo-headers (RFC 9114 4.3.1: the same); CONNECT (8.5 / RFC 9114 4.4) needs
+     * another set and is not supported */
+    ml = strlen(method);
+    pl = strlen(path);
+    if (!h2_token(method) || h2_is_c(method, "CONNECT") || pl == 0 ||
+        !(path[0] == '/' || (h2_is_c(path, "*") && h2_is_c(method, "OPTIONS"))) ||
+        !brisk__hpack_field_ok((const uint8_t *)":path", 5, (const uint8_t *)path, pl) ||
+        ml + 16 > max_field || pl + 16 > max_field) {
+        return BRISK_E_ARG;
+    }
+    *list = (uint64_t)ml + 7 + 32 + 5 + 7 + 32 + auth_len + 10 + 32 + pl + 5 + 32;
+    for (i = 0; i < n; i++) {
+        const char *nm = hdrs[i].name, *v = hdrs[i].value;
+        size_t nl, vl;
+        if (nm == NULL || v == NULL) {
+            return BRISK_E_ARG;
+        }
+        nl = strlen(nm);
+        vl = strlen(v);
+        /* 8.2.1 octets (and lowercase), no pseudo-header from the caller (8.3), no
+         * connection-specific field (8.2.2; RFC 9114 4.2), te only as "trailers", no host
+         * (8.3.1: :authority carries it), content-length that matches the body (8.1.1) */
+        if (!brisk__hpack_field_ok((const uint8_t *)nm, nl, (const uint8_t *)v, vl) ||
+            nm[0] == ':' || brisk__http_conn_specific((const uint8_t *)nm, nl) ||
+            h2_is_c(nm, "host") || (h2_is_c(nm, "te") && !h2_is_c(v, "trailers")) ||
+            nl + vl + 16 > max_field ||
+            (h2_is_c(nm, "content-length") &&
+             (!brisk__http_cl_parse((const uint8_t *)v, vl, &cl) || cl != (uint64_t)body_len))) {
+            return BRISK_E_ARG;
+        }
+        *list += (uint64_t)nl + vl + 32;
+    }
+    return BRISK_OK;
+}
+
+unsigned brisk__http_sensitive(const char *nm)
+{
+    /* RFC 7541 7.1.3 / RFC 9204 7.1.3: credentials never enter any table */
+    return h2_is_c(nm, "authorization") || h2_is_c(nm, "proxy-authorization") ||
+                   h2_is_c(nm, "cookie") || h2_is_c(nm, "set-cookie")
+               ? BRISK__HPACK_NEVER_INDEXED
+               : 0;
+}
+
+size_t brisk__http_authority(const char *host, size_t host_len, uint16_t port, char *out)
+{
+    size_t n = 0;
+    /* RFC 9113 8.3.1 / RFC 9114 3.3 / RFC 3986 3.2.2: host, an IPv6 literal in brackets, plus
+     * ":port" unless it is the https default */
+    if (memchr(host, ':', host_len) != NULL) {
+        out[n++] = '[';
+    }
+    memcpy(out + n, host, host_len);
+    n += host_len;
+    if (out[0] == '[') {
+        out[n++] = ']';
+    }
+    if (port != 0 && port != 443) {
+        char d[5];
+        size_t k = 0;
+        do {
+            d[k++] = (char)('0' + port % 10);
+            port = (uint16_t)(port / 10);
+        } while (port != 0);
+        out[n++] = ':';
+        while (k != 0) {
+            out[n++] = d[--k];
+        }
+    }
+    return n;
+}
+
 int brisk_h2_request(brisk_h2 *h, const char *method, const char *path, const brisk_h2_header *hdrs,
                      size_t n, const void *body, size_t body_len, brisk_h2_stream **out)
 {
     const uint8_t *b = (const uint8_t *)body;
-    uint64_t list, cl;
+    uint64_t list;
     size_t i, off = 0, ml, pl;
     uint32_t fstart;
     unsigned used = 0, lim;
@@ -1109,36 +1199,12 @@ int brisk_h2_request(brisk_h2 *h, const char *method, const char *path, const br
     if (h->goaway) {
         return BRISK_E_RETRY; /* 6.8: no new streams after GOAWAY - never sent, safe to retry */
     }
-    /* 8.3.1 pseudo-headers; CONNECT (8.5) needs another set and is not supported */
-    ml = strlen(method);
-    pl = strlen(path);
-    if (!h2_token(method) || h2_is_c(method, "CONNECT") || pl == 0 ||
-        !(path[0] == '/' || (h2_is_c(path, "*") && h2_is_c(method, "OPTIONS"))) ||
-        !brisk__hpack_field_ok((const uint8_t *)":path", 5, (const uint8_t *)path, pl) ||
-        ml + 16 > H2_L || pl + 16 > H2_L) {
+    if (brisk__http_req_check(method, path, hdrs, n, body_len, h->auth_len, H2_L, &list) !=
+        BRISK_OK) {
         return BRISK_E_ARG;
     }
-    list = (uint64_t)ml + 7 + 32 + 5 + 7 + 32 + h->auth_len + 10 + 32 + pl + 5 + 32;
-    for (i = 0; i < n; i++) {
-        const char *nm = hdrs[i].name, *v = hdrs[i].value;
-        size_t nl, vl;
-        if (nm == NULL || v == NULL) {
-            return BRISK_E_ARG;
-        }
-        nl = strlen(nm);
-        vl = strlen(v);
-        /* 8.2.1 octets (and lowercase), no pseudo-header from the caller (8.3), no
-         * connection-specific field (8.2.2), te only as "trailers", no host (8.3.1: :authority
-         * carries it), content-length that matches the body (8.1.1) */
-        if (!brisk__hpack_field_ok((const uint8_t *)nm, nl, (const uint8_t *)v, vl) ||
-            nm[0] == ':' || h2_conn_specific((const uint8_t *)nm, nl) || h2_is_c(nm, "host") ||
-            (h2_is_c(nm, "te") && !h2_is_c(v, "trailers")) || nl + vl + 16 > H2_L ||
-            (h2_is_c(nm, "content-length") &&
-             (!h2_cl_parse((const uint8_t *)v, vl, &cl) || cl != (uint64_t)body_len))) {
-            return BRISK_E_ARG;
-        }
-        list += (uint64_t)nl + vl + 32;
-    }
+    ml = strlen(method);
+    pl = strlen(path);
     if (list > h->p_list) {
         return BRISK_E_ARG; /* 10.5.1: the server's SETTINGS_MAX_HEADER_LIST_SIZE */
     }
@@ -1187,13 +1253,8 @@ int brisk_h2_request(brisk_h2 *h, const char *method, const char *path, const br
     }
     for (i = 0; i < n && rc == BRISK_OK; i++) {
         const char *nm = hdrs[i].name;
-        /* RFC 7541 7.1.3: credentials never enter any table */
-        unsigned fl = h2_is_c(nm, "authorization") || h2_is_c(nm, "proxy-authorization") ||
-                              h2_is_c(nm, "cookie") || h2_is_c(nm, "set-cookie")
-                          ? BRISK__HPACK_NEVER_INDEXED
-                          : 0;
         rc = h2_hfield(h, &fstart, (const uint8_t *)nm, strlen(nm), (const uint8_t *)hdrs[i].value,
-                       strlen(hdrs[i].value), fl, s->id);
+                       strlen(hdrs[i].value), brisk__http_sensitive(nm), s->id);
     }
     if (rc != BRISK_OK) {
         goto fail;

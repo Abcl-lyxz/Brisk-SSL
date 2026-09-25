@@ -846,6 +846,462 @@ static void test_udp_errors(void)
 }
 #    endif
 
+/* ---------------------------------------------------------------- M7 prerequisites ------ */
+
+/* One of our 1-RTT packets, opened with the client application secret `c_ap` (hex). */
+static int open_ap(const char *c_ap, size_t n, const uint8_t **pl, size_t *pll)
+{
+    brisk__quic_keys k;
+    brisk__quic_hdr h;
+    uint8_t sec[32], first;
+    uint64_t pn;
+    size_t po, o = 0;
+    int rc;
+    t_unhex(c_ap, sec, 32);
+    /* skip coalesced long-header packets (a Handshake ACK before 1-RTT, RFC 9000 12.2) */
+    while (brisk__quic_hdr_parse(g_d + o, n - o, 8, &h) == BRISK_OK && h.type != BRISK__QPKT_1RTT &&
+           h.pkt_len < n - o) {
+        o += h.pkt_len;
+    }
+    rc = o < n && brisk__quic_hdr_parse(g_d + o, n - o, 8, &h) == BRISK_OK &&
+         h.type == BRISK__QPKT_1RTT && brisk__quic_keys_init(&k, 0x1301, sec, 32) == BRISK_OK &&
+         brisk__quic_open(&k, g_d + o, h.pn_off, h.pkt_len, 0, &first, &pn, &po, pll) == BRISK_OK;
+    *pl = g_d + o + po;
+    brisk__quic_keys_wipe(&k);
+    return rc;
+}
+
+/* RFC 9000 19: the frames a client sends, one at a time. 1 and the frame in f, 0 at the end,
+ * -1 on a frame this walker does not know. */
+typedef struct {
+    uint64_t type, id, a, b;
+    const uint8_t *d;
+    size_t n;
+} qfr;
+
+static int next_frame(const uint8_t **p, const uint8_t *end, qfr *f)
+{
+    uint64_t t, v, i, cnt;
+    memset(f, 0, sizeof *f);
+    while (*p < end && **p == 0x00) {
+        (*p)++; /* PADDING */
+    }
+    if (*p >= end || !brisk__quic_varint_get(p, end, &t)) {
+        return 0;
+    }
+    f->type = t;
+    if (t == 0x01 || t == 0x1e) {
+        return 1;
+    }
+    if (t == 0x02 || t == 0x03) { /* ACK: largest, delay, count, first, ranges, ECN */
+        if (!brisk__quic_varint_get(p, end, &f->a) || !brisk__quic_varint_get(p, end, &v) ||
+            !brisk__quic_varint_get(p, end, &cnt) || !brisk__quic_varint_get(p, end, &v)) {
+            return -1;
+        }
+        for (i = 0; i < 2 * cnt + (t == 0x03 ? 3 : 0); i++) {
+            if (!brisk__quic_varint_get(p, end, &v)) {
+                return -1;
+            }
+        }
+        return 1;
+    }
+    if (t >= 0x08 && t <= 0x0f) { /* STREAM */
+        if (!brisk__quic_varint_get(p, end, &f->id) ||
+            ((t & 0x04) && !brisk__quic_varint_get(p, end, &f->a))) {
+            return -1;
+        }
+        if (t & 0x02) {
+            if (!brisk__quic_varint_get(p, end, &v) || v > (uint64_t)(end - *p)) {
+                return -1;
+            }
+        } else {
+            v = (uint64_t)(end - *p);
+        }
+        f->d = *p;
+        f->n = (size_t)v;
+        f->b = t & 0x01; /* FIN */
+        *p += f->n;
+        return 1;
+    }
+    switch (t) {
+    case 0x04: /* RESET_STREAM id code final */
+        return brisk__quic_varint_get(p, end, &f->id) && brisk__quic_varint_get(p, end, &f->a) &&
+                       brisk__quic_varint_get(p, end, &f->b)
+                   ? 1
+                   : -1;
+    case 0x05: /* STOP_SENDING id code */
+    case 0x11: /* MAX_STREAM_DATA id max */
+    case 0x15:
+        return brisk__quic_varint_get(p, end, &f->id) && brisk__quic_varint_get(p, end, &f->a) ? 1
+                                                                                               : -1;
+    case 0x10:
+    case 0x12:
+    case 0x13:
+    case 0x14:
+    case 0x16:
+    case 0x17:
+    case 0x19:
+        return brisk__quic_varint_get(p, end, &f->a) ? 1 : -1;
+    case 0x1c:
+    case 0x1d: /* CONNECTION_CLOSE code [type] reason */
+        if (!brisk__quic_varint_get(p, end, &f->a) ||
+            (t == 0x1c && !brisk__quic_varint_get(p, end, &v)) ||
+            !brisk__quic_varint_get(p, end, &v) || v > (uint64_t)(end - *p)) {
+            return -1;
+        }
+        *p += (size_t)v;
+        return 1;
+    default:
+        return -1;
+    }
+}
+
+/* ACK every packet we sent so far (1-RTT space), as the server */
+static size_t ack_all(brisk_quic *q, uint8_t *fr)
+{
+    uint64_t largest = q->q.tx_pn[2] - 1;
+    size_t k = 0;
+    fr[k++] = 0x02;
+    k += varint(fr + k, largest);
+    k += varint(fr + k, 0);
+    k += varint(fr + k, 0);
+    k += varint(fr + k, largest);
+    return k;
+}
+
+static int slot_of(const brisk_quic *q, uint64_t id)
+{
+    unsigned i;
+    for (i = 0; i < BRISK_QUIC_MAX_STREAMS; i++) {
+        if (q->q.st[i].flags != 0 && q->q.st[i].id == id) {
+            return (int)i;
+        }
+    }
+    return -1;
+}
+
+/* brisk__quic_stream_abort (RFC 9000 2.4 / 3.5; for RFC 9114 4.1.1 cancellation) */
+static void test_abort(void)
+{
+    const uint8_t *pl, *p;
+    uint8_t fr[64];
+    uint64_t err;
+    size_t n, pll, k;
+    int rst = 0, stop = 0, r;
+    qfr f;
+    brisk_quic *q = established();
+    CHECK(q != NULL && confirm(q, 1));
+    if (q == NULL) {
+        return;
+    }
+    CHECK(brisk_quic_stream_open(q, 1) == 0 && brisk_quic_stream_write(q, 0, "request", 7, 0) == 7);
+    drain(q, 2);
+    CHECK(brisk__quic_stream_abort(&q->q, 0, (uint64_t)1 << 62, 3) == BRISK_E_ARG &&
+          brisk__quic_stream_abort(&q->q, 4, 0x10c, 3) == BRISK_E_ARG &&
+          brisk__quic_stream_abort(NULL, 0, 0x10c, 3) == BRISK_E_ARG);
+    CHECK(brisk__quic_stream_abort(&q->q, 0, 0x10c, 3) == BRISK_OK);
+    /* RESET_STREAM(0, 0x10c, final size 7) and STOP_SENDING(0, 0x10c) in the next packet */
+    n = brisk_quic_pull(q, g_d, 1600, 3);
+    CHECK(n > 0 && open_ap(QUIC_API_C_AP, n, &pl, &pll));
+    for (p = pl; (r = next_frame(&p, pl + pll, &f)) == 1;) {
+        rst |= f.type == 0x04 && f.id == 0 && f.a == 0x10c && f.b == 7;
+        stop |= f.type == 0x05 && f.id == 0 && f.a == 0x10c;
+    }
+    CHECK(r == 0 && rst && stop);
+    /* the sending part is gone for the application; so is the receiving part */
+    CHECK(brisk_quic_stream_write(q, 0, "x", 1, 0) < 0 &&
+          brisk_quic_stream_read(q, 0, fr, sizeof fr, &err) == BRISK_E_ARG);
+    /* data that still arrives is counted and dropped, its connection credit handed back */
+    k = 0;
+    fr[k++] = 0x0a; /* STREAM len, offset 0 */
+    k += varint(fr + k, 0);
+    k += varint(fr + k, 5);
+    memcpy(fr + k, "hello", 5);
+    k += 5;
+    CHECK(feed_1rtt(q, fr, k, 4) == BRISK_OK && q->q.consumed >= 5 && slot_of(q, 0) >= 0);
+    drain(q, 4);
+    /* the slot frees once our RESET_STREAM is ACKed and the peer's final size is known */
+    k = ack_all(q, fr);
+    CHECK(feed_1rtt(q, fr, k, 5) == BRISK_OK && slot_of(q, 0) >= 0);
+    k = 0;
+    fr[k++] = 0x04; /* RESET_STREAM(0, H3_REQUEST_CANCELLED, 5) */
+    k += varint(fr + k, 0);
+    k += varint(fr + k, 0x10c);
+    k += varint(fr + k, 5);
+    CHECK(feed_1rtt(q, fr, k, 6) == BRISK_OK && slot_of(q, 0) < 0 &&
+          brisk_quic_status(q) == BRISK_OK);
+    drain(q, 6);
+    /* the whole response already received (FIN): only RESET_STREAM, no STOP_SENDING (3.5) */
+    CHECK(brisk_quic_stream_open(q, 1) == 4 && brisk_quic_stream_write(q, 4, "r", 1, 0) == 1);
+    drain(q, 7);
+    k = 0;
+    fr[k++] = 0x0b; /* STREAM len fin */
+    k += varint(fr + k, 4);
+    k += varint(fr + k, 2);
+    fr[k++] = 'o';
+    fr[k++] = 'k';
+    CHECK(feed_1rtt(q, fr, k, 8) == BRISK_OK);
+    drain(q, 8);
+    CHECK(brisk__quic_stream_abort(&q->q, 4, 0x10c, 3) == BRISK_OK);
+    n = brisk_quic_pull(q, g_d, 1600, 9);
+    rst = stop = 0;
+    CHECK(n > 0 && open_ap(QUIC_API_C_AP, n, &pl, &pll));
+    for (p = pl; (r = next_frame(&p, pl + pll, &f)) == 1;) {
+        rst |= f.type == 0x04 && f.id == 4 && f.a == 0x10c && f.b == 1;
+        stop |= f.type == 0x05;
+    }
+    CHECK(r == 0 && rst && !stop);
+    k = ack_all(q, fr);
+    CHECK(feed_1rtt(q, fr, k, 10) == BRISK_OK && slot_of(q, 4) < 0);
+}
+
+#    if BRISK_ENABLE_H3
+static brisk_cfg cfg_alpn(const char *alpn)
+{
+    brisk_cfg c = cfg_ok();
+    c.alpn = alpn;
+    return c;
+}
+
+/* our HTTP/3 transport parameters (RFC 9114 6.2) and the slot budget */
+static void test_h3_tps(void)
+{
+    static const char *const offer[] = {"h3", "hq-interop,h3", "x,h3,y", "h3x", "h3-29,hq", "xh3"};
+    const char *name;
+    size_t i, len;
+    brisk_cfg c;
+    brisk_quic *q;
+    for (i = 0; i < sizeof offer / sizeof offer[0]; i++) {
+        int h3 = i < 3;
+        c = cfg_alpn(offer[i]);
+        q = setup_off(&c, i & 3);
+        CHECKI(q != NULL && q->q.my_tp.initial_max_streams_uni == (h3 ? 3u : 0u) &&
+                   q->q.my_tp.initial_max_stream_data_uni == (h3 ? BRISK_QUIC_STREAM_BUF : 0u),
+               i);
+    }
+    c = cfg_alpn("h3");
+    q = setup_off(&c, 0);
+    CHECK(q != NULL && (!KNOBS_DEFAULT || pull_is(q, QUIC_API_H3_INIT, 0)));
+    CHECK(KNOBS_DEFAULT || brisk_quic_pull(q, g_d, 1600, 0) == 1200);
+    CHECK(feed_hex(q, QUIC_API_S_H3, 1) == BRISK_OK && brisk_quic_status(q) == BRISK_OK &&
+          brisk_quic_alpn(q, &name, &len) == BRISK_OK && len == 2 && memcmp(name, "h3", 2) == 0);
+    drain(q, 1);
+    /* 3 server uni + our control + MAX_STREAMS - 4 requests; the next one waits (E_WANT) */
+    CHECK(brisk_quic_stream_open(q, 0) == 2);
+    for (i = 0; i < BRISK_QUIC_MAX_STREAMS - 4; i++) {
+        CHECKI(brisk_quic_stream_open(q, 1) == (int64_t)(4 * i), i);
+    }
+    CHECK(brisk_quic_stream_open(q, 1) == BRISK_E_WANT && brisk_quic_status(q) == BRISK_OK);
+}
+
+/* ---- HTTP/3 end to end over a sans-I/O brisk_quic: q->io is a scripted server ----------- */
+static const uint8_t *g_lpkt[8];
+static size_t g_lpkt_len[8], g_nlpkt, g_lp;
+static uint8_t g_cap[2][512]; /* our stream 2 (control) and stream 0 (request), as sent */
+static size_t g_capn[2];
+static int g_cap_fin0;
+
+static void lo_drain(brisk_quic *q)
+{
+    const uint8_t *pl, *p;
+    size_t n, pll;
+    qfr f;
+    while ((n = brisk_quic_pull(q, g_d, 1600, 100)) != 0) {
+        if (!open_ap(QUIC_API_H3_C_AP, n, &pl, &pll)) {
+            continue;
+        }
+        for (p = pl; next_frame(&p, pl + pll, &f) == 1;) {
+            unsigned w = f.id == 2 ? 0 : 1;
+            if (f.type >= 0x08 && f.type <= 0x0f && (f.id == 0 || f.id == 2) && f.a == g_capn[w] &&
+                f.n <= sizeof g_cap[w] - g_capn[w]) {
+                memcpy(g_cap[w] + g_capn[w], f.d, f.n); /* in order: nothing is lost here */
+                g_capn[w] += f.n;
+                g_cap_fin0 |= f.id == 0 && f.b;
+            }
+        }
+    }
+}
+
+static int lo_io(brisk_quic *q, int op)
+{
+    if (op == BRISK__QIO_WAIT) {
+        lo_drain(q);
+        if (g_lp == g_nlpkt) {
+            return BRISK_E_TIMEOUT;
+        }
+        if (g_lpkt[g_lp] == NULL) {
+            g_lp++;
+            return BRISK_E_TIMEOUT; /* a stall: harmless */
+        }
+        g_lp++;
+        return feed_1rtt(q, g_lpkt[g_lp - 1], g_lpkt_len[g_lp - 1], 100) == BRISK_OK ? BRISK_OK
+                                                                                     : q->q.err;
+    }
+    if (op == BRISK__QIO_FLUSH) {
+        lo_drain(q);
+    }
+    return BRISK_OK;
+}
+
+static brisk_quic *h3_established(void)
+{
+    brisk_cfg c = cfg_alpn("h3");
+    brisk_quic *q = setup_off(&c, 1);
+    uint8_t sec[32];
+    t_unhex(QUIC_API_H3_S_AP, sec, sizeof sec);
+    brisk__quic_keys_init(&g_sap, 0x1301, sec, 32);
+    g_spn = 0;
+    if (q == NULL || brisk_quic_pull(q, g_d, 1600, 0) != 1200 ||
+        feed_hex(q, QUIC_API_S_H3, 1) != BRISK_OK || brisk_quic_status(q) != BRISK_OK) {
+        return NULL;
+    }
+    drain(q, 1);
+    q->io = lo_io; /* the "blocking" handle brisk_h3_open requires */
+    g_lp = g_nlpkt = 0;
+    g_capn[0] = g_capn[1] = 0;
+    g_cap_fin0 = 0;
+    return q;
+}
+
+static size_t stream_fr(uint8_t *fr, uint64_t id, const uint8_t *d, size_t n, int fin)
+{
+    size_t k = 0;
+    fr[k++] = (uint8_t)(0x0a | (fin ? 1 : 0)); /* STREAM, offset 0, length */
+    k += varint(fr + k, id);
+    k += varint(fr + k, n);
+    memcpy(fr + k, d, n);
+    return k + n;
+}
+
+typedef struct {
+    int n, ok;
+} hdrs_seen;
+
+static void on_h3_hdr(void *ctx, const char *name, size_t nl, const char *value, size_t vl)
+{
+    hdrs_seen *h = (hdrs_seen *)ctx;
+    h->n++;
+    h->ok = nl == 12 && memcmp(name, "content-type", 12) == 0 && vl == 10 &&
+            memcmp(value, "text/plain", 10) == 0;
+}
+
+typedef struct {
+    int n, bad;
+} req_seen;
+
+static int on_req_field(void *ctx, const uint8_t *name, size_t nl, const uint8_t *value, size_t vl,
+                        unsigned flags)
+{
+    static const char *const want[4][2] = {
+        {":method", "GET"}, {":scheme", "https"}, {":authority", HOST}, {":path", "/index.html"}};
+    req_seen *r = (req_seen *)ctx;
+    (void)flags;
+    if (r->n >= 4 || nl != strlen(want[r->n][0]) || memcmp(name, want[r->n][0], nl) != 0 ||
+        vl != strlen(want[r->n][1]) || memcmp(value, want[r->n][1], vl) != 0) {
+        r->bad = 1;
+    }
+    r->n++;
+    return 0;
+}
+
+static void test_h3_loop(void)
+{
+    static uint8_t p1[256], p2[256], p3[64], mem[1u << 17];
+    static const uint8_t sset[] = {0x00, 0x04, 0x00}, qenc[] = {0x02}, qdec[] = {0x03};
+    static const uint8_t resp[] = {0x01, 0x03, 0x00, 0x00, 0xd9, /* HEADERS :status 200 */
+                                   0x00, 0x05, 'h',  'e',  'l',  'l', 'o'};
+    static const uint8_t resp2[] = {0x01, 0x04, 0x00, 0x00, 0xd9, 0xf5}; /* + text/plain */
+    static const uint8_t bad[] = {0x00, 0x07, 0x01, 0x00};               /* GOAWAY first */
+    uint8_t buf[64], sscr[256];
+    size_t k1 = 0, k2;
+    brisk_h3_stream *s = NULL;
+    brisk_h3 *h = NULL;
+    hdrs_seen hs = {0, 0};
+    req_seen rs = {0, 0};
+    uint64_t v;
+    int st = 0, rc;
+    brisk_quic *q = h3_established();
+    CHECK(q != NULL && brisk_h3_size() <= sizeof mem);
+    if (q == NULL) {
+        return;
+    }
+    /* the server: HANDSHAKE_DONE + its control (empty SETTINGS) + QPACK streams, a stall,
+     * then the response on stream 0 */
+    p1[k1++] = 0x1e;
+    k1 += stream_fr(p1 + k1, 3, sset, sizeof sset, 0);
+    k1 += stream_fr(p1 + k1, 7, qenc, 1, 0);
+    k1 += stream_fr(p1 + k1, 11, qdec, 1, 0);
+    k2 = stream_fr(p2, 0, resp, sizeof resp, 0);
+    g_lpkt[0] = p1;
+    g_lpkt_len[0] = k1;
+    g_lpkt[1] = NULL; /* BRISK_E_TIMEOUT once */
+    g_lpkt[2] = p2;
+    g_lpkt_len[2] = k2;
+    g_nlpkt = 3;
+    CHECK(brisk_h3_open(q, mem + 1, brisk_h3_size(), &h) == BRISK_OK && h != NULL);
+    CHECK(brisk_h3_request(h, "GET", "/index.html", NULL, 0, NULL, 0, &s) == BRISK_OK);
+    rc = brisk_h3_response(s, &st, on_h3_hdr, &hs);
+    CHECK(rc == BRISK_E_TIMEOUT && st == 0); /* the stall: harmless */
+    CHECK(brisk_h3_response(s, &st, on_h3_hdr, &hs) == BRISK_OK && st == 200 && hs.n == 0);
+    CHECK(brisk_h3_read(s, buf, sizeof buf) == 5 && memcmp(buf, "hello", 5) == 0);
+    CHECK(brisk_h3_read(s, buf, sizeof buf) == BRISK_E_TIMEOUT); /* no FIN yet */
+    brisk_h3_stream_close(s); /* cancels: RESET_STREAM + STOP_SENDING H3_REQUEST_CANCELLED */
+    /* our control stream: type 0x00 + SETTINGS; our request: HEADERS, FIN */
+    lo_drain(q);
+    CHECK(g_capn[0] == t_unhex(QUIC_API_H3_PREFACE, sscr, sizeof sscr) &&
+          memcmp(g_cap[0], sscr, g_capn[0]) == 0);
+    CHECK(g_capn[1] > 2 && g_cap[1][0] == 0x01 && g_cap_fin0);
+    {
+        const uint8_t *p = g_cap[1] + 1;
+        CHECK(brisk__quic_varint_get(&p, g_cap[1] + g_capn[1], &v) &&
+              v == (uint64_t)(g_capn[1] - (size_t)(p - g_cap[1])) &&
+              brisk__qpack_decode(p, (size_t)v, sscr, sizeof sscr, 4096, on_req_field, &rs) ==
+                  BRISK_OK &&
+              rs.n == 4 && !rs.bad);
+    }
+    /* a second request on the same connection, complete this time */
+    g_lpkt[3] = p3;
+    g_lpkt_len[3] = stream_fr(p3, 4, resp2, sizeof resp2, 1);
+    g_nlpkt = 4;
+    CHECK(brisk_h3_request(h, "GET", "/index.html", NULL, 0, NULL, 0, &s) == BRISK_OK);
+    CHECK(brisk_h3_response(s, &st, on_h3_hdr, &hs) == BRISK_OK && st == 200 && hs.n == 1 && hs.ok);
+    CHECK(brisk_h3_read(s, buf, sizeof buf) == 0);
+    brisk_h3_stream_close(s);
+    brisk_h3_close(h);
+    CHECK(all_zero(mem + 1, brisk_h3_size()) && brisk_quic_status(q) == BRISK_OK);
+
+    /* a connection error: CONNECTION_CLOSE 0x1d with H3_MISSING_SETTINGS (RFC 9114 6.2.1) */
+    q = h3_established();
+    CHECK(q != NULL);
+    if (q == NULL) {
+        return;
+    }
+    g_lpkt[0] = p1;
+    g_lpkt_len[0] = stream_fr(p1, 3, bad, sizeof bad, 0);
+    g_nlpkt = 1;
+    CHECK(brisk_h3_open(q, mem, brisk_h3_size(), &h) == BRISK_OK);
+    CHECK(brisk_h3_request(h, "GET", "/", NULL, 0, NULL, 0, &s) == BRISK_OK);
+    CHECK(brisk_h3_response(s, &st, NULL, NULL) == BRISK_E_PROTO &&
+          brisk_quic_status(q) == BRISK_E_PROTO && brisk_quic_error(q) == 0x10a);
+    CHECK(brisk_h3_read(s, buf, 1) == BRISK_E_ARG);
+    brisk_h3_close(h);
+    /* brisk_h3_open refuses a sans-I/O handle and another ALPN */
+    q = h3_established();
+    CHECK(q != NULL);
+    if (q != NULL) {
+        q->io = NULL;
+        CHECK(brisk_h3_open(q, mem, brisk_h3_size(), &h) == BRISK_E_ARG && h == NULL);
+    }
+    q = established(); /* hq-interop */
+    CHECK(q != NULL);
+    if (q != NULL) {
+        q->io = lo_io;
+        CHECK(brisk_h3_open(q, mem, brisk_h3_size(), &h) == BRISK_E_ARG && h == NULL);
+        q->io = NULL;
+    }
+}
+#    endif /* BRISK_ENABLE_H3 */
+
 void test_quic_api(void)
 {
     g_root_len = t_unhex(QUIC_API_ROOT, g_root, sizeof g_root);
@@ -865,6 +1321,11 @@ void test_quic_api(void)
     test_close();
     test_wipe();
     test_seams();
+    test_abort();
+#    if BRISK_ENABLE_H3
+    test_h3_tps();
+    test_h3_loop();
+#    endif
 #    ifdef __linux__
     test_blocking();
     test_udp_errors();

@@ -45,6 +45,46 @@
  * SHA-256/384/512, HMAC and HKDF are always built: every TLS configuration needs them.
  */
 
+/* HTTP/3 (RFC 9114) with QPACK (RFC 9204): an optional module over a brisk_quic connection whose
+ * ALPN the application chose ("h3") - never switched on by the core. src/http/qpack.c (static
+ * table only: our SETTINGS_QPACK_MAX_TABLE_CAPACITY and _BLOCKED_STREAMS stay 0, so no dynamic
+ * table, no blocked streams, no encoder/decoder stream of ours) and src/http/h3.c (frames, the
+ * control stream, SETTINGS, GOAWAY, brisk_h3_*). On in FULL. It needs QUIC, and it forces HTTP/2
+ * on as well: QPACK reuses the HPACK Huffman decoder (huffman.c) and the RFC 9113 / 9114 field
+ * checks live in h2.c - one copy of each, at the price that "H3 without H2" is not a build. With
+ * it off both files compile to empty translation units. */
+#ifndef BRISK_ENABLE_H3
+#    define BRISK_ENABLE_H3 (BRISK_PROFILE >= BRISK_PROFILE_FULL)
+#endif
+#if BRISK_ENABLE_H3
+#    if defined(BRISK_ENABLE_QUIC) && !BRISK_ENABLE_QUIC
+#        error                                                                                     \
+            "BRISK_ENABLE_H3 needs BRISK_ENABLE_QUIC: drop -DBRISK_ENABLE_QUIC=0 or add -DBRISK_ENABLE_H3=0"
+#    endif
+#    if defined(BRISK_ENABLE_H2) && !BRISK_ENABLE_H2
+#        error                                                                                     \
+            "BRISK_ENABLE_H3 needs BRISK_ENABLE_H2 (shared Huffman + field checks): drop -DBRISK_ENABLE_H2=0 or add -DBRISK_ENABLE_H3=0"
+#    endif
+#    ifndef BRISK_ENABLE_QUIC
+#        define BRISK_ENABLE_QUIC 1
+#    endif
+#    ifndef BRISK_ENABLE_H2
+#        define BRISK_ENABLE_H2 1
+#    endif
+#endif
+
+/* The SETTINGS_MAX_FIELD_SECTION_SIZE this HTTP/3 client advertises (RFC 9114 4.2.2, 7.2.4.1), in
+ * octets: the largest response header section (sum of name + value + 32 per field) it accepts.
+ * A bigger one aborts only that request (H3_EXCESSIVE_LOAD). A RAM knob: every request slot
+ * owns one buffer of this size, and brisk_h3_size() adds two more. It also bounds our own
+ * encoded request header section. */
+#ifndef BRISK_H3_MAX_HEADER_LIST
+#    define BRISK_H3_MAX_HEADER_LIST 8192
+#endif
+#if BRISK_H3_MAX_HEADER_LIST < 4096 || BRISK_H3_MAX_HEADER_LIST > 65535
+#    error "BRISK_H3_MAX_HEADER_LIST must be 4096..65535"
+#endif
+
 /* TLS 1.2 client (RFC 5246 mechanics, RFC 9846 downgrade and E rules; src/tls/tls12.c). The
  * ClientHello then offers TLS 1.3 AND 1.2 (supported_versions [0x0304, 0x0303]) with the six
  * ECDHE + AEAD suites (ECDSA/RSA x AES-128/256-GCM, ChaCha20-Poly1305), extended_main_secret
@@ -104,6 +144,11 @@
 #if BRISK_QUIC_STREAM_BUF < 1024 || BRISK_QUIC_STREAM_BUF > 65536 ||                               \
     (BRISK_QUIC_STREAM_BUF & 7) != 0
 #    error "BRISK_QUIC_STREAM_BUF must be 1024..65536 and a multiple of 8"
+#endif
+/* HTTP/3 holds 4 slots for the whole connection (the server's control + 2 QPACK streams, our
+ * control stream); the rest carry requests: BRISK_QUIC_MAX_STREAMS - 4 at once. */
+#if BRISK_ENABLE_H3 && BRISK_QUIC_MAX_STREAMS < 5
+#    error "BRISK_ENABLE_H3 needs BRISK_QUIC_MAX_STREAMS >= 5 (4 are HTTP/3's own streams)"
 #endif
 
 /* The SETTINGS_HEADER_TABLE_SIZE this client advertises, in octets: the largest HPACK dynamic

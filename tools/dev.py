@@ -7,7 +7,7 @@
   python tools/dev.py size [--arch all|mipsel..] [--md] [--save] [--check] [--profile FULL]
                                                  per-module flash/RAM from the linker map (-Os, static)
   python tools/dev.py ct                         constant-time check: the ct suite under valgrind
-  python tools/dev.py fuzz [der|name|tls13_hs|tls13_rec|ticket|conn|hpack|h2|quic_pkt|quic_tp] [--seconds N]  libFuzzer over a parser, seeded from its .inc
+  python tools/dev.py fuzz [der|name|tls13_hs|tls13_rec|ticket|conn|hpack|h2|quic_pkt|quic_tp|qpack|h3] [--seconds N]  libFuzzer over a parser, seeded from its .inc
   python tools/dev.py interop                    brisk_get vs s_server/nginx/Caddy; h2_get vs nginx/h2o/nghttpd
   python tools/dev.py badssl                     brisk_get vs badssl.com (needs internet)
   python tools/dev.py image                      (re)build the brisk-dev Docker image
@@ -272,7 +272,15 @@ FUZZ = {"der": ("fuzz/fuzz_der.c src/x509/der.c", "tests/kat/der.inc"),
                     "src/crypto/aes_ct.c src/crypto/aes_ct64.c src/crypto/gcm.c src/crypto/x25519.c "
                     "src/crypto/p256.c src/crypto/p384.c src/crypto/bn.c src/crypto/rsa.c "
                     "src/x509/der.c src/x509/cert.c src/x509/chain.c src/x509/name.c",
-                    "tests/kat/quic_tp.inc")}
+                    "tests/kat/quic_tp.inc"),
+        # QPACK (M7, RFC 9204): field sections + re-encode round trip, and the encoder / decoder
+        # instruction streams whole vs split. H3 is FULL only: the -D rides in the source list.
+        "qpack": ("-DBRISK_ENABLE_H3=1 fuzz/fuzz_qpack.c src/http/qpack.c src/http/hpack.c "
+                  "src/http/huffman.c src/http/h2.c src/util.c", "tests/kat/qpack_fuzz.inc"),
+        # HTTP/3 (M7, RFC 9114): server stream events through the brisk__h3_io seam while the
+        # public calls run. Seeds are the h3.inc scenarios in binary form.
+        "h3": ("-DBRISK_ENABLE_H3=1 fuzz/fuzz_h3.c src/http/h3.c src/http/qpack.c src/http/hpack.c "
+               "src/http/huffman.c src/http/h2.c src/util.c", "tests/kat/h3_fuzz.inc")}
 
 
 def fuzz_corpus(inc, out):

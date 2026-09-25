@@ -41,18 +41,49 @@ size_t brisk_quic_size(void)
            brisk__quic_scratch_size();
 }
 
+#    if BRISK_ENABLE_H3
+/* 1 if the comma-separated ALPN list offers the exact token "h3" */
+static int qa_offers_h3(const char *alpn)
+{
+    const char *p = alpn;
+    while (*p != '\0') {
+        const char *e = p;
+        while (*e != '\0' && *e != ',') {
+            e++;
+        }
+        if (e - p == 2 && p[0] == 'h' && p[1] == '3') {
+            return 1;
+        }
+        p = *e == ',' ? e + 1 : e;
+    }
+    return 0;
+}
+#    endif
+
 /* RFC 9000 18.2: our transport parameters. Every limit is what the memory holds (the
  * brisk__quic_conn_init ceilings): a stream window = one ring, the connection window = all
- * rings. No peer-initiated streams: a server-opened bidi stream is useless to a client-only
- * library and hq-interop opens no uni stream (HTTP/3, M7, will need 3). max_udp_payload_size =
- * the UDP driver's receive buffer (18.2: never advertise more than we can receive). */
-static void qa_tp(brisk__quic_tp *tp, const uint8_t *scid)
+ * rings. No server-initiated bidi streams: useless to a client-only library (RFC 9114 6.1 makes
+ * them an error for HTTP/3 too - here it is STREAM_LIMIT_ERROR). Server uni streams only when
+ * the ALPN list offers "h3": RFC 9114 6.2 (MUST) lets the server open 3 (control, QPACK encoder
+ * and decoder), each with a ring's worth of credit (>= 1024, SHOULD). Tied to the OFFER, so
+ * hq-interop and every other ALPN stay byte-identical and keep all slots - that is a limit
+ * sized to what we asked for, not protocol switching. max_udp_payload_size = the UDP driver's
+ * receive buffer (18.2: never advertise more than we can receive). */
+static void qa_tp(brisk__quic_tp *tp, const uint8_t *scid, const char *alpn)
 {
     brisk__quic_tp_default(tp);
     tp->max_idle_timeout = 30000;
     tp->max_udp_payload_size = BRISK__QUIC_RX_MAX;
     tp->initial_max_data = (uint64_t)BRISK_QUIC_MAX_STREAMS * BRISK_QUIC_STREAM_BUF;
     tp->initial_max_stream_data_bidi_local = BRISK_QUIC_STREAM_BUF;
+#    if BRISK_ENABLE_H3
+    if (qa_offers_h3(alpn)) {
+        tp->initial_max_stream_data_uni = BRISK_QUIC_STREAM_BUF;
+        tp->initial_max_streams_uni = 3;
+    }
+#    else
+    (void)alpn;
+#    endif
     memcpy(tp->iscid, scid, 8); /* 7.3 */
     tp->iscid_len = 8;
 }
@@ -82,7 +113,7 @@ int brisk__quic_setup(void *mem, size_t mem_len, const brisk_cfg *cfg, const cha
     hs_scratch = m + sizeof *q;
     memset(q, 0, sizeof *q);
     rc = brisk__conn_core(&q->c, cfg, host, wall_ms, rnd, sys_anchor, 1, hs_scratch);
-    qa_tp(&tp, rnd + BRISK__CONN_RAND + 8);
+    qa_tp(&tp, rnd + BRISK__CONN_RAND + 8, cfg->alpn);
     if (rc == BRISK_OK) {
         rc = brisk__quic_tp_write(&tp, q->tp, sizeof q->tp, &n);
     }
@@ -247,6 +278,11 @@ static int qa_err(const brisk_quic *q, int rc)
 static int qa_wait(brisk_quic *q)
 {
     return q->io != NULL ? q->io(q, BRISK__QIO_WAIT) : BRISK_E_WANT;
+}
+
+int brisk__quic_wait(brisk_quic *q)
+{
+    return q != NULL ? qa_wait(q) : BRISK_E_ARG;
 }
 
 int64_t brisk_quic_stream_open(brisk_quic *q, int bidi)

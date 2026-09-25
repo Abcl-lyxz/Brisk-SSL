@@ -166,7 +166,18 @@ Tick a box only when the work is green on **every** arch (`python tools/dev.py t
       front half is static outside QUIC builds).
 
 ## M7 HTTP/3
-- [ ] QPACK static-only (capacity 0) + Huffman; control stream + SETTINGS; `brisk_h3_*`
+- [x] QPACK static-only (capacity 0) + Huffman; control stream + SETTINGS; `brisk_h3_*`
+  - `src/http/qpack.c` (RFC 9204: static table, dynamic capacity 0 / blocked streams 0, the
+    Huffman decoder shared with HPACK), `src/http/h3.c` (RFC 9114: framing, control stream +
+    SETTINGS + GOAWAY, QPACK encoder/decoder streams read and checked, request state machine),
+    public `brisk_h3_*` over a blocking `brisk_quic` mirroring `brisk_h2_*` (same header types).
+    `BRISK_ENABLE_H3` (FULL) forces QUIC + H2 on. Server uni streams (3) are granted only when
+    cfg.alpn offers "h3"; other ALPNs keep byte-identical transport parameters. stream.c gained
+    a local abort (RESET_STREAM / STOP_SENDING with an app code).
+  - Vectors: RFC 9204 static table + Appendix B where static-only applies, a Python QPACK
+    encoder/decoder, 104 h3 scenario rows, fuzz seeds (fuzz_qpack, fuzz_h3). 3 review rounds.
+  - Not yet: interop against real h3 servers (quic-go / ngtcp2 / nginx-quic) -
+    `examples/h3_get.c` exists; run it on the VPS with the ns-3 interop run.
 
 ## M8 Hardening + release
 - [ ] Fuzzers (libFuzzer/AFL++) for every parser, seed corpora. Still missing: `fuzz_pem`

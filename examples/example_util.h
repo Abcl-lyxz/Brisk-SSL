@@ -52,7 +52,7 @@ static const char *err_name(int rc)
     case BRISK_E_TIMEOUT:
         return "E_TIMEOUT";
     case BRISK_E_RETRY:
-        return "E_RETRY (HTTP/2: not processed, retry on a new connection)";
+        return "E_RETRY (HTTP/2, HTTP/3: not processed, retry on a new connection)";
     default:
         return "unknown error";
     }

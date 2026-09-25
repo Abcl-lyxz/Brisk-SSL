@@ -76,10 +76,12 @@ enum {
     BRISK_E_WANT = -8,       /* sans-I/O only, and not a failure: "feed me more bytes first" -
                               * brisk_status while the handshake is still running, brisk_app_read
                               * when no application data has arrived yet. */
-    BRISK_E_RETRY = -9       /* HTTP/2 only: the server guaranteed it did NOT process this request
-                              * (RFC 9113 8.7: RST_STREAM REFUSED_STREAM, a stream above a GOAWAY's
-                              * last stream id, or a request made after a GOAWAY). Safe to retry on
-                              * a NEW connection, even a POST. */
+    BRISK_E_RETRY = -9       /* brisk_h2_* / brisk_h3_* only: the server guaranteed it did NOT
+                              * process this request (RFC 9113 8.7: RST_STREAM REFUSED_STREAM or a
+                              * stream above a GOAWAY's last stream id; RFC 9114 4.1.1, 5.2:
+                              * RESET_STREAM H3_REQUEST_REJECTED or a stream at or above a GOAWAY's
+                              * id; both: a request made after a GOAWAY). Safe to retry on a NEW
+                              * connection, even a POST. */
 };
 
 /* Library version, e.g. "0.1.0-dev". */
@@ -505,7 +507,8 @@ BRISK_API void brisk_h2_close(brisk_h2 *h);
  *     brisk_quic_resumed() == 0). Delete a ticket once offered (RFC 9001 4.5).
  * Our transport parameters are internal: 30 s idle timeout, 1472-byte datagrams in, flow-control
  * windows equal to the stream buffers (BRISK_QUIC_STREAM_BUF per stream, BRISK_QUIC_MAX_STREAMS
- * of them in total), and no server-initiated streams.
+ * of them in total), and no server-initiated streams - except, when cfg.alpn offers "h3", the
+ * three unidirectional ones HTTP/3 needs (RFC 9114 6.2).
  *
  * Errors: BRISK_E_AUTH (certificate), BRISK_E_PROTO (the server broke the protocol),
  * BRISK_E_PEER_ALERT (the server closed the connection - brisk_quic_error() holds its code -
@@ -624,8 +627,103 @@ BRISK_API int brisk_quic_stream_read(brisk_quic *q, uint64_t id, void *buf, size
                                      uint64_t *app_err);
 
 /* The next stream the server opened: BRISK_OK and *id, BRISK_E_WANT / BRISK_E_TIMEOUT, or the
- * sticky error. (Our transport parameters allow the server no streams today.) */
+ * sticky error. The server may open streams only when cfg.alpn offers "h3" (its 3 HTTP/3
+ * unidirectional streams, RFC 9114 6.2); otherwise our transport parameters allow it none. */
 BRISK_API int brisk_quic_stream_accept(brisk_quic *q, uint64_t *id);
+
+/* ------------------------------------------------------------------------------------------------
+ * HTTP/3 client (RFC 9114, QPACK RFC 9204), BRISK_ENABLE_H3 (FULL profile only). Declared in
+ * every profile, defined only in FULL - same rule as brisk_quic_*.
+ *
+ * An optional module you call explicitly over a blocking brisk_quic_connect handle whose ALPN you
+ * chose (cfg.alpn = "h3") and the server selected: brisk_quic_alpn() must say exactly "h3". The
+ * same shape as brisk_h2_*, and it reuses brisk_h2_header / brisk_h2_header_fn:
+ *   brisk_quic_connect(&cfg, "api.example.com", 443, &q);
+ *   brisk_h3_open(q, mem, sizeof mem, &h);
+ *   brisk_h3_request(h, "GET", "/v1/status", hdrs, 1, NULL, 0, &s);
+ *   brisk_h3_response(s, &status, on_header, ctx);
+ *   while ((n = brisk_h3_read(s, buf, sizeof buf)) > 0) { ... }   (0 = complete, < 0 = error)
+ *   brisk_h3_stream_close(s); brisk_h3_close(h); brisk_quic_close(q, 0x0100);
+ *
+ * Requests run in parallel up to BRISK_QUIC_MAX_STREAMS - 4 (4 with the defaults): HTTP/3 keeps
+ * four QUIC streams for the whole connection (the server's control and QPACK streams, our
+ * control stream). While one call waits, the others' data stays buffered in QUIC (up to
+ * BRISK_QUIC_STREAM_BUF per stream) and the server's control stream is served (SETTINGS,
+ * GOAWAY). A slot is held until brisk_h3_stream_close.
+ *
+ * ERRORS. A connection-level violation by the server (RFC 9114 8: a frame where it is not
+ * allowed, a bad SETTINGS, a closed critical stream, a QPACK error ...) closes the QUIC
+ * connection with that H3 / QPACK code: every later call returns BRISK_E_PROTO and
+ * brisk_quic_error() holds the code. A malformed response (RFC 9114 4.1.2: bad :status,
+ * uppercase or connection-specific fields, content-length that does not match the DATA ...)
+ * aborts only that request (H3_MESSAGE_ERROR) and its calls return BRISK_E_PROTO. BRISK_E_RETRY:
+ * the server sent GOAWAY before this request (or reset it with H3_REQUEST_REJECTED) - it was
+ * not processed, retry on a new connection. BRISK_E_PEER_ALERT: the server reset the request
+ * stream, or closed the connection. BRISK_E_TIMEOUT from brisk_h3_response / brisk_h3_read is
+ * harmless (call again); from brisk_h3_request it cancels that request. BRISK_E_IO: the
+ * connection ended (idle timeout).
+ *
+ * LIMITS (documented deviations): a response header section larger than
+ * BRISK_H3_MAX_HEADER_LIST (default 8192, our SETTINGS_MAX_FIELD_SECTION_SIZE) aborts that
+ * request (H3_EXCESSIVE_LOAD, BRISK_E_PROTO); our own request header section must encode into
+ * the same number of octets; interim 1xx responses and trailers are validated and discarded.
+ * QPACK uses the static table only (our dynamic table capacity is 0 - nothing is ever indexed
+ * or Huffman-encoded on the way out). No server push (we never send MAX_PUSH_ID), no CONNECT,
+ * no extended CONNECT, no 0-RTT, no priority signals. Linux only (blocking brisk_quic). */
+typedef struct brisk_h3 brisk_h3;               /* opaque, lives in the caller's memory */
+typedef struct brisk_h3_stream brisk_h3_stream; /* opaque, a slot inside that memory */
+
+/* Bytes of memory brisk_h3_open needs (any alignment). A function: it depends on the
+ * brisk_config.h knobs. About 48 KB with the defaults: (2 + BRISK_QUIC_MAX_STREAMS - 4) x
+ * BRISK_H3_MAX_HEADER_LIST, plus the handle - flow control and data buffers live in QUIC. */
+BRISK_API size_t brisk_h3_size(void);
+
+/* Start HTTP/3 on q (from brisk_quic_connect, whose ALPN answer is "h3"): open our control
+ * stream and send our SETTINGS (RFC 9114 6.2.1). It does not wait for the server's SETTINGS
+ * (7.2.4.2) but serves whatever already arrived. mem[0..mem_len) must stay valid until
+ * brisk_h3_close. BRISK_OK and *out, else *out = NULL and: BRISK_E_ARG (NULL / short mem, a
+ * sans-I/O handle, ALPN not "h3"), BRISK_E_TIMEOUT, or the connection's error. */
+BRISK_API int brisk_h3_open(brisk_quic *q, void *mem, size_t mem_len, brisk_h3 **out);
+
+/* Send one request on a new stream: :method (a token; CONNECT is refused), :scheme https,
+ * :authority (the host q was opened with, IPv6 in brackets, ":port" unless 443), :path ("/..."
+ * or "*" for OPTIONS), then hdrs[0..n), then body[0..body_len) in one DATA frame, and FIN.
+ * Returns once everything is queued (serving the connection meanwhile when the stream's buffer
+ * is full). BRISK_OK and *out, else *out = NULL and:
+ *   BRISK_E_ARG   bad method / path / header (as brisk_h2_request: uppercase or invalid octets,
+ *                 any ":" name, "host", connection / keep-alive / proxy-connection /
+ *                 transfer-encoding / upgrade, "te" other than "trailers", content-length !=
+ *                 body_len), a header section larger than the server's
+ *                 SETTINGS_MAX_FIELD_SECTION_SIZE or than BRISK_H3_MAX_HEADER_LIST once encoded,
+ *                 or every request slot held (close one first);
+ *   BRISK_E_RETRY the server sent GOAWAY: never sent, retry on a new connection;
+ *   others        as listed above.
+ * authorization / proxy-authorization / cookie / set-cookie are sent with QPACK's N bit (RFC
+ * 9204 7.1.3). A server that answers early and stops the upload (STOP_SENDING) ends the upload,
+ * not the request: the response is still read normally (RFC 9114 4.1). */
+BRISK_API int brisk_h3_request(brisk_h3 *h, const char *method, const char *path,
+                               const brisk_h2_header *hdrs, size_t n, const void *body,
+                               size_t body_len, brisk_h3_stream **out);
+
+/* Wait for the final response header section of s (1xx interim responses are skipped):
+ * *status is the :status (200..599), each field goes to fn(ctx, ...) (fn may be NULL; it must
+ * not call brisk_h3_*). Once per stream; a second call is BRISK_E_ARG. BRISK_OK or < 0. */
+BRISK_API int brisk_h3_response(brisk_h3_stream *s, int *status, brisk_h2_header_fn fn, void *ctx);
+
+/* Response content after brisk_h3_response: > 0 bytes (at most min(cap, INT_MAX)), 0 = the
+ * stream ended and matched any content-length, or < 0. BRISK_E_ARG before brisk_h3_response
+ * succeeded, for cap 0, or for a closed stream handle. Trailers are discarded. */
+BRISK_API int brisk_h3_read(brisk_h3_stream *s, void *buf, size_t cap);
+
+/* Release the request slot. A request that is not complete both ways is cancelled (RFC 9114
+ * 4.1.1: RESET_STREAM and STOP_SENDING with H3_REQUEST_CANCELLED). The handle is invalid
+ * afterwards. NULL-safe. */
+BRISK_API void brisk_h3_stream_close(brisk_h3_stream *s);
+
+/* Wipe all of mem. Does NOT close q - call brisk_quic_close(q, 0x0100) (H3_NO_ERROR) yourself
+ * (our control stream must stay open while the connection lives, RFC 9114 6.2.1). Every stream
+ * handle becomes invalid. NULL-safe. */
+BRISK_API void brisk_h3_close(brisk_h3 *h);
 
 #ifdef __cplusplus
 }

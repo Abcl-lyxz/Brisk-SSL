@@ -504,8 +504,7 @@ int brisk_h2_open(brisk_conn *c, void *mem, size_t mem_len, brisk_h2 **out)
 {
     char auth[264];
     const char *alpn;
-    size_t alen, n = 0;
-    uint16_t port;
+    size_t alen, n;
     brisk_h2 *h;
     int rc;
 
@@ -519,29 +518,7 @@ int brisk_h2_open(brisk_conn *c, void *mem, size_t mem_len, brisk_h2 **out)
     if (brisk_alpn(c, &alpn, &alen) != BRISK_OK || alen != 2 || memcmp(alpn, "h2", 2) != 0) {
         return BRISK_E_ARG;
     }
-    /* RFC 9113 8.3.1 / RFC 3986 3.2.2: :authority = host, an IPv6 literal in brackets, plus
-     * ":port" unless it is the https default */
-    if (memchr(c->host, ':', c->host_len) != NULL) {
-        auth[n++] = '[';
-    }
-    memcpy(auth + n, c->host, c->host_len);
-    n += c->host_len;
-    if (auth[0] == '[') {
-        auth[n++] = ']';
-    }
-    port = c->port;
-    if (port != 0 && port != 443) {
-        char d[5];
-        size_t k = 0;
-        do {
-            d[k++] = (char)('0' + port % 10);
-            port = (uint16_t)(port / 10);
-        } while (port != 0);
-        auth[n++] = ':';
-        while (k != 0) {
-            auth[n++] = d[--k];
-        }
-    }
+    n = brisk__http_authority(c->host, c->host_len, c->port, auth); /* RFC 9113 8.3.1 */
     rc = brisk__h2_setup(mem, mem_len, auth, n, net_h2_rd, net_h2_wr, c, &h);
     if (rc == BRISK_OK) {
         rc = brisk__h2_start(h);

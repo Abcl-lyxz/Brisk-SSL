@@ -313,6 +313,31 @@ int main(int argc, char **argv)
         }
     }
 #    endif
+#    if BRISK_ENABLE_H3 && defined(__linux__)
+    {
+        /* HTTP/3 (M7): brisk_h3_* over a blocking brisk_quic; the arena is the probe's BSS */
+        static uint8_t h3mem[1 << 17];
+        static const brisk_h2_header h3h[] = {{"accept", "*/*"}};
+        brisk_cfg h3cfg = BRISK_DEFAULTS;
+        brisk_quic *h3q = NULL;
+        brisk_h3 *h3 = NULL;
+        brisk_h3_stream *h3s = NULL;
+        int h3st;
+        h3cfg.alpn = "h3";
+        if (brisk_quic_connect(&h3cfg, "a.example", 443, &h3q) == BRISK_OK) {
+            if (brisk_h3_size() <= sizeof h3mem &&
+                brisk_h3_open(h3q, h3mem, sizeof h3mem, &h3) == BRISK_OK) {
+                if (brisk_h3_request(h3, "GET", "/", h3h, 1, out, 8, &h3s) == BRISK_OK &&
+                    brisk_h3_response(h3s, &h3st, NULL, NULL) == BRISK_OK) {
+                    out[0] = (uint8_t)brisk_h3_read(h3s, out, sizeof out);
+                }
+                brisk_h3_stream_close(h3s);
+                brisk_h3_close(h3);
+            }
+            brisk_quic_close(h3q, 0x100);
+        }
+    }
+#    endif
 #endif
 #if BRISK_ENABLE_H2
     {

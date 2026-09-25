@@ -2342,7 +2342,8 @@ enum {
     BRISK__QS_RETIRE = 0x080,   /* carried RETIRE_CONNECTION_ID */
     BRISK__QS_MAXSTR = 0x100,   /* carried MAX_STREAMS */
     BRISK__QS_ACKED = 0x200,    /* set by rec_on_ack: newly acknowledged */
-    BRISK__QS_LOST = 0x400      /* set by rec_on_ack / rec_on_timeout: declared lost */
+    BRISK__QS_LOST = 0x400,     /* set by rec_on_ack / rec_on_timeout: declared lost */
+    BRISK__QS_STOP = 0x800      /* carried STOP_SENDING */
 };
 #    define BRISK__QS_CRYPTO 0xff /* slot: the record carried CRYPTO data */
 #    define BRISK__QS_NONE   0xfe /* slot: no CRYPTO / STREAM data */
@@ -2435,7 +2436,7 @@ typedef struct {
     uint64_t rx_read, rx_hi, rx_max, rx_final, rx_err; /* final UINT64_MAX = not known yet */
     uint64_t tx_base, tx_next, tx_hi, tx_len, tx_max;  /* acked prefix .. written by the app */
     uint64_t ack_lo, ack_hi;                           /* one acked range above tx_base */
-    uint64_t tx_err, reset_pn, msd_pn;                 /* STOP_SENDING code; last carrying PNs */
+    uint64_t tx_err, reset_pn, msd_pn, ss_pn; /* our RESET_STREAM code; last carrying PNs */
     uint32_t rx_pos, tx_pos;
     uint16_t flags;
 } brisk__quic_stream;
@@ -2584,6 +2585,13 @@ int brisk__quic_stream_read(brisk__quic_conn *q, uint64_t id, uint8_t *out, size
                             uint64_t *app_err);
 /* The next peer-opened stream not reported yet: BRISK_OK with *id, or BRISK_E_WANT. */
 int brisk__quic_stream_accept(brisk__quic_conn *q, uint64_t *id);
+/* Abort a stream locally (RFC 9000 2.4, 3.5) with application code app_err: dirs & 1 = reset
+ * our sending part (RESET_STREAM, final size = the highest offset sent; nothing if every byte
+ * and the FIN were acknowledged), dirs & 2 = abort reading (STOP_SENDING unless the final size
+ * is already reached; data that still arrives is counted for flow control and dropped). The
+ * slot frees once the RESET_STREAM is ACKed and the peer's final size is known. BRISK_OK, or
+ * BRISK_E_ARG (unknown / closed stream, code > 2^62-1). */
+int brisk__quic_stream_abort(brisk__quic_conn *q, uint64_t id, uint64_t app_err, unsigned dirs);
 /* Frame handlers (level 2 only): 0 or a QUIC error code. STREAM 0x08..0x0f. */
 uint64_t brisk__quic_stream_frame(brisk__quic_conn *q, uint64_t id, uint64_t off, const uint8_t *d,
                                   size_t n, int fin);
@@ -2644,6 +2652,10 @@ int brisk__quic_setup(void *mem, size_t mem_len, const brisk_cfg *cfg, const cha
                       int64_t wall_ms, const uint8_t rnd[BRISK__QUIC_RAND],
                       brisk__x509_anchor_fn sys_anchor, const uint16_t *suites, size_t n_suites,
                       brisk_quic **out);
+/* Blocking handles: one I/O round (flush, wait for a datagram or the next timer, feed):
+ * BRISK_OK, BRISK_E_TIMEOUT (cfg.timeout_ms without progress since the last QIO_START) or the
+ * sticky error. Sans-I/O handles: BRISK_E_WANT. For modules that drive several streams (h3.c). */
+int brisk__quic_wait(brisk_quic *q);
 
 /* ---- os/linux_udp.c: the blocking QUIC driver ------------------------------------------------ */
 /* Resolve (first getaddrinfo address), open a non-blocking UDP socket with DF set where the
@@ -2684,6 +2696,9 @@ int brisk__hpack_int_decode(const uint8_t *p, size_t len, unsigned n, uint32_t *
 /* RFC 7541 5.2 + Appendix B. BRISK_E_PROTO on EOS, padding > 7 bits, non-EOS padding, or output
  * longer than cap (a local limit). An empty input is an empty string. */
 int brisk__huff_decode(const uint8_t *in, size_t len, uint8_t *out, size_t cap, size_t *out_len);
+/* The same walk without output: BRISK_OK and the decoded length, or BRISK_E_PROTO for an
+ * invalid code (so QPACK can tell a coding error from its own buffer limit). */
+int brisk__huff_len(const uint8_t *in, size_t len, size_t *out_len);
 
 /* hpack.c */
 #    define BRISK__HPACK_NEVER_INDEXED                                                             \
@@ -2817,7 +2832,111 @@ int brisk__h2_start(brisk_h2 *h);
 int brisk__h2_feed(brisk_h2 *h, const uint8_t *in, size_t len, size_t *used);
 /* Queued outbound bytes, whole frames only, into out[0..cap); returns the count (0 = none). */
 size_t brisk__h2_pull(brisk_h2 *h, uint8_t *out, size_t cap);
+
+/* Shared by h2.c and h3.c (RFC 9113 8.x and RFC 9114 4.x ask the same): */
+/* RFC 9110 8.6 content-length: 1..19 digits. 1 and *out, else 0. */
+int brisk__http_cl_parse(const uint8_t *v, size_t n, uint64_t *out);
+/* 1 for connection / proxy-connection / keep-alive / transfer-encoding / upgrade */
+int brisk__http_conn_specific(const uint8_t *n, size_t nl);
+/* :status value -> 100..599 (never 101), or 0 when malformed */
+unsigned brisk__http_status(const uint8_t *v, size_t n);
+/* The request checks of brisk_h2_request / brisk_h3_request (method token, not CONNECT; path;
+ * every field's octets; no ':' / host / connection-specific; te only "trailers";
+ * content-length == body_len; each field n + v + 16 <= max_field). *list = the header section
+ * size (n + v + 32 per field, the four pseudo-headers included with :authority auth_len).
+ * BRISK_OK or BRISK_E_ARG. */
+int brisk__http_req_check(const char *method, const char *path, const brisk_h2_header *hdrs,
+                          size_t n, size_t body_len, size_t auth_len, size_t max_field,
+                          uint64_t *list);
+/* BRISK__HPACK_NEVER_INDEXED for authorization / proxy-authorization / cookie / set-cookie */
+unsigned brisk__http_sensitive(const char *name);
+/* :authority from a host and port into out (>= host_len + 8): IPv6 literals bracketed,
+ * ":port" unless 0 or 443. Returns the length. */
+size_t brisk__http_authority(const char *host, size_t host_len, uint16_t port, char *out);
 #endif /* BRISK_ENABLE_H2 */
+
+#if BRISK_ENABLE_H3
+/* ---- http/qpack.c: QPACK (RFC 9204), static table only ---------------------------------------
+ * We advertise SETTINGS_QPACK_MAX_TABLE_CAPACITY 0 and SETTINGS_QPACK_BLOCKED_STREAMS 0 (both
+ * the defaults, RFC 9204 5), so the peer's encoder can never insert: every field section has
+ * Required Insert Count 0, nothing blocks, no Section Acknowledgment is owed (4.4.1) and we open
+ * no encoder / decoder stream of our own (4.2 MAY). Stateless: no dynamic table exists. Not
+ * constant time (header fields are not secrets here). */
+#    define BRISK__QPACK_DECOMPRESSION_FAILED 0x0200u
+#    define BRISK__QPACK_ENCODER_STREAM_ERROR 0x0201u
+#    define BRISK__QPACK_DECODER_STREAM_ERROR 0x0202u
+/* Internal status only (never returned by a public call): a LOCAL limit was hit - one decoded
+ * field larger than the scratch, or the section larger than max_list. HTTP/3 turns it into a
+ * stream error (the response is discarded, RFC 9114 4.2.2), not a connection error. */
+#    define BRISK__QPACK_E_LIMIT (-64)
+/* RFC 9204 4.1.1 (RFC 7541 5.1 with the 62-bit range QPACK needs): p[0]'s low n bits (1..8)
+ * start it. BRISK_OK with *v and *used; BRISK_E_WANT = the input ends inside it; BRISK_E_PROTO
+ * = above 2^62-1 or more than 10 continuation octets; BRISK_E_ARG = NULL / n out of range. */
+int brisk__qpack_int_decode(const uint8_t *p, size_t len, unsigned n, uint64_t *v, size_t *used);
+/* One complete encoded field section (a HEADERS frame payload). fn is called per field line
+ * with flags = BRISK__HPACK_NEVER_INDEXED for the N bit. scratch bounds one decoded field
+ * (name || value), max_list the section (n + v + 32 per field, RFC 9114 4.2.2). BRISK_OK,
+ * BRISK_E_PROTO (= QPACK_DECOMPRESSION_FAILED, a connection error: RFC 9204 2.2 / 4.5),
+ * BRISK__QPACK_E_LIMIT, BRISK_E_ARG, or fn's nonzero value. Fields delivered before a failure
+ * belong to a section that failed: discard them. */
+int brisk__qpack_decode(const uint8_t *blk, size_t len, uint8_t *scratch, size_t scratch_cap,
+                        size_t max_list, brisk__hpack_field_fn fn, void *ctx);
+/* Encode n fields as one section: prefix 00 00 (Required Insert Count 0, Base 0), then per field
+ * an indexed static line on an exact match, else a literal with a static name reference, else a
+ * literal with a literal name; the N bit for BRISK__HPACK_NEVER_INDEXED; never Huffman (no
+ * compression-oracle surface, RFC 9204 7.1). Every field must pass brisk__hpack_field_ok.
+ * BRISK_OK with *out_len, or BRISK_E_ARG with *out_len = 0 (invalid field, cap too small). */
+int brisk__qpack_encode(const brisk__hpack_field *f, size_t n, uint8_t *out, size_t cap,
+                        size_t *out_len);
+/* One field line of such a section, without the prefix (h3.c streams a request into its
+ * buffer field by field). Same rules and results. */
+int brisk__qpack_encode_field(const brisk__hpack_field *f, uint8_t *out, size_t cap,
+                              size_t *out_len);
+/* The peer's encoder stream (RFC 9204 4.3) / decoder stream (4.4), incremental: whole
+ * instructions are consumed, a trailing partial one is left (*used < len - call again with it
+ * and more bytes). BRISK_OK, or BRISK_E_PROTO with *err = QPACK_ENCODER_STREAM_ERROR /
+ * QPACK_DECODER_STREAM_ERROR (a connection error). With our capacity 0 the encoder stream may
+ * only carry Set Dynamic Table Capacity 0; the decoder stream only Stream Cancellation. */
+int brisk__qpack_enc_stream(const uint8_t *in, size_t len, size_t *used, uint64_t *err);
+int brisk__qpack_dec_stream(const uint8_t *in, size_t len, size_t *used, uint64_t *err);
+
+/* ---- http/h3.c: HTTP/3 (RFC 9114) -------------------------------------------------------------
+ * The whole of h3.c talks to QUIC through this seam: the brisk_quic wrappers in h3.c in
+ * production (brisk_h3_open), a scripted fake in tests/test_h3.c and fuzz/fuzz_h3.c. Every call
+ * is non-blocking except wait. Results follow brisk__quic_stream_*:
+ *   read   > 0 bytes, 0 = FIN consumed, BRISK_E_WANT, BRISK_E_PEER_ALERT (RESET_STREAM, *app_err
+ *          = its code), BRISK_E_ARG; never a connection error (status reports those)
+ *   write  bytes taken (0..n, fin once all n are taken), BRISK_E_PEER_ALERT (STOP_SENDING), < 0
+ *   open   the new stream id, BRISK_E_WANT (no credit / slot yet), < 0
+ *   accept BRISK_OK and the next server-opened stream, or BRISK_E_WANT
+ *   start  a blocking call begins or made progress: restart the stall clock
+ *   wait   one I/O round: BRISK_OK, BRISK_E_TIMEOUT (no progress for the timeout), or the
+ *          connection's sticky error
+ *   abort  brisk__quic_stream_abort; close = close the connection with an H3 / QPACK code
+ *   status 0 while the connection lives, else its sticky error */
+typedef struct {
+    int (*read)(void *io, uint64_t id, uint8_t *buf, size_t cap, uint64_t *app_err);
+    int (*write)(void *io, uint64_t id, const uint8_t *buf, size_t n, int fin);
+    int64_t (*open)(void *io, int bidi);
+    int (*accept)(void *io, uint64_t *id);
+    void (*start)(void *io);
+    int (*wait)(void *io);
+    int (*abort)(void *io, uint64_t id, uint64_t app_err, unsigned dirs);
+    void (*close)(void *io, uint64_t app_err);
+    int (*status)(void *io);
+} brisk__h3_io;
+/* Lay brisk_h3 out in mem (any alignment, mem_len >= brisk_h3_size()); no I/O. authority =
+ * the :authority value (1..255 octets, already bracketed / port-suffixed). BRISK_E_ARG. */
+int brisk__h3_setup(void *mem, size_t mem_len, const char *authority, size_t auth_len,
+                    const brisk__h3_io *ops, void *io, brisk_h3 **out);
+/* Open our control stream and send its preface (RFC 9114 6.2.1), then serve whatever the
+ * server already sent - without waiting for its SETTINGS (7.2.4.2). BRISK_OK or an error. */
+int brisk__h3_start(brisk_h3 *h);
+/* The control-stream preface: stream type 0x00, then our SETTINGS (MAX_FIELD_SECTION_SIZE =
+ * BRISK_H3_MAX_HEADER_LIST and one reserved "grease" setting, 7.2.4.1). Its length, or 0 when
+ * cap is too small. */
+size_t brisk__h3_settings(uint8_t *out, size_t cap);
+#endif /* BRISK_ENABLE_H3 */
 
 /* ---- os/linux_net.c (Linux builds only): clocks and TCP -------------------------------------- */
 int64_t brisk__os_wall_ms(void); /* CLOCK_REALTIME, widened; 0 if the clock cannot be read */

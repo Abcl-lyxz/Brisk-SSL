@@ -43,6 +43,9 @@ reference before emission. Differential vectors come from a fixed seed.
 | hpack_swift_nio_hpack_huffman_00 | https://raw.githubusercontent.com/http2jp/hpack-test-case/8a1406e7d14bfcb6c046021f13cc15cfb162726d/swift-nio-hpack-huffman/story_00.json | `3e7f76ec2000e462fb06d10b25630dca3eba6fb65b30f49b727324aecd46c881` |
 | hpack_swift_nio_hpack_huffman_02 | https://raw.githubusercontent.com/http2jp/hpack-test-case/8a1406e7d14bfcb6c046021f13cc15cfb162726d/swift-nio-hpack-huffman/story_02.json | `fd74c184250bd9f2a718692bd3f622a6d00064562aaa38f5a7b95ce4e98831fb` |
 | hpack_swift_nio_hpack_huffman_08 | https://raw.githubusercontent.com/http2jp/hpack-test-case/8a1406e7d14bfcb6c046021f13cc15cfb162726d/swift-nio-hpack-huffman/story_08.json | `270863e03878eeb9bccb8e83ca1f22993f5a5fa9d5f81e51d05827f3f07559ba` |
+| qif_fb_req | https://raw.githubusercontent.com/litespeedtech/ls-qpack/91567706c41c0d97ab8dc576873ecd472d7869fa/test/qifs/fb-req.qif | `75b501df8290c6615b0e626527c64ccf19c53c813c52e841004e558db947642b` |
+| qif_fb_resp | https://raw.githubusercontent.com/litespeedtech/ls-qpack/91567706c41c0d97ab8dc576873ecd472d7869fa/test/qifs/fb-resp.qif | `698d06cdfa85fc34d9044ff5c2ef800ac2c1993c3ea7bae589992ed4f209f612` |
+| qif_netbsd | https://raw.githubusercontent.com/litespeedtech/ls-qpack/91567706c41c0d97ab8dc576873ecd472d7869fa/test/qifs/netbsd.qif | `5a09b7cd4b0ce902a8b4e141ea9e0e4a1e0f9891ebef72e8dcd9505198916ec3` |
 | rfc4231 | https://www.rfc-editor.org/rfc/rfc4231.txt | `72178527ce93500e730bc8eb182b857e583096d652b64ece0879c52ba1df973b` |
 | rfc5246 | https://www.rfc-editor.org/rfc/rfc5246.txt | `2ebe1b8e651696aeacc8ab3848bedb465505737901ea3b691acf40c392958feb` |
 | rfc5288 | https://www.rfc-editor.org/rfc/rfc5288.txt | `f68375c3f1948802240ca5b21f3aa44311ea02f877e4e240d1fc70927ecf1307` |
@@ -63,6 +66,8 @@ reference before emission. Differential vectors come from a fixed seed.
 | rfc9001 | https://www.rfc-editor.org/rfc/rfc9001.txt | `3bbaecdf5afd278052a2c48348ce118c4ff8d0cf6b9915549858171b3f98a591` |
 | rfc9002 | https://www.rfc-editor.org/rfc/rfc9002.txt | `3a8a54eea1ad5d1c134a548bf15edfa0e21bfb4106dbd7db3c09cace842099af` |
 | rfc9113 | https://www.rfc-editor.org/rfc/rfc9113.txt | `a00ef91b64e111a282e77ec66980f5242e77c0bb5e33e0927e3b6757080506de` |
+| rfc9114 | https://www.rfc-editor.org/rfc/rfc9114.txt | `6b84555c88eeebcf5d2b2e1d9d7b58630abc97ab877b2cf62dee4cd635db34e4` |
+| rfc9204 | https://www.rfc-editor.org/rfc/rfc9204.txt | `926b4d7e9772b5c316fe87a1e160f5ced118101459ede5b13d11bf9a9273c931` |
 | rfc9846 | https://www.rfc-editor.org/rfc/rfc9846.txt | `b1bee06a814f92ca4677c85b97519be53869b2bf8edc79ade955fb51c0402b17` |
 | tls13_wp_p384_ecdsa_der | https://raw.githubusercontent.com/C2SP/wycheproof/main/testvectors_v1/ecdsa_secp384r1_sha384_test.json | `8a5b3ae1760975143414811f13588c24d951d9d8c904195087ba327591dfe9cc` |
 | wp_aes_gcm | https://raw.githubusercontent.com/C2SP/wycheproof/main/testvectors_v1/aes_gcm_test.json | `985e5ecc172e181eaf49e89508b9470dcf478002eb7e8559c707eb42dc97dfe7` |
@@ -347,7 +352,27 @@ reference before emission. Differential vectors come from a fixed seed.
   ALPN hq-interop, 8.1; the parameters, 8.2), and every client datagram - first Initial,
   Finished flight, CH2 after an HRR, the Initial after a Retry, the resumed ClientHello, the
   ALPN-failure CONNECTION_CLOSE - from PyQConn against tls13_fixture's server. The independent
-  oracle is interop: tools/interop/README.md (quic-go and ngtcp2).
+  oracle is interop: tools/interop/README.md (quic-go and ngtcp2). The `H3_*` blobs are the
+  same handshake with ALPN h3, whose transport parameters add the server's 3 uni streams
+  (RFC 9114 6.2).
+
+- **QPACK (M7, `qpack.inc`).** OFFICIAL: RFC 9204 Appendix A (the static table, asserted
+  against src/http/qpack.c) and Appendix B - B.1 is the only static-only example; B.2-B.5
+  reference the dynamic table and are INVALID rows for a decoder at capacity 0 (their encoder
+  and decoder instructions too). The qpackers/qifi interop corpus named in the plan is gone
+  upstream (404 on 2026-09-25); real field lists come instead from ls-qpack's commit-pinned
+  `.qif` captures (rows above), encoded by PyQpackEnc the way a server may (Huffman, static
+  references, literal names, N bits, huge Delta Base) and read back by PyQpackDec. GENERATED:
+  every dynamic form, bad prefixes / integers / strings, truncations, local limits, our
+  encoder policy and the instruction streams. When pylsqpack (aioquic's ls-qpack binding) is
+  importable every row is also decoded by ls-qpack; its three documented looser spots are
+  listed in qpack_dec_rows.
+
+- **HTTP/3 (M7, `h3.inc`).** RFC 9114 has no byte-level vectors: every row is a scenario
+  (the server's stream events, the brisk_h3_* calls with their results, the exact client
+  log), written from the RFC text with the section of each MUST in its note. aioquic's
+  H3Connection was planned as the second implementation; it is not used (it needs a stub
+  QUIC connection and is not installed here) - interop is the oracle.
 
 ## x509-limbo skip tally
 

@@ -77,6 +77,12 @@ SRC = {
     "x509_limbo": "https://raw.githubusercontent.com/C2SP/x509-limbo/main/limbo.json",
     "rfc7541": "https://www.rfc-editor.org/rfc/rfc7541.txt",
     "rfc9113": "https://www.rfc-editor.org/rfc/rfc9113.txt",
+    # HTTP/3 + QPACK (M7). ls-qpack's .qif captures (real field lists), pinned by commit.
+    "rfc9204": "https://www.rfc-editor.org/rfc/rfc9204.txt",
+    "rfc9114": "https://www.rfc-editor.org/rfc/rfc9114.txt",
+    **{f"qif_{k}": "https://raw.githubusercontent.com/litespeedtech/ls-qpack/"
+       f"91567706c41c0d97ab8dc576873ecd472d7869fa/test/qifs/{f}.qif"
+       for k, f in (("netbsd", "netbsd"), ("fb_req", "fb-req"), ("fb_resp", "fb-resp"))},
     # TLS 1.2 (M5): the RFC texts are the audit trail for the labels and layouts tls12_rfc_checks
     # asserts; the vectors are NIST ACVP, pinned by commit, cached under the SRC key (every file
     # is called prompt.json / expectedResults.json).
@@ -7726,6 +7732,8 @@ def h2_lib_check(rows):
         "8.1.1 malformed response: name with": "h2 does not check 8.2.1 name octets",
         "8.1.1 malformed response: value with": "h2 does not check 8.2.1 value octets",
         "8.1.1 malformed response: conflicting content-length": "h2 takes the last one",
+        "8.1.1 malformed response: te field": "h2 allows te in any header block (8.2.2: requests "
+                                               "only)",
     }
     bad, skipped = [], 0
     for r in rows:
@@ -8327,6 +8335,7 @@ def h2_rows():
         ("value with NUL", [(":status", "200"), ("x", "a\x00b")]), ("value with leading SP", [(":status", "200"), ("x", " a")]),
         ("connection field", [(":status", "200"), ("connection", "close")]),
         ("transfer-encoding field", [(":status", "200"), ("transfer-encoding", "chunked")]),
+        ("te field (8.2.2: requests only)", [(":status", "200"), ("te", "trailers")]),
         ("content-length '12a'", [(":status", "200"), ("content-length", "12a")]),
         ("conflicting content-length", [(":status", "200"), ("content-length", "5"), ("content-length", "6")]),
         ("empty content-length", [(":status", "200"), ("content-length", "")]),
@@ -8378,6 +8387,1243 @@ def h2_fuzz_seeds(rows):
     """fuzz/fuzz_h2.c input: a selector byte (bits 0-1: split size), then the server stream."""
     return [(bytes([i & 3]) + bytes.fromhex(r[1]), r[4]) for i, r in enumerate(rows)
             if len(r[1]) // 2 <= 8000]
+
+
+# ------------------------------------------------------------------------------------ QPACK
+# RFC 9204 (M7). OFFICIAL: the Appendix A static table (asserted against src/http/qpack.c) and
+# Appendix B. Only B.1 is static-only; B.2-B.5 use the dynamic table, which a client advertising
+# SETTINGS_QPACK_MAX_TABLE_CAPACITY 0 must refuse, so their field sections and instructions are
+# INVALID rows here. The qpackers/qifi interop corpus the plan named is gone upstream (404,
+# checked 2026-09-25) - nothing is silently dropped for it: real field lists come from ls-qpack's
+# .qif captures instead (commit-pinned, never master), encoded by PyQpackEnc (Huffman, static
+# references, literal names, N bits, huge Delta Base - what a server may send) and read back by
+# the independent PyQpackDec. When pylsqpack (aioquic's ls-qpack binding) is importable, every
+# valid section, every invalid one and every output of our encoder policy is also run through
+# ls-qpack's decoder at MaxTableCapacity 0 (generation-time only: the .inc never depends on it).
+QPACK_STATIC = []  # [(name, value)], index 0..98
+QP_MAX = (1 << 62) - 1
+QP_L = 8192  # BRISK_H3_MAX_HEADER_LIST: the decode scratch and max_list h3.c uses
+QP_LIMIT = "BRISK__QPACK_E_LIMIT"
+QPACK_ENC_ERR, QPACK_DEC_ERR = 0x201, 0x202
+
+
+def rfc9204_static():
+    txt = "\n".join(rfc_lines(fetch("rfc9204")))
+    a, b = txt.rindex("Appendix A.  Static Table"), txt.index("Table 4: Static Table")
+    rows = []
+    for ln in txt[a:b].splitlines():
+        m = re.match(r"^\s+\|\s*(\d*)\s*\|(.*)\|(.*)\|\s*$", ln)
+        if not m:
+            continue
+        idx, n, v = m.group(1), m.group(2).strip(), m.group(3).strip()
+        if idx:
+            rows.append([int(idx), n, v])
+        elif rows and (n or v):
+            # a wrapped cell: the RFC breaks after '-' or '/' (joined as is) or after ';' (the
+            # value has "; " there - text/html; charset=utf-8, the HSTS and CSP entries)
+            r = rows[-1]
+            r[1] += n
+            r[2] += (" " if r[2].endswith(";") else "") + v
+    if [r[0] for r in rows] != list(range(99)):
+        die("RFC 9204 Appendix A: expected indices 0..98")
+    QPACK_STATIC[:] = [(n.encode(), v.encode()) for _, n, v in rows]
+    d = lsqpack_decoder()
+    if d is not None:  # the wrap rule above, checked by an independent table
+        for i, (n, v) in enumerate(QPACK_STATIC):
+            if d.feed_header(i * 4, b"\x00\x00" + py_qint_enc(i, 6, 0xC0))[1] != [(n, v)]:
+                die(f"RFC 9204 Appendix A: entry {i} disagrees with ls-qpack")
+
+
+def check_qpack_source_constants():
+    src = (ROOT / "src/http/qpack.c").read_text()
+    m = re.search(r'static const char qp_static\[\] =(.*?")\s*;', src, re.S)  # ";" also sits inside values
+    if not m:
+        die("src/http/qpack.c: qp_static[] not found")
+    body = m.group(1)  # no comment stripping: "*/*" is a value (the comments hold no quotes)
+    lits = re.findall(r'"((?:[^"\\]|\\.)*)"', body)
+    parts = b"".join(x.encode().decode("unicode_escape").encode("latin-1") for x in lits).split(b"\0")
+    if parts[-1] != b"" or [tuple(parts[i:i + 2]) for i in range(0, len(parts) - 1, 2)] != QPACK_STATIC:
+        die("src/http/qpack.c: qp_static does not match RFC 9204 Appendix A")
+
+
+_LSQ = [None, False]  # (module, probed)
+
+
+def lsqpack_decoder():
+    """A pylsqpack Decoder at MaxTableCapacity 0 / BlockedStreams 0, or None when not installed."""
+    if not _LSQ[1]:
+        _LSQ[1] = True
+        try:
+            import pylsqpack
+            _LSQ[0] = pylsqpack
+        except ImportError:
+            print("  qpack: pylsqpack not installed - ls-qpack cross-check skipped")
+    return _LSQ[0].Decoder(0, 0) if _LSQ[0] else None
+
+
+def py_qint_enc(v, n, flags=0):
+    """RFC 9204 4.1.1 (= RFC 7541 5.1), minimal, no upper bound (so invalid rows can exceed)."""
+    mx = (1 << n) - 1
+    if v < mx:
+        return bytes([flags | v])
+    out, v = [flags | mx], v - mx
+    while v >= 128:
+        out.append(v % 128 + 128)
+        v //= 128
+    return bytes(out + [v])
+
+
+def py_qint_dec(b, pos, n):
+    """-> (value, next pos), "want" (input ends inside it) or None (above 2^62-1, or an 11th
+    continuation octet - our limit, RFC 7541 5.1 "exceed implementation limits")."""
+    if pos >= len(b):
+        return "want"
+    mx = (1 << n) - 1
+    v = b[pos] & mx
+    if v < mx:
+        return v, pos + 1
+    c = 0
+    for k in range(1, 11):
+        if pos + k >= len(b):
+            return "want"
+        c |= (b[pos + k] & 0x7F) << (7 * (k - 1))
+        if not b[pos + k] & 0x80:
+            return (v + c, pos + k + 1) if v + c <= QP_MAX else None
+    return None
+
+
+def py_qstr(blk, pos, n, cap):
+    """4.1.2 string with an n-bit length prefix, H just above it. -> (bytes, pos) | "fail" | "limit"."""
+    r = py_qint_dec(blk, pos, n)
+    if not isinstance(r, tuple) or r[0] > len(blk) - r[1]:
+        return "fail"
+    raw = blk[r[1]:r[1] + r[0]]
+    if blk[pos] & (1 << n):
+        s = py_huff_dec(raw)
+        if s is None:
+            return "fail"
+    else:
+        s = raw
+    return "limit" if len(s) > cap else (s, r[1] + r[0])
+
+
+def py_qpack_decode(blk, scratch=QP_L, max_list=QP_L):
+    """Reference decoder at MaxTableCapacity 0 -> (verdict "ok" / "fail" / "limit", fields
+    [(name, value, flags)] delivered before the verdict). "fail" = QPACK_DECOMPRESSION_FAILED."""
+    fields, total = [], 0
+    r = py_qint_dec(blk, 0, 8)
+    if not isinstance(r, tuple) or r[0] != 0:  # 4.5.1.1: RIC must be 0 (FullRange 0)
+        return "fail", fields
+    pos = r[1]
+    if pos >= len(blk) or blk[pos] & 0x80:  # 4.5.1.2: Sign 1 with RIC 0 is invalid
+        return "fail", fields
+    r = py_qint_dec(blk, pos, 7)
+    if not isinstance(r, tuple):
+        return "fail", fields
+    pos = r[1]
+    while pos < len(blk):
+        b, flags = blk[pos], 0
+        if b & 0x80:  # 4.5.2 indexed; T=0 = dynamic
+            r = py_qint_dec(blk, pos, 6)
+            if not b & 0x40 or not isinstance(r, tuple) or r[0] >= 99:
+                return "fail", fields
+            (name, value), pos = QPACK_STATIC[r[0]], r[1]
+            if len(name) > scratch or len(value) > scratch - len(name):
+                return "limit", fields
+        elif b & 0x40:  # 4.5.4 literal with name reference
+            r = py_qint_dec(blk, pos, 4)
+            if not b & 0x10 or not isinstance(r, tuple) or r[0] >= 99:
+                return "fail", fields
+            flags, name, pos = (1 if b & 0x20 else 0), QPACK_STATIC[r[0]][0], r[1]
+            if len(name) > scratch:
+                return "limit", fields
+            s = py_qstr(blk, pos, 7, scratch - len(name))
+            if isinstance(s, str):
+                return s, fields
+            value, pos = s
+        elif b & 0x20:  # 4.5.6 literal with literal name
+            flags = 1 if b & 0x10 else 0
+            s = py_qstr(blk, pos, 3, scratch)
+            if isinstance(s, str):
+                return s, fields
+            name, pos = s
+            s = py_qstr(blk, pos, 7, scratch - len(name))
+            if isinstance(s, str):
+                return s, fields
+            value, pos = s
+        else:  # 4.5.3 / 4.5.5 post-Base: always a dynamic entry
+            return "fail", fields
+        total += len(name) + len(value) + 32
+        if total > max_list:
+            return "limit", fields
+        fields.append((name, value, flags))
+    return "ok", fields
+
+
+def qp_static_find(n, v):
+    exact = next((i for i, e in enumerate(QPACK_STATIC) if e == (n, v)), None)
+    name = next((i for i, e in enumerate(QPACK_STATIC) if e[0] == n), None)
+    return exact, name
+
+
+def py_qpack_encode(fields):
+    """Our encoder policy (src/http/qpack.c): None if a field is invalid (RFC 9113 8.2.1)."""
+    out = bytearray(b"\x00\x00")
+    for n, v, fl in fields:
+        if not hpack_field_ok(n, v):
+            return None
+        exact, name = qp_static_find(n, v)
+        if exact is not None and not fl:
+            out += py_qint_enc(exact, 6, 0xC0)
+            continue
+        if name is not None:
+            out += py_qint_enc(name, 4, 0x70 if fl else 0x50)
+        else:
+            out += py_qint_enc(len(n), 3, 0x30 if fl else 0x20) + n
+        out += py_qint_enc(len(v), 7) + v
+    return bytes(out)
+
+
+def hpack_field_ok(n, v):
+    """RFC 9113 8.2.1 as brisk__hpack_field_ok."""
+    if not n or any(c <= 0x20 or 0x41 <= c <= 0x5A or c >= 0x7F for c in n) or b":" in n[1:]:
+        return False
+    if any(c in (0, 0x0A, 0x0D) for c in v):
+        return False
+    return not v or (v[0] not in (0x20, 0x09) and v[-1] not in (0x20, 0x09))
+
+
+class PyQpackEnc:
+    """A server-style encoder at capacity 0: what ls-qpack / nghttp3 / quinn may legally send -
+    static references, Huffman or raw strings chosen per string, literal names, the N bit and any
+    Delta Base with Sign 0. Seeded, so the .inc is reproducible."""
+
+    def __init__(self, seed):
+        self.rnd = random.Random(seed)
+
+    def _s(self, x, n, flags):
+        if self.rnd.random() < 0.6:
+            h = py_huff_enc(x)
+            return py_qint_enc(len(h), n, flags | (1 << n)) + h
+        return py_qint_enc(len(x), n, flags) + x
+
+    def section(self, fields, delta=None):
+        rnd = self.rnd
+        if delta is None:
+            delta = rnd.choice([0, 0, 0, 1, 126, 127, 5000, 1 << 32, QP_MAX])
+        out, got = bytearray(b"\x00" + py_qint_enc(delta, 7)), []
+        for n, v in fields:
+            exact, name = qp_static_find(n, v)
+            nb = 1 if rnd.random() < 0.1 else 0
+            if exact is not None and rnd.random() < 0.85:
+                out += py_qint_enc(exact, 6, 0xC0)
+                nb = 0
+            elif name is not None and rnd.random() < 0.85:
+                out += py_qint_enc(name, 4, 0x50 | nb << 5) + self._s(v, 7, 0)
+            else:
+                out += self._s(n, 3, 0x20 | nb << 4) + self._s(v, 7, 0)
+            got.append((n, v, nb))
+        return bytes(out), got
+
+
+def qif_sections(name, limit):
+    """ls-qpack's .qif: sections separated by blank lines, 'name<TAB>value' per line."""
+    out = []
+    for sec in fetch(name).replace(b"\r\n", b"\n").split(b"\n\n"):
+        fl = [ln.split(b"\t", 1) for ln in sec.split(b"\n") if ln and not ln.startswith(b"#")]
+        if fl:
+            out.append([(f[0], f[1] if len(f) > 1 else b"") for f in fl])
+        if len(out) == limit:
+            break
+    return out
+
+
+def rfc9204_examples():
+    """Appendix B as [(section, stream, bytes)] - 'Stream: 0 / Encoder / Decoder / 4 / 8'."""
+    text = "\n".join(rfc_lines(fetch("rfc9204")))
+    text = text[text.index("\nAppendix B.  Encoding and Decoding Examples"):
+                text.index("\nAppendix C.  Sample Single-Pass Encoding Algorithm")]
+    out, sec, cur = [], None, None
+    for ln in text.splitlines():
+        m = re.match(r"^(B\.\d)\.  ", ln)
+        if m:
+            sec = m.group(1)
+            continue
+        m = re.match(r"^\s+Stream: (\S+)$", ln)
+        if m:
+            cur = [sec, m.group(1), b""]
+            out.append(cur)
+            continue
+        m = re.match(r"^\s+((?:[0-9a-f]{2,4} ?)+)\s*\|", ln)
+        if cur and m:
+            cur[2] += bytes.fromhex(m.group(1).replace(" ", ""))
+        elif not ln.strip():
+            cur = None if cur and cur[2] else cur
+    return out
+
+
+def qpack_int_rows():
+    """(hex, n, value, used, rc, note): rc 0 / -4 (E_PROTO) / -8 (E_WANT)."""
+    rows = []
+    for n in range(1, 9):
+        for v in sorted({0, (1 << n) - 2, (1 << n) - 1, 1 << n, 1 << 32, QP_MAX - 1, QP_MAX}):
+            if v < 0:
+                continue
+            b = py_qint_enc(v, n, 0xFF & ~((1 << n) - 1))  # flag bits set: must be ignored
+            rows.append((b.hex(), n, v, len(b), 0, f"{n}-bit prefix, {v}"))
+            if len(b) > 1:
+                rows.append((b[:-1].hex(), n, 0, 0, -8, f"{n}-bit prefix, {v} truncated"))
+        b = py_qint_enc(QP_MAX + 1, n)
+        rows.append((b.hex(), n, 0, 0, -4, f"{n}-bit prefix, 2^62: above 4.1.1's range"))
+        mx = (1 << n) - 1
+        b = bytes([mx]) + b"\x80" * 9 + b"\x00"
+        rows.append((b.hex(), n, mx, 11, 0, f"{n}-bit prefix, 10 continuation octets (zeros)"))
+        b = bytes([mx]) + b"\x80" * 10 + b"\x00"
+        rows.append((b.hex(), n, 0, 0, -4, f"{n}-bit prefix, 11 continuation octets"))
+        rows.append((bytes([mx]).hex(), n, 0, 0, -8, f"{n}-bit prefix, continuation missing"))
+    rows.append(("", 8, 0, 0, -8, "empty input"))
+    for r in rows:
+        want = py_qint_dec(bytes.fromhex(r[0]), 0, r[1])
+        got = "want" if r[4] == -8 else None if r[4] == -4 else (r[2], r[3])
+        if want != got:
+            die(f"qpack int row {r[5]}: reference decoder disagrees")
+    return rows
+
+
+def qpack_dec_rows(examples):
+    """(block hex, fields hex, rc, scratch, max_list, note). rc 0 ok, -4 fail, LIMIT."""
+    rows = []
+    # Where ls-qpack 2.x is looser than RFC 9204 - checked against the RFC text; a NEW
+    # disagreement anywhere else fails generation.
+    lsq_known = {
+        "Sign 1, Delta Base 0 with RIC 0 (4.5.1.2)": "ls-qpack ignores the Base when RIC is 0",
+        "Sign 1, Delta Base 254": "same (4.5.1.2 MUST: Sign 1 with RIC <= Delta Base is invalid)",
+        "Delta Base 2^62: integer out of range": "ls-qpack decodes integers past 4.1.1's 2^62-1",
+    }
+
+    def row(blk, note, scratch=QP_L, max_list=QP_L, want=None):
+        verdict, fields = py_qpack_decode(blk, scratch, max_list)
+        if want is not None and verdict != want:
+            die(f"qpack row {note}: expected {want}, reference says {verdict}")
+        rc = {"ok": 0, "fail": -4, "limit": QP_LIMIT}[verdict]
+        rows.append((blk.hex(), hp_fields(fields).hex() if verdict == "ok" else "", rc, scratch, max_list,
+                     note))
+
+    b1 = next(x for x in examples if x[0] == "B.1" and x[1] == "0")[2]
+    row(b1, "RFC 9204 B.1: literal with static name reference :path=/index.html", want="ok")
+    for sec, st, data in examples:
+        if st.isdigit() and sec != "B.1":
+            row(data, f"RFC 9204 {sec} stream {st}: dynamic references, RIC != 0 (4.5.1.1)",
+                want="fail")
+    # every static entry, indexed; and each as a name reference with another value
+    row(b"\x00\x00" + b"".join(py_qint_enc(i, 6, 0xC0) for i in range(99)), "all 99 static entries, indexed",
+        max_list=1 << 20, want="ok")
+    row(b"\x00\x00" + b"".join(py_qint_enc(i, 4, 0x50) + py_qint_enc(1, 7) + b"x" for i in range(99)),
+        "all 99 static names, literal with name reference", max_list=1 << 20, want="ok")
+    # 3.1 / 2.2.3 / 4.5.1
+    for v, note in ((99, "static index 99 (3.1)"), (QP_MAX, "static index 2^62-1"),
+                    (QP_MAX + 1, "static index 2^62: integer out of range")):
+        row(b"\x00\x00" + py_qint_enc(v, 6, 0xC0), f"indexed: {note}", want="fail")
+        row(b"\x00\x00" + py_qint_enc(v, 4, 0x50) + b"\x01x", f"name reference: {note}", want="fail")
+    row(b"\x00\x00\xd1\xc0" + bytes([0xFF]) + b"\x80" * 10 + b"\x00", "indexed: 11 continuation octets",
+        want="fail")
+    for ric in (1, 2, 255, QP_MAX):
+        row(py_qint_enc(ric, 8) + b"\x00\xd1", f"Required Insert Count {ric} with capacity 0 (4.5.1.1)",
+            want="fail")
+    row(py_qint_enc(QP_MAX + 1, 8) + b"\x00", "Required Insert Count 2^62: integer out of range", want="fail")
+    row(b"\x00\x80\xd1", "Sign 1, Delta Base 0 with RIC 0 (4.5.1.2)", want="fail")
+    row(b"\x00\xff\x7f\xd1", "Sign 1, Delta Base 254", want="fail")
+    for d in (1, 127, 5000, 1 << 32, QP_MAX):
+        row(b"\x00" + py_qint_enc(d, 7) + b"\xd1", f"Sign 0, Delta Base {d}: any Base is legal", want="ok")
+    row(b"\x00" + py_qint_enc(QP_MAX + 1, 7) + b"\xd1", "Delta Base 2^62: integer out of range", want="fail")
+    row(b"\x00" + bytes([0x7F]) + b"\x80" * 10 + b"\x00", "Delta Base with 11 continuation octets", want="fail")
+    for pre, note in ((b"\x80", "indexed, dynamic (T=0)"), (b"\xbf\x00", "indexed, dynamic index 63"),
+                      (b"\x10", "indexed with post-Base index"), (b"\x1f\x7f", "post-Base index 142"),
+                      (b"\x40\x01x", "name reference, dynamic (T=0)"),
+                      (b"\x60\x01x", "name reference, dynamic, N=1"),
+                      (b"\x00\x01x", "literal with post-Base name reference"),
+                      (b"\x08\x01x", "literal with post-Base name reference, N=1")):
+        row(b"\x00\x00\xd1" + pre, f"2.2.3: {note}", want="fail")
+    row(b"", "empty: no prefix", want="fail")
+    row(b"\x00", "prefix without Delta Base", want="fail")
+    row(b"\x00\x00", "prefix only: an empty field section", want="ok")
+    # strings
+    row(b"\x00\x00\x51\x05/ab", "value length past the section end", want="fail")
+    row(b"\x00\x00\x51\x7f\xff\xff\xff\xff\x0f/", "value length 2^35: past the section end", want="fail")
+    row(b"\x00\x00\x27\x80" + b"\x80" * 8 + b"\x01", "literal name length above 2^62", want="fail")
+    eos = py_huff_enc(b"a")[:-1] + b"\xff\xff\xff\xff"  # 'a' then EOS (30 ones) in the padding
+    for s, note in ((eos, "Huffman value containing EOS"), (b"\xff", "Huffman padding of 8 bits"),
+                    (py_huff_enc(b"ab")[:-1] + bytes([py_huff_enc(b"ab")[-1] & 0xFE]),
+                     "Huffman padding not all ones")):
+        if py_huff_dec(s) is not None:
+            die(f"qpack row {note}: meant to be an invalid Huffman string")
+        row(b"\x00\x00\x51" + py_qint_enc(len(s), 7, 0x80) + s, note, want="fail")
+        row(b"\x00\x00" + py_qint_enc(len(s), 3, 0x28) + s + b"\x00", f"{note} (literal name)", want="fail")
+    hn = py_huff_enc(b"x-huff-name")
+    row(b"\x00\x00" + py_qint_enc(len(hn), 3, 0x28) + hn + b"\x02ok", "literal name, Huffman (H=1)", want="ok")
+    row(b"\x00\x00" + py_qint_enc(len(hn), 3, 0x38) + hn + b"\x02ok", "literal name, Huffman, N=1", want="ok")
+    row(b"\x00\x00\x74\x03abc", "name reference with N=1 (content-length): reported never-indexed", want="ok")
+    row(b"\x00\x00\x27\x04" + b"x-long-name" + b"\x00", "literal name length 11 (3-bit prefix + 1 octet)",
+        want="ok")
+    row(b"\x00\x00\x23abc\x7f\x81\x01" + b"v" * 256, "value length 256 (7-bit prefix + 2 octets)", want="ok")
+    row(b"\x00\x00\x23ABC\x01v", "uppercase name: QPACK passes it on (RFC 9114 4.2 judges it)", want="ok")
+    # local limits (h3.c: stream error, never DECOMPRESSION_FAILED)
+    nv = b"\x00\x00\x23abc\x0cvalue-twelve"
+    row(nv, "scratch exactly name + value", scratch=15, want="ok")
+    row(nv, "scratch one short: local limit", scratch=14, want="limit")
+    row(nv, "max_list exactly n + v + 32", max_list=47, want="ok")
+    row(nv, "max_list one short: local limit", max_list=46, want="limit")
+    hv = py_huff_enc(b"value-twelve")
+    hb = b"\x00\x00\x23abc" + py_qint_enc(len(hv), 7, 0x80) + hv
+    row(hb, "Huffman value fits the scratch exactly", scratch=15, want="ok")
+    row(hb, "Huffman value one past the scratch: limit, not a coding error", scratch=14, want="limit")
+    row(b"\x00\x00\xd1\xd1\xd1", "max_list for two of three fields", max_list=2 * (7 + 3 + 32), want="limit")
+    row(b"\x00\x00\xdf", "static entry larger than a tiny scratch", scratch=8,
+        want="limit")
+    # real field lists: ls-qpack's captures, encoded server-style
+    enc = PyQpackEnc(20260925)
+    sections = []
+    for name, lim in (("qif_netbsd", 1000), ("qif_fb_req", 40), ("qif_fb_resp", 40)):
+        for i, fl in enumerate(qif_sections(name, lim)):
+            blk, got = enc.section(fl)
+            verdict, fields = py_qpack_decode(blk, 1 << 16, 1 << 20)
+            if verdict != "ok" or fields != got:
+                die(f"qpack {name} #{i}: PyQpackDec disagrees with PyQpackEnc")
+            row(blk, f"{name} section {i} (server-style encoding)", scratch=1 << 16, max_list=1 << 20)
+            sections.append(blk)
+    # truncation at every byte of a few valid sections: the reference decides each verdict
+    for blk in [b1] + sections[:3]:
+        for k in range(len(blk)):
+            row(blk[:k], f"truncated to {k} of {len(blk)} octets", scratch=1 << 16, max_list=1 << 20)
+    d = lsqpack_decoder()
+    if d is not None:
+        bad = []
+        for i, r in enumerate(rows):
+            blk = bytes.fromhex(r[0])
+            full = py_qpack_decode(blk, 1 << 20, 1 << 30)
+            try:
+                got = d.feed_header(1000 + 4 * i, blk)[1]
+                ok = full[0] == "ok" and got == [(n, v) for n, v, _ in full[1]]
+            except Exception:  # noqa: BLE001 - ls-qpack refused the section
+                ok = full[0] == "fail"
+            if not ok and full[0] == "ok" and not full[1]:
+                continue  # ls-qpack refuses an EMPTY field section; RFC 9204 does not (RFC 9114 does)
+            if not ok and r[5] not in lsq_known:
+                bad.append(r[5])
+        for b in bad:
+            print("   ls-qpack disagrees:", b)
+        if bad:
+            die(f"qpack: {len(bad)} rows disagree with ls-qpack")
+        print(f"  qpack: {len(rows)} decode rows agree with ls-qpack")
+    return rows
+
+
+def qpack_enc_rows():
+    """(fields hex with flags, block hex, rc, note): our encoder policy, byte for byte."""
+    rows, rnd = [], random.Random(20260926)
+
+    def row(fields, note):
+        fl = [(h2b(n), h2b(v), f) for n, v, f in fields]
+        blk = py_qpack_encode(fl)
+        if blk is not None:
+            verdict, got = py_qpack_decode(blk, 1 << 16, 1 << 20)
+            if verdict != "ok" or got != fl:
+                die(f"qpack enc row {note}: does not decode back")
+            d = lsqpack_decoder()
+            if d is not None and fl and d.feed_header(4 * len(rows), blk)[1] != [(n, v) for n, v, _ in fl]:
+                die(f"qpack enc row {note}: ls-qpack decodes it differently")
+        rows.append((hp_fields(fl).hex(), blk.hex() if blk is not None else "", 0 if blk is not None else -1,
+                     note))
+
+    row([(":path", "/index.html", 0)], "RFC 9204 B.1 re-encoded")
+    row([(":method", "GET", 0), (":scheme", "https", 0), (":authority", "example.com", 0), (":path", "/", 0)],
+        "request pseudo-headers: static exact, exact, name reference, exact")
+    row([("authorization", "Bearer x", 1), ("cookie", "a=b", 1), ("proxy-authorization", "p", 1),
+         ("set-cookie", "s", 1)], "7.1.3: sensitive fields get N=1")
+    row([("cookie", "", 1)], "sensitive exact static match: literal with N=1, never indexed")
+    row([("cookie", "", 0)], "non-sensitive exact static match: indexed")
+    row([("x-custom", "v" * 300, 0), ("x-" + "n" * 200, "", 0)], "multi-octet lengths (3-bit and 7-bit prefixes)")
+    row([("x-secret", "s", 1)], "literal name with N=1")
+    row([("content-type", "application/json", 0), ("content-type", "text/xml", 0)],
+        "exact match at index 46, then the lowest name index 44")
+    row([("x-frame-options", "sameorigin", 0), ("user-agent", "brisk", 0)], "index 98 and 95 (2-octet index)")
+    row([], "no fields: the prefix alone")
+    for bad, note in (([("Bad", "x", 0)], "uppercase name"), ([("a", "x\r", 0)], "CR in a value"),
+                      ([("a", " x", 0)], "leading SP"), ([("", "x", 0)], "empty name"),
+                      ([(":a:b", "x", 0)], "':' inside a name"), ([("ok", "v", 0), ("a\x7f", "x", 0)],
+                                                                   "second field invalid: nothing emitted")):
+        row(bad, f"refused: {note}")
+    names = [n for n, _ in QPACK_STATIC] + [b"x-a", b"x-device-id", b"accept-language"]
+    for i in range(40):
+        fl = []
+        for _ in range(rnd.randrange(0, 12)):
+            n, v = QPACK_STATIC[rnd.randrange(99)] if rnd.random() < 0.4 else (
+                rnd.choice(names), bytes(rnd.choice(b"abcxyz0189-_./;=") for _ in range(rnd.choice([0, 1, 5, 126, 127, 300]))))
+            if v and (v[0] in b" \t" or v[-1] in b" \t"):
+                continue
+            fl.append((n, v, 1 if n in SENSITIVE else 0))
+        row(fl, f"random field list {i}")
+    return rows
+
+
+def qpack_ins_rows(examples):
+    """(0 encoder / 1 decoder stream, hex, rc, err, used, note)."""
+    rows = []
+
+    def row(dec, data, rc, err, used, note):
+        rows.append((dec, data.hex(), rc, err, used, note))
+
+    for sec, st, data in examples:
+        if st == "Encoder":
+            row(0, data, -4, QPACK_ENC_ERR, 0, f"RFC 9204 {sec} encoder stream (capacity / insert / duplicate)")
+        elif st == "Decoder":
+            ok = data[0] & 0xC0 == 0x40
+            row(1, data, 0 if ok else -4, 0 if ok else QPACK_DEC_ERR, len(data) if ok else 0,
+                f"RFC 9204 {sec} decoder stream ({'Stream Cancellation' if ok else 'ack / increment'})")
+    row(0, b"", 0, 0, 0, "empty encoder stream")
+    row(0, b"\x20", 0, 0, 1, "Set Dynamic Table Capacity 0 (4.3.1)")
+    row(0, b"\x20\x20\x20", 0, 0, 3, "capacity 0, three times")
+    row(0, b"\x21", -4, QPACK_ENC_ERR, 0, "capacity 1 > our 0 (4.3.1 MUST)")
+    row(0, b"\x20\x3f\xe1\x1f", -4, QPACK_ENC_ERR, 1, "capacity 0 then 4096")
+    row(0, b"\x3f", -4, QPACK_ENC_ERR, 0, "capacity >= 31, first octet only")
+    row(0, b"\xc0\x01x", -4, QPACK_ENC_ERR, 0, "Insert With Name Reference, static (3.2.2)")
+    row(0, b"\x80\x01x", -4, QPACK_ENC_ERR, 0, "Insert With Name Reference, dynamic")
+    row(0, b"\x41a\x01x", -4, QPACK_ENC_ERR, 0, "Insert With Literal Name")
+    row(0, b"\x00", -4, QPACK_ENC_ERR, 0, "Duplicate 0 (2.2.3: no such entry)")
+    row(1, b"", 0, 0, 0, "empty decoder stream")
+    row(1, b"\x41", 0, 0, 1, "Stream Cancellation 1 (4.4.2): ignored")
+    big = py_qint_enc(QP_MAX, 6, 0x40)
+    row(1, big, 0, 0, len(big), "Stream Cancellation of stream 2^62-1")
+    row(1, b"\x41\x7f\x80", 0, 0, 1, "a cancellation, then a partial one (left for later)")
+    row(1, b"\x7f" + b"\x80" * 10 + b"\x00", -4, QPACK_DEC_ERR, 0, "Stream Cancellation, 11 continuation octets")
+    row(1, py_qint_enc(QP_MAX + 1, 6, 0x40), -4, QPACK_DEC_ERR, 0, "Stream Cancellation of 2^62: out of range")
+    row(1, b"\x80", -4, QPACK_DEC_ERR, 0, "Section Acknowledgment 0 (4.4.1)")
+    row(1, b"\x41\xff\x00", -4, QPACK_DEC_ERR, 1, "cancel then Section Acknowledgment 127")
+    row(1, b"\x00", -4, QPACK_DEC_ERR, 0, "Insert Count Increment 0 (4.4.3 MUST)")
+    row(1, b"\x01", -4, QPACK_DEC_ERR, 0, "Insert Count Increment 1 > our 0 inserts")
+    row(1, b"\x3f\x00", -4, QPACK_DEC_ERR, 0, "Insert Count Increment 63")
+    return rows
+
+
+def qpack_fuzz_seeds(dec_rows, ins_rows):
+    """fuzz/fuzz_qpack.c input: a selector byte (0 section, 1 encoder stream, 2 decoder stream;
+    bits 2-7 the split), then the bytes."""
+    seeds = [(bytes([0 | (i & 0x3F) << 2]) + bytes.fromhex(r[0]), r[5]) for i, r in enumerate(dec_rows)
+             if len(r[0]) // 2 <= 4000]
+    seeds += [(bytes([1 + r[0] | (i & 0x3F) << 2]) + bytes.fromhex(r[1]), r[5]) for i, r in enumerate(ins_rows)]
+    return [(s.hex(), n) for s, n in seeds]
+
+
+def emit_qpack(ir, dr, er, nr):
+    note = lambda r: f'"{cesc(r)}"'
+    emit("qpack.inc", "struct qpack_int_kat QPACK_INT_KAT", ir,
+         lambda r: f'{cstr(r[0])}, {r[1]}, UINT64_C({r[2]:#x}), {r[3]}, {r[4]}, {note(r[5])}')
+    emit("qpack.inc", "struct qpack_dec_kat QPACK_DEC_KAT", dr,
+         lambda r: f'{cstr(r[0])}, {cstr(r[1])}, {r[2]}, {r[3]}u, {r[4]}u, {note(r[5])}', append=True)
+    emit("qpack.inc", "struct qpack_enc_kat QPACK_ENC_KAT", er,
+         lambda r: f'{cstr(r[0])}, {cstr(r[1])}, {r[2]}, {note(r[3])}', append=True)
+    emit("qpack.inc", "struct qpack_ins_kat QPACK_INS_KAT", nr,
+         lambda r: f'{r[0]}, {cstr(r[1])}, {r[2]}, 0x{r[3]:x}u, {r[4]}u, {note(r[5])}', append=True)
+    # Seeds for fuzz/fuzz_qpack.c (tools/dev.py fuzz qpack), not included by any test.
+    emit("qpack_fuzz.inc", "struct qpack_fuzz_seed QPACK_FUZZ_SEED", qpack_fuzz_seeds(dr, nr),
+         lambda r: f'{cstr(r[0])}, {note(r[1])}')
+
+
+# ----------------------------------------------------------------------------------- HTTP/3
+# RFC 9114 has no byte-level test vectors. Every row is a SCENARIO for tests/test_h3.c: the
+# server's stream events (data on its control / QPACK / other unidirectional streams and on our
+# request streams, FIN, RESET_STREAM, STOP_SENDING, CONNECTION_CLOSE), the brisk_h3_* calls with
+# the result each must return, and the exact client log - bytes written per stream, stream
+# aborts (RESET_STREAM + STOP_SENDING with a code) and the connection close code. The C test
+# replays each row through a scripted brisk__h3_io at many chunkings. Server field sections come
+# from PyQpackEnc (server-style: Huffman, name references, N bits) and are read back by
+# PyQpackDec; client sections come from py_qpack_encode (our policy, which the qpack rows pin).
+# aioquic's H3Connection would be the independent second implementation; it is not used (not
+# installed on the generation host, and it needs a stub QUIC connection) - the protocol rows
+# instead cite the RFC 9114 section of every MUST they exercise, and interop is the oracle.
+H3_L = 8192  # BRISK_H3_MAX_HEADER_LIST
+H3_NS = 4    # BRISK_QUIC_MAX_STREAMS - 4 request slots
+H3E = {"NO_ERROR": 0x100, "GENERAL": 0x101, "STREAM_CREATION": 0x103, "CLOSED_CRITICAL": 0x104,
+       "FRAME_UNEXPECTED": 0x105, "FRAME": 0x106, "EXCESSIVE_LOAD": 0x107, "ID": 0x108,
+       "SETTINGS": 0x109, "MISSING_SETTINGS": 0x10A, "REQUEST_REJECTED": 0x10B,
+       "REQUEST_CANCELLED": 0x10C, "REQUEST_INCOMPLETE": 0x10D, "MESSAGE": 0x10E,
+       "QPACK_DECOMPRESSION": 0x200, "QPACK_ENCODER_STREAM": 0x201, "QPACK_DECODER_STREAM": 0x202}
+H3_GREASE_SETTING = 0x1F * 10 + 0x21
+H3RC = {"OK": 0, "ARG": -1, "PROTO": -4, "PEER": -5, "IO": -6, "RETRY": -9}
+
+
+def h3fr(t, pl=b""):
+    """RFC 9114 7.1: Type (varint), Length (varint), payload."""
+    return qv(t) + qv(len(pl)) + pl
+
+
+def h3_settings(*kv):
+    return h3fr(0x04, b"".join(qv(k) + qv(v) for k, v in kv))
+
+
+def h3_preface():
+    """Our control stream: type 0x00, SETTINGS (MAX_FIELD_SECTION_SIZE, one grease id)."""
+    return b"\x00" + h3_settings((0x06, H3_L), (H3_GREASE_SETTING, 0))
+
+
+def check_rfc9114_codes():
+    """8.1: the error codes used here, against the RFC text."""
+    text = "\n".join(rfc_lines(fetch("rfc9114")))
+    for name, code in H3E.items():
+        if not name.startswith("QPACK") and not re.search(r"H3_%s\w* \(0x%04x\)" % (name, code), text):
+            die(f"RFC 9114 8.1: H3_{name}* is not {code:#06x}")
+    t9204 = "\n".join(rfc_lines(fetch("rfc9204")))
+    for name, code in (("DECOMPRESSION_FAILED", 0x200), ("ENCODER_STREAM_ERROR", 0x201),
+                       ("DECODER_STREAM_ERROR", 0x202)):
+        if not re.search(r"QPACK_%s \(0x%04x\)" % (name, code), t9204):
+            die(f"RFC 9204 6: QPACK_{name} is not {code:#06x}")
+
+
+class H3Row:
+    """One scenario; methods append server events / calls / expected client records in the order
+    the C code produces them (it reads lazily: one delivered chunk per wait)."""
+
+    def __init__(self, note, flags=0):
+        self.note, self.flags = note, flags  # flags bit 0: no TIMEOUT-injection replays
+        self.ev, self.ops, self.cli = [], [], []
+        self.next_bidi, self.uni_started = 0, set()
+        self.enc = PyQpackEnc(0x5EED + len(note))
+
+    # --- server events
+    def s(self, sid, data):
+        if sid & 3 == 3 and sid not in self.uni_started:
+            self.uni_started.add(sid)
+        self.ev.append(f"S{sid},{bytes(data).hex()}")
+
+    def fin(self, sid):
+        self.ev.append(f"F{sid}")
+
+    def rst(self, sid, code):
+        self.ev.append(f"R{sid},{code:x}")
+
+    def stop(self, sid, code):
+        self.ev.append(f"T{sid},{code:x}")
+
+    def kill(self, code):
+        self.ev.append(f"K{code:x}")
+
+    def ctl(self, *frames, sid=3, typ=True):
+        self.s(sid, (b"\x00" if typ else b"") + b"".join(frames))
+
+    def section(self, fields, verify=True, **kw):
+        fields = [(h2b(n), h2b(v)) for n, v in fields]
+        blk, got = self.enc.section(fields, **kw)
+        if verify:
+            verdict, dec = py_qpack_decode(blk, 1 << 16, 1 << 20)
+            if verdict != "ok" or [(n, v) for n, v, _ in dec] != fields:
+                die(f"h3 row {self.note}: PyQpackDec disagrees with PyQpackEnc")
+        return blk
+
+    def hdrs(self, fields, **kw):
+        return h3fr(0x01, self.section(fields, **kw))
+
+    # --- client records
+    def w(self, sid, data, fin=False):
+        if self.cli and self.cli[-1].startswith(f"W{sid},"):
+            self.cli[-1] += bytes(data).hex()
+        elif data:
+            self.cli.append(f"W{sid},{bytes(data).hex()}")
+        if fin:
+            self.cli.append(f"F{sid}")
+
+    def abort(self, sid, code):
+        self.cli.append(f"A{sid},{code:x},3")
+
+    def conn_err(self, code):
+        self.cli.append(f"X{code:x}")
+
+    # --- calls
+    def open(self, rc=0):
+        self.ops.append(f"O{rc}")
+        if rc == 0:
+            self.w(2, h3_preface())
+
+    def req(self, slot, method="GET", path="/", hdrs=(), body=b"", rc=0, auth=b"example.com"):
+        m, p = h2b(method), h2b(path)
+        hd = [(h2b(n), h2b(v)) for n, v in hdrs]
+        self.ops.append(f"Q{slot},{rc},{m.hex()},{p.hex()},{h2_fields_hex(hd)},{bytes(body).hex()}")
+        if rc != 0:
+            return None
+        sid = self.next_bidi
+        self.next_bidi += 4
+        fl = [(b":method", m, 0), (b":scheme", b"https", 0), (b":authority", auth, 0), (b":path", p, 0)] + \
+            [(n, v, 1 if n in SENSITIVE else 0) for n, v in hd]
+        sec = py_qpack_encode(fl)
+        if sec is None:
+            die(f"h3 row {self.note}: request fields refused by py_qpack_encode")
+        self.w(sid, h3fr(0x01, sec), fin=not body)
+        if body:
+            self.w(sid, qv(0x00) + qv(len(body)))
+            self.w(sid, body, fin=True)
+        return sid
+
+    def resp(self, slot, rc=0, status=0, fields=()):
+        self.ops.append(f"R{slot},{rc},{status},{h2_fields_hex(fields)}")
+
+    def body(self, slot, rc=0, data=b"", cap=4096):
+        self.ops.append(f"D{slot},{rc},{cap},{bytes(data).hex()}")
+
+    def read1(self, slot, rc, data=b"", cap=16):
+        self.ops.append(f"d{slot},{rc},{cap},{bytes(data).hex()}")
+
+    def close_s(self, slot, abort_sid=None):
+        self.ops.append(f"C{slot}")
+        if abort_sid is not None:
+            self.abort(abort_sid, H3E["REQUEST_CANCELLED"])
+
+    def close(self):
+        self.ops.append("X")
+
+    def pump(self):
+        self.ops.append("P")
+
+    def row(self):
+        return (" ".join(self.ev), " ".join(self.ops), " ".join(self.cli), self.flags, self.note)
+
+
+def h3_rows():
+    rows = []
+    E = H3E
+    OK200 = [(":status", "200"), ("content-type", "text/plain")]
+    SET = h3_settings((0x06, 16384), (0x01, 0), (0x07, 0))
+
+    def new(note, flags=0):
+        r = H3Row(note, flags)
+        rows.append(r)
+        return r
+
+    def srv_ok(r, qpack=True):
+        """The server's usual preface: control stream + SETTINGS, QPACK streams."""
+        r.ctl(SET)
+        if qpack:
+            r.s(7, b"\x02")
+            r.s(11, b"\x03")
+
+    def get(note, fields=OK200, data=b"hello", after=None, flags=0, **kw):
+        """open, GET /, the server's preface, a response; R + D + C + X."""
+        r = new(note, flags)
+        r.open()
+        sid = r.req(0)
+        srv_ok(r)
+        if after:
+            after(r, sid)
+        else:
+            r.s(sid, r.hdrs(fields, **kw) + (h3fr(0, data) if data else b""))
+            r.fin(sid)
+        return r, sid
+
+    # --- basics
+    r, sid = get("GET: control + QPACK streams, 200, DATA, FIN")
+    r.resp(0, 0, 200, [("content-type", "text/plain")])
+    r.body(0, 0, b"hello")
+    r.close_s(0)
+    r.close()
+
+    r = new("POST with a body and content-length, 201, then 1-byte reads")
+    r.open()
+    sid = r.req(0, "POST", "/v1/telemetry", [("content-type", "application/json"), ("content-length", "13"),
+                                              ("authorization", "Bearer abc"), ("cookie", "k=v")],
+                b'{"t": 21.5,1}')
+    srv_ok(r)
+    r.s(sid, r.hdrs([(":status", "201"), ("content-length", "3")]) + h3fr(0, b"ok!"))
+    r.fin(sid)
+    r.resp(0, 0, 201, [("content-length", "3")])
+    r.read1(0, 1, b"o", 1)
+    r.read1(0, 1, b"k", 1)
+    r.read1(0, 1, b"!", 1)
+    r.read1(0, 0, b"", 1)
+    r.close_s(0)
+    r.close()
+
+    r = new("7.2.4.2: a response before the server's control stream - nothing waits for SETTINGS")
+    r.open()
+    sid = r.req(0, "GET", "/late")
+    r.s(sid, r.hdrs(OK200) + h3fr(0, b"x"))
+    r.fin(sid)
+    r.resp(0, 0, 200, [("content-type", "text/plain")])
+    srv_ok(r)
+    r.body(0, 0, b"x")
+    r.close_s(0)
+    r.close()
+
+    r, sid = get("DATA split into many frames, empty DATA frames, read with cap 3", data=None,
+                 after=lambda r, sid: (r.s(sid, r.hdrs(OK200) + h3fr(0, b"") + h3fr(0, b"abcd") + h3fr(0, b"")
+                                           + h3fr(0, b"efghij") + h3fr(0, b"k")), r.fin(sid)))
+    r.resp(0, 0, 200, [("content-type", "text/plain")])
+    r.body(0, 0, b"abcdefghijk", 3)
+    r.close_s(0)
+    r.close()
+
+    big = bytes((i * 7 + 3) & 0xFF for i in range(20000))
+    r, sid = get("a 20000-byte response in 6 DATA frames, read 1000 at a time", data=None,
+                 after=lambda r, sid: (r.s(sid, r.hdrs([(":status", "200"), ("content-length", "20000")])),
+                                       [r.s(sid, h3fr(0, big[i:i + 3500])) for i in range(0, 20000, 3500)],
+                                       r.fin(sid)))
+    r.resp(0, 0, 200, [("content-length", "20000")])
+    r.body(0, 0, big, 1000)
+    r.close_s(0)
+    r.close()
+
+    r, sid = get("1xx: 100 then 103 then 200 (4.1: interim responses skipped)", data=None,
+                 after=lambda r, sid: (r.s(sid, r.hdrs([(":status", "100")]) + r.hdrs([(":status", "103"),
+                                                                                       ("link", "</a>")])
+                                           + r.hdrs(OK200) + h3fr(0, b"z")), r.fin(sid)))
+    r.resp(0, 0, 200, [("content-type", "text/plain")])
+    r.body(0, 0, b"z")
+    r.close_s(0)
+    r.close()
+
+    r, sid = get("trailers: validated and discarded", data=None,
+                 after=lambda r, sid: (r.s(sid, r.hdrs(OK200) + h3fr(0, b"body") + r.hdrs([("x-checksum", "abc")])),
+                                       r.fin(sid)))
+    r.resp(0, 0, 200, [("content-type", "text/plain")])
+    r.body(0, 0, b"body")
+    r.close_s(0)
+    r.close()
+
+    for st, extra, note in ((204, [("content-length", "5")], "204 with content-length 5 and no DATA"),
+                            (304, [("content-length", "9")], "304 with content-length 9 and no DATA")):
+        r, sid = get(f"4.1.2: {note} is not malformed", data=None,
+                     after=lambda r, sid, st=st, extra=extra: (r.s(sid, r.hdrs([(":status", str(st))] + extra)),
+                                                               r.fin(sid)))
+        r.resp(0, 0, st, extra)
+        r.body(0, 0, b"")
+        r.close_s(0)
+        r.close()
+
+    r = new("HEAD: content-length without DATA")
+    r.open()
+    sid = r.req(0, "HEAD", "/big")
+    srv_ok(r)
+    r.s(sid, r.hdrs([(":status", "200"), ("content-length", "1000000")]))
+    r.fin(sid)
+    r.resp(0, 0, 200, [("content-length", "1000000")])
+    r.body(0, 0, b"")
+    r.close_s(0)
+    r.close()
+
+    r, sid = get("server fields: Huffman, literal names, N bit, huge Delta Base", data=None,
+                 after=lambda r, sid: (r.s(sid, r.hdrs([(":status", "200"), ("server", "brisk-test"),
+                                                        ("x-weird-name", "v" * 300), ("set-cookie", "a=b"),
+                                                        ("cache-control", "no-cache")], delta=QP_MAX)),
+                                       r.fin(sid)))
+    r.resp(0, 0, 200, [("server", "brisk-test"), ("x-weird-name", "v" * 300), ("set-cookie", "a=b"),
+                       ("cache-control", "no-cache")])
+    r.body(0, 0, b"")
+    r.close_s(0)
+    r.close()
+
+    # --- ignored things (RFC 9114 6.2, 7.2.4.1, 7.2.8 grease, 9)
+    r = new("ignored: grease stream type, unknown settings, grease frames on control + request")
+    r.open()
+    sid = r.req(0)
+    r.s(15, qv(0x1F * 3 + 0x21) + b"junk junk")
+    r.fin(15)
+    r.ctl(h3_settings((0x06, 1 << 20), (0x21, 7), (0x33, 1), (0x08, 1), (0x1F * 5 + 0x21, 99)),
+          h3fr(0x1F * 2 + 0x21, b"grease"), h3fr(0x2A, b""))
+    r.s(7, b"\x02\x20")  # encoder stream: Set Dynamic Table Capacity 0
+    r.s(11, b"\x03\x41")  # decoder stream: Stream Cancellation 1
+    r.s(sid, h3fr(0x21, b"x") + r.hdrs(OK200) + h3fr(0x1F * 7 + 0x21, b"abc") + h3fr(0, b"hi") + h3fr(0x40, b""))
+    r.fin(sid)
+    r.resp(0, 0, 200, [("content-type", "text/plain")])
+    r.body(0, 0, b"hi")
+    r.close_s(0)
+    r.close()
+
+    r = new("6.2: a uni stream reset before its type octet is tolerated")
+    r.open()
+    sid = r.req(0)
+    r.s(3, b"")
+    r.rst(3, 0x21)
+    r.ctl(SET, sid=7)
+    r.s(sid, r.hdrs(OK200))
+    r.fin(sid)
+    r.resp(0, 0, 200, [("content-type", "text/plain")])
+    r.body(0, 0, b"")
+    r.close_s(0)
+    r.close()
+
+    # --- connection errors on the control stream
+    def cerr(note, events, code, qpack=True, flags=0):
+        r = new(note, flags)
+        r.open()
+        sid = r.req(0)
+        for ev in events:
+            ev(r)
+        r.resp(0, H3RC["PROTO"])
+        r.conn_err(code)
+        r.body(0, H3RC["ARG"])  # before a response: a caller mistake
+        r.close_s(0)  # the connection is closed: nothing more is sent
+        r.close()
+        return r
+
+    for sid_, name in ((0x00, "0x00"), (0x02, "0x02"), (0x03, "0x03"), (0x04, "0x04"), (0x05, "0x05")):
+        cerr(f"7.2.4.1: reserved HTTP/2 setting {name}", [lambda r, i=sid_: r.ctl(h3_settings((i, 0)))],
+             E["SETTINGS"])
+    cerr("7.2.4: the same setting twice", [lambda r: r.ctl(h3_settings((0x06, 100), (0x21, 0), (0x06, 100)))],
+         E["SETTINGS"])
+    cerr("7.2.4: a second SETTINGS", [lambda r: r.ctl(SET, h3_settings())], E["FRAME_UNEXPECTED"])
+    cerr("6.2.1: GOAWAY before SETTINGS", [lambda r: r.ctl(h3fr(0x07, qv(0)))], E["MISSING_SETTINGS"])
+    cerr("6.2.1: an unknown frame before SETTINGS", [lambda r: r.ctl(h3fr(0x21, b""), SET)], E["MISSING_SETTINGS"])
+    for t, name in ((0x00, "DATA"), (0x01, "HEADERS"), (0x05, "PUSH_PROMISE"), (0x0D, "MAX_PUSH_ID")):
+        cerr(f"7.2: {name} on the control stream", [lambda r, t=t: r.ctl(SET, h3fr(t, b"\x00\x00"))],
+             E["FRAME_UNEXPECTED"])
+    for t in (0x02, 0x06, 0x08, 0x09):
+        cerr(f"7.2.8: reserved HTTP/2 frame type {t:#04x} on the control stream",
+             [lambda r, t=t: r.ctl(SET, h3fr(t, b"\x00"))], E["FRAME_UNEXPECTED"])
+    cerr("7.2.3: CANCEL_PUSH (no MAX_PUSH_ID was sent)", [lambda r: r.ctl(SET, h3fr(0x03, qv(0)))], E["ID"])
+    cerr("7.1: SETTINGS ending in half a setting", [lambda r: r.ctl(h3fr(0x04, qv(0x06) + qv(100) + qv(0x21)))],
+         E["FRAME"])
+    cerr("7.1: SETTINGS with a truncated varint", [lambda r: r.ctl(h3fr(0x04, qv(0x06) + b"\x40"))], E["FRAME"])
+    cerr("7.1: GOAWAY with two ids", [lambda r: r.ctl(SET, h3fr(0x07, qv(0) + qv(4)))], E["FRAME"])
+    cerr("7.1: GOAWAY with a 2-octet varint in 3 octets", [lambda r: r.ctl(SET, h3fr(0x07, b"\x40\x00\x00"))],
+         E["FRAME"])
+    cerr("7.1: GOAWAY with an empty payload", [lambda r: r.ctl(SET, h3fr(0x07, b""))], E["FRAME"])
+    cerr("local: SETTINGS payload over 256 octets",
+         [lambda r: r.ctl(h3_settings(*[(0x21 + 0x1F * i, 1 << 40) for i in range(40)]))], E["EXCESSIVE_LOAD"])
+    cerr("6.2.1: a second control stream", [lambda r: (r.ctl(SET), r.ctl(SET, sid=15))], E["STREAM_CREATION"])
+    cerr("RFC 9204 4.2: a second encoder stream", [lambda r: (r.ctl(SET), r.s(7, b"\x02"), r.s(15, b"\x02"))],
+         E["STREAM_CREATION"])
+    cerr("RFC 9204 4.2: a second decoder stream", [lambda r: (r.ctl(SET), r.s(7, b"\x03"), r.s(15, b"\x03"))],
+         E["STREAM_CREATION"])
+    cerr("6.2.1: the control stream ends (FIN)", [lambda r: (r.ctl(SET), r.fin(3))], E["CLOSED_CRITICAL"])
+    cerr("6.2.1: the control stream is reset", [lambda r: (r.ctl(SET), r.rst(3, 0x100))], E["CLOSED_CRITICAL"])
+    cerr("6.2.1: STOP_SENDING on our control stream after SETTINGS",
+         [lambda r: (r.ctl(SET), r.stop(2, 0x100))], E["CLOSED_CRITICAL"])
+    cerr("6.2.1: FIN inside a control frame", [lambda r: (r.ctl(SET, h3fr(0x21, b"abc")[:-1]), r.fin(3))],
+         E["CLOSED_CRITICAL"])
+    cerr("RFC 9204 4.2: the encoder stream ends", [lambda r: (r.ctl(SET), r.s(7, b"\x02"), r.fin(7))],
+         E["CLOSED_CRITICAL"])
+    cerr("RFC 9204 4.2: the decoder stream is reset", [lambda r: (r.ctl(SET), r.s(7, b"\x03"), r.rst(7, 0))],
+         E["CLOSED_CRITICAL"])
+    cerr("6.2.2: a push stream (we never sent MAX_PUSH_ID)", [lambda r: (r.ctl(SET), r.s(15, b"\x01\x00"))], E["ID"])
+    cerr("RFC 9204 4.3.1: Set Dynamic Table Capacity 1", [lambda r: (r.ctl(SET), r.s(7, b"\x02\x21"))],
+         E["QPACK_ENCODER_STREAM"])
+    cerr("RFC 9204 3.2.2: Insert With Literal Name", [lambda r: (r.ctl(SET), r.s(7, b"\x02\x20\x41a\x01b"))],
+         E["QPACK_ENCODER_STREAM"])
+    cerr("RFC 9204 4.4.1: Section Acknowledgment", [lambda r: (r.ctl(SET), r.s(11, b"\x03\x80"))],
+         E["QPACK_DECODER_STREAM"])
+    cerr("RFC 9204 4.4.3: Insert Count Increment 0", [lambda r: (r.ctl(SET), r.s(11, b"\x03\x41\x00"))],
+         E["QPACK_DECODER_STREAM"])
+    cerr("5.2: GOAWAY with a stream id that is not client bidi", [lambda r: r.ctl(SET, h3fr(0x07, qv(2)))], E["ID"])
+    cerr("5.2: GOAWAY ids must not increase", [lambda r: r.ctl(SET, h3fr(0x07, qv(8)), h3fr(0x07, qv(12)))],
+         E["ID"])
+    cerr("control-frame flood: 1001 unknown frames without progress",
+         [lambda r: r.ctl(SET, h3fr(0x21, b"") * 1001)], E["EXCESSIVE_LOAD"], flags=1)
+
+    # --- request streams: connection errors (4.1, 7.2)
+    def rerr(note, frames, code, late=None):
+        if late is None:
+            cerr(note, [lambda r: (srv_ok(r), r.s(0, frames(r)), r.fin(0))], code)
+            return
+        r = new(note)  # the violation comes after the final response: found by the read
+        r.open()
+        r.req(0)
+        srv_ok(r)
+        r.s(0, frames(r))
+        r.fin(0)
+        r.resp(0, 0, 200, [("content-type", "text/plain")])
+        r.body(0, H3RC["PROTO"], late)
+        r.conn_err(code)
+        r.close_s(0)
+        r.close()
+
+    rerr("4.1: DATA before HEADERS", lambda r: h3fr(0, b"x") + r.hdrs(OK200), E["FRAME_UNEXPECTED"])
+    rerr("4.1: HEADERS after the trailers",
+         lambda r: r.hdrs(OK200) + h3fr(0, b"ab") + r.hdrs([("x-t", "1")]) + r.hdrs([("x-t", "2")]),
+         E["FRAME_UNEXPECTED"], late=b"ab")
+    rerr("4.1: DATA after the trailers", lambda r: r.hdrs(OK200) + r.hdrs([("x-t", "1")]) + h3fr(0, b"x"),
+         E["FRAME_UNEXPECTED"], late=b"")
+    rerr("7.2.5: PUSH_PROMISE on a request stream", lambda r: h3fr(0x05, qv(0) + r.section(OK200)) + r.hdrs(OK200),
+         E["ID"])
+    for t, name in ((0x04, "SETTINGS"), (0x07, "GOAWAY"), (0x0D, "MAX_PUSH_ID"), (0x03, "CANCEL_PUSH"),
+                    (0x06, "reserved 0x06")):
+        rerr(f"7.2: {name} on a request stream", lambda r, t=t: h3fr(t, qv(0)), E["FRAME_UNEXPECTED"])
+    rerr("7.1: FIN inside a frame header", lambda r: b"\x40", E["FRAME"])
+    rerr("7.1: FIN inside a frame header after the response", lambda r: r.hdrs(OK200) + b"\x00\x40",
+         E["FRAME"], late=b"")
+    rerr("RFC 9204 4.5.1.1: a field section with Required Insert Count 1",
+         lambda r: h3fr(0x01, b"\x01\x00\xd9"), E["QPACK_DECOMPRESSION"])
+    rerr("RFC 9204 2.2.3: a dynamic reference", lambda r: h3fr(0x01, b"\x00\x00\x80"), E["QPACK_DECOMPRESSION"])
+    rerr("RFC 9204 3.1: static index 99", lambda r: h3fr(0x01, b"\x00\x00\xff\x24"), E["QPACK_DECOMPRESSION"])
+
+    r = new("1xx flood: 17 interim responses", flags=1)
+    r.open()
+    r.req(0)
+    srv_ok(r)
+    r.s(0, r.hdrs([(":status", "100")]) * 17 + r.hdrs(OK200))
+    r.resp(0, H3RC["PROTO"])
+    r.conn_err(E["EXCESSIVE_LOAD"])
+    r.close_s(0)
+    r.close()
+
+    # truncated last frame inside a DATA payload: found by the read, not the response
+    r, sid = get("7.1: FIN inside a DATA payload", data=None,
+                 after=lambda r, sid: (r.s(sid, r.hdrs(OK200) + h3fr(0, b"abcdef")[:-2]), r.fin(sid)))
+    r.resp(0, 0, 200, [("content-type", "text/plain")])
+    r.body(0, H3RC["PROTO"], b"abcd")
+    r.conn_err(E["FRAME"])
+    r.close_s(0)
+    r.close()
+
+    # --- malformed responses: stream errors, the connection survives (4.1.2)
+    def malformed(note, fields, extra=b"", code="MESSAGE", data_rc=None):
+        r = new(f"4.1.2 malformed: {note}")
+        r.open()
+        s0 = r.req(0)
+        s1 = r.req(1, "GET", "/two")
+        srv_ok(r)
+        r.s(s0, r.hdrs(fields, verify=False) + extra)
+        r.fin(s0)
+        r.s(s1, r.hdrs(OK200) + h3fr(0, b"fine"))
+        r.fin(s1)
+        if data_rc is None:
+            r.resp(0, H3RC["PROTO"])
+            r.abort(s0, E[code])
+        else:
+            r.resp(0, 0, 200, data_rc[0])
+            r.body(0, H3RC["PROTO"], data_rc[1])
+            r.abort(s0, E[code])
+        r.close_s(0)
+        r.resp(1, 0, 200, [("content-type", "text/plain")])
+        r.body(1, 0, b"fine")
+        r.close_s(1)
+        r.close()
+
+    malformed("uppercase name", [(":status", "200"), ("Content-Type", "x")])
+    malformed("connection header", [(":status", "200"), ("connection", "close")])
+    malformed("transfer-encoding (4.1 MUST NOT)", [(":status", "200"), ("transfer-encoding", "chunked")])
+    malformed("te (4.2: requests only)", [(":status", "200"), ("te", "trailers")])
+    malformed(":status after a regular field", [("server", "x"), (":status", "200")])
+    malformed("two :status", [(":status", "200"), (":status", "200")])
+    malformed(":status 20", [(":status", "20")])
+    malformed(":status 101 (4.5)", [(":status", "101")])
+    malformed("request pseudo-header :path", [(":status", "200"), (":path", "/")])
+    malformed("no :status", [("server", "x")])
+    malformed("value with a CR", [(":status", "200"), ("x", "a\rb")])
+    malformed("conflicting content-length", [(":status", "200"), ("content-length", "1"), ("content-length", "2")])
+    malformed("content-length 3 with 5 octets of DATA", [(":status", "200"), ("content-length", "3")],
+              h3fr(0, b"abcde"), data_rc=([("content-length", "3")], b""))
+    malformed("content-length 9 with 5 octets then FIN", [(":status", "200"), ("content-length", "9")],
+              h3fr(0, b"abcde"), data_rc=([("content-length", "9")], b"abcde"))
+    malformed("DATA after a 1xx", [(":status", "100")], h3fr(0, b"x"))
+    malformed("trailers with a pseudo-header", OK200, h3fr(0, b"ok") + h3fr(0x01, py_qpack_encode(
+        [(b":status", b"200", 0)])), data_rc=([("content-type", "text/plain")], b"ok"))
+    malformed("FIN before the final response", [(":status", "103")])
+    malformed("local: HEADERS frame over BRISK_H3_MAX_HEADER_LIST", [(":status", "200"), ("x-big", "v" * 12000)],
+              code="EXCESSIVE_LOAD")
+    malformed("local: section over BRISK_H3_MAX_HEADER_LIST once decoded",
+              [(":status", "200")] + [("x-h", "1")] * 250, code="EXCESSIVE_LOAD")
+
+    # --- resets, GOAWAY (5.2), retries
+    for code, rc, note in ((E["REQUEST_REJECTED"], "RETRY", "H3_REQUEST_REJECTED: retry"),
+                           (E["REQUEST_CANCELLED"], "PEER", "H3_REQUEST_CANCELLED"),
+                           (0x21, "PEER", "an unknown code")):
+        r = new(f"4.1.1: the server resets the request, {note}")
+        r.open()
+        sid = r.req(0)
+        srv_ok(r)
+        r.rst(sid, code)
+        r.resp(0, H3RC[rc])
+        r.close_s(0)
+        r.close()
+
+    r, sid = get("a reset in the middle of the body: the stream fails, the connection does not", data=None,
+                 after=lambda r, sid: (r.s(sid, r.hdrs(OK200) + h3fr(0, b"abcdef")[:5]), r.rst(sid, 0x10C)))
+    r.resp(0, 0, 200, [("content-type", "text/plain")])
+    r.body(0, H3RC["PEER"], b"abc")
+    r.close_s(0)
+    r.close()
+
+    r = new("5.2 GOAWAY(4): stream 0 completes, stream 4 is retried, no new request")
+    r.open()
+    s0 = r.req(0)
+    s4 = r.req(1, "GET", "/b")
+    srv_ok(r)
+    r.ctl(h3fr(0x07, qv(4)), typ=False)
+    r.s(s0, r.hdrs(OK200) + h3fr(0, b"done"))
+    r.fin(s0)
+    r.resp(0, 0, 200, [("content-type", "text/plain")])
+    r.resp(1, H3RC["RETRY"])
+    r.req(2, rc=H3RC["RETRY"])
+    r.body(0, 0, b"done")
+    r.close_s(0)
+    r.close_s(1, abort_sid=s4)
+    r.close()
+
+    r = new("5.2: a GOAWAY still unparsed in the control ring stops the next request")
+    r.open()
+    srv_ok(r)
+    r.ctl(h3fr(0x07, qv(0)), typ=False)
+    r.pump()
+    r.req(0, rc=H3RC["RETRY"])
+    r.close()
+
+    r = new("5.2: GOAWAY ids may shrink")
+    r.open()
+    s0 = r.req(0)
+    srv_ok(r)
+    r.ctl(h3fr(0x07, qv(8)), h3fr(0x07, qv(4)), h3fr(0x07, qv(4)), typ=False)
+    r.s(s0, r.hdrs(OK200))
+    r.fin(s0)
+    r.resp(0, 0, 200, [("content-type", "text/plain")])
+    r.req(1, rc=H3RC["RETRY"])
+    r.body(0, 0, b"")
+    r.close_s(0)
+    r.close()
+
+    r = new("the server closes the connection: every call fails")
+    r.open()
+    sid = r.req(0)
+    srv_ok(r)
+    r.kill(0x100)
+    r.resp(0, H3RC["PEER"])
+    r.req(1, rc=H3RC["PEER"])
+    r.close_s(0)  # a dead connection: nothing to cancel
+    r.close()
+
+    r = new("the connection goes idle: IO")
+    r.open()
+    sid = r.req(0)
+    srv_ok(r)
+    r.resp(0, H3RC["IO"])
+    r.close_s(0)
+    r.close()
+
+    # --- request builder (the brisk_h2_request refusal table) and slots
+    r = new("request refusals (as brisk_h2_request)")
+    r.open()
+    for m, p, hd, body in (("CONNECT", "/", (), b""), ("GET", "", (), b""),
+                           ("GET", "x", (), b""), ("GE T", "/", (), b""), ("GET", "*", (), b""),
+                           ("GET", "/a\r", (), b""), ("GET", "/", (("Host", "x"),), b""),
+                           ("GET", "/", (("host", "x"),), b""), ("GET", "/", ((":path", "/"),), b""),
+                           ("GET", "/", (("connection", "close"),), b""),
+                           ("GET", "/", (("keep-alive", "1"),), b""),
+                           ("GET", "/", (("proxy-connection", "1"),), b""),
+                           ("GET", "/", (("transfer-encoding", "chunked"),), b""),
+                           ("GET", "/", (("upgrade", "h2c"),), b""), ("GET", "/", (("te", "gzip"),), b""),
+                           ("POST", "/", (("content-length", "4"),), b"abc"),
+                           ("POST", "/", (("content-length", "x"),), b"abc"),
+                           ("GET", "/", (("x", " lead"),), b""),
+                           ("GET", "/", (("x-big", "v" * (H3_L - 10)),), b"")):
+        r.req(0, m, p, hd, body, rc=H3RC["ARG"])
+    sid = r.req(0, "OPTIONS", "*", [("te", "trailers")])
+    srv_ok(r)
+    r.s(sid, r.hdrs(OK200))
+    r.fin(sid)
+    r.resp(0, 0, 200, [("content-type", "text/plain")])
+    r.body(0, 0, b"")
+    r.close_s(0)
+    r.close()
+
+    r = new("4.2.2: the server's SETTINGS_MAX_FIELD_SECTION_SIZE bounds our next request")
+    r.open()
+    s0 = r.req(0)
+    r.ctl(h3_settings((0x06, 250)))
+    r.s(s0, r.hdrs(OK200))
+    r.fin(s0)
+    r.resp(0, 0, 200, [("content-type", "text/plain")])
+    r.req(1, "GET", "/" + "p" * 80, rc=H3RC["ARG"])  # 7+3+32 + 7+5+32 + 10+11+32 + 5+81+32 = 257
+    r.req(1, "GET", "/" + "p" * 72)  # 249
+    r.body(0, 0, b"")
+    r.close_s(0)
+    r.close_s(1, abort_sid=4)
+    r.close()
+
+    r = new("slots: 4 requests at once, a 5th is refused until one closes")
+    r.open()
+    sids = [r.req(i, "GET", f"/{i}") for i in range(H3_NS)]
+    r.req(4, "GET", "/4", rc=H3RC["ARG"])
+    r.close_s(0, abort_sid=sids[0])
+    s5 = r.req(0, "GET", "/5")
+    srv_ok(r)
+    for sid in sids[1:] + [s5]:
+        r.s(sid, r.hdrs(OK200) + h3fr(0, str(sid).encode()))
+        r.fin(sid)
+    for i, sid in zip((1, 2, 3, 0), sids[1:] + [s5]):
+        r.resp(i, 0, 200, [("content-type", "text/plain")])
+        r.body(i, 0, str(sid).encode())
+        r.close_s(i)
+    r.close()
+
+    r = new("stream_close before the response cancels the request (4.1.1)")
+    r.open()
+    sid = r.req(0)
+    srv_ok(r)
+    r.close_s(0, abort_sid=sid)
+    r.close()
+
+    r = new("response read partly, then closed: cancelled")
+    r.open()
+    sid = r.req(0)
+    srv_ok(r)
+    r.s(sid, r.hdrs(OK200) + h3fr(0, b"0123456789"))
+    r.resp(0, 0, 200, [("content-type", "text/plain")])
+    r.read1(0, 1, b"0", 1)  # one octet: what a read returns depends on arrival otherwise
+    r.close_s(0, abort_sid=sid)
+    r.close()
+
+    r = new("brisk_h3_response twice / read before response are caller mistakes")
+    r.open()
+    sid = r.req(0)
+    srv_ok(r)
+    r.body(0, H3RC["ARG"])
+    r.s(sid, r.hdrs(OK200))
+    r.fin(sid)
+    r.resp(0, 0, 200, [("content-type", "text/plain")])
+    r.resp(0, H3RC["ARG"])
+    r.body(0, 0, b"")
+    r.close_s(0)
+    r.close()
+    return rows
+
+
+def h3_fuzz_seeds(rows):
+    """fuzz/fuzz_h3.c input: a chunk-size byte, then binary events: [kind | stream << 2] with
+    kind 0 data ([u8 len][bytes]), 1 FIN, 2 RESET_STREAM ([u16 code]), 3 CONNECTION_CLOSE, for
+    the streams 3, 7, 11, 15, 0, 4, 8, 19. Events on other streams are left out."""
+    ids = {3: 0, 7: 1, 11: 2, 15: 3, 0: 4, 4: 5, 8: 6, 19: 7}
+    seeds = []
+    for i, r in enumerate(rows):
+        out = bytearray([i & 7])
+        for ev in r[0].split():
+            kind, rest = ev[0], ev[1:]
+            if kind == "K":
+                out.append(3)
+                continue
+            sid, _, arg = rest.partition(",")
+            if int(sid) not in ids or kind == "T":
+                continue
+            sel = ids[int(sid)] << 2
+            if kind == "S":
+                data = bytes.fromhex(arg)
+                for j in range(0, max(len(data), 1), 255):
+                    chunk = data[j:j + 255]
+                    out += bytes([sel, len(chunk)]) + chunk
+            elif kind == "F":
+                out.append(sel | 1)
+            else:
+                out += bytes([sel | 2]) + (int(arg, 16) & 0xFFFF).to_bytes(2, "big")
+        if len(out) <= 8000:
+            seeds.append((bytes(out), r[4]))
+    return seeds
+
+
+def emit_h3(rows):
+    note = lambda r: f'"{cesc(r)}"'
+    out = [r.row() for r in rows]
+    emit("h3.inc", "struct h3_kat H3_KAT", out,
+         lambda r: f'{cstr(r[0])}, {cstr(r[1])}, {cstr(r[2])}, {r[3]}, {note(r[4])}')
+    with open(OUT / "h3.inc", "a", newline="\n") as fh:
+        fh.write(f"#define H3_KAT_L {H3_L}\n#define H3_KAT_NS {H3_NS}\n"
+                 f"static const char H3_KAT_PREFACE[] = {cstr(h3_preface().hex())};\n")
+    emit("h3_fuzz.inc", "struct h3_fuzz_seed H3_FUZZ_SEED", h3_fuzz_seeds(out),
+         lambda r: f'{cstr(r[0].hex())}, {note(r[1])}')
 
 
 # ------------------------------------------------------------------------------ QUIC v1 (M6)
@@ -11278,6 +12524,23 @@ def quic_api_vectors():
     out["PSK_FIN"] = finish(c, sp, ACK0 + q_crypto(0, sp["sh"]))
     # a NewSessionTicket for the 1-RTT CRYPTO stream (RFC 9001 4.5); the C test seals it
     out["NST"] = rec_nst(7200, 0x01020304, b"\x00", seed(b"quic api nst"), [])
+    # 6. HTTP/3 (M7): when cfg.alpn offers "h3" our TPs let the server open its 3 uni streams
+    #    (RFC 9114 6.2 MUST), each with a ring's worth of credit (6.2 SHOULD >= 1024):
+    #    initial_max_stream_data_uni (0x07) 4096 and initial_max_streams_uni (0x09) 3. Every other
+    #    ALPN keeps the TPs above byte for byte. The server allows 8 bidi and 3 uni streams.
+    ctp3 = tp_enc([(0x01, qv(30000)), (0x03, qv(1472)), (0x04, qv(QMAXS * 4096)), (0x05, qv(4096)),
+                   (0x07, qv(4096)), (0x09, qv(3)), (0x0F, cscid)])
+    ch3 = t_ch(rnd, b"", TLS13_SUITES, TLS13_GROUPS, TLS13_SIGS, 0x001D, f["c_pub"], host,
+               alpn=t_alpn([b"h3"]), quic_tp=ctp3)
+    stp3 = [(0x00, dcid), (0x01, qv(30000)), (0x02, reset), (0x04, qv(1 << 20)), (0x05, qv(65536)),
+            (0x06, qv(65536)), (0x07, qv(65536)), (0x08, qv(8)), (0x09, qv(3)), (0x0F, sscid)]
+    s3 = server(0x1301, [ch3], stp=stp3, alpn_sel=b"h3")
+    c3 = PyQConn(dcid, cscid, dict(MY, sd_uni=4096, streams_uni=3))
+    c3.crypto(0, ch3)
+    out["H3_INIT"] = c3.send()
+    out["S_H3"] = s_initial(0, ACK0 + q_crypto(0, s3["sh"])) + s_hs(s3)
+    out["H3_S_AP"], out["H3_C_AP"] = s3["s_ap"], s3["c_ap"]
+    out["H3_PREFACE"] = h3_preface()
     return out, now_ms
 
 
@@ -11713,6 +12976,13 @@ def main():
     emit("h2_fuzz.inc", "struct h2_fuzz_seed H2_FUZZ_SEED", h2_fuzz_seeds(h2rows),
          lambda r: f'{cstr(r[0].hex())}, {note(r[1])}')
 
+    rfc9204_static()
+    check_qpack_source_constants()
+    qex = rfc9204_examples()
+    emit_qpack(qpack_int_rows(), qpack_dec_rows(qex), qpack_enc_rows(), qpack_ins_rows(qex))
+    check_rfc9114_codes()
+    emit_h3(h3_rows())
+
     rows = "\n".join(f"| {k} | {u} | `{h}` |" for k, (u, h) in sorted(fetched.items()))
     (OUT / "SOURCES.md").write_text(
         "# Known-answer vector sources\n\n"
@@ -11964,7 +13234,25 @@ def main():
         "  ALPN hq-interop, 8.1; the parameters, 8.2), and every client datagram - first Initial,\n"
         "  Finished flight, CH2 after an HRR, the Initial after a Retry, the resumed ClientHello, the\n"
         "  ALPN-failure CONNECTION_CLOSE - from PyQConn against tls13_fixture's server. The independent\n"
-        "  oracle is interop: tools/interop/README.md (quic-go and ngtcp2).\n\n"
+        "  oracle is interop: tools/interop/README.md (quic-go and ngtcp2). The `H3_*` blobs are the\n"
+        "  same handshake with ALPN h3, whose transport parameters add the server's 3 uni streams\n"
+        "  (RFC 9114 6.2).\n\n"
+        "- **QPACK (M7, `qpack.inc`).** OFFICIAL: RFC 9204 Appendix A (the static table, asserted\n"
+        "  against src/http/qpack.c) and Appendix B - B.1 is the only static-only example; B.2-B.5\n"
+        "  reference the dynamic table and are INVALID rows for a decoder at capacity 0 (their encoder\n"
+        "  and decoder instructions too). The qpackers/qifi interop corpus named in the plan is gone\n"
+        "  upstream (404 on 2026-09-25); real field lists come instead from ls-qpack's commit-pinned\n"
+        "  `.qif` captures (rows above), encoded by PyQpackEnc the way a server may (Huffman, static\n"
+        "  references, literal names, N bits, huge Delta Base) and read back by PyQpackDec. GENERATED:\n"
+        "  every dynamic form, bad prefixes / integers / strings, truncations, local limits, our\n"
+        "  encoder policy and the instruction streams. When pylsqpack (aioquic's ls-qpack binding) is\n"
+        "  importable every row is also decoded by ls-qpack; its three documented looser spots are\n"
+        "  listed in qpack_dec_rows.\n\n"
+        "- **HTTP/3 (M7, `h3.inc`).** RFC 9114 has no byte-level vectors: every row is a scenario\n"
+        "  (the server's stream events, the brisk_h3_* calls with their results, the exact client\n"
+        "  log), written from the RFC text with the section of each MUST in its note. aioquic's\n"
+        "  H3Connection was planned as the second implementation; it is not used (it needs a stub\n"
+        "  QUIC connection and is not installed here) - interop is the oracle.\n\n"
         "## x509-limbo skip tally\n\n"
         f"limbo.json carries {len(x509_limbo) + sum(x509_limbo_skipped.values())} testcases and this "
         f"library exercises {len(x509_limbo)} of them.\n"
