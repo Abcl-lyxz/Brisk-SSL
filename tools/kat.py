@@ -12522,6 +12522,7 @@ def quic_api_vectors():
     c, out["PSK_INIT"] = start(psk_ch)
     out["S_PSK"] = s_initial(0, ACK0 + q_crypto(0, sp["sh"])) + s_hs(sp)
     out["PSK_FIN"] = finish(c, sp, ACK0 + q_crypto(0, sp["sh"]))
+    out["S_AP_PSK"] = sp["s_ap"]  # seals the NST below on this resumed flow
     # a NewSessionTicket for the 1-RTT CRYPTO stream (RFC 9001 4.5); the C test seals it
     out["NST"] = rec_nst(7200, 0x01020304, b"\x00", seed(b"quic api nst"), [])
     # 6. HTTP/3 (M7): when cfg.alpn offers "h3" our TPs let the server open its 3 uni streams

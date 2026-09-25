@@ -338,14 +338,18 @@ static void test_resumption(void)
     c.ticket_len = t_unhex(QUIC_API_BLOB_OTHER, blob, sizeof blob);
     q = setup_off(&c, 0);
     CHECK(q != NULL && (!KNOBS_DEFAULT || pull_is(q, QUIC_API_INIT1, 0)));
-    /* RFC 9001 4.5: a NewSessionTicket in 1-RTT CRYPTO reaches on_ticket */
-    c = cfg_ok();
+    /* RFC 9001 4.5: a NewSessionTicket in 1-RTT CRYPTO reaches on_ticket. On the resumed flow:
+     * with on_ticket set every CH1 carries psk_key_exchange_modes (RFC 9846 4.3.9), and this
+     * is the flow whose CH1 already does. */
+    c.ticket_len = t_unhex(QUIC_API_BLOB, blob, sizeof blob);
     c.on_ticket = on_ticket;
     q = setup_off(&c, 0);
-    srv_keys();
-    CHECK(q != NULL && brisk_quic_pull(q, g_d, 1600, 0) == 1200 &&
-          feed2(q, QUIC_API_S_INIT, QUIC_API_S_HS, 0) == BRISK_OK);
-    drain(q, 0);
+    CHECK(q != NULL && (!KNOBS_DEFAULT || pull_is(q, QUIC_API_PSK_INIT, 0)));
+    CHECK(feed_hex(q, QUIC_API_S_PSK, 1) == BRISK_OK && brisk_quic_resumed(q) == 1);
+    drain(q, 1);
+    t_unhex(QUIC_API_S_AP_PSK, g_tmp, sizeof g_tmp);
+    brisk__quic_keys_init(&g_sap, 0x1301, g_tmp, 32);
+    g_spn = 0;
     n = t_unhex(QUIC_API_NST, g_tmp, sizeof g_tmp);
     k = 0;
     nstf[k++] = 0x06; /* CRYPTO at offset 0 */
@@ -825,9 +829,9 @@ static void test_blocking(void)
  * end the connection. And PMTUDISC_PROBE: a forged PMTU below 1200 never reaches our sends. */
 static void test_udp_errors(void)
 {
-    static const int lost[] = {EAGAIN,      EWOULDBLOCK,  EINTR,        ENOBUFS,    EMSGSIZE,
+    static const int lost[] = {EAGAIN,       EWOULDBLOCK,  EINTR,       ENOBUFS,    EMSGSIZE,
                                ECONNREFUSED, EHOSTUNREACH, ENETUNREACH, EACCES,     ENOPROTOOPT,
-                               EHOSTDOWN,   ENETDOWN,     EPERM,        ECONNRESET, ENOMEM};
+                               EHOSTDOWN,    ENETDOWN,     EPERM,       ECONNRESET, ENOMEM};
     static const int fatal[] = {EBADF, ENOTSOCK, EFAULT, EINVAL, EDESTADDRREQ, ENOTCONN};
     size_t i;
     int fd = -1, v = -1;

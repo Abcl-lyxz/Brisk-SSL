@@ -688,10 +688,9 @@ static void on_ticket(void *ctx, const uint8_t *blob, size_t len)
     tk_len = len;
 }
 
-/* Up to CONNECTED on the P-256 row, the client flight pulled. */
-static int connect_p256(const brisk_cfg *cfg)
+/* Up to CONNECTED on row k (no HRR, suite 0x1301), the client flight pulled. */
+static int connect_row(const struct tls13_flow_kat *k, const brisk_cfg *cfg)
 {
-    const struct tls13_flow_kat *k = row("fixture: P-256 leaf");
     size_t n;
     if (setup(k, 1, cfg, now_of(k)) != BRISK_OK || !pull_hello(k->ch1, 0x0301)) {
         return 1;
@@ -700,25 +699,50 @@ static int connect_p256(const brisk_cfg *cfg)
     return brisk_feed(C, srv, n, &n) != BRISK_OK || !flight_is(k, 0x1301, sizeof wire - 1);
 }
 
+static int connect_p256(const brisk_cfg *cfg)
+{
+    return connect_row(row("fixture: P-256 leaf"), cfg);
+}
+
+static const uint8_t *ch_ext(const uint8_t *w, size_t n, unsigned type, size_t *len);
+
+/* RFC 9846 4.3.9: psk_key_exchange_modes also governs the tickets a server may issue - without
+ * it real servers (OpenSSL, BoringSSL) send none, so resumption could never start. The first
+ * ClientHello carries it exactly when on_ticket is set. Tickets then reach on_ticket; the
+ * resumed row is used so that its (modes-carrying) CH1 matches byte for byte. */
 static void conn_ticket(void)
 {
-    const struct tls13_flow_kat *k = row("fixture: P-256 leaf");
+    const struct tls13_flow_kat *k = row("fixture: resumed from a ticket blob");
     brisk__tls_dir sw;
     brisk__tls13_psk psk;
     brisk_cfg cfg;
-    size_t n, nm, used;
+    size_t n, nm, used, el;
     const uint8_t *m;
     int i;
 
+    for (i = 0; i < 2; i++) {
+        arena_used = 0;
+        cfg = cfg_of(k);
+        if (i == 1) {
+            cfg.on_ticket = on_ticket;
+            cfg.ticket_ctx = &tk_calls;
+        }
+        CHECKI(setup(k, 0, &cfg, now_of(k)) == BRISK_OK, i);
+        n = brisk_pull(C, wire, sizeof wire);
+        m = ch_ext(wire, n, 45, &el);
+        CHECKI(i == 0 ? m == NULL : m != NULL && el == 2 && m[0] == 1 && m[1] == 1, i);
+        brisk_conn_wipe(C);
+    }
     for (i = 0; i < 3; i++) {
         arena_used = 0;
         cfg = cfg_of(k);
+        cfg.ticket = dec(TLS13_CONN_BLOB, &cfg.ticket_len);
         if (i != 1) {
             cfg.on_ticket = on_ticket;
             cfg.ticket_ctx = &tk_calls;
         }
         tk_calls = 0;
-        CHECKI(connect_p256(&cfg) == 0, i);
+        CHECKI(connect_row(k, &cfg) == 0, i);
         CHECKI(dir_from(&sw, BRISK__EPOCH_APP, 0x1301, k->s_ap) == BRISK_OK, i);
         if (i < 2) { /* RFC 8448 sect 3's NewSessionTicket, sealed under this s_ap */
             size_t j;

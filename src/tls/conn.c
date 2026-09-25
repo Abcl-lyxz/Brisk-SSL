@@ -221,8 +221,8 @@ static int conn_hello(brisk_conn *c, uint8_t *buf)
 #if BRISK_ENABLE_QUIC
     quic = c->quic;
     if (quic) {
-        p.session_id_len = 0; /* RFC 9001 8.4 (MUST NOT): no compatibility mode */
-        p.tls12 = 0;          /* RFC 9001 4.2 (MUST NOT): TLS 1.3 only */
+        p.session_id_len = 0;   /* RFC 9001 8.4 (MUST NOT): no compatibility mode */
+        p.tls12 = 0;            /* RFC 9001 4.2 (MUST NOT): TLS 1.3 only */
         p.quic_tp = c->quic_tp; /* 8.2 (MUST) */
         p.quic_tp_len = c->quic_tp_len;
         p.suites = c->suites;
@@ -254,7 +254,9 @@ static int conn_hello(brisk_conn *c, uint8_t *buf)
     }
     for (;;) {
         p.psk = use_psk ? &psk : NULL;
-        p.psk_modes = (uint8_t)use_psk; /* 4.3.9: psk_dhe_ke, only alongside a PSK */
+        /* 4.3.9: psk_dhe_ke alongside a PSK, and whenever tickets are wanted: the modes also
+         * govern the tickets a server issues, and real servers send none without them */
+        p.psk_modes = (uint8_t)(use_psk || c->cfg.on_ticket != NULL);
         rc = brisk__tls13_ch_write(&p, buf, CONN_CH_MAX, &n);
         /* CH1 offers the PSK only if CH2 is sure to fit too: at most a cookie extension and a
          * P-256 share instead of x25519 more (4.2.2 forbids dropping it there). QUIC keeps CH1
@@ -326,9 +328,9 @@ static int conn_host_ok(const char *host, size_t *len)
     return brisk__x509_match_host(&none, host, n) != BRISK_E_ARG;
 }
 
-CONN_SHARED int brisk__conn_core(brisk_conn *c, const brisk_cfg *cfg, const char *host, int64_t now_ms,
-                     const uint8_t rnd[BRISK__CONN_RAND], brisk__x509_anchor_fn sys_anchor,
-                     int quic, uint8_t *hs_scratch)
+CONN_SHARED int brisk__conn_core(brisk_conn *c, const brisk_cfg *cfg, const char *host,
+                                 int64_t now_ms, const uint8_t rnd[BRISK__CONN_RAND],
+                                 brisk__x509_anchor_fn sys_anchor, int quic, uint8_t *hs_scratch)
 {
     brisk__tls13_hs_cfg hc;
     size_t host_len = 0, n = 0;
