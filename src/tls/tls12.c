@@ -65,6 +65,15 @@ int brisk__tls12_suite(uint16_t suite, brisk_hash_alg *prf, size_t *key_len, siz
     return 1;
 }
 
+/* A server below the security floor (brisk.h BRISK_E_INSECURE): the same fatal alert as any
+ * refusal, but the caller learns that it was a policy refusal, not a broken peer. */
+static int tls12_insecure(brisk__tls13_hs *hs, uint8_t alert)
+{
+    brisk__hs_fail(hs, alert);
+    hs->err = BRISK_E_INSECURE;
+    return hs->err;
+}
+
 /* RFC 5246 7.4.1.3 + RFC 9846 4.2.3 / E: a ServerHello without supported_versions whose random
  * carries no downgrade sentinel (handshake.c checked that first). */
 int brisk__tls12_on_sh(brisk__tls13_hs *hs, const uint8_t *m, size_t n, const uint8_t *ext,
@@ -79,7 +88,9 @@ int brisk__tls12_on_sh(brisk__tls13_hs *hs, const uint8_t *m, size_t n, const ui
     /* E.1 / E.5, RFC 8996: exactly 0x0303. 0x0300-0x0302 are not acceptable; 0x0304 or above
      * without supported_versions is not a version this client offered either. */
     if (brisk__load_be16(b) != 0x0303) {
-        return brisk__hs_fail(hs, BRISK__ALERT_PROTOCOL_VERSION);
+        return brisk__load_be16(b) < 0x0303 && b[0] == 3
+                   ? tls12_insecure(hs, BRISK__ALERT_PROTOCOL_VERSION) /* RFC 8996 */
+                   : brisk__hs_fail(hs, BRISK__ALERT_PROTOCOL_VERSION);
     }
     /* local (RFC 9846 4.1.4 / 4.2.4): a HelloRetryRequest committed the server to TLS 1.3, and
      * the HRR random is no TLS 1.2 random */
@@ -139,7 +150,7 @@ int brisk__tls12_on_sh(brisk__tls13_hs *hs, const uint8_t *m, size_t n, const ui
     /* RFC 7627 5.2 / RFC 9325 3.5: without the extended main secret the handshake is refused;
      * RFC 9325 3.5: a server that does not acknowledge renegotiation_info MUST be refused too */
     if (!(seen & 2u) || !(seen & 1u)) {
-        return brisk__hs_fail(hs, BRISK__ALERT_HANDSHAKE_FAILURE);
+        return tls12_insecure(hs, BRISK__ALERT_HANDSHAKE_FAILURE);
     }
     brisk__secure_zero(hs->psk, sizeof hs->psk); /* a ticket offered for TLS 1.3 is dead */
     hs->psk_len = 0;

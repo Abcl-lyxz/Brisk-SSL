@@ -255,8 +255,9 @@ static int conn_hello(brisk_conn *c, uint8_t *buf)
     for (;;) {
         p.psk = use_psk ? &psk : NULL;
         /* 4.3.9: psk_dhe_ke alongside a PSK, and whenever tickets are wanted: the modes also
-         * govern the tickets a server issues, and real servers send none without them */
-        p.psk_modes = (uint8_t)(use_psk || c->cfg.on_ticket != NULL);
+         * govern the tickets a server issues, and real servers send none without them. 4.2.2:
+         * a CH2 that drops CH1's PSK (another hash) keeps the modes - only the PSK may go. */
+        p.psk_modes = (uint8_t)(use_psk || c->cfg.on_ticket != NULL || (ch2 && hs->psk_offered));
         rc = brisk__tls13_ch_write(&p, buf, CONN_CH_MAX, &n);
         /* CH1 offers the PSK only if CH2 is sure to fit too: at most a cookie extension and a
          * P-256 share instead of x25519 more (4.2.2 forbids dropping it there). QUIC keeps CH1

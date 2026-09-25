@@ -917,6 +917,24 @@ static void conn_hrr_psk(void)
         CHECKI(e != NULL && brisk__load_be32(e + 4 + T[i]) - age1 == (i == 1 ? 3600000u : 0u), i);
         brisk_conn_wipe(C);
     }
+    /* 4.2.2: an HRR choosing TLS_AES_256_GCM_SHA384 drops the SHA-256 PSK from CH2 - and only
+     * the PSK: psk_key_exchange_modes stays (no on_ticket here, so only the PSK put it in CH1) */
+    arena_used = 0;
+    t.ticket_len = 100;
+    CHECK(brisk__tls13_ticket_export(&t, now - 1000, k->host, strlen(k->host), blob, sizeof blob,
+                                     &blob_len) == BRISK_OK);
+    cfg = cfg_of(k);
+    cfg.ticket = blob;
+    cfg.ticket_len = blob_len;
+    CHECK(setup(k, 0, &cfg, now) == BRISK_OK);
+    n = brisk_pull(C, wire, sizeof wire);
+    CHECK(ch_ext(wire, n, 41, &el) != NULL && ch_ext(wire, n, 45, &el) != NULL);
+    n = big_hrr(srv);
+    srv[5 + 72] = 0x02; /* cipher_suite 0x1301 -> 0x1302 */
+    CHECK(brisk_feed(C, srv, n, &n) == BRISK_OK && brisk_status(C) == BRISK_E_WANT);
+    n = brisk_pull(C, wire, sizeof wire);
+    CHECK(n != 0 && ch_ext(wire, n, 41, &el) == NULL && ch_ext(wire, n, 45, &el) != NULL);
+    brisk_conn_wipe(C);
 }
 
 static void conn_alpn(void)

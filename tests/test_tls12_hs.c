@@ -300,6 +300,14 @@ static void rows(void)
             continue;
         }
         want = err_of(k->alert);
+        /* brisk.h BRISK_E_INSECURE: a server below the floor, not a broken one */
+        if (strstr(k->note, "no extended_main_secret") != NULL ||
+            strstr(k->note, "no renegotiation_info") != NULL ||
+            strstr(k->note, "legacy_version 0300") != NULL ||
+            strstr(k->note, "legacy_version 0301") != NULL ||
+            strstr(k->note, "legacy_version 0302") != NULL) {
+            want = BRISK_E_INSECURE;
+        }
         if (k->fail_at == 2) { /* the server Finished */
             dirs(&cw, &sw, k->suite);
             CHECKI(to_flight(k, i & 7, 0, &cw) == 0, i);

@@ -51,6 +51,9 @@ static const char *err_name(int rc)
         return "E_IO (network error)";
     case BRISK_E_TIMEOUT:
         return "E_TIMEOUT";
+    case BRISK_E_INSECURE:
+        return "E_INSECURE (server only offers TLS below the security floor: TLS 1.2 without "
+               "extended master secret / renegotiation_info, or TLS <= 1.1)";
     case BRISK_E_RETRY:
         return "E_RETRY (HTTP/2, HTTP/3: not processed, retry on a new connection)";
     default:

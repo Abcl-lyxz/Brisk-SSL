@@ -76,12 +76,20 @@ enum {
     BRISK_E_WANT = -8,       /* sans-I/O only, and not a failure: "feed me more bytes first" -
                               * brisk_status while the handshake is still running, brisk_app_read
                               * when no application data has arrived yet. */
-    BRISK_E_RETRY = -9       /* brisk_h2_* / brisk_h3_* only: the server guaranteed it did NOT
+    BRISK_E_RETRY = -9,      /* brisk_h2_* / brisk_h3_* only: the server guaranteed it did NOT
                               * process this request (RFC 9113 8.7: RST_STREAM REFUSED_STREAM or a
                               * stream above a GOAWAY's last stream id; RFC 9114 4.1.1, 5.2:
                               * RESET_STREAM H3_REQUEST_REJECTED or a stream at or above a GOAWAY's
                               * id; both: a request made after a GOAWAY). Safe to retry on a NEW
                               * connection, even a POST. */
+    BRISK_E_INSECURE = -10   /* the server speaks the protocol correctly but only below this
+                              * library's security floor, which no setting lowers: TLS 1.2
+                              * without extended_main_secret (RFC 7627) or renegotiation_info
+                              * (RFC 5746; both required by RFC 9325 3.5), or a TLS 1.1 / 1.0 /
+                              * SSL 3.0 ServerHello (RFC 8996) - in builds with TLS 1.2 (without
+                              * it, and over QUIC, such a ServerHello is E_PROTO).
+                              * handshake_failure / protocol_version was sent. Retrying will not
+                              * help: the server needs an update (common on old IoT brokers). */
 };
 
 /* Library version, e.g. "0.1.0-dev". */
@@ -286,7 +294,8 @@ typedef struct brisk_conn brisk_conn;
  * IP literal, 1..255 bytes.
  * BRISK_OK with *out set, else *out = NULL and: BRISK_E_ARG (bad cfg/host), BRISK_E_RNG,
  * BRISK_E_IO, BRISK_E_TIMEOUT, BRISK_E_AUTH (the server's certificate or signature is not
- * acceptable), BRISK_E_PROTO or BRISK_E_PEER_ALERT. Needs -lrt on glibc older than 2.17. */
+ * acceptable), BRISK_E_INSECURE, BRISK_E_PROTO or BRISK_E_PEER_ALERT. Needs -lrt on glibc older
+ * than 2.17. */
 BRISK_API int brisk_connect(const brisk_cfg *cfg, const char *host, uint16_t port,
                             brisk_conn **out);
 
@@ -331,8 +340,8 @@ BRISK_API int brisk_conn_init(void *mem, size_t mem_len, const brisk_cfg *cfg, c
 
 /* Take bytes received from the server, in any split. *used = bytes consumed; it is short of len
  * while decrypted application data waits to be read (brisk_app_read, then feed the rest).
- * BRISK_OK, or a sticky BRISK_E_AUTH / BRISK_E_PROTO / BRISK_E_ARG (then brisk_pull the alert)
- * or BRISK_E_PEER_ALERT. */
+ * BRISK_OK, or a sticky BRISK_E_AUTH / BRISK_E_INSECURE / BRISK_E_PROTO / BRISK_E_ARG (then
+ * brisk_pull the alert) or BRISK_E_PEER_ALERT. */
 BRISK_API int brisk_feed(brisk_conn *c, const void *in, size_t len, size_t *used);
 
 /* Bytes to send to the server: whole TLS records only, as many as fit in cap. 0 = nothing to
