@@ -33,7 +33,7 @@
 
 #    define HOST "device.example.com"
 /* the byte-exact rows assume the default knobs (our TPs are derived from them) */
-#    define KNOBS_DEFAULT (BRISK_QUIC_MAX_STREAMS == 4 && BRISK_QUIC_STREAM_BUF == 4096)
+#    define KNOBS_DEFAULT (BRISK_QUIC_MAX_STREAMS == 8 && BRISK_QUIC_STREAM_BUF == 4096)
 
 static uint8_t g_root[1024], g_rnd[BRISK__QUIC_RAND], g_d[1600 + 8], g_w[1600], g_tmp[4096];
 static size_t g_root_len;

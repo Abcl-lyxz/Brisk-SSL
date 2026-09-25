@@ -14,8 +14,9 @@
     {
       "name": "dev",
       "inherits": "base",
-      "displayName": "Host: native gcc, debug + UBSan (trap)",
+      "displayName": "Host: native gcc, debug + UBSan (trap), DEFAULT profile (the shipped one)",
       "cacheVariables": {
+        "BRISK_PROFILE": "",
         "CMAKE_C_COMPILER": "gcc",
         "CMAKE_C_FLAGS": "-fsanitize=undefined -fsanitize-undefined-trap-on-error"
       }

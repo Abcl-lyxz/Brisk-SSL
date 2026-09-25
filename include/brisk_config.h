@@ -88,11 +88,12 @@
  * depends on them. BRISK_QUIC_MAX_STREAMS stream slots live at once (local + peer-initiated);
  * each one takes 2 * BRISK_QUIC_STREAM_BUF + BRISK_QUIC_STREAM_BUF / 8 bytes of the connection
  * scratch (receive ring + its bitmap, send ring), about 8.5 KB at the defaults, so
- * brisk__quic_scratch_size() grows by ~34 KB. The per-stream flow-control window we advertise
- * never exceeds BRISK_QUIC_STREAM_BUF: a peer that sends past it gets FLOW_CONTROL_ERROR
- * instead of a buffer overrun. */
+ * brisk__quic_scratch_size() grows by ~68 KB. 8 = HTTP/3's 3 unidirectional streams (control +
+ * 2 QPACK, RFC 9114 6.2) plus room for parallel requests. The per-stream flow-control window
+ * we advertise never exceeds BRISK_QUIC_STREAM_BUF: a peer that sends past it gets
+ * FLOW_CONTROL_ERROR instead of a buffer overrun. */
 #ifndef BRISK_QUIC_MAX_STREAMS
-#    define BRISK_QUIC_MAX_STREAMS 4
+#    define BRISK_QUIC_MAX_STREAMS 8
 #endif
 #if BRISK_QUIC_MAX_STREAMS < 2 || BRISK_QUIC_MAX_STREAMS > 64
 #    error "BRISK_QUIC_MAX_STREAMS must be 2..64"

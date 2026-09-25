@@ -152,9 +152,8 @@ Tick a box only when the work is green on **every** arch (`python tools/dev.py t
       PATH_RESPONSE generation (13.2.1, 8.2.2). Keep brisk__quic_conn's own sent TPs for it.
       conn.c pkt_finish hard-codes a 4-byte PN: pass brisk__quic_pn_len's value to the payload
       layout in brisk__quic_send / cc_build once largest_acked is tracked. Keep the application
-      traffic secret for key update (the engine wipes it after on_secret). Before M7 adds
-      another FULL-only knob, take BRISK_PROFILE=FULL off the `base` preset so host x64 builds
-      the shipped DEFAULT (TLS 1.2 on) again.
+      traffic secret for key update (the engine wipes it after on_secret). The `dev` host preset
+      builds the shipped DEFAULT profile; dev32 and every Docker preset build FULL.
 - [x] Retry, version negotiation, stateless-reset detection, receive-side key update
 - [x] quic-interop-runner harness (hq-interop) + the public `brisk_quic_*` API (sans-I/O and
       blocking over one UDP socket, streams by id). tools/interop/: all 7 cases pass against
@@ -162,10 +161,8 @@ Tick a box only when the work is green on **every** arch (`python tools/dev.py t
       (`run_local.sh`) is BLOCKED on this WSL2 box (it forwards no UDP even quic-go <-> quic-go) -
       rerun on native Linux for loss / reordering. Our TP defaults: max_idle_timeout 30000,
       max_udp_payload_size 1472 (the UDP driver's buffer), initial_max_data = MAX_STREAMS *
-      STREAM_BUF, bidi_local = STREAM_BUF, no peer streams (bidi / uni 0). OPEN for M7: h3 needs
-      initial_max_streams_uni 3 (control + 2 QPACK) - with FULL's MAX_STREAMS 4 that leaves one
-      request slot, so raise the FULL MAX_STREAMS default there and regenerate the quic_api CH
-      vectors. DEFAULT size: conn.c grew ~60-260 B (conn_hello takes its buffer; the shared
+      STREAM_BUF, bidi_local = STREAM_BUF, no peer streams (bidi / uni 0). BRISK_QUIC_MAX_STREAMS
+      default 4 -> 8 for M7 (h3 needs 3 uni streams: control + 2 QPACK). DEFAULT size: conn.c grew ~60-260 B (conn_hello takes its buffer; the shared
       front half is static outside QUIC builds).
 
 ## M7 HTTP/3
