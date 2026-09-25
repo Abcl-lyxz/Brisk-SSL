@@ -1,0 +1,36 @@
+# QUIC interop through quic-interop-runner's ns-3 simulator (tools/interop/run_local.sh).
+# Needs native Linux + Docker (WSL2 does not forward the simulator's UDP), so it runs here.
+# Manual only: gh workflow run interop.yml [-f servers=quic-go -f tests=handshake]
+name: interop
+on:
+  workflow_dispatch:
+    inputs:
+      servers: {description: "comma-separated server implementations", default: "quic-go,ngtcp2"}
+      tests: {description: "comma-separated test cases",
+              default: "handshake,transfer,multiplexing,retry,chacha20,keyupdate,resumption"}
+jobs:
+  ns3:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - name: host setup (tshark, IPv6 Docker)
+        run: |
+          sudo DEBIAN_FRONTEND=noninteractive apt-get update -q
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -q tshark
+          echo '{"ipv6": true, "fixed-cidr-v6": "fd00::/80"}' | sudo tee /etc/docker/daemon.json
+          sudo systemctl restart docker
+          sudo modprobe ip6table_filter
+      - name: run_local.sh
+        run: tools/interop/run_local.sh "${{ inputs.servers }}" "${{ inputs.tests }}"
+      - name: result
+        if: always()
+        run: cat build/interop/result.json || true
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: interop
+          path: |
+            build/interop/result.json
+            build/interop/logs
+          retention-days: 7
