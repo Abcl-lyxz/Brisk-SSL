@@ -28,13 +28,19 @@ session ends run **`/handoff`**.
 ```
 include/brisk.h        public API = the reference docs      include/brisk_config.h  the only config
 src/brisk_int.h        internal decls (brisk__ prefix)      src/util.c              ct compare, wipe, build info
-src/crypto/            sha2 hkdf aead ec bn rsa             src/x509/               der.c (+ cert, chain, names next)
-src/{tls,quic,http}/   later milestones                     src/os/                 linux_rand.c
+src/crypto/            sha2 hkdf aes_ct(64) gcm chacha20_poly1305 x25519 p256 p384 bn rsa
+src/x509/              der cert chain name bundle(PEM)
+src/tls/               handshake keyschedule record tls12 ticket conn
+src/quic/              packet conn recovery stream api
+src/http/              huffman hpack h2 qpack h3            src/os/                 linux_{rand,ca,net,udp}.c
 tests/test_*.c         suites (runner: tests/test_main.c)   tests/kat/*.inc         generated vectors, don't edit
 fuzz/fuzz_*.c          libFuzzer entry points               tools/kat.py            fetch + verify vectors
-tools/dev.py           test / size / ct / fuzz / image      tools/mcp/rfc_server.py MCP: rfc_get / rfc_search
-docker/Dockerfile      cross gcc + qemu image               size/baseline.json      size regression baseline
-docs/ROADMAP.md  docs/ARCHITECTURE.md  docs/CONFIG.md
+tools/dev.py           test size ct fuzz amalg interop      tools/mcp/rfc_server.py MCP: rfc_get / rfc_search
+tools/amalg.py         -> dist/brisk.{c,h} (gitignored)     tools/apidoc.py         -> docs/API.md (CI --check)
+docker/Dockerfile      cross gcc + qemu image               size/baseline.json      per-module size baseline
+size/budget.json       max flash per profile (CI gate)      openwrt/brisk-ssl/      OpenWrt package Makefile
+examples/              brisk_get h2_get h3_get mqtt_tls aws_iot_https (built by every Docker preset)
+docs/ ROADMAP ARCHITECTURE CONFIG API(generated) TROUBLESHOOTING
 ```
 
 ## Commands
@@ -45,6 +51,9 @@ docs/ROADMAP.md  docs/ARCHITECTURE.md  docs/CONFIG.md
 | constant-time check (valgrind) | `python tools/dev.py ct` |
 | fuzz a parser (clang + ASan/UBSan) | `python tools/dev.py fuzz der --seconds 60` |
 | size table / save baseline | `python tools/dev.py size --arch all --md` / `... --save` |
+| amalgamation check (dist/brisk.c, all profiles, gcc+clang, tests) | `python tools/dev.py amalg` |
+| size per profile vs budget / update CONFIG.md table | `python tools/dev.py size --profiles [--doc]` |
+| regenerate docs/API.md after editing brisk.h | `python tools/apidoc.py` |
 | regenerate vectors | `python tools/kat.py` |
 | rebuild Docker image | `python tools/dev.py image` |
 | one preset directly | `cmake --workflow --preset dev` |

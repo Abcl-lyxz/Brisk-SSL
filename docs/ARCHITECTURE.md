@@ -22,13 +22,15 @@ TLS <= 1.1, CBC suites, static RSA, SHA-1 signatures, compression.
 
 ## Layers (dependencies point down only)
 ```
-L6 src/os/       Linux: sockets (connect timeout, MSG_NOSIGNAL), getrandom -> /dev/urandom,
-                 monotonic + wall clocks, CA bundle autodetect
-L5 src/brisk.c   blocking public API: brisk_connect/read/write/close, brisk_h2_*, brisk_h3_*
+L6 src/os/       Linux only: linux_net.c (blocking brisk_connect/read/write/close over TCP),
+                 linux_udp.c (blocking brisk_quic_connect), linux_rand.c (getrandom ->
+                 /dev/urandom), linux_ca.c (CA bundle autodetect); clocks
+L5 src/tls/conn.c  the public connection, sans-I/O (brisk_conn_init/feed/pull/app_*)
+   src/quic/api.c  the public brisk_quic_*, sans-I/O                           (optional)
 L4 src/http/     h2 + HPACK, h3 + QPACK (static-only), shared Huffman decoder     (optional)
-L3 src/tls/      TLS 1.3 handshake engine, record layer, TLS 1.2
+L3 src/tls/      TLS 1.3 handshake engine, record layer, TLS 1.2, ticket blobs
    src/quic/     packets/header protection, streams, ACK/loss/NewReno          (optional)
-L2 src/x509/     DER, chain building, RFC 9525 names, time policy, pins
+L2 src/x509/     DER, chain building, RFC 9525 names, time policy, PEM bundles
 L1 src/crypto/   sha2, hkdf (HMAC/HKDF/Expand-Label/PRF), aead (AES-ct+GCM, ChaCha20-Poly1305),
                  ec (X25519, P-256 on fiat-crypto), bn (i31: RSA verify, P-384 verify)
 L0 src/util.c    constant-time compare, secure wipe, build info
@@ -55,15 +57,16 @@ brisk_write(c, req, req_len);
 n = brisk_read(c, buf, sizeof buf);          /* >0 data, 0 close_notify, <0 BRISK_E_* */
 brisk_close(c);
 
-brisk_h2 *h = brisk_h2_open(c);                          /* optional modules (M4, M7) */
-brisk_h3 *q = brisk_h3_connect(&cfg, host, 443);
+brisk_h2_open(c, mem, brisk_h2_size(), &h);             /* optional modules (M4, M7) */
+brisk_quic_connect(&cfg, host, 443, &q);                 /* cfg.alpn = "h3" */
+brisk_h3_open(q, mem3, brisk_h3_size(), &h3);
 
 /* sans-I/O for your own loop, in your own memory (brisk_conn_size() bytes) */
 brisk_conn_init(mem, sizeof mem, &cfg, host, &c);
 brisk_pull(c, out, cap); brisk_feed(c, in, n, &used); brisk_app_read(c, buf, cap, &got);
 ```
-Status-returning calls (`int` + out-parameter), never a NULL-means-error pointer. TLS 1.2 adds
-no `versions` knob until M5 needs one.
+Status-returning calls (`int` + out-parameter), never a NULL-means-error pointer. There is no
+runtime `versions` knob: TLS 1.2 is the compile-time `BRISK_ENABLE_TLS12` (profile DEFAULT).
 
 HTTP/2 (decided 2026-09-23): simple blocking API over an open brisk_conn whose ALPN is "h2" -
 `brisk_h2_open(c, mem, len, &h)`, `brisk_h2_request(...) -> stream`, `brisk_h2_response`,
@@ -74,11 +77,13 @@ sized by `brisk_h2_size()`. No push, no priority.
 ## Memory model
 - Core: caller-provided memory sized by `brisk_*_size()`; blocking API does one arena malloc
   per connection.
-- Arena = fixed state | rec_in 16,645 B | rec_out 4 KB | union{handshake scratch, h2/h3 runtime}.
-  The receive record buffer must hold a full 2^14+256+5 record: OpenSSL and Go servers ignore
-  RFC 8449 record_size_limit, so smaller buffers only work against servers you control
-  (opt-in `max_fragment_length`, handshake fails cleanly if not acknowledged).
-- Certificate chain reassembly cap 12 KB (knob); scratch reused for HTTP state after Finished.
+- Arena = fixed state | rec_in 16,645 B | handshake scratch. The receive record buffer must
+  hold a full 2^14+256+5 record: OpenSSL and Go servers ignore RFC 8449 record_size_limit
+  (which Brisk sends), so a smaller buffer would only work against servers you control;
+  max_fragment_length is not implemented.
+- Certificate chain reassembly cap 12 KB (knob `BRISK_TLS_MAX_HS_MSG`). The scratch lives as
+  long as the connection (post-handshake NewSessionTicket / KeyUpdate); h2/h3 state is separate
+  caller memory.
 - MEASURED (M3 line 4): `brisk_conn_size()` = 41,839 B on 32-bit targets (i686 41,763) and
   42,663 B on 64-bit: rec_in 16,645 + handshake scratch 19.8-20.4 KB (12 KB reassembly +
   CertificateVerify + certificate array + 6 KB output queue with mTLS) + ~5.4 KB fixed state
@@ -93,28 +98,36 @@ sized by `brisk_h2_size()`. No push, no priority.
   receive key waiting for the server CCS (~48 B), 16 offered suites instead of 8, and 73 more
   bytes of reassembly so a Certificate plus an RSA-4096 ServerKeyExchange fit together. A
   BRISK_ENABLE_TLS12=0 build keeps the pre-M5 figure to within a few bytes.
-- Estimates until measured: + h2 ~35-40 KB, QUIC + h3 ~45 KB.
+- HTTP/2, QUIC and HTTP/3 add their own caller-owned memory: `brisk_h2_size()` (HPACK ring,
+  header buffers, per-stream windows), a QUIC connection ~8.4 KB + `brisk__quic_scratch_size()`
+  82 KB at the defaults (8 stream slots of 2 x 4 KB), `brisk_h3_size()` ~49 KB. Formulas and
+  the knobs that shrink them: docs/CONFIG.md.
 
 ## Security defaults
-- Verification always on (chain + RFC 9525 hostname, SAN only); `insecure` is explicit and logged.
-- TLS 1.3 suites: ChaCha20-Poly1305 first on CPUs without AES instructions, else AES-128-GCM;
-  AES-256-GCM available. Groups: x25519, secp256r1 (P-384 is verify-only - no P-384 ECDHE).
+- Verification always on (chain + RFC 9525 hostname, SAN only); there is no switch to turn it
+  off. The only date-related opt-out is the compile-time `BRISK_X509_TIME_POLICY_INSECURE_NO_TIME`,
+  which `brisk_build_info()` reports. No revocation checking (CRL / OCSP).
+- TLS 1.3 suites, in this order on every CPU: ChaCha20-Poly1305, AES-128-GCM, AES-256-GCM
+  (constant-time software AES is slower than ChaCha20 everywhere; the server still chooses). Groups: x25519, secp256r1 (P-384 is verify-only - no P-384 ECDHE).
   Decided 2026-09-24 to keep it so: a server that accepts only secp384r1 key shares (seen:
   pantip.com) fails closed with its handshake_failure alert. IoT backends accept X25519/P-256.
 - Signatures accepted: ECDSA P-256/P-384 (SHA-256/384), RSA-PSS and PKCS#1 v1.5 (certs) 2048-4096.
 - TLS 1.2 (M5): ECDHE + AEAD only, EMS required, renegotiation refused, downgrade sentinel checked.
+  A server below that floor (no EMS / renegotiation_info, or TLS <= 1.1) fails with its own
+  code, `BRISK_E_INSECURE`, so the field can tell "old server" from "broken server".
 - No 0-RTT (telemetry POSTs are not replay-safe).
 - Clock policy FLOOR (default): if the wall clock is below `BRISK_X509_TIME_FLOOR` (the build
   date) the clock is "unsynced" - check notAfter against the floor, skip notBefore. STRICT
   refuses instead; INSECURE_NO_TIME skips the window. The floor is compile-time only today: a
   persisted last-known-good time cannot raise it, and must NOT be passed as `now` instead - that
   lifts the clock above the floor and re-enables the notBefore check against a stale value, so
-  every freshly issued certificate is refused. A runtime floor belongs to the M3 client config,
-  where the device's storage is already in the picture. The trust anchor is
+  every freshly issued certificate is refused. A runtime floor (from the device's storage) is not in
+  v0.1.0. The trust anchor is
   exempt from the window (RFC 5280 6.1.1 (d); DST Root CA X3, 2021). Dates are int64, never
   `time_t` (Y2038, 9999 notAfter). Knob table in docs/CONFIG.md.
-- SPKI pins are additive (never replace chain validation); pin roots, not leaves/intermediates
-  (Let's Encrypt rotates intermediates; certificate lifetimes drop to 47 days by 2029).
+- SPKI pinning is NOT in v0.1.0; a private PKI uses `ca_mem` with only its own root. If pins
+  come, they are additive (never replace chain validation) and pin roots, not
+  leaves/intermediates (Let's Encrypt rotates intermediates; lifetimes drop to 47 days by 2029).
 - RNG: getrandom (own per-arch syscall table, checked against the headers). Only on kernels
   < 4.8 without it (ENOSYS, or EPERM from seccomp): /dev/urandom once /dev/random has been
   readable, waited for once per process (on >= 4.8 readable no longer means seeded, so a filter
@@ -148,7 +161,10 @@ sized by `brisk_h2_size()`. No push, no priority.
   armv7hf, armv5 (ARM926), mips (BE), mipsel, mips64, riscv64, ppc (BE) under qemu-user.
 - `tools/dev.py size` links a static probe at -Os and attributes kept sections per module from
   the GNU ld map; fails if 64-bit division or float helpers appear in 32-bit builds.
-- Later: amalgamated `dist/brisk.c` + `dist/brisk.h` for copy-two-files integration.
+- Amalgamation (M8): `tools/amalg.py` writes `dist/brisk.c` + `dist/brisk.h` for
+  copy-two-files integration; `dev.py amalg` compiles it -Werror per profile (gcc + clang) and
+  runs the suite against it. Size budgets per profile: `size/budget.json`, `dev.py size --profiles`.
+- Fuzzing: a libFuzzer harness per parser (`fuzz/`, `dev.py fuzz <target>`), seeded from the KATs.
 
 ## Key facts from research (2026-09)
 - RFC 9846 (July 2026) obsoletes RFC 8446, 5246, 7627, 8422, 5077: cite 9846.

@@ -90,7 +90,9 @@ A host that does not answer at all (seen: mqtt.eclipseprojects.io:8883) ends her
 A caller mistake or a local limit, never the peer: a NULL or too-short buffer, an invalid host
 string (1..255 bytes, A-labels for IDNs), an ALPN entry that is empty or longer than 255, a
 `client_key` that is not 32 bytes, a device chain over `BRISK_TLS_MAX_CLIENT_CHAIN`, a stream
-call on a stream that is already closed. Also a `sign` callback that refused (internal_error).
+call on a stream that is already closed. Also a `sign` callback that refused (internal_error),
+and mTLS with a `sign` callback against a TLS 1.2 server that asks for a certificate: in v0.1.0
+the callback works over TLS 1.3 only - use `client_key` there, or enable TLS 1.3 on the server.
 
 ## `BRISK_E_RNG` (-2): no kernel randomness
 

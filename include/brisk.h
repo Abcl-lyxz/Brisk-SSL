@@ -17,7 +17,7 @@
 #define BRISK_SSL_VERSION_MAJOR  0
 #define BRISK_SSL_VERSION_MINOR  1
 #define BRISK_SSL_VERSION_PATCH  0
-#define BRISK_SSL_VERSION_STRING "0.1.0-dev"
+#define BRISK_SSL_VERSION_STRING "0.1.0"
 
 /* Symbol export: only a shared-library build (BRISK_SHARED_BUILD) exports the API. In a static
  * build it stays empty so a .so that embeds libbrisk.a keeps its own visibility policy.
@@ -92,10 +92,10 @@ enum {
                               * help: the server needs an update (common on old IoT brokers). */
 };
 
-/* Library version, e.g. "0.1.0-dev". */
+/* Library version, e.g. "0.1.0". */
 BRISK_API const char *brisk_version(void);
 
-/* What this binary was compiled with, e.g. "0.1.0-dev profile=DEFAULT". The same text is embedded
+/* What this binary was compiled with, e.g. "0.1.0 profile=DEFAULT". The same text is embedded
  * as "@(#)BRISKCFG ..." so `strings firmware.bin | grep BRISKCFG` works on a shipped image. */
 BRISK_API const char *brisk_build_info(void);
 
