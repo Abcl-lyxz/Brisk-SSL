@@ -90,18 +90,20 @@ carries the verdict for all three and reads the column the build selected.
 does this gateway accept an expired certificate?" on an image nobody has the build flags for any
 more. `STRICT` reports itself the same way; the default stays silent and costs nothing.
 
-## Measured size (M1a, `python tools/dev.py size --arch all`)
-Flash = code + read-only data + data of the library objects actually linked (libc excluded).
+## Measured size per profile
+Generated - do not edit by hand. CI prints the same table on every push and fails when a
+profile exceeds its budget in `size/budget.json`; per-module numbers: `python tools/dev.py size
+--arch all --profile FULL`.
 
-| module | x86_64 | i686 | aarch64 | armv7hf | armv5 | mips | mipsel | mips64 | riscv64 | ppc |
-|---|---|---|---|---|---|---|---|---|---|---|
-| hkdf (HMAC+HKDF+Expand-Label) | 1098 | 1212 | 1271 | 729 | 1095 | 1736 | 1740 | 1684 | 1041 | 1243 |
-| sha2 (SHA-256/384/512) | 3272 | 4520 | 3344 | 3306 | 4348 | 5712 | 5716 | 4720 | 3376 | 4460 |
-| util | 136 | 183 | 169 | 127 | 201 | 212 | 212 | 216 | 141 | 305 |
-| **total flash** | 4506 | 5915 | 4784 | 4162 | 5644 | 7660 | 7668 | 6620 | 4558 | 6008 |
+<!-- size-table:begin (tools/dev.py size --profiles --doc) -->
+| profile | budget | x86_64 | i686 | aarch64 | armv7hf | armv5 | mips | mipsel | mips64 | riscv64 | ppc |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| TINY | 104 | 69.0 | 84.9 | 64.9 | 51.8 | 76.5 | 96.8 | 97.1 | 88.5 | 55.7 | 80.5 |
+| DEFAULT | 144 | 96.6 | 114.2 | 92.9 | 71.3 | 106.2 | 133.6 | 134.0 | 124.0 | 78.2 | 110.9 |
+| FULL | 216 | 140.8 | 167.1 | 137.8 | 107.7 | 158.8 | 200.9 | 201.3 | 180.7 | 114.7 | 167.1 |
 
-RAM: no static RAM beyond a few bytes; contexts are caller-owned
-(`brisk_sha256_ctx` 104 B, `brisk_sha512_ctx` 200 B, `brisk_hmac_ctx` 408 B on 64-bit).
+KB of flash (text + rodata + data, -Os, static link map, libc excluded); budget = the most any arch may take (size/budget.json). Static RAM is at most 132 B on any arch and profile - every context is caller-owned.
+<!-- size-table:end -->
 
 ## What did my firmware get compiled with?
 `brisk_build_info()` returns e.g. `0.1.0-dev profile=DEFAULT`; the same text is embedded as

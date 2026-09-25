@@ -26,8 +26,16 @@ jobs:
           cache-to: type=gha,mode=max
       - name: Test on every arch (x86_64, asan, 9 cross archs under qemu)
         run: python3 tools/dev.py test --arch all -j 4
+      - name: API index is current (docs/API.md from include/brisk.h)
+        run: python3 tools/apidoc.py --check
+      - name: Amalgamation (dist/brisk.c per profile, gcc + clang -Werror, tests)
+        run: python3 tools/dev.py amalg
       - name: Size report
         run: |
           python3 tools/dev.py size --arch all --md > size.md
           cat size.md >> "$GITHUB_STEP_SUMMARY"
           cat size.md
+      - name: Size per profile vs size/budget.json (fails when over budget)
+        run: |
+          python3 tools/dev.py size --profiles -j 4 | tee profiles.md  # pipefail: over budget fails
+          cat profiles.md >> "$GITHUB_STEP_SUMMARY"
