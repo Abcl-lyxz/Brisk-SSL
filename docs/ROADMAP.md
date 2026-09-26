@@ -219,9 +219,12 @@ default still holds: certificate verification can never be switched off.
       `brisk_cfg` changed layout - rebuild against the new header; positional initialisers break,
       zero-init / designated ones do not. `BRISK_TLS_MAX_CLIENT_CHAIN` now bounds the DER bytes
       of the chain, not `client_chain_len` (PEM text is ~1.37x). BER keys are refused on purpose
-- [ ] Custom transport: `brisk_connect_fd` (a socket/fd the caller opened; not closed by
+- [x] Custom transport: `brisk_connect_fd` (a socket/fd the caller opened; not closed by
       brisk_close) and `brisk_connect_io` (send/recv callbacks for UART, tunnels, tests);
-      net_flush/net_fill go through the io vtable; read/write for non-socket fds
+      net_flush/net_fill go through the io vtable; read/write for non-socket fds.
+      The fd is O_NONBLOCK while held and its flags are restored at close / on failure;
+      callbacks get the ms left (>= 1) and any out-of-range answer is BRISK_E_IO. Tested over
+      loopback TCP (fd + io) and a raw-mode pty; test seam `brisk__connect_via`
 - [ ] Public crypto API (`BRISK_ENABLE_CRYPTO_API`): brisk_random, AEAD seal/open (AES-GCM,
       ChaCha20-Poly1305), HKDF, X25519, P-256 keygen/ECDH/sign/verify, P-384 + RSA verify - thin
       wrappers over src/crypto, tested against the existing KATs, ct-checked

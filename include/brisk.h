@@ -258,9 +258,9 @@ typedef struct {
      * BRISK_E_ARG). client_chain: leaf first, whose leaf key is P-256 - concatenated DER
      * certificates (first byte 0x30), or PEM text with one or more BEGIN CERTIFICATE blocks
      * (other blocks and text between them are skipped; a malformed block is BRISK_E_ARG). The
-     * DER certificates may total BRISK_TLS_MAX_CLIENT_CHAIN (4096 by default) bytes, however long the text.
-     * Then EXACTLY ONE of client_key or sign (a callback, e.g. into a secure element; sign_ctx is
-     * passed through). client_key / client_key_len, auto-detected:
+     * DER certificates may total BRISK_TLS_MAX_CLIENT_CHAIN (4096 by default) bytes, however
+     * long the text. Then EXACTLY ONE of client_key or sign (a callback, e.g. into a secure
+     * element; sign_ctx is passed through). client_key / client_key_len, auto-detected:
      *   len 0 or 32   the 32-byte big-endian private scalar d (0 keeps v0.1 code working, so
      *                 the buffer MUST then hold 32 bytes: when passing a file's size, refuse
      *                 an empty file yourself - 0 never means "no key")
@@ -327,9 +327,49 @@ BRISK_API int brisk_read(brisk_conn *c, void *buf, size_t cap);
  * sent). Writing after the server's close_notify is allowed (RFC 9846 6.1). */
 BRISK_API int brisk_write(brisk_conn *c, const void *buf, size_t len);
 
-/* Send close_notify (best effort, waiting at most 1 s), close the socket, wipe and free
- * everything. For connections from brisk_connect only. NULL is a no-op. */
+/* Send close_notify (best effort, waiting at most 1 s), close the socket (brisk_connect's only:
+ * never the fd of brisk_connect_fd), wipe and free everything. For connections from
+ * brisk_connect / brisk_connect_fd / brisk_connect_io only. NULL is a no-op. */
 BRISK_API void brisk_close(brisk_conn *c);
+
+/* ---- your own transport (Linux) ----------------------------------------------------------------
+ * The same blocking connection over a byte stream you opened yourself: a TCP socket from your own
+ * dialer (proxy, SO_BINDTODEVICE, a VRF), a UART tty, a socketpair, a test harness. `host`
+ * is still the SNI / certificate name (no DNS). brisk_read / brisk_write / brisk_close /
+ * brisk_h2_open work as after brisk_connect; cfg.timeout_ms bounds the handshake and each read
+ * or write. brisk_h2_open sends no port in :authority (as for 443). */
+
+/* Handshake over `fd`, ONE connected bidirectional stream: a SOCK_STREAM socket, a raw-mode tty,
+ * anything poll() and read() / write() accept (separate read and write fds, e.g. two pipes: use
+ * brisk_connect_io). The fd stays YOURS: never closed, not even on failure; close it after
+ * brisk_close. While the connection lives the fd is O_NONBLOCK - a flag of the open file
+ * description, so dup()ed or inherited copies see it too - and brisk_close (or the failure)
+ * puts back the flags it had at this call. Sockets are sent with MSG_NOSIGNAL; a tty never
+ * raises SIGPIPE. Returns as brisk_connect; BRISK_E_ARG also for an fd that is not open or a
+ * socket that is not SOCK_STREAM (a datagram socket would cut records). */
+BRISK_API int brisk_connect_fd(const brisk_cfg *cfg, const char *host, int fd, brisk_conn **out);
+
+/* A transport as two blocking callbacks (ctx passed through). timeout_ms (>= 1) is the time left
+ * until the call's deadline: do not block much longer than that.
+ *   send  write up to len bytes of buf; return how many were taken (1..len - a partial send is
+ *         fine, the rest comes in the next call), BRISK_E_TIMEOUT if none could be in time, or
+ *         any other negative value for a failure.
+ *   recv  read up to cap bytes into buf; return how many (1..cap), 0 once the peer closed the
+ *         stream (before close_notify: a truncation, BRISK_E_IO), BRISK_E_TIMEOUT if nothing
+ *         arrived in time, or any other negative value for a failure.
+ * BRISK_E_TIMEOUT means what it does for a socket (harmless in brisk_read, final in
+ * brisk_write); every other failure or out-of-range value becomes BRISK_E_IO. */
+typedef struct {
+    int (*send)(void *ctx, const uint8_t *buf, size_t len, uint32_t timeout_ms);
+    int (*recv)(void *ctx, uint8_t *buf, size_t cap, uint32_t timeout_ms);
+    void *ctx;
+} brisk_io;
+
+/* Handshake over the callbacks in *io (copied; *io need not outlive the call, ctx must live until
+ * brisk_close, which calls no callback after sending close_notify). Returns as brisk_connect;
+ * BRISK_E_ARG if io, io->send or io->recv is NULL. */
+BRISK_API int brisk_connect_io(const brisk_cfg *cfg, const char *host, const brisk_io *io,
+                               brisk_conn **out);
 
 /* ---- sans-I/O API: your own event loop, your own memory --------------------------------------
  * The same connection with no socket and no allocation: you move bytes between the network and

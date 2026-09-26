@@ -2184,7 +2184,10 @@ struct brisk_conn {
     int64_t ch1_ms; /* now_ms when CH1 was built: CH2 re-imports its PSK at that time (4.2.2) */
     /* blocking layer (src/os/linux_net.c) only; fd = -1 and the rest 0 for sans-I/O */
     int fd, io_err;
-    uint8_t fixed_now; /* test seam: never refresh now_ms from the clock */
+    int fd_flags;            /* brisk_connect_fd: the caller's F_GETFL, restored at close */
+    uint8_t fd_own, fd_sock; /* close fd at the end (brisk_connect); send/recv vs write/read */
+    brisk_io io;             /* brisk_connect_io: the caller's transport (send NULL = fd) */
+    uint8_t fixed_now;       /* test seam: never refresh now_ms from the clock */
     uint32_t timeout_ms;
     uint8_t *heap, *tx, *rx;
     size_t heap_len, rx_off, rx_len;
@@ -2562,7 +2565,7 @@ struct brisk__quic_conn {
     uint8_t token[BRISK__QUIC_TOKEN_MAX]; /* RFC 9000 17.2.5.2: echoed in every later Initial */
     uint16_t token_len;
     uint8_t retry_scid[20], retry_scid_len, retry_done; /* 7.3: checked against the TP */
-    uint8_t key_phase; /* RFC 9001 6: the phase we send (and currently receive) */
+    uint8_t key_phase;   /* RFC 9001 6: the phase we send (and currently receive) */
     uint8_t dcid_unsent; /* RFC 9000 10.3.1: switched to a new server CID, nothing sent on it */
     /* test / interop-harness seam, NULL by default and never reachable from brisk.h: every
      * Handshake and 1-RTT secret as the engine exports it (NSS SSLKEYLOGFILE lines) */
@@ -3001,15 +3004,17 @@ int brisk__os_tcp_connect(const char *host, uint16_t port, uint32_t timeout_ms, 
  * address does not starve the next. BRISK_OK and *fd, or BRISK_E_IO / BRISK_E_TIMEOUT. */
 struct addrinfo;
 int brisk__os_dial(const struct addrinfo *res, int64_t deadline_mono_ms, int *fd);
-/* All n bytes, MSG_NOSIGNAL, EINTR retried, polling until the monotonic deadline.
+/* All n bytes of a non-blocking fd (send + MSG_NOSIGNAL for a socket, else write), EINTR
+ * retried, polling until the monotonic deadline. BRISK_OK, BRISK_E_IO or BRISK_E_TIMEOUT. */
+int brisk__os_send_all(int fd, int sock, const uint8_t *p, size_t n, int64_t deadline_mono_ms);
+/* Up to cap bytes (recv for a socket, else read); *n 0 = the peer closed (EOF).
  * BRISK_OK, BRISK_E_IO or BRISK_E_TIMEOUT. */
-int brisk__os_send_all(int fd, const uint8_t *p, size_t n, int64_t deadline_mono_ms);
-/* Up to cap bytes; *n 0 = the peer closed (TCP EOF). BRISK_OK, BRISK_E_IO or BRISK_E_TIMEOUT. */
-int brisk__os_recv(int fd, uint8_t *p, size_t cap, int64_t deadline_mono_ms, size_t *n);
-/* Test seam for brisk_connect: handshake over an already connected `fd` (always consumed:
- * closed on failure). rnd NULL = brisk__os_random; now_ms < 0 = the clock, refreshed before
- * every feed; otherwise that fixed time. */
-int brisk__connect_fd(const brisk_cfg *cfg, const char *host, int fd, const uint8_t *rnd,
-                      int64_t now_ms, brisk_conn **out);
+int brisk__os_recv(int fd, int sock, uint8_t *p, size_t cap, int64_t deadline_mono_ms, size_t *n);
+/* Test seam behind brisk_connect / _fd / _io: handshake over `fd` (own = closed on failure and
+ * by brisk_close, as brisk_connect's socket; else brisk_connect_fd's rules) or over `io` when it
+ * is not NULL. rnd NULL = brisk__os_random; now_ms < 0 = the clock, refreshed before every feed;
+ * otherwise that fixed time. */
+int brisk__connect_via(const brisk_cfg *cfg, const char *host, int fd, int own, const brisk_io *io,
+                       const uint8_t *rnd, int64_t now_ms, brisk_conn **out);
 
 #endif /* BRISK_INT_H */

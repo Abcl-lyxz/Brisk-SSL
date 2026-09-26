@@ -25,6 +25,7 @@
 #    define _TIME_BITS 64
 #endif
 #include <errno.h>
+#include <fcntl.h>
 #include <limits.h>
 #include <netdb.h>
 #include <poll.h>
@@ -84,12 +85,13 @@ static int net_wait(int fd, short ev, int64_t deadline)
     }
 }
 
-int brisk__os_send_all(int fd, const uint8_t *p, size_t n, int64_t deadline)
+int brisk__os_send_all(int fd, int sock, const uint8_t *p, size_t n, int64_t deadline)
 {
     ssize_t r;
     int rc;
     while (n != 0) {
-        r = send(fd, p, n, MSG_NOSIGNAL); /* EPIPE instead of SIGPIPE killing the process */
+        /* MSG_NOSIGNAL: EPIPE instead of SIGPIPE killing the process; a tty / pipe has no send */
+        r = sock ? send(fd, p, n, MSG_NOSIGNAL) : write(fd, p, n);
         if (r > 0) {
             p += r;
             n -= (size_t)r;
@@ -107,13 +109,13 @@ int brisk__os_send_all(int fd, const uint8_t *p, size_t n, int64_t deadline)
     return BRISK_OK;
 }
 
-int brisk__os_recv(int fd, uint8_t *p, size_t cap, int64_t deadline, size_t *n)
+int brisk__os_recv(int fd, int sock, uint8_t *p, size_t cap, int64_t deadline, size_t *n)
 {
     ssize_t r;
     int rc;
     *n = 0;
     for (;;) {
-        r = recv(fd, p, cap, 0);
+        r = sock ? recv(fd, p, cap, 0) : read(fd, p, cap);
         if (r >= 0) {
             *n = (size_t)r; /* 0 = the peer closed its side */
             return BRISK_OK;
@@ -267,13 +269,70 @@ static int net_dead(brisk_conn *c, int rc)
     return rc;
 }
 
+/* ms left until the deadline for a brisk_io callback (>= 1), or 0 once it has passed */
+static uint32_t net_left(int64_t deadline)
+{
+    int64_t left = deadline - brisk__os_mono_ms();
+    return left <= 0 ? 0 : left > (int64_t)UINT32_MAX ? UINT32_MAX : (uint32_t)left;
+}
+
+/* All n bytes through the connection's transport: the caller's callbacks, else its fd. A
+ * callback's answer is checked like any untrusted input: out of range is BRISK_E_IO. */
+static int net_send(brisk_conn *c, const uint8_t *p, size_t n, int64_t deadline)
+{
+    uint32_t ms;
+    int r;
+    if (c->io.send == NULL) {
+        return brisk__os_send_all(c->fd, c->fd_sock, p, n, deadline);
+    }
+    while (n != 0) {
+        if ((ms = net_left(deadline)) == 0) {
+            return BRISK_E_TIMEOUT;
+        }
+        /* (c->io.send): a stack that #defines send(...) as a macro must not rewrite the call */
+        r = (c->io.send)(c->io.ctx, p, n > INT_MAX ? INT_MAX : n, ms);
+        if (r == BRISK_E_TIMEOUT) {
+            return r;
+        }
+        if (r <= 0 || (size_t)r > n) {
+            return BRISK_E_IO;
+        }
+        p += r;
+        n -= (size_t)r;
+    }
+    return BRISK_OK;
+}
+
+/* Up to BRISK__CONN_RX bytes into c->rx; *n 0 = the peer closed. */
+static int net_recv(brisk_conn *c, int64_t deadline, size_t *n)
+{
+    uint32_t ms;
+    int r;
+    *n = 0;
+    if (c->io.recv == NULL) {
+        return brisk__os_recv(c->fd, c->fd_sock, c->rx, BRISK__CONN_RX, deadline, n);
+    }
+    if ((ms = net_left(deadline)) == 0) {
+        return BRISK_E_TIMEOUT;
+    }
+    r = (c->io.recv)(c->io.ctx, c->rx, BRISK__CONN_RX, ms);
+    if (r == BRISK_E_TIMEOUT) {
+        return r;
+    }
+    if (r < 0 || (size_t)r > BRISK__CONN_RX) {
+        return BRISK_E_IO;
+    }
+    *n = (size_t)r;
+    return BRISK_OK;
+}
+
 /* Send everything the connection owes (handshake flight, alert, KeyUpdate, close_notify). */
 static int net_flush(brisk_conn *c, int64_t deadline)
 {
     size_t n;
     int rc;
     while ((n = brisk_pull(c, c->tx, BRISK__CONN_TX)) != 0) {
-        rc = brisk__os_send_all(c->fd, c->tx, n, deadline);
+        rc = net_send(c, c->tx, n, deadline);
         if (rc != BRISK_OK) {
             return net_dead(c, rc);
         }
@@ -287,7 +346,7 @@ static int net_fill(brisk_conn *c, int64_t deadline)
     size_t n, used;
     int rc;
     if (c->rx_len == 0) {
-        rc = brisk__os_recv(c->fd, c->rx, BRISK__CONN_RX, deadline, &n);
+        rc = net_recv(c, deadline, &n);
         if (rc == BRISK_OK && n == 0) {
             rc = BRISK_E_IO; /* FIN without close_notify: truncation, never EOF (6.1) */
         }
@@ -316,8 +375,10 @@ static void net_free(brisk_conn *c)
 {
     uint8_t *heap = c->heap;
     size_t len = c->heap_len;
-    if (c->fd >= 0) {
+    if (c->fd >= 0 && c->fd_own) {
         close(c->fd);
+    } else if (c->fd >= 0 && c->fd_flags >= 0) {
+        fcntl(c->fd, F_SETFL, c->fd_flags); /* brisk_connect_fd: the fd goes back as it came */
     }
     brisk_conn_wipe(c);
     brisk__secure_zero(heap, len);
@@ -325,31 +386,33 @@ static void net_free(brisk_conn *c)
 }
 
 /* One malloc: [conn arena | tx | rx]; the handshake runs until connected with our last flight
- * sent (RFC 9846 4.4.4: the client Finished completes it; tickets are not waited for). */
-static int net_connect(const brisk_cfg *cfg, const char *host, int fd, const uint8_t *rnd,
-                       int64_t now_ms, uint16_t port, brisk_conn **out)
+ * sent (RFC 9846 4.4.4: the client Finished completes it; tickets are not waited for). The
+ * transport: io when set, else fd, else a TCP connection to host:port. */
+static int net_connect(const brisk_cfg *cfg, const char *host, int fd, int own, const brisk_io *io,
+                       const uint8_t *rnd, int64_t now_ms, uint16_t port, brisk_conn **out)
 {
     size_t size = brisk_conn_size(), total = size + BRISK__CONN_TX + BRISK__CONN_RX;
-    uint8_t *heap, own[BRISK__CONN_RAND];
+    uint8_t *heap, own_rnd[BRISK__CONN_RAND];
     int64_t deadline = 0;
     brisk_conn *c = NULL;
-    int rc;
+    int rc, t;
+    socklen_t tl = sizeof t;
 
     heap = (uint8_t *)calloc(1, total);
     if (heap == NULL) {
-        if (fd >= 0) {
+        if (fd >= 0 && own) {
             close(fd);
         }
         return BRISK_E_IO;
     }
-    rc = rnd != NULL ? BRISK_OK : brisk__conn_rand(own);
+    rc = rnd != NULL ? BRISK_OK : brisk__conn_rand(own_rnd);
     if (rc == BRISK_OK) {
         rc = brisk__conn_setup(heap, size, cfg, host, now_ms >= 0 ? now_ms : brisk__os_wall_ms(),
-                               rnd != NULL ? rnd : own, brisk__os_ca_anchor, &c);
+                               rnd != NULL ? rnd : own_rnd, brisk__os_ca_anchor, &c);
     }
-    brisk__secure_zero(own, sizeof own);
+    brisk__secure_zero(own_rnd, sizeof own_rnd);
     if (rc != BRISK_OK) {
-        if (fd >= 0) {
+        if (fd >= 0 && own) {
             close(fd);
         }
         free(heap); /* setup wiped it */
@@ -362,10 +425,27 @@ static int net_connect(const brisk_cfg *cfg, const char *host, int fd, const uin
     c->fixed_now = (uint8_t)(now_ms >= 0);
     c->timeout_ms = cfg->timeout_ms != 0 ? cfg->timeout_ms : NET_TIMEOUT_DEFAULT;
     c->fd = fd;
+    c->fd_own = (uint8_t)own;
+    c->fd_sock = 1;
+    c->fd_flags = -1;
     c->port = port;
-    if (fd < 0) {
+    if (io != NULL) {
+        c->io = *io;
+    } else if (fd < 0) {
         rc = net_open(host, port, c->timeout_ms, &c->fd, &deadline);
-    } else {
+        c->fd_own = 1;
+    } else if (!own) {
+        /* the caller's fd: non-blocking while we hold it (every wait is a bounded poll) */
+        c->fd_sock = (uint8_t)(getsockopt(fd, SOL_SOCKET, SO_TYPE, &t, &tl) == 0);
+        c->fd_flags = fcntl(fd, F_GETFL);
+        if (c->fd_flags < 0 || (c->fd_sock && t != SOCK_STREAM)) {
+            c->fd_flags = -1; /* not an open fd, or datagrams: nothing changed, nothing to undo */
+            rc = BRISK_E_ARG;
+        } else if (fcntl(fd, F_SETFL, c->fd_flags | O_NONBLOCK) != 0) {
+            rc = BRISK_E_IO;
+        }
+    }
+    if (io != NULL || fd >= 0) {
         deadline = brisk__os_mono_ms() + c->timeout_ms;
     }
     while (rc == BRISK_OK) {
@@ -391,22 +471,39 @@ int brisk_connect(const brisk_cfg *cfg, const char *host, uint16_t port, brisk_c
     if (cfg == NULL || host == NULL || out == NULL) {
         return BRISK_E_ARG;
     }
-    return net_connect(cfg, host, -1, NULL, -1, port, out);
+    return net_connect(cfg, host, -1, 1, NULL, NULL, -1, port, out);
 }
 
-int brisk__connect_fd(const brisk_cfg *cfg, const char *host, int fd, const uint8_t *rnd,
-                      int64_t now_ms, brisk_conn **out)
+int brisk__connect_via(const brisk_cfg *cfg, const char *host, int fd, int own, const brisk_io *io,
+                       const uint8_t *rnd, int64_t now_ms, brisk_conn **out)
 {
     if (out != NULL) {
         *out = NULL;
     }
-    if (cfg == NULL || host == NULL || out == NULL || fd < 0) {
-        if (fd >= 0) {
+    if (cfg == NULL || host == NULL || out == NULL ||
+        (io != NULL ? io->send == NULL || io->recv == NULL : fd < 0)) {
+        if (fd >= 0 && own) {
             close(fd);
         }
         return BRISK_E_ARG;
     }
-    return net_connect(cfg, host, fd, rnd, now_ms, 0, out);
+    return net_connect(cfg, host, io != NULL ? -1 : fd, own, io, rnd, now_ms, 0, out);
+}
+
+int brisk_connect_fd(const brisk_cfg *cfg, const char *host, int fd, brisk_conn **out)
+{
+    return brisk__connect_via(cfg, host, fd, 0, NULL, NULL, -1, out);
+}
+
+int brisk_connect_io(const brisk_cfg *cfg, const char *host, const brisk_io *io, brisk_conn **out)
+{
+    if (io == NULL) {
+        if (out != NULL) {
+            *out = NULL;
+        }
+        return BRISK_E_ARG;
+    }
+    return brisk__connect_via(cfg, host, -1, 0, io, NULL, -1, out);
 }
 
 int brisk_read(brisk_conn *c, void *buf, size_t cap)
@@ -453,7 +550,7 @@ int brisk_write(brisk_conn *c, const void *buf, size_t len)
     while (len != 0) {
         rc = brisk_app_write(c, p, len, &used, c->tx, BRISK__CONN_TX, &n);
         if (n != 0) {
-            int s = brisk__os_send_all(c->fd, c->tx, n, brisk__os_mono_ms() + c->timeout_ms);
+            int s = net_send(c, c->tx, n, brisk__os_mono_ms() + c->timeout_ms);
             if (s != BRISK_OK) {
                 return net_dead(c, s);
             }
