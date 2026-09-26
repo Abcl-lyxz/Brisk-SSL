@@ -288,6 +288,37 @@
 #    error "BRISK_ENABLE_X25519 and BRISK_ENABLE_P256_KX are both 0: no key exchange left"
 #endif
 
+/* clang-format off */
+/* Features every profile has; an explicit 0 drops one for flash. None of them weakens a
+ * connection: what is gone is refused at setup (BRISK_E_ARG) or simply never offered.
+ *
+ *   BRISK_ENABLE_TICKETS    session resumption (RFC 9846 4.6.1 / 2.2), src/tls/ticket.c. Off:
+ *                           cfg.ticket and cfg.on_ticket are ignored - always a full handshake.
+ *   BRISK_ENABLE_PEM        PEM text anywhere (RFC 7468): cfg.ca_file bundles, PEM cfg.ca_mem,
+ *                           PEM client_key / client_chain; src/x509/bundle.c. Off: DER only, and
+ *                           the file store goes too (every CA bundle on disk is PEM), so
+ *                           cfg.ca_file and PEM input are BRISK_E_ARG at setup.
+ *   BRISK_ENABLE_SYSTEM_CA  the autodetected system bundle (/etc/ssl/certs/...) when cfg sets no
+ *                           anchors. Needs PEM. Off: ca_file and ca_mem both NULL is BRISK_E_ARG.
+ *   BRISK_ENABLE_CUSTOM_IO  brisk_connect_fd / brisk_connect_io (a caller's fd or callbacks as
+ *                           the transport). Off: brisk_connect only; the two no longer link. */
+/* clang-format on */
+#ifndef BRISK_ENABLE_TICKETS
+#    define BRISK_ENABLE_TICKETS 1
+#endif
+#ifndef BRISK_ENABLE_PEM
+#    define BRISK_ENABLE_PEM 1
+#endif
+#ifndef BRISK_ENABLE_SYSTEM_CA
+#    define BRISK_ENABLE_SYSTEM_CA BRISK_ENABLE_PEM
+#endif
+#ifndef BRISK_ENABLE_CUSTOM_IO
+#    define BRISK_ENABLE_CUSTOM_IO 1
+#endif
+#if BRISK_ENABLE_SYSTEM_CA && !BRISK_ENABLE_PEM
+#    error "BRISK_ENABLE_SYSTEM_CA needs BRISK_ENABLE_PEM (system bundles are PEM files)"
+#endif
+
 /* Which constant-time AES: BRISK_AES_IMPL_CT32 (aes_ct.c, 2 blocks per pass, ~0.6 KB stack) or
  * BRISK_AES_IMPL_CT64 (aes_ct64.c, 4 blocks, ~1.1 KB, faster on 64-bit CPUs). Both are
  * bitsliced and table-free. Undefined = CT64 on 64-bit pointers, CT32 elsewhere. */

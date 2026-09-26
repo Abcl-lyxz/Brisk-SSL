@@ -51,6 +51,62 @@ void brisk__secure_zero(void *p, size_t n)
 #    define BRISK__TIME_NAME ""
 #endif
 
+/* Every brisk_config.h knob that is on by default in every profile and was turned off, so a
+ * firmware that cannot reach an RSA server says why: " -rsa -x25519". Empty by default. */
+#if BRISK_ENABLE_AESGCM
+#    define BRISK__OFF_AESGCM ""
+#else
+#    define BRISK__OFF_AESGCM " -aesgcm"
+#endif
+#if BRISK_ENABLE_AES256
+#    define BRISK__OFF_AES256 ""
+#else
+#    define BRISK__OFF_AES256 " -aes256"
+#endif
+#if BRISK_ENABLE_CHACHA
+#    define BRISK__OFF_CHACHA ""
+#else
+#    define BRISK__OFF_CHACHA " -chacha"
+#endif
+#if BRISK_ENABLE_X25519
+#    define BRISK__OFF_X25519 ""
+#else
+#    define BRISK__OFF_X25519 " -x25519"
+#endif
+#if BRISK_ENABLE_P256_KX
+#    define BRISK__OFF_P256_KX ""
+#else
+#    define BRISK__OFF_P256_KX " -p256_kx"
+#endif
+#if BRISK_ENABLE_RSA
+#    define BRISK__OFF_RSA ""
+#else
+#    define BRISK__OFF_RSA " -rsa"
+#endif
+#if BRISK_ENABLE_TICKETS
+#    define BRISK__OFF_TICKETS ""
+#else
+#    define BRISK__OFF_TICKETS " -tickets"
+#endif
+#if BRISK_ENABLE_PEM
+#    define BRISK__OFF_PEM ""
+#else
+#    define BRISK__OFF_PEM " -pem"
+#endif
+#if BRISK_ENABLE_SYSTEM_CA
+#    define BRISK__OFF_SYSTEM_CA ""
+#else
+#    define BRISK__OFF_SYSTEM_CA " -system_ca"
+#endif
+#if BRISK_ENABLE_CUSTOM_IO
+#    define BRISK__OFF_CUSTOM_IO ""
+#else
+#    define BRISK__OFF_CUSTOM_IO " -custom_io"
+#endif
+#define BRISK__OFF_NAMES                                                                           \
+    BRISK__OFF_AESGCM BRISK__OFF_AES256 BRISK__OFF_CHACHA BRISK__OFF_X25519 BRISK__OFF_P256_KX     \
+        BRISK__OFF_RSA BRISK__OFF_TICKETS BRISK__OFF_PEM BRISK__OFF_SYSTEM_CA BRISK__OFF_CUSTOM_IO
+
 /* "@(#)" makes `strings`/`what` find the configuration in a shipped firmware image. The consumer
  * links with --gc-sections, which would drop the string unless brisk_build_info() is called, so:
  * `retain` (GCC >= 11, Clang >= 13, binutils >= 2.36) keeps it in .rodata, and on older ELF
@@ -64,14 +120,26 @@ void brisk__secure_zero(void *p, size_t n)
 #    define BRISK__RETAIN
 #    if defined(__ELF__)
 __asm__(".pushsection .comment\n\t.asciz \"@(#)BRISKCFG " BRISK_SSL_VERSION_STRING
-        " profile=" BRISK__PROFILE_NAME BRISK__TIME_NAME "\"\n\t.popsection");
+        " profile=" BRISK__PROFILE_NAME BRISK__TIME_NAME BRISK__OFF_NAMES "\"\n\t.popsection");
 #    endif
 #endif
 
 BRISK__RETAIN static const char brisk__build_info[] =
-    "@(#)BRISKCFG " BRISK_SSL_VERSION_STRING " profile=" BRISK__PROFILE_NAME BRISK__TIME_NAME;
+    "@(#)BRISKCFG " BRISK_SSL_VERSION_STRING
+    " profile=" BRISK__PROFILE_NAME BRISK__TIME_NAME BRISK__OFF_NAMES;
 #undef BRISK__RETAIN
 #undef BRISK__TIME_NAME
+#undef BRISK__OFF_NAMES
+#undef BRISK__OFF_AESGCM
+#undef BRISK__OFF_AES256
+#undef BRISK__OFF_CHACHA
+#undef BRISK__OFF_X25519
+#undef BRISK__OFF_P256_KX
+#undef BRISK__OFF_RSA
+#undef BRISK__OFF_TICKETS
+#undef BRISK__OFF_PEM
+#undef BRISK__OFF_SYSTEM_CA
+#undef BRISK__OFF_CUSTOM_IO
 
 const char *brisk_version(void)
 {

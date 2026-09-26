@@ -70,10 +70,10 @@ int main(int argc, char **argv)
         brisk_aead_open((brisk_aead_alg)argc, out, 32, out, out, 5, out, 16, out, out + 48);
         brisk_hkdf_extract(alg, out, 32, out, 32, out);
         brisk_hkdf_expand(alg, out, 32, out, 5, out, 32);
-#if BRISK_ENABLE_X25519
+#    if BRISK_ENABLE_X25519
         brisk_x25519_keygen(out, out + 32);
         brisk_x25519(out, out + 32, out);
-#endif
+#    endif
         brisk_p256_keygen(out, pt);
         brisk_p256_ecdh(out, out + 32, pt);
         brisk_p256_sign(sig, out, out + 32, 32);
@@ -168,7 +168,9 @@ int main(int argc, char **argv)
     {
         static brisk__x509_bundle bundle; /* 2 KB: the probe reports it as linux_ca's RAM */
         brisk__x509_cert anchor;
+#    if BRISK_ENABLE_SYSTEM_CA
         brisk__os_ca_path();
+#    endif
         brisk__os_ca_anchor(&bundle, out, 8, 0, &anchor);
     }
 #endif

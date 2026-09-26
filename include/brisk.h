@@ -348,7 +348,9 @@ typedef struct {
      *                               whole Web PKI. To add the system store, set ca_file too.
      *   ca_file set                 that PEM bundle file (plus ca_mem when set).
      * Fewer anchors can only refuse more connections, never accept one the rule above would not.
-     * A bundle that cannot be read holds no anchors: the handshake fails with bad_certificate. */
+     * A bundle that cannot be read holds no anchors: the handshake fails with bad_certificate.
+     * Build knobs: BRISK_ENABLE_PEM=0 takes DER ca_mem only (ca_file and PEM are BRISK_E_ARG);
+     * BRISK_ENABLE_SYSTEM_CA=0 makes "neither set" BRISK_E_ARG. */
     const char *ca_file;   /* path of a PEM bundle, scanned per lookup (never cached in RAM) */
     const uint8_t *ca_mem; /* concatenated DER certificates (first byte 0x30), or PEM text with
                             * one or more BEGIN CERTIFICATE blocks; used in place, not copied */
@@ -385,7 +387,8 @@ typedef struct {
     /* Resumption (RFC 9846 2.2): ticket = a blob from a previous on_ticket for this host, or
      * NULL. A blob that is malformed, for another host, expired (7 days at most) or too large to
      * offer is silently ignored and a full handshake runs; brisk_resumed() tells which happened.
-     * on_ticket receives the server's new tickets (NULL = tickets are ignored). */
+     * on_ticket receives the server's new tickets (NULL = tickets are ignored). Both are ignored
+     * with BRISK_ENABLE_TICKETS=0. */
     const uint8_t *ticket;
     size_t ticket_len;
     brisk_ticket_fn on_ticket;
@@ -451,7 +454,8 @@ BRISK_API void brisk_close(brisk_conn *c);
  * description, so dup()ed or inherited copies see it too - and brisk_close (or the failure)
  * puts back the flags it had at this call. Sockets are sent with MSG_NOSIGNAL; a tty never
  * raises SIGPIPE. Returns as brisk_connect; BRISK_E_ARG also for an fd that is not open or a
- * socket that is not SOCK_STREAM (a datagram socket would cut records). */
+ * socket that is not SOCK_STREAM (a datagram socket would cut records). brisk_connect_fd and
+ * brisk_connect_io are not linked with BRISK_ENABLE_CUSTOM_IO=0. */
 BRISK_API int brisk_connect_fd(const brisk_cfg *cfg, const char *host, int fd, brisk_conn **out);
 
 /* A transport as two blocking callbacks (ctx passed through). timeout_ms (>= 1) is the time left

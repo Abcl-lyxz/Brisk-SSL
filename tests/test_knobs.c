@@ -1,13 +1,15 @@
-/* test_knobs.c - the brisk_config.h algorithm knobs (AESGCM, AES256, CHACHA, X25519, P256_KX,
- * RSA): the default ClientHello offers exactly the suites, groups and signature schemes this
- * build has, and every entry point refuses one it does not - a caller's own suite list, a key
- * share, a TLS 1.2 suite, the public AEAD. Runs in every build: the normal suite checks the
- * all-on offer, and `dev.py knobs` builds this file alone (-DT_KNOBS_MAIN) once per knob off,
+/* test_knobs.c - the brisk_config.h knobs. Algorithms (AESGCM, AES256, CHACHA, X25519,
+ * P256_KX, RSA): the default ClientHello offers exactly the suites, groups and signature schemes
+ * this build has, and every entry point refuses one it does not - a caller's own suite list, a
+ * key share, a TLS 1.2 suite, the public AEAD. PEM / SYSTEM_CA: a trust source the build lacks is
+ * BRISK_E_ARG at setup. Runs in every build: the normal suite checks the all-on build, and
+ * `dev.py amalg` builds this file alone (-DT_KNOBS_MAIN) once per knob off,
  * where the replayed-transcript suites cannot run because the ClientHello bytes differ.
  *
  * SPDX-License-Identifier: Apache-2.0
  */
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 #include "brisk_int.h"
@@ -21,6 +23,7 @@ typedef struct {
     int on;
 } knob_row;
 
+/* clang-format off */
 static const knob_row SUITES[] = {
     {0x1301, BRISK_ENABLE_AESGCM},
     {0x1302, BRISK_ENABLE_AES256},
@@ -32,11 +35,16 @@ static const knob_row SUITES[] = {
     {0xC030, BRISK_ENABLE_TLS12 && BRISK_ENABLE_AES256 && BRISK_ENABLE_RSA},
     {0xCCA9, BRISK_ENABLE_TLS12 && BRISK_ENABLE_CHACHA},
     {0xCCA8, BRISK_ENABLE_TLS12 && BRISK_ENABLE_CHACHA && BRISK_ENABLE_RSA}};
+/* clang-format on */
 static const knob_row GROUPS[] = {{0x001d, BRISK_ENABLE_X25519}, {0x0017, BRISK_ENABLE_P256_KX}};
-static const knob_row SIGS[] = {
-    {0x0403, 1},                {0x0503, BRISK_ENABLE_P384}, {0x0804, BRISK_ENABLE_RSA},
-    {0x0805, BRISK_ENABLE_RSA}, {0x0806, BRISK_ENABLE_RSA},  {0x0401, BRISK_ENABLE_RSA},
-    {0x0501, BRISK_ENABLE_RSA}, {0x0601, BRISK_ENABLE_RSA}};
+static const knob_row SIGS[] = {{0x0403, 1},
+                                {0x0503, BRISK_ENABLE_P384},
+                                {0x0804, BRISK_ENABLE_RSA},
+                                {0x0805, BRISK_ENABLE_RSA},
+                                {0x0806, BRISK_ENABLE_RSA},
+                                {0x0401, BRISK_ENABLE_RSA},
+                                {0x0501, BRISK_ENABLE_RSA},
+                                {0x0601, BRISK_ENABLE_RSA}};
 
 #define DEF_GROUP (BRISK_ENABLE_X25519 ? 0x001d : 0x0017)
 
@@ -167,8 +175,66 @@ static void aead_api(void)
 }
 #endif
 
+/* PEM / SYSTEM_CA: what the build lacks is BRISK_E_ARG at setup, never a weaker trust store.
+ * The setup parses no anchor, so any bytes stand in for the certificates. */
+static int dummy_anchor(void *ctx, const uint8_t *dn, size_t dn_len, size_t index,
+                        brisk__x509_cert *out)
+{
+    (void)ctx, (void)dn, (void)dn_len, (void)index, (void)out;
+    return BRISK_E_ARG;
+}
+
+static void trust_setup(void)
+{
+    static const uint8_t der[] = {0x30, 0x00}, pem[] = "-----BEGIN CERTIFICATE-----";
+    uint8_t rnd[BRISK__CONN_RAND];
+    size_t size = brisk_conn_size();
+    void *mem = malloc(size);
+    brisk_conn *c;
+    brisk_cfg cfg;
+    memset(rnd, 0x11, sizeof rnd); /* every slice a valid key, the P-256 d included */
+    if (mem == NULL) {
+        CHECK(0);
+        return;
+    }
+    memset(&cfg, 0, sizeof cfg); /* no anchors named: the system store */
+    CHECK((brisk__conn_setup(mem, size, &cfg, "a.example", 0, rnd, dummy_anchor, &c) == BRISK_OK) ==
+          BRISK_ENABLE_SYSTEM_CA);
+    cfg.ca_file = "/etc/ssl/cert.pem";
+    CHECK((brisk__conn_setup(mem, size, &cfg, "a.example", 0, rnd, dummy_anchor, &c) == BRISK_OK) ==
+          BRISK_ENABLE_PEM);
+    cfg.ca_file = NULL;
+    cfg.ca_mem = pem;
+    cfg.ca_mem_len = sizeof pem - 1;
+    CHECK((brisk__conn_setup(mem, size, &cfg, "a.example", 0, rnd, dummy_anchor, &c) == BRISK_OK) ==
+          BRISK_ENABLE_PEM);
+    cfg.ca_mem = der;
+    cfg.ca_mem_len = sizeof der;
+    CHECK(brisk__conn_setup(mem, size, &cfg, "a.example", 0, rnd, dummy_anchor, &c) == BRISK_OK);
+    free(mem);
+}
+
+/* brisk_build_info names every knob that is off, so a shipped image says what it lacks */
+static void build_info(void)
+{
+    static const struct {
+        const char *tag;
+        int on;
+    } K[] = {{" -aesgcm", BRISK_ENABLE_AESGCM},       {" -aes256", BRISK_ENABLE_AES256},
+             {" -chacha", BRISK_ENABLE_CHACHA},       {" -x25519", BRISK_ENABLE_X25519},
+             {" -p256_kx", BRISK_ENABLE_P256_KX},     {" -rsa", BRISK_ENABLE_RSA},
+             {" -tickets", BRISK_ENABLE_TICKETS},     {" -pem", BRISK_ENABLE_PEM},
+             {" -system_ca", BRISK_ENABLE_SYSTEM_CA}, {" -custom_io", BRISK_ENABLE_CUSTOM_IO}};
+    size_t i;
+    for (i = 0; i < N(K); i++) {
+        CHECKI((strstr(brisk_build_info(), K[i].tag) != NULL) == !K[i].on, i);
+    }
+}
+
 void test_knobs(void)
 {
+    build_info();
+    trust_setup();
     offer();
     own_suites();
 #if BRISK_ENABLE_CRYPTO_API

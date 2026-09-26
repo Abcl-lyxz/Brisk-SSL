@@ -282,7 +282,7 @@ static int net_send(brisk_conn *c, const uint8_t *p, size_t n, int64_t deadline)
 {
     uint32_t ms;
     int r;
-    if (c->io.send == NULL) {
+    if (!BRISK_ENABLE_CUSTOM_IO || c->io.send == NULL) {
         return brisk__os_send_all(c->fd, c->fd_sock, p, n, deadline);
     }
     while (n != 0) {
@@ -309,7 +309,7 @@ static int net_recv(brisk_conn *c, int64_t deadline, size_t *n)
     uint32_t ms;
     int r;
     *n = 0;
-    if (c->io.recv == NULL) {
+    if (!BRISK_ENABLE_CUSTOM_IO || c->io.recv == NULL) {
         return brisk__os_recv(c->fd, c->fd_sock, c->rx, BRISK__CONN_RX, deadline, n);
     }
     if ((ms = net_left(deadline)) == 0) {
@@ -481,7 +481,7 @@ int brisk__connect_via(const brisk_cfg *cfg, const char *host, int fd, int own, 
         *out = NULL;
     }
     if (cfg == NULL || host == NULL || out == NULL ||
-        (io != NULL ? io->send == NULL || io->recv == NULL : fd < 0)) {
+        (io != NULL ? !BRISK_ENABLE_CUSTOM_IO || io->send == NULL || io->recv == NULL : fd < 0)) {
         if (fd >= 0 && own) {
             close(fd);
         }
@@ -490,6 +490,7 @@ int brisk__connect_via(const brisk_cfg *cfg, const char *host, int fd, int own, 
     return net_connect(cfg, host, io != NULL ? -1 : fd, own, io, rnd, now_ms, 0, out);
 }
 
+#if BRISK_ENABLE_CUSTOM_IO
 int brisk_connect_fd(const brisk_cfg *cfg, const char *host, int fd, brisk_conn **out)
 {
     return brisk__connect_via(cfg, host, fd, 0, NULL, NULL, -1, out);
@@ -505,6 +506,7 @@ int brisk_connect_io(const brisk_cfg *cfg, const char *host, const brisk_io *io,
     }
     return brisk__connect_via(cfg, host, -1, 0, io, NULL, -1, out);
 }
+#endif
 
 int brisk_read(brisk_conn *c, void *buf, size_t cap)
 {

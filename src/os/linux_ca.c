@@ -44,12 +44,16 @@
  * NOT supported either: a hashed directory (/etc/ssl/certs/HASH.0). It needs getdents and a
  * second Name-to-hash implementation to find a file, and every system that ships one also
  * ships the concatenated bundle above. */
+#if BRISK_ENABLE_PEM
+#    if BRISK_ENABLE_SYSTEM_CA
 static const char *const CA_PATHS[] = {"/etc/ssl/certs/ca-certificates.crt",
                                        "/etc/pki/tls/certs/ca-bundle.crt",
                                        "/etc/ssl/ca-bundle.pem",
                                        "/etc/ssl/cert.pem",
                                        "/etc/pki/tls/cacert.pem",
                                        "/etc/ssl/certs/ca-bundle.crt"};
+
+#    endif
 
 /* O_CLOEXEC so a bundle fd cannot leak into a child this library never knew about; a gateway
  * that fork/execs a helper between connections is the normal case, not the exotic one. */
@@ -62,6 +66,7 @@ static int open_ro(const char *path)
     return fd;
 }
 
+#    if BRISK_ENABLE_SYSTEM_CA
 /* A path only counts as "the bundle" if it is a non-empty REGULAR file. Two reasons, both
  * things that happen on real images rather than hypotheticals:
  *   - a stripped OpenWrt or Alpine image often leaves an EMPTY /etc/ssl/certs/ca-certificates.crt
@@ -92,6 +97,7 @@ const char *brisk__os_ca_path(void)
     }
     return NULL;
 }
+#    endif
 
 int brisk__os_ca_anchor(void *ctx, const uint8_t *dn, size_t dn_len, size_t index,
                         brisk__x509_cert *out)
@@ -111,7 +117,9 @@ int brisk__os_ca_anchor(void *ctx, const uint8_t *dn, size_t dn_len, size_t inde
         return BRISK_E_ARG;
     }
     if (b->path == NULL) {
+#    if BRISK_ENABLE_SYSTEM_CA
         b->path = brisk__os_ca_path(); /* once per bundle, not once per lookup */
+#    endif
         if (b->path == NULL) {
             return BRISK_E_ARG;
         }
@@ -161,3 +169,17 @@ done:
     }
     return rc;
 }
+
+#else /* !BRISK_ENABLE_PEM: no file store (bundles are PEM); conn setup refuses cfg.ca_file */
+
+int brisk__os_ca_anchor(void *ctx, const uint8_t *dn, size_t dn_len, size_t index,
+                        brisk__x509_cert *out)
+{
+    (void)ctx, (void)dn, (void)dn_len, (void)index;
+    if (out != NULL) {
+        memset(out, 0, sizeof *out);
+    }
+    return BRISK_E_ARG;
+}
+
+#endif /* BRISK_ENABLE_PEM */

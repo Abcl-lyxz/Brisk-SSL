@@ -33,7 +33,7 @@ that says how to fix it. Knobs are added as their milestone lands.
 Let's Encrypt's Generation Y intermediates are P-384, so a chain from them cannot be verified
 without it. With it off, `src/crypto/p384.c` compiles to an empty object and costs nothing.
 
-### Algorithm knobs (on in every profile; only an explicit 0 turns one off)
+### Algorithm and feature knobs (on in every profile; only an explicit 0 turns one off)
 
 | Knob | Removes | Notes |
 |---|---|---|
@@ -43,6 +43,10 @@ without it. With it off, `src/crypto/p384.c` compiles to an empty object and cos
 | `BRISK_ENABLE_X25519` | the x25519 group; `x25519.c` | CH1's key share becomes secp256r1 |
 | `BRISK_ENABLE_P256_KX` | the secp256r1 group | `p256.c` stays (ECDSA verify is always built). TLS 1.2: a conforming server may not pick ECDHE_ECDSA with a P-256 certificate when the client does not list secp256r1 (RFC 8422 5.3), so 1.2 then needs RSA or another curve |
 | `BRISK_ENABLE_RSA` | RSA PKCS#1 / PSS verify (certificates, CertificateVerify, TLS 1.2 ECDHE_RSA); `rsa.c`, and `bn.c` too when P384 is off | an RSA certificate anywhere in the chain is refused as unsupported |
+| `BRISK_ENABLE_TICKETS` | session resumption; `ticket.c` | `cfg.ticket` / `cfg.on_ticket` are ignored: always a full handshake |
+| `BRISK_ENABLE_PEM` | PEM anywhere: `ca_file` bundles, PEM `ca_mem` / `client_key` / `client_chain`; `bundle.c` | DER only; `ca_file` and PEM input are `BRISK_E_ARG` at setup. Also drops SYSTEM_CA (bundles on disk are PEM) |
+| `BRISK_ENABLE_SYSTEM_CA` | the autodetected system bundle | needs PEM; `ca_file` and `ca_mem` both NULL is `BRISK_E_ARG` |
+| `BRISK_ENABLE_CUSTOM_IO` | `brisk_connect_fd`, `brisk_connect_io` | they no longer link; `brisk_connect` stays |
 | `BRISK_AES_IMPL` | - | `BRISK_AES_IMPL_CT32` (`aes_ct.c`, less stack) or `BRISK_AES_IMPL_CT64` (`aes_ct64.c`, faster on 64-bit); default by pointer width. AES only: GHASH stays by pointer width |
 
 At least one AEAD and one group must stay (`#error` otherwise). **Off is not conformant**:
@@ -125,3 +129,5 @@ KB of flash (text + rodata + data, -Os, static link map, libc excluded); budget 
 ## What did my firmware get compiled with?
 `brisk_build_info()` returns e.g. `0.1.0 profile=DEFAULT`; the same text is embedded as
 `@(#)BRISKCFG ...`, so `strings firmware.bin | grep BRISKCFG` works on a shipped image.
+Every knob from the table above that was switched off is appended (`profile=DEFAULT -rsa
+-x25519`), as is a non-default time policy.

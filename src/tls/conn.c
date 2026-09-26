@@ -196,8 +196,8 @@ static int conn_hello(brisk_conn *c, uint8_t *buf)
     int ch2 = hs->state == BRISK__HS_WAIT_CH2, use_psk = 0, rc, quic = 0;
     /* CH1's share: x25519 unless brisk_config.h left it out (the engine refuses a group that is
      * not in this build, so an HRR can only name one that is) */
-    uint16_t g = ch2 && hs->hrr_group != 0 ? hs->hrr_group
-                                           : (BRISK_ENABLE_X25519 ? CONN_X25519 : CONN_P256);
+    uint16_t g =
+        ch2 && hs->hrr_group != 0 ? hs->hrr_group : (BRISK_ENABLE_X25519 ? CONN_X25519 : CONN_P256);
     const uint8_t *priv = c->rnd + (g == CONN_P256 ? CONN_RND_P : CONN_RND_X);
     size_t n = 0;
 
@@ -340,6 +340,14 @@ CONN_SHARED int brisk__conn_core(brisk_conn *c, const brisk_cfg *cfg, const char
     size_t host_len = 0, n = 0;
     int rc;
 
+    /* what brisk_config.h left out is refused here, never silently weakened: no PEM = DER only
+     * (and no bundle file, which is PEM); no system store = the caller names the anchors */
+    if ((!BRISK_ENABLE_PEM &&
+         (cfg->ca_file != NULL ||
+          (cfg->ca_mem_len != 0 && cfg->ca_mem != NULL && cfg->ca_mem[0] != 0x30))) ||
+        (!BRISK_ENABLE_SYSTEM_CA && cfg->ca_file == NULL && cfg->ca_mem == NULL)) {
+        return BRISK_E_ARG;
+    }
     if (!conn_host_ok(host, &host_len) || (cfg->ca_mem == NULL) != (cfg->ca_mem_len == 0) ||
         (cfg->client_chain == NULL && cfg->client_chain_len != 0) ||
         (cfg->client_key == NULL && cfg->client_key_len != 0)) {
@@ -348,6 +356,11 @@ CONN_SHARED int brisk__conn_core(brisk_conn *c, const brisk_cfg *cfg, const char
     memset(c, 0, sizeof *c);
     c->fd = -1;
     c->cfg = *cfg;
+#if !BRISK_ENABLE_TICKETS
+    c->cfg.ticket = NULL; /* resumption is not in this build: always a full handshake */
+    c->cfg.ticket_len = 0;
+    c->cfg.on_ticket = NULL;
+#endif
     memcpy(c->host, host, host_len);
     c->host_len = host_len;
     memcpy(c->rnd, rnd, BRISK__CONN_RAND);
@@ -366,7 +379,7 @@ CONN_SHARED int brisk__conn_core(brisk_conn *c, const brisk_cfg *cfg, const char
     memset(&hc, 0, sizeof hc);
     hc.auth = brisk__tls13_auth_x509; /* verification is always on */
     hc.auth_ctx = &c->auth;
-    hc.on_ticket = cfg->on_ticket != NULL ? conn_on_ticket : NULL; /* NULL: 4.7.1 ignore */
+    hc.on_ticket = c->cfg.on_ticket != NULL ? conn_on_ticket : NULL; /* NULL: 4.7.1 ignore */
     hc.ticket_ctx = c;
     hc.client_chain = cfg->client_chain;
     hc.client_chain_len = cfg->client_chain_len;

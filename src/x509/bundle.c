@@ -14,10 +14,12 @@
  */
 #include "brisk_int.h"
 
+#if BRISK_ENABLE_PEM
+
 /* Matched WHOLE, which is the only reason a "-----BEGIN RSA PRIVATE KEY-----" line cannot open
  * a certificate block. The NUL is not part of it. */
 static const char BEGIN_LINE[] = "-----BEGIN CERTIFICATE-----";
-#define BEGIN_LEN (sizeof BEGIN_LINE - 1)
+#    define BEGIN_LEN (sizeof BEGIN_LINE - 1)
 
 /* PEM_-prefixed although they are file-scope: these are enum constants, so #undef cannot save
  * them if the amalgamation ever puts a record-layer or HPACK state machine in the same TU, and
@@ -176,9 +178,9 @@ int brisk__x509_pem_feed(brisk__x509_pem *p, const uint8_t **in, size_t *len)
     return 0;
 }
 
-#undef BEGIN_LEN
+#    undef BEGIN_LEN
 
-#if BRISK_ENABLE_MTLS
+#    if BRISK_ENABLE_MTLS
 /* ---- one-shot and STRICT: the device's own chain and key (see brisk_int.h for
  * why) -------- */
 
@@ -305,4 +307,6 @@ fail:
     }
     return BRISK_E_ARG;
 }
-#endif /* BRISK_ENABLE_MTLS */
+#    endif /* BRISK_ENABLE_MTLS */
+
+#endif /* BRISK_ENABLE_PEM */

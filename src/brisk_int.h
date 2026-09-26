@@ -174,9 +174,8 @@ int brisk__chacha20_poly1305_open(const uint8_t key[32], const uint8_t nonce[12]
 /* Off in this build: fail-closed stubs keep one code path in the callers. The gates that
  * pick a suite / group / scheme never select what is off, so these are unreachable. */
 #    if BRISK_ENABLE_QUIC /* header protection is its only user outside the TU */
-static inline void brisk__chacha20(const uint8_t key[32], uint32_t counter,
-                                   const uint8_t nonce[12], const uint8_t *in, uint8_t *out,
-                                   size_t len)
+static inline void brisk__chacha20(const uint8_t key[32], uint32_t counter, const uint8_t nonce[12],
+                                   const uint8_t *in, uint8_t *out, size_t len)
 {
     (void)key, (void)counter, (void)nonce, (void)in;
     memset(out, 0, len);
@@ -216,7 +215,8 @@ static inline int brisk__chacha20_poly1305_open(const uint8_t key[32], const uin
 #    endif
 #endif
 /* GHASH word size (gcm.c) is its own axis, never BRISK_AES_IMPL: ctmul64 on a 32-bit core would
- * pull in a libgcc multiply helper. -DBRISK__GHASH64=0 builds the 32-bit one anywhere (dev.py ct). */
+ * pull in a libgcc multiply helper. -DBRISK__GHASH64=0 builds the 32-bit one anywhere (dev.py ct).
+ */
 #ifndef BRISK__GHASH64
 #    if UINTPTR_MAX > 0xFFFFFFFFu
 #        define BRISK__GHASH64 1
@@ -1308,6 +1308,7 @@ typedef struct {
     uint8_t bol;   /* the next byte starts a line, so a BEGIN line may begin there */
 } brisk__x509_pem;
 
+#if BRISK_ENABLE_PEM
 void brisk__x509_pem_init(brisk__x509_pem *p);
 
 /* Consume bytes from **in until a certificate is complete or the input runs out. On return *in
@@ -1317,6 +1318,18 @@ void brisk__x509_pem_init(brisk__x509_pem *p);
  *   0  the input is exhausted; hand over more, or stop.
  * There is no error return: a malformed block is skipped, not reported (see above). */
 int brisk__x509_pem_feed(brisk__x509_pem *p, const uint8_t **in, size_t *len);
+#else
+/* Off in this build (brisk_config.h): fail-closed stubs keep one code path in the callers. */
+static inline void brisk__x509_pem_init(brisk__x509_pem *p)
+{
+    (void)p;
+}
+static inline int brisk__x509_pem_feed(brisk__x509_pem *p, const uint8_t **in, size_t *len)
+{
+    (void)p, (void)in, (void)len;
+    return 0; /* no certificate */
+}
+#endif
 
 #if BRISK_ENABLE_MTLS
 /* ---- x509/bundle.c: ONE PEM block out of a buffer, STRICT --------------------------------
@@ -1341,8 +1354,18 @@ int brisk__x509_pem_feed(brisk__x509_pem *p, const uint8_t **in, size_t *len);
  *                            more than cap bytes).
  * Constant time in the body's characters (the device key's base64 is the secret): only the
  * byte class (data / pad / layout / newline / dash) and the final verdict are declassified. */
+#    if BRISK_ENABLE_PEM
 int brisk__x509_pem_block(const uint8_t *in, size_t len, size_t *off, const char *label,
                           uint8_t *out, size_t cap, size_t *out_len);
+#    else
+static inline int brisk__x509_pem_block(const uint8_t *in, size_t len, size_t *off,
+                                        const char *label, uint8_t *out, size_t cap,
+                                        size_t *out_len)
+{
+    (void)in, (void)len, (void)off, (void)label, (void)out, (void)cap, (void)out_len;
+    return BRISK_E_ARG; /* PEM is not in this build: DER only */
+}
+#    endif
 
 /* ---- x509/key.c: the device's P-256 private key (cfg.client_key) --------------------------
  *
@@ -1510,7 +1533,9 @@ typedef struct {
  * static storage, never freed. Only the presence of the file is checked here - an unreadable or
  * empty bundle is indistinguishable from one that holds no matching root, and both end as
  * BRISK_E_AUTH from the walk. */
+#if BRISK_ENABLE_SYSTEM_CA
 const char *brisk__os_ca_path(void);
+#endif
 
 /* A brisk__x509_anchor_fn over a brisk__x509_bundle (passed as `ctx`). `*out` stays valid until
  * the next call with the same ctx, which is exactly as long as brisk__x509_chain_verify uses
@@ -2063,10 +2088,27 @@ size_t brisk__hs_chain_entries(const uint8_t *chain, size_t len, uint8_t *out, s
  * went back) or an age >= min(lifetime, 604800) s (4.7.1, 4.3.11.1) is refused, which just
  * means a full handshake. out->identity points into `blob`. Import does not consume: the caller
  * deletes the blob once it has been offered (C.4, clients SHOULD NOT reuse a ticket). */
+#if BRISK_ENABLE_TICKETS
 int brisk__tls13_ticket_export(const brisk__tls13_ticket *t, int64_t now_ms, const char *sni,
                                size_t sni_len, uint8_t *out, size_t cap, size_t *out_len);
 int brisk__tls13_ticket_import(const uint8_t *blob, size_t len, const char *sni, size_t sni_len,
                                int64_t now_ms, brisk__tls13_psk *out);
+#else
+/* Off in this build (brisk_config.h): fail-closed stubs keep one code path in the callers. */
+static inline int brisk__tls13_ticket_export(const brisk__tls13_ticket *t, int64_t now_ms,
+                                             const char *sni, size_t sni_len, uint8_t *out,
+                                             size_t cap, size_t *out_len)
+{
+    (void)t, (void)now_ms, (void)sni, (void)sni_len, (void)out, (void)cap, (void)out_len;
+    return BRISK_E_ARG;
+}
+static inline int brisk__tls13_ticket_import(const uint8_t *blob, size_t len, const char *sni,
+                                             size_t sni_len, int64_t now_ms, brisk__tls13_psk *out)
+{
+    (void)blob, (void)len, (void)sni, (void)sni_len, (void)now_ms, (void)out;
+    return BRISK_E_ARG;
+}
+#endif
 
 /* RFC 9846 7.5 exporter; CONNECTED only (BRISK_E_ARG otherwise). */
 int brisk__tls13_hs_exporter(const brisk__tls13_hs *hs, const char *label, const uint8_t *ctx,

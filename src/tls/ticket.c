@@ -11,8 +11,10 @@
  */
 #include "brisk_int.h"
 
-#define TK_HDR     20      /* ver 1 + suite 2 + issued 8 + lifetime 4 + age_add 4 + psk_len 1 */
-#define TK_MAX_AGE 604800u /* seconds; RFC 9846 4.7.1: never more than 7 days */
+#if BRISK_ENABLE_TICKETS
+
+#    define TK_HDR     20      /* ver 1 + suite 2 + issued 8 + lifetime 4 + age_add 4 + psk_len 1 */
+#    define TK_MAX_AGE 604800u /* seconds; RFC 9846 4.7.1: never more than 7 days */
 
 /* HashLen of a TLS 1.3 suite this build runs, 0 for anything else (RFC 9846 B.4). */
 static size_t tk_hl(uint16_t suite)
@@ -142,5 +144,7 @@ int brisk__tls13_ticket_import(const uint8_t *b, size_t len, const char *sni, si
     return BRISK_OK;
 }
 
-#undef TK_HDR
-#undef TK_MAX_AGE
+#    undef TK_HDR
+#    undef TK_MAX_AGE
+
+#endif /* BRISK_ENABLE_TICKETS */
