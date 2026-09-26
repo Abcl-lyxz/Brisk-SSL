@@ -278,7 +278,10 @@ int brisk__x25519(uint8_t out[32], const uint8_t scalar[32], const uint8_t u[32]
  * brisk__os_random - L1 crypto never calls the OS itself. */
 void brisk__x25519_base(uint8_t out[32], const uint8_t scalar[32]);
 
-/* ---- crypto/p256.c: P-256 (secp256r1) ECDHE, ECDSA verify and (BRISK_ENABLE_MTLS) ECDSA sign ---
+/* ECDSA P-256 signing is compiled for mTLS and for the public crypto API (brisk_p256_sign). */
+#define BRISK__P256_SIGN (BRISK_ENABLE_MTLS || BRISK_ENABLE_CRYPTO_API)
+
+/* ---- crypto/p256.c: P-256 (secp256r1) ECDHE, ECDSA verify and (BRISK__P256_SIGN) ECDSA sign ----
  * RFC 9846 4.3.8.2 (key_share encoding + the MUST to validate the peer point), 7.4.2 (the ECDHE
  * shared secret), 4.3.3 (ecdsa_secp256r1_sha256); FIPS 186-5 6.4.2 (verify); parameters from
  * RFC 5903 3.1 = SP 800-186 3.2.1.3. Both halves are mandatory-to-implement for a TLS 1.3 client
@@ -291,7 +294,7 @@ void brisk__x25519_base(uint8_t out[32], const uint8_t scalar[32]);
  * when signing landed: the sign path runs its fault-check verify nested inside its own frame, so
  * the two add up and no reordering removes that - the countermeasure is worth the kilobyte (see
  * brisk__p256_ecdsa_sign). Verify and ECDH still fit the old 2 KB, so a TINY build without
- * BRISK_ENABLE_MTLS keeps the smaller number. The figures are not optimisation-independent and
+ * BRISK__P256_SIGN keeps the smaller number. The figures are not optimisation-independent and
  * only -Os holds on the 64-bit field: -O2 needs 2144 B for a verify and 3200 B for a sign, -O3
  * 3328 B for a sign - all over budget, which is why -Os is pinned PRIVATE in CMakeLists.txt.
  * Above brisk__aes_key's 1.1 KB, and no VLA or malloc hides it - see src/crypto/p256.c for the
@@ -332,11 +335,11 @@ int brisk__p256_ecdh(uint8_t out[32], const uint8_t priv[32], const uint8_t peer
 int brisk__p256_ecdsa_verify(const uint8_t pub[65], const uint8_t *hash, size_t hash_len,
                              const uint8_t sig[64]);
 
-#if BRISK_ENABLE_MTLS
+#if BRISK__P256_SIGN
 /* ECDSA signature generation (FIPS 186-5 6.4.1) with a deterministic nonce (RFC 6979 3.2), hedged
  * with caller-supplied extra data (RFC 6979 3.6, bullet 2) when `extra` is non-NULL. The mTLS
- * device-key half of RFC 9846 4.3.3; gated by BRISK_ENABLE_MTLS because p256.c is linked into
- * every build for ECDHE and a TINY image never signs.
+ * device-key half of RFC 9846 4.3.3 and brisk_p256_sign; gated by BRISK__P256_SIGN because
+ * p256.c is linked into every build for ECDHE and a TINY image never signs.
  *
  * `sig`   receives r || s, 64 bytes, fixed width. The DER ECDSA-Sig-Value of RFC 9846 4.3.3 is
  *         wrapped by the caller, mirroring brisk__p256_ecdsa_verify's input contract.

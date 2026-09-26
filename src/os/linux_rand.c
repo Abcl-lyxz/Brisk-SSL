@@ -174,4 +174,64 @@ int brisk__os_random(uint8_t *out, size_t len)
     return r;
 }
 
+#if BRISK_ENABLE_CRYPTO_API
+/* The public crypto API calls that draw randomness (the rest is src/crypto/api.c). */
+
+/* A bad RNG that keeps producing d == 0 or d >= n (p ~ 2^-32 per honest draw) is an RNG failure,
+ * not a reason to spin forever. */
+#    define KEYGEN_TRIES 8
+
+int brisk_random(void *out, size_t len)
+{
+    int rc = brisk__os_random((uint8_t *)out, len);
+    if (rc != BRISK_OK) { /* a failure part-way leaves some fresh bytes: none may be used */
+        brisk__secure_zero(out, len);
+    }
+    return rc;
+}
+
+int brisk_x25519_keygen(uint8_t priv[BRISK_X25519_LEN], uint8_t pub[BRISK_X25519_LEN])
+{
+    int rc = brisk_random(priv, BRISK_X25519_LEN);
+    if (rc == BRISK_OK) {
+        brisk__x25519_base(pub, priv);
+    } else {
+        memset(pub, 0, BRISK_X25519_LEN); /* never the previous key pair */
+    }
+    return rc;
+}
+
+int brisk_p256_keygen(uint8_t priv[BRISK_P256_PRIV_LEN], uint8_t pub[BRISK_P256_PUB_LEN])
+{
+    int tries, rc = BRISK_E_RNG;
+    for (tries = 0; tries < KEYGEN_TRIES; tries++) {
+        rc = brisk__os_random(priv, BRISK_P256_PRIV_LEN);
+        if (rc != BRISK_OK) {
+            break;
+        }
+        if (brisk__p256_keygen(pub, priv) == BRISK_OK) {
+            return BRISK_OK;
+        }
+        rc = BRISK_E_RNG;
+    }
+    brisk__secure_zero(priv, BRISK_P256_PRIV_LEN);
+    memset(pub, 0, BRISK_P256_PUB_LEN);
+    return rc;
+}
+
+int brisk_p256_sign(uint8_t sig[BRISK_P256_SIG_LEN], const uint8_t priv[BRISK_P256_PRIV_LEN],
+                    const uint8_t *hash, size_t hash_len)
+{
+    uint8_t extra[32]; /* RFC 6979 3.6 k': a signature stays safe if this RNG draw is weak */
+    int rc = brisk__os_random(extra, sizeof extra);
+    if (rc == BRISK_OK) {
+        rc = brisk__p256_ecdsa_sign(sig, priv, hash, hash_len, extra, sizeof extra);
+    }
+    brisk__secure_zero(extra, sizeof extra);
+    return rc;
+}
+
+#    undef KEYGEN_TRIES
+#endif /* BRISK_ENABLE_CRYPTO_API */
+
 #undef NR_GETRANDOM

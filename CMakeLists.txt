@@ -29,6 +29,7 @@ add_library(brisk STATIC
     src/crypto/bn.c       # i31 constant-time Montgomery big integers
     src/crypto/p384.c     # ECDSA P-384 verify on bn.c (empty TU when BRISK_ENABLE_P384 is 0)
     src/crypto/rsa.c      # RSASSA-PKCS1-v1_5 / RSASSA-PSS verify (RFC 8017)
+    src/crypto/api.c      # public crypto API wrappers (empty TU when BRISK_ENABLE_CRYPTO_API is 0)
     src/x509/der.c        # strict DER reader (ITU-T X.690), the X.509 foundation
     src/x509/cert.c       # one certificate: fields, extensions, validity dates
     src/x509/chain.c      # path building to a trust anchor + the signature checks

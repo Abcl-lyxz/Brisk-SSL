@@ -162,6 +162,16 @@ static void rsa_at_offset(const struct rsa_kat *v, const struct row_bufs *b, int
     memcpy(sb + off, b->s, b->sl);
     rc = rsa_call(v, nb + off, b->nl, eb + off, b->el, hb + off, b->hl, sb + off, b->sl);
     CHECKI(rc == want, idx);
+#if BRISK_ENABLE_CRYPTO_API
+    if (v->salt_len < 0) {
+        rc = brisk_rsa_pkcs1_verify(nb + off, b->nl, eb + off, b->el, alg_of(v->bits), hb + off,
+                                    b->hl, sb + off, b->sl);
+    } else {
+        rc = brisk_rsa_pss_verify(nb + off, b->nl, eb + off, b->el, alg_of(v->bits),
+                                  (size_t)v->salt_len, hb + off, b->hl, sb + off, b->sl);
+    }
+    CHECKI(rc == want, idx);
+#endif
     /* Nothing the caller owns may move, and nothing outside the operands may be touched. */
     CHECKI(memcmp(nb + off, b->n, b->nl) == 0, idx);
     CHECKI(memcmp(eb + off, b->e, b->el) == 0, idx);

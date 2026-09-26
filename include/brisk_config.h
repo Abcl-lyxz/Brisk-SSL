@@ -224,6 +224,16 @@
 #    define BRISK_ENABLE_P384 (BRISK_PROFILE >= BRISK_PROFILE_DEFAULT)
 #endif
 
+/* Public crypto API (src/crypto/api.c): brisk_random, AEAD seal/open, HKDF, X25519, P-256
+ * keygen/ECDH/sign/verify, RSA verify, and P-384 verify when BRISK_ENABLE_P384 is on - for a
+ * device's own payload encryption and signatures. Thin wrappers over the same code the TLS stack
+ * runs. Off in TINY. Needs nothing forced: ECDSA signing (src/crypto/p256.c) is compiled when
+ * either this or BRISK_ENABLE_MTLS is on. A static link drops the wrappers a program never
+ * calls. */
+#ifndef BRISK_ENABLE_CRYPTO_API
+#    define BRISK_ENABLE_CRYPTO_API (BRISK_PROFILE >= BRISK_PROFILE_DEFAULT)
+#endif
+
 /* GHASH without multiply instructions (src/crypto/gcm.c). The default GHASH is constant time
  * only if the CPU's integer multiply is: ARM7/ARM9 (armv5) and some MIPS32 cores (4K family)
  * finish early on small operands, which would leak the GCM hash key H through timing. 1 = use

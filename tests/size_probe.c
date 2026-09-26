@@ -56,10 +56,36 @@ int main(int argc, char **argv)
         brisk__p256_scalar_add(out, out + 32, out);
         brisk__p256_scalar_mul(out, out + 32, out);
         brisk__p256_scalar_inv(out, out + 32);
-#if BRISK_ENABLE_MTLS
+#if BRISK__P256_SIGN
         brisk__p256_ecdsa_sign(out, out + 32, pt, 32, pt + 32, 32);
 #endif
     }
+#if BRISK_ENABLE_CRYPTO_API
+    {
+        uint8_t pt[65], sig[64];
+        brisk_random(out, 8);
+        brisk_aead_seal((brisk_aead_alg)argc, out, 32, out, out, 5, out, 16, out, out + 48);
+        brisk_aead_open((brisk_aead_alg)argc, out, 32, out, out, 5, out, 16, out, out + 48);
+        brisk_hkdf_extract(alg, out, 32, out, 32, out);
+        brisk_hkdf_expand(alg, out, 32, out, 5, out, 32);
+        brisk_x25519_keygen(out, out + 32);
+        brisk_x25519(out, out + 32, out);
+        brisk_p256_keygen(out, pt);
+        brisk_p256_ecdh(out, out + 32, pt);
+        brisk_p256_sign(sig, out, out + 32, 32);
+        brisk_p256_verify(pt, out, 32, sig);
+        brisk_rsa_pkcs1_verify(out, 32, out, 3, alg, out, 32, out, 32);
+        brisk_rsa_pss_verify(out, 32, out, 3, alg, 32, out, 32, out, 32);
+#    if BRISK_ENABLE_P384
+        {
+            uint8_t pt97[97], sig96[96];
+            memset(pt97, 0x04, sizeof pt97);
+            memset(sig96, 0x11, sizeof sig96);
+            brisk_p384_verify(pt97, out, 48, sig96);
+        }
+#    endif
+    }
+#endif
 #if BRISK_ENABLE_P384
     {
         uint8_t pt97[97], sig96[96]; /* sig is 96 bytes: `out` is 64 and would be over-read */

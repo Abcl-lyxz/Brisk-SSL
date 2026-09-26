@@ -352,9 +352,17 @@ static void test_gcm_vectors(void)
             CHECKI(brisk__gcm_init(&gk, GK, klen) == BRISK_OK, i);
             CHECKI(gcm_open_fails(&gk, GN, GA, alen, GC, n, GT), i);
             brisk__secure_zero(&gk, sizeof gk);
+#if BRISK_ENABLE_CRYPTO_API
+            t_aead_api_row(klen == 16 ? BRISK_AEAD_AES128_GCM : BRISK_AEAD_AES256_GCM, GK, klen, GN,
+                           GA, alen, NULL, GC, n, GT, 0, GWO, (long)i);
+#endif
             continue;
         }
         CHECKI(t_unhex(v->pt, GP, GBUF) == n, i);
+#if BRISK_ENABLE_CRYPTO_API
+        t_aead_api_row(klen == 16 ? BRISK_AEAD_AES128_GCM : BRISK_AEAD_AES256_GCM, GK, klen, GN, GA,
+                       alen, GP, GC, n, GT, 1, GWO, (long)i);
+#endif
         for (off = 0; off < 4; off++) {
             uint8_t *key = GWK + off, *iv = GWN + off, *aad = GWA + off, *in = GWI + off,
                     *out = GWO + off, *tag = GWT + off;

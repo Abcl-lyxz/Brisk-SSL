@@ -91,7 +91,7 @@ struct p256_sign_kat {
 #include "kat/p256_params.inc"
 #include "kat/p256_scalar.inc"
 #include "kat/p256_verify.inc"
-#if BRISK_ENABLE_MTLS
+#if BRISK__P256_SIGN
 #    include "kat/p256_sign.inc"
 #endif
 
@@ -102,7 +102,7 @@ struct p256_sign_kat {
  * test_aes.c:53. Update both places together. */
 typedef char p256_ecdh_row_count[N(P256_ECDH_KAT) == 462 ? 1 : -1];
 typedef char p256_verify_row_count[N(P256_VERIFY_KAT) == 344 ? 1 : -1];
-#if BRISK_ENABLE_MTLS
+#if BRISK__P256_SIGN
 typedef char p256_sign_row_count[N(P256_SIGN_KAT) == 57 ? 1 : -1];
 #endif
 
@@ -321,6 +321,11 @@ static void ecdh_one(const uint8_t *priv, const uint8_t *peer, const uint8_t *wa
     } else {
         CHECKI(all_zero(os + off, SL), idx); /* fail closed: no half-computed secret */
     }
+#if BRISK_ENABLE_CRYPTO_API
+    memset(os + off, 0xA5, SL);
+    CHECKI(brisk_p256_ecdh(os + off, ps + off, qs + off) == rc, idx);
+    CHECKI(ok ? memcmp(os + off, want, SL) == 0 : all_zero(os + off, SL), idx);
+#endif
 }
 
 static void test_ecdh(void)
@@ -397,6 +402,9 @@ static void verify_one(const uint8_t *pub, const uint8_t *h, size_t hlen, const 
     memcpy(hs + off, h, hlen);
     memcpy(ss + off, sig, GL);
     CHECKI(rc_code(brisk__p256_ecdsa_verify(qs + off, hs + off, hlen, ss + off)) == expect, idx);
+#if BRISK_ENABLE_CRYPTO_API
+    CHECKI(rc_code(brisk_p256_verify(qs + off, hs + off, hlen, ss + off)) == expect, idx);
+#endif
     CHECKI(memcmp(qs + off, pub, PL) == 0, idx); /* inputs are never modified */
     CHECKI(memcmp(hs + off, h, hlen) == 0, idx);
     CHECKI(memcmp(ss + off, sig, GL) == 0, idx);
@@ -470,7 +478,7 @@ static void test_verify(void)
     }
 }
 
-#if BRISK_ENABLE_MTLS
+#if BRISK__P256_SIGN
 /* ------------------------------------------------------------------------------ ECDSA sign */
 /* One sign at chosen offsets, with canaries around the output. */
 static void sign_one(const uint8_t *priv, const uint8_t *h, size_t hlen, const uint8_t *ex,
@@ -651,7 +659,7 @@ static void test_sign_hook(void)
           BRISK_E_ARG);
     CHECK(canary_ok(sig, GL)); /* refused, not truncated */
 }
-#endif /* BRISK_ENABLE_MTLS */
+#endif /* BRISK__P256_SIGN */
 
 void test_p256(void)
 {
@@ -659,7 +667,7 @@ void test_p256(void)
     test_keygen();
     test_ecdh();
     test_verify();
-#if BRISK_ENABLE_MTLS
+#if BRISK__P256_SIGN
     test_sign();
     test_sign_hook();
 #endif

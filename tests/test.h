@@ -14,6 +14,12 @@ void t_check(int ok, const char *file, int line, const char *what, long idx);
 /* Decode a hex string into out (cap bytes). Aborts the run on odd length / bad digit / overflow. */
 size_t t_unhex(const char *hex, uint8_t *out, size_t cap);
 
+/* One AEAD KAT row through the public brisk_aead_seal/open (BRISK_ENABLE_CRYPTO_API; test_aead.c).
+ * alg is a brisk_aead_alg; scratch holds n bytes. */
+void t_aead_api_row(int alg, const uint8_t *key, size_t klen, const uint8_t *nonce,
+                    const uint8_t *aad, size_t alen, const uint8_t *pt, const uint8_t *ct, size_t n,
+                    const uint8_t *tag, int valid, uint8_t *scratch, long idx);
+
 /* tests/kat/mtls_key.inc (tools/kat.py key_vectors): the mTLS fixture's device key and chain in
  * every accepted form - raw d, SEC1 / PKCS#8 DER, both PEM labels, PEM chains - plus refusals. */
 struct key_mtls_kat {

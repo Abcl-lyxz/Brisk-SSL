@@ -168,6 +168,109 @@ BRISK_API int brisk_hmac(brisk_hash_alg alg, const void *key, size_t key_len, co
                          size_t len, uint8_t *out);
 
 /* ------------------------------------------------------------------------------------------------
+ * Crypto API (BRISK_ENABLE_CRYPTO_API, on from DEFAULT up): the primitives the TLS stack runs,
+ * for a device's own payload encryption, key agreement and signatures. One-shot and stateless;
+ * the caller owns all memory and wipes the secrets it gets back (private keys, shared secrets).
+ * Nothing here hashes a message for you: sign and verify take the digest (brisk_sha256 above).
+ * Status: BRISK_OK or a negative BRISK_E_*; BRISK_E_ARG is a caller mistake or malformed key
+ * material, BRISK_E_AUTH a failed tag or signature check.
+ */
+
+/* len bytes from the kernel CSPRNG (getrandom, /dev/urandom before Linux 3.17). BRISK_OK, or
+ * BRISK_E_RNG with out zeroed. */
+BRISK_API int brisk_random(void *out, size_t len);
+
+/* AEAD with a detached 16-byte tag: AES-GCM (SP 800-38D) and ChaCha20-Poly1305 (RFC 8439).
+ * key_len must match the algorithm (16, 32, 32), else BRISK_E_ARG. A nonce must NEVER repeat
+ * under one key - a repeat leaks the XOR of the plaintexts and, for GCM, lets anyone forge. Use
+ * a counter; random 12-byte nonces are safe for about 2^32 messages per key. in == out is
+ * allowed (no partial overlap); aad, in and out may be NULL when their length is 0. BRISK_E_ARG
+ * also for len beyond the algorithm's limit (GCM 2^36 - 32 bytes, ChaCha20-Poly1305 2^38 - 64)
+ * or aad_len >= 2^61 (GCM, 64-bit only). */
+typedef enum {
+    BRISK_AEAD_AES128_GCM = 1,
+    BRISK_AEAD_AES256_GCM = 2,
+    BRISK_AEAD_CHACHA20_POLY1305 = 3
+} brisk_aead_alg;
+#define BRISK_AEAD_NONCE_LEN 12
+#define BRISK_AEAD_TAG_LEN   16
+
+BRISK_API int brisk_aead_seal(brisk_aead_alg alg, const uint8_t *key, size_t key_len,
+                              const uint8_t nonce[BRISK_AEAD_NONCE_LEN], const void *aad,
+                              size_t aad_len, const void *in, size_t len, void *out,
+                              uint8_t tag[BRISK_AEAD_TAG_LEN]);
+/* The tag is checked in constant time before anything is decrypted. BRISK_E_AUTH: out[0..len)
+ * is zeroed (in place that destroys the ciphertext) - never use it. */
+BRISK_API int brisk_aead_open(brisk_aead_alg alg, const uint8_t *key, size_t key_len,
+                              const uint8_t nonce[BRISK_AEAD_NONCE_LEN], const void *aad,
+                              size_t aad_len, const void *in, size_t len, void *out,
+                              const uint8_t tag[BRISK_AEAD_TAG_LEN]);
+
+/* HKDF (RFC 5869). Extract writes brisk_hash_len(alg) bytes to prk; an empty salt means HashLen
+ * zero bytes. Expand: prk_len >= brisk_hash_len(alg) and out_len <= 255 * HashLen, else
+ * BRISK_E_ARG; out may alias prk but must not overlap info. Both BRISK_E_ARG for an unknown
+ * alg. */
+BRISK_API int brisk_hkdf_extract(brisk_hash_alg alg, const void *salt, size_t salt_len,
+                                 const void *ikm, size_t ikm_len, uint8_t *prk);
+BRISK_API int brisk_hkdf_expand(brisk_hash_alg alg, const uint8_t *prk, size_t prk_len,
+                                const void *info, size_t info_len, uint8_t *out, size_t out_len);
+
+/* X25519 key agreement (RFC 7748). keygen: a fresh private key from brisk_random and its public
+ * key; BRISK_OK, or BRISK_E_RNG with priv and pub zeroed. brisk_x25519: shared = X25519(priv,
+ * peer); BRISK_E_ARG with shared zeroed when the peer sent a small-order key (RFC 7748 6.1) - abort
+ * the exchange. Feed the shared secret through HKDF; never use it as a key directly. */
+#define BRISK_X25519_LEN 32
+BRISK_API int brisk_x25519_keygen(uint8_t priv[BRISK_X25519_LEN], uint8_t pub[BRISK_X25519_LEN]);
+BRISK_API int brisk_x25519(uint8_t shared[BRISK_X25519_LEN], const uint8_t priv[BRISK_X25519_LEN],
+                           const uint8_t peer[BRISK_X25519_LEN]);
+
+/* P-256 (secp256r1). Private key: 32 bytes big-endian. Public key: uncompressed 0x04 || X || Y.
+ * Signature: raw r || s, not DER (JWS/COSE use this form; X.509 and OpenSSL wrap it in DER).
+ *   keygen  fresh key pair from brisk_random; BRISK_OK, or BRISK_E_RNG with priv and pub
+ *           zeroed.
+ *   ecdh    shared = X(priv * peer), the peer point validated first; BRISK_E_ARG with shared
+ *           zeroed for a bad point or key. Feed it through HKDF.
+ *   sign    ECDSA with an RFC 6979 nonce hedged by 32 bytes of brisk_random (RFC 6979 3.6), so a
+ *           weak RNG alone cannot leak the key. hash_len is 32, 48 or 64 (the digest of SHA-256,
+ *           -384, -512; only the leftmost 32 bytes are signed). BRISK_E_ARG for a bad key or
+ *           hash_len, BRISK_E_RNG, or BRISK_E_AUTH with sig zeroed when the self-check of the
+ *           signature failed (a fault; the signature is withheld to protect the key).
+ *   verify  BRISK_OK, BRISK_E_AUTH (bad signature) or BRISK_E_ARG (pub not on the curve, or
+ *           hash_len < 32). */
+#define BRISK_P256_PRIV_LEN   32
+#define BRISK_P256_PUB_LEN    65
+#define BRISK_P256_SHARED_LEN 32
+#define BRISK_P256_SIG_LEN    64
+BRISK_API int brisk_p256_keygen(uint8_t priv[BRISK_P256_PRIV_LEN], uint8_t pub[BRISK_P256_PUB_LEN]);
+BRISK_API int brisk_p256_ecdh(uint8_t shared[BRISK_P256_SHARED_LEN],
+                              const uint8_t priv[BRISK_P256_PRIV_LEN],
+                              const uint8_t peer[BRISK_P256_PUB_LEN]);
+BRISK_API int brisk_p256_sign(uint8_t sig[BRISK_P256_SIG_LEN],
+                              const uint8_t priv[BRISK_P256_PRIV_LEN], const uint8_t *hash,
+                              size_t hash_len);
+BRISK_API int brisk_p256_verify(const uint8_t pub[BRISK_P256_PUB_LEN], const uint8_t *hash,
+                                size_t hash_len, const uint8_t sig[BRISK_P256_SIG_LEN]);
+
+/* P-384 ECDSA verify only (also needs BRISK_ENABLE_P384). Same encodings and outcomes as
+ * brisk_p256_verify; hash_len >= 48, and only the leftmost 48 bytes are used. */
+#define BRISK_P384_PUB_LEN 97
+#define BRISK_P384_SIG_LEN 96
+BRISK_API int brisk_p384_verify(const uint8_t pub[BRISK_P384_PUB_LEN], const uint8_t *hash,
+                                size_t hash_len, const uint8_t sig[BRISK_P384_SIG_LEN]);
+
+/* RSA signature verify only (RFC 8017): PKCS#1 v1.5 (8.2.2) and PSS with MGF1 over the same hash
+ * (8.1.2). n and e are the big-endian modulus and exponent (leading zeros allowed); the modulus
+ * is 2048 .. BRISK_RSA_MAX_BITS bits. hash_len must equal brisk_hash_len(alg). For PSS pass the
+ * signer's salt length - usually hash_len. BRISK_OK, BRISK_E_AUTH (bad signature) or
+ * BRISK_E_ARG (bad key or arguments). */
+BRISK_API int brisk_rsa_pkcs1_verify(const uint8_t *n, size_t n_len, const uint8_t *e, size_t e_len,
+                                     brisk_hash_alg alg, const uint8_t *hash, size_t hash_len,
+                                     const uint8_t *sig, size_t sig_len);
+BRISK_API int brisk_rsa_pss_verify(const uint8_t *n, size_t n_len, const uint8_t *e, size_t e_len,
+                                   brisk_hash_alg alg, size_t salt_len, const uint8_t *hash,
+                                   size_t hash_len, const uint8_t *sig, size_t sig_len);
+
+/* ------------------------------------------------------------------------------------------------
  * Client-certificate signing hook (mTLS, BRISK_ENABLE_MTLS).
  *
  * The library can sign with its own ECDSA P-256 key, but a device key is better off in a secure

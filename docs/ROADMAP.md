@@ -225,9 +225,13 @@ default still holds: certificate verification can never be switched off.
       The fd is O_NONBLOCK while held and its flags are restored at close / on failure;
       callbacks get the ms left (>= 1) and any out-of-range answer is BRISK_E_IO. Tested over
       loopback TCP (fd + io) and a raw-mode pty; test seam `brisk__connect_via`
-- [ ] Public crypto API (`BRISK_ENABLE_CRYPTO_API`): brisk_random, AEAD seal/open (AES-GCM,
-      ChaCha20-Poly1305), HKDF, X25519, P-256 keygen/ECDH/sign/verify, P-384 + RSA verify - thin
-      wrappers over src/crypto, tested against the existing KATs, ct-checked
+- [x] Public crypto API (`BRISK_ENABLE_CRYPTO_API`, DEFAULT/FULL): brisk_random, AEAD seal/open
+      (AES-128/256-GCM, ChaCha20-Poly1305; key_len checked), HKDF extract/expand, X25519,
+      P-256 keygen/ECDH/sign/verify, P-384 + RSA PKCS#1/PSS verify - thin wrappers in
+      src/crypto/api.c; the RNG-drawing ones live in src/os/linux_rand.c (Linux-only link).
+      Every KAT row of each primitive also runs through its wrapper; RNG faults (none, stuck
+      0xFF) fail closed with outputs zeroed; ct suite covers them. Signing now compiles for
+      MTLS || CRYPTO_API (BRISK__P256_SIGN). Signatures are raw r || s (no DER helper yet)
 - [ ] Compile-time knobs: AESGCM, CHACHA, AES256, X25519, P256_KX, RSA, TICKETS, SYSTEM_CA, PEM,
       CUSTOM_IO, ERROR_STRINGS (+ `brisk_strerror`), KEYLOG (default off everywhere),
       AES_IMPL; deps auto-resolved with #error on conflict; CI knob-matrix job (each knob off)

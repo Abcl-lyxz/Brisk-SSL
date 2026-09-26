@@ -78,10 +78,11 @@ static void distinct_and_unbiased(source_fn f, long src)
     CHECKI(ones > 16384 - 800 && ones < 16384 + 800, src);
 }
 
-/* CMakeLists.txt links the tests with -Wl,--wrap=syscall,--wrap=poll,--wrap=uname,--wrap=personality,
- * so the library's getrandom call (its only syscall() use), its /dev/random wait and its
- * kernel-version check land here: pass through, or fail the way the real world does. */
-enum { PASS, FAIL, HALF, INTR, ZERO, OVER };
+/* CMakeLists.txt links the tests with
+ * -Wl,--wrap=syscall,--wrap=poll,--wrap=uname,--wrap=personality, so the library's getrandom call
+ * (its only syscall() use), its /dev/random wait and its kernel-version check land here: pass
+ * through, or fail the way the real world does. */
+enum { PASS, FAIL, HALF, INTR, ZERO, OVER, ONES };
 enum { P_PASS, P_FAIL, P_ERR, P_INTR_ONCE };
 static int mode, fail_errno, poll_mode;
 static long calls, polls;
@@ -179,6 +180,9 @@ long __wrap_syscall(long nr, ...)
         return 0;
     case OVER: /* broken emulator: more than asked for */
         return (long)n + 1;
+    case ONES: /* stuck RNG: every byte 0xFF */
+        memset(buf, 0xFF, n);
+        return (long)n;
     }
     return __real_syscall(nr, buf, n, flags);
 }
@@ -249,6 +253,76 @@ static void fault_injection(void)
     mode = PASS;
 }
 
+#if BRISK_ENABLE_CRYPTO_API
+static int public_random(uint8_t *out, size_t len)
+{
+    return brisk_random(out, len);
+}
+
+static int zeroed(const uint8_t *p, size_t n)
+{
+    size_t i;
+    for (i = 0; i < n; i++) {
+        if (p[i]) {
+            return 0;
+        }
+    }
+    return 1;
+}
+
+/* The public calls that draw randomness (M9): round trips through the KAT-tested primitives, and
+ * every RNG failure fails closed - no key or signature is released, and a stuck RNG cannot spin
+ * brisk_p256_keygen forever. */
+static void crypto_api(void)
+{
+    uint8_t a[BRISK_P256_PRIV_LEN], b[BRISK_P256_PRIV_LEN], pa[BRISK_P256_PUB_LEN],
+        pb[BRISK_P256_PUB_LEN], s1[32], s2[32], h[32], sig[BRISK_P256_SIG_LEN];
+    fill_checks(public_random, 30);
+    CHECK(brisk_random(NULL, 0) == BRISK_OK);
+
+    CHECK(brisk_x25519_keygen(a, pa) == BRISK_OK && brisk_x25519_keygen(b, pb) == BRISK_OK);
+    CHECK(memcmp(a, b, 32) != 0);
+    brisk__x25519_base(s1, a);
+    CHECK(memcmp(s1, pa, 32) == 0);
+    CHECK(brisk_x25519(s1, a, pb) == BRISK_OK && brisk_x25519(s2, b, pa) == BRISK_OK);
+    CHECK(memcmp(s1, s2, 32) == 0);
+
+    CHECK(brisk_p256_keygen(a, pa) == BRISK_OK && brisk_p256_keygen(b, pb) == BRISK_OK);
+    CHECK(memcmp(a, b, 32) != 0 && pa[0] == 0x04);
+    CHECK(brisk_p256_ecdh(s1, a, pb) == BRISK_OK && brisk_p256_ecdh(s2, b, pa) == BRISK_OK);
+    CHECK(memcmp(s1, s2, 32) == 0);
+    brisk_sha256("brisk", 5, h);
+    CHECK(brisk_p256_sign(sig, a, h, sizeof h) == BRISK_OK);
+    CHECK(brisk_p256_verify(pa, h, sizeof h, sig) == BRISK_OK);
+    CHECK(brisk_p256_verify(pb, h, sizeof h, sig) == BRISK_E_AUTH);
+    memcpy(s1, sig, 32);
+    CHECK(brisk_p256_sign(sig, a, h, sizeof h) == BRISK_OK); /* hedged: a fresh k each time */
+    CHECK(memcmp(s1, sig, 32) != 0 && brisk_p256_verify(pa, h, sizeof h, sig) == BRISK_OK);
+    CHECK(brisk_p256_sign(sig, a, h, 20) == BRISK_E_ARG);
+
+    mode = ZERO; /* the RNG fails: nothing is produced */
+    memset(s1, 0x11, sizeof s1);
+    CHECK(brisk_random(s1, sizeof s1) == BRISK_E_RNG && zeroed(s1, sizeof s1));
+    memset(b, 0x11, sizeof b);
+    memset(pb, 0x11, sizeof pb);
+    CHECK(brisk_x25519_keygen(b, pb) == BRISK_E_RNG);
+    CHECK(zeroed(b, 32) && zeroed(pb, 32) && pb[32] == 0x11);
+    memset(b, 0x11, sizeof b);
+    memset(pb, 0x11, sizeof pb);
+    CHECK(brisk_p256_keygen(b, pb) == BRISK_E_RNG);
+    CHECK(zeroed(b, sizeof b) && zeroed(pb, sizeof pb));
+    memset(sig, 0xA5, sizeof sig);
+    CHECK(brisk_p256_sign(sig, a, h, sizeof h) == BRISK_E_RNG);
+    CHECK(sig[0] == 0xA5 && sig[63] == 0xA5);
+    mode = ONES; /* d = 2^256 - 1 >= n on every draw: bounded retries, then BRISK_E_RNG */
+    calls = 0;
+    CHECK(brisk_p256_keygen(b, pb) == BRISK_E_RNG);
+    CHECK(calls == 8 && zeroed(b, sizeof b));
+    CHECK(brisk_x25519_keygen(b, pb) == BRISK_OK); /* every 32-byte string is an X25519 key */
+    mode = PASS;
+}
+#endif
+
 void test_rand(void)
 {
     static const source_fn src[] = {brisk__os_random, brisk__os_getrandom, brisk__os_urandom};
@@ -261,4 +335,7 @@ void test_rand(void)
         distinct_and_unbiased(src[s], s);
     }
     fault_injection();
+#if BRISK_ENABLE_CRYPTO_API
+    crypto_api();
+#endif
 }

@@ -129,6 +129,9 @@ static void verify_one(const uint8_t *pub, const uint8_t *h, size_t hlen, const 
     memcpy(ss + off, sig, GL);
     memset(ss + off + GL, 0xA5, CANARY);
     CHECKI(rc_code(brisk__p384_ecdsa_verify(qs + off, hs + off, hlen, ss + off)) == expect, idx);
+#    if BRISK_ENABLE_CRYPTO_API
+    CHECKI(rc_code(brisk_p384_verify(qs + off, hs + off, hlen, ss + off)) == expect, idx);
+#    endif
     CHECKI(memcmp(qs + off, pub, PL) == 0, idx); /* inputs are never modified */
     CHECKI(memcmp(hs + off, h, hlen) == 0, idx);
     CHECKI(memcmp(ss + off, sig, GL) == 0, idx);

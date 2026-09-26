@@ -83,6 +83,10 @@ static void one(const uint8_t *k, const uint8_t *u, const uint8_t *want, int ok,
     if (!ok) {
         CHECKI(all_zero(os + off), idx); /* fail closed: no half-computed secret is released */
     }
+#if BRISK_ENABLE_CRYPTO_API
+    memset(os + off, 0xA5, L);
+    CHECKI(brisk_x25519(os + off, ks + off, us + off) == rc && memcmp(os + off, want, L) == 0, idx);
+#endif
 }
 
 static void test_vectors(void)

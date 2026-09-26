@@ -239,6 +239,17 @@ static void hkdf_kat(void)
             pl = t_unhex(v->prk, want_prk, sizeof want_prk);
             CHECKI(pl == hl && memcmp(prk, want_prk, hl) == 0, i);
         }
+#if BRISK_ENABLE_CRYPTO_API
+        { /* the public wrappers on the same row (they may clobber A: the ikm is used up) */
+            uint8_t p2[BRISK_HASH_MAX_LEN];
+            CHECKI(brisk_hkdf_extract(a, B, sl, A, il, p2) == BRISK_OK, i);
+            CHECKI(memcmp(p2, prk, hl) == 0, i);
+            rc = brisk_hkdf_expand(a, p2, hl, C + 1, nl, A + 3, v->size);
+            CHECKI(v->valid ? rc == BRISK_OK && memcmp(A + 3, D + 8, ol) == 0 : rc == BRISK_E_ARG,
+                   i);
+            CHECKI(brisk_hkdf_expand(a, p2, hl - 1, C + 1, nl, A + 3, 1) == BRISK_E_ARG, i);
+        }
+#endif
         if (v->valid) {
             canary_set(A + 3, v->size);
             rc = brisk__hkdf_expand(a, prk, hl, C + 1, nl, A + 3, v->size);
@@ -341,6 +352,10 @@ static void edge_cases(void)
     CHECK(brisk_hmac_init(&h, (brisk_hash_alg)7, "k", 1) == BRISK_E_ARG);
     CHECK(brisk_hmac((brisk_hash_alg)0, "k", 1, "m", 1, out) == BRISK_E_ARG);
     CHECK(brisk__hkdf_expand((brisk_hash_alg)9, want, 32, NULL, 0, out, 32) == BRISK_E_ARG);
+#if BRISK_ENABLE_CRYPTO_API
+    CHECK(brisk_hkdf_expand((brisk_hash_alg)9, want, 32, NULL, 0, out, 32) == BRISK_E_ARG);
+    CHECK(brisk_hkdf_extract((brisk_hash_alg)9, NULL, 0, want, 32, out) == BRISK_E_ARG);
+#endif
 
     /* HKDF length limit: 255 * HashLen (RFC 5869 2.3) */
     memset(prk, 7, sizeof prk);

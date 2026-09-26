@@ -98,9 +98,9 @@ profile exceeds its budget in `size/budget.json`; per-module numbers: `python to
 <!-- size-table:begin (tools/dev.py size --profiles --doc) -->
 | profile | budget | x86_64 | i686 | aarch64 | armv7hf | armv5 | mips | mipsel | mips64 | riscv64 | ppc |
 |---|---|---|---|---|---|---|---|---|---|---|---|
-| TINY | 104 | 69.1 | 85.0 | 65.2 | 51.9 | 76.7 | 97.0 | 97.3 | 88.7 | 55.8 | 80.6 |
-| DEFAULT | 144 | 99.5 | 117.2 | 96.1 | 73.4 | 109.4 | 137.7 | 138.1 | 128.1 | 80.5 | 114.2 |
-| FULL | 216 | 143.7 | 170.1 | 140.9 | 109.8 | 162.1 | 205.0 | 205.4 | 184.7 | 117.0 | 170.4 |
+| TINY | 104 | 69.8 | 85.6 | 65.9 | 52.4 | 77.4 | 97.9 | 98.2 | 89.5 | 56.3 | 81.4 |
+| DEFAULT | 144 | 101.1 | 119.0 | 97.8 | 74.5 | 111.1 | 140.3 | 140.7 | 130.6 | 81.6 | 116.4 |
+| FULL | 216 | 145.3 | 171.9 | 142.7 | 110.8 | 163.7 | 207.6 | 208.0 | 187.3 | 118.1 | 172.7 |
 
 KB of flash (text + rodata + data, -Os, static link map, libc excluded); budget = the most any arch may take (size/budget.json). Static RAM is at most 132 B on any arch and profile - every context is caller-owned.
 <!-- size-table:end -->

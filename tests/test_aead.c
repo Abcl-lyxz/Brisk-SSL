@@ -136,6 +136,51 @@ static int open_fails(const uint8_t *key, const uint8_t *nonce, const uint8_t *a
     return ok;
 }
 
+#if BRISK_ENABLE_CRYPTO_API
+void t_aead_api_row(int alg, const uint8_t *key, size_t klen, const uint8_t *nonce,
+                    const uint8_t *aad, size_t alen, const uint8_t *pt, const uint8_t *ct, size_t n,
+                    const uint8_t *tag, int valid, uint8_t *scratch, long idx)
+{
+    brisk_aead_alg a = (brisk_aead_alg)alg;
+    uint8_t t[16];
+    if (valid) {
+        CHECKI(brisk_aead_seal(a, key, klen, nonce, aad, alen, pt, n, scratch, t) == BRISK_OK, idx);
+        CHECKI(memcmp(scratch, ct, n) == 0 && memcmp(t, tag, 16) == 0, idx);
+    }
+    memset(scratch, 0xA5, n);
+    CHECKI(brisk_aead_open(a, key, klen, nonce, aad, alen, ct, n, scratch, tag) ==
+               (valid ? BRISK_OK : BRISK_E_AUTH),
+           idx);
+    CHECKI(valid ? memcmp(scratch, pt, n) == 0 : all_zero(scratch, n), idx);
+    /* the key length must match the algorithm */
+    CHECKI(brisk_aead_seal(a, key, klen - 1, nonce, aad, alen, pt, n, scratch, t) == BRISK_E_ARG,
+           idx);
+}
+
+/* Misuse of the public AEAD API: unknown algorithm, key length of the other algorithm. */
+static void test_aead_api_args(void)
+{
+    uint8_t tag[16];
+    memset(K, 0x42, sizeof K);
+    CHECK(brisk_aead_seal((brisk_aead_alg)0, K, 32, NC, NULL, 0, NULL, 0, NULL, tag) ==
+          BRISK_E_ARG);
+    CHECK(brisk_aead_seal((brisk_aead_alg)4, K, 32, NC, NULL, 0, NULL, 0, NULL, tag) ==
+          BRISK_E_ARG);
+    CHECK(brisk_aead_open((brisk_aead_alg)4, K, 32, NC, NULL, 0, NULL, 0, NULL, tag) ==
+          BRISK_E_ARG);
+    CHECK(brisk_aead_seal(BRISK_AEAD_AES128_GCM, K, 32, NC, NULL, 0, NULL, 0, NULL, tag) ==
+          BRISK_E_ARG);
+    CHECK(brisk_aead_seal(BRISK_AEAD_AES256_GCM, K, 16, NC, NULL, 0, NULL, 0, NULL, tag) ==
+          BRISK_E_ARG);
+    CHECK(brisk_aead_seal(BRISK_AEAD_CHACHA20_POLY1305, K, 16, NC, NULL, 0, NULL, 0, NULL, tag) ==
+          BRISK_E_ARG);
+    CHECK(brisk_aead_seal(BRISK_AEAD_AES256_GCM, K, 32, NC, NULL, 0, NULL, 0, NULL, tag) ==
+          BRISK_OK);
+    CHECK(brisk_aead_open(BRISK_AEAD_AES256_GCM, K, 32, NC, NULL, 0, NULL, 0, NULL, tag) ==
+          BRISK_OK);
+}
+#endif
+
 static void test_aead_vectors(void)
 {
     size_t i, off;
@@ -148,6 +193,10 @@ static void test_aead_vectors(void)
         n = t_unhex(v->pt, P, BUF);
         CHECKI(t_unhex(v->ct, C, BUF) == n, i);
         t_unhex(v->tag, T, 16);
+#if BRISK_ENABLE_CRYPTO_API
+        t_aead_api_row(BRISK_AEAD_CHACHA20_POLY1305, K, 32, NC, A, alen, P, C, n, T, v->valid, WO,
+                       (long)i);
+#endif
         if (!v->valid) {
             CHECKI(open_fails(K, NC, A, alen, C, n, T), i);
             continue;
@@ -295,6 +344,9 @@ void test_aead(void)
     test_chacha();
     test_poly();
     test_aead_vectors();
+#if BRISK_ENABLE_CRYPTO_API
+    test_aead_api_args();
+#endif
     test_tamper();
     test_limits();
     test_quic_a5();

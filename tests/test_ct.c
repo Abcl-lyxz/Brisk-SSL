@@ -195,7 +195,7 @@ static void ct_p256(void)
     memset(sig, 0x22, sizeof sig);
     CHECK(brisk__p256_ecdsa_verify(peer, hash, sizeof hash, sig) == BRISK_E_AUTH);
 
-#if BRISK_ENABLE_MTLS
+#if BRISK__P256_SIGN
     /* ECDSA sign: the device key and the RFC 6979 3.6 hedging input k' are secret, and so is
      * everything the DRBG derives from them (K, V, k, k^-1, s). The message digest is public -
      * it is the transcript hash the peer computes too. The only value declassified inside the
@@ -332,6 +332,41 @@ static void ct_bn_rsa(void)
                                 sizeof xb) != BRISK_OK);
 }
 
+#if BRISK_ENABLE_CRYPTO_API
+/* The public crypto API (src/crypto/api.c) with secret keys: the wrappers add only an algorithm
+ * and key-length dispatch, which is public. The calls that draw randomness (keygen, sign) are
+ * Linux-only and run the same primitives covered above. */
+static void ct_api(void)
+{
+    static const uint8_t nonce[12] = {7}, peer25519[32] = {9};
+    uint8_t ct[sizeof plain], pt[sizeof plain], tag[16], out[64], pub[65];
+    brisk_aead_alg algs[3] = {BRISK_AEAD_AES128_GCM, BRISK_AEAD_AES256_GCM,
+                              BRISK_AEAD_CHACHA20_POLY1305};
+    size_t i;
+    for (i = 0; i < 3; i++) {
+        size_t kl = algs[i] == BRISK_AEAD_AES128_GCM ? 16 : 32;
+        CHECK(brisk_aead_seal(algs[i], secret32, kl, nonce, NULL, 0, plain, sizeof plain, ct,
+                              tag) == BRISK_OK);
+        BRISK__CT_PUBLIC(ct, sizeof ct); /* ciphertext and tag go on the wire */
+        BRISK__CT_PUBLIC(tag, sizeof tag);
+        CHECK(brisk_aead_open(algs[i], secret32, kl, nonce, NULL, 0, ct, sizeof ct, pt, tag) ==
+              BRISK_OK);
+        tag[0] ^= 1;
+        CHECK(brisk_aead_open(algs[i], secret32, kl, nonce, NULL, 0, ct, sizeof ct, pt, tag) ==
+              BRISK_E_AUTH);
+    }
+    CHECK(brisk_hkdf_extract(BRISK_HASH_SHA256, NULL, 0, secret32, 32, out) == BRISK_OK);
+    CHECK(brisk_hkdf_expand(BRISK_HASH_SHA256, out, 32, "k", 1, out, 64) == BRISK_OK);
+    CHECK(brisk_x25519(out, secret32, peer25519) == BRISK_OK);
+    memset(pt, 0x07, 32); /* a public scalar: its point is the peer */
+    CHECK(brisk__p256_keygen(pub, pt) == BRISK_OK);
+    BRISK__CT_PUBLIC(pub, sizeof pub);
+    CHECK(brisk_p256_ecdh(out, secret32, pub) == BRISK_OK);
+    brisk__secure_zero(out, sizeof out);
+    brisk__secure_zero(pt, sizeof pt);
+}
+#endif
+
 void test_ct(void)
 {
     mark_secrets();
@@ -347,6 +382,9 @@ void test_ct(void)
     ct_memeq();
 #if BRISK_ENABLE_MTLS
     ct_key();
+#endif
+#if BRISK_ENABLE_CRYPTO_API
+    ct_api();
 #endif
     tls13_hs_ct_run();  /* the handshake engine over RFC 8448 sect 3, ECDHE key secret */
     tls13_rec_ct_run(); /* record seal/open, dir_init/update with secret keys */

@@ -4,9 +4,9 @@
  * RFC 9846 4.3.8.2 (KeyShareEntry encoding and the MUST to validate the peer point), 7.4.2 (the
  * ECDHE shared secret), 4.3.3 (ecdsa_secp256r1_sha256); FIPS 186-5 6.4.2 (verify) and 6.4.1
  * (sign) with the deterministic-plus-hedged nonce of RFC 6979 3.2/3.6; domain parameters from
- * RFC 5903 3.1 = SP 800-186 3.2.1.3 = SEC 2 2.4.2. Signing sits behind BRISK_ENABLE_MTLS: this
- * file is linked into every build for ECDHE, which is mandatory-to-implement, so a TINY image
- * would otherwise carry a signer it never runs.
+ * RFC 5903 3.1 = SP 800-186 3.2.1.3 = SEC 2 2.4.2. Signing sits behind BRISK__P256_SIGN
+ * (BRISK_ENABLE_MTLS or BRISK_ENABLE_CRYPTO_API): this file is linked into every build for ECDHE,
+ * which is mandatory-to-implement, so a TINY image would otherwise carry a signer it never runs.
  *
  * The field layer is vendor/fiat/p256_{64,32}.c, generated and proved by fiat-crypto. Every
  * function there is `static`, so the file is #included here rather than compiled on its own
@@ -54,7 +54,7 @@
  *   -O2, x86_64:                1792 / 2144 / 3200   <- verify and sign both over budget
  *   -O3, x86_64:                1552 / 1904 / 3328   <- sign over budget
  *   -O2, i686 / 32-bit field:   1224 / 1576 / 2296
- * Budget 3 KB with BRISK_ENABLE_MTLS, 2 KB without. Only -Os meets both on the 64-bit field, and
+ * Budget 3 KB with BRISK__P256_SIGN, 2 KB without. Only -Os meets both on the 64-bit field, and
  * that is why -Os is pinned PRIVATE in CMakeLists.txt (so the build type's -O0/-O2 never reaches
  * library code, and there is no -O0 row to quote). Do not raise the level without re-measuring.
  * The sign figure is the fault-check verify nested inside the signing frame:
@@ -836,7 +836,7 @@ int brisk__p256_ecdsa_verify(const uint8_t pub[65], const uint8_t *hash, size_t 
     return brisk__ct_memeq(v, sig, 32) ? BRISK_OK : BRISK_E_AUTH;
 }
 
-#if BRISK_ENABLE_MTLS
+#if BRISK__P256_SIGN
 /* ------------------------------------------------------- ECDSA sign: RFC 6979 nonce + 6.4.1 */
 /* The per-signature HMAC_DRBG of RFC 6979 3.2. It is nonce derivation, not a randomness source -
  * seeded only from (d, h1, k'), never persisted, never reseeded from anywhere - so the "no
@@ -1039,7 +1039,7 @@ int brisk__p256_ecdsa_sign(uint8_t sig[64], const uint8_t priv[32], const uint8_
     brisk__secure_zero(out, sizeof out);
     return rc;
 }
-#endif /* BRISK_ENABLE_MTLS */
+#endif /* BRISK__P256_SIGN */
 
 #undef FE_LIMBS
 #undef FE_LIMB_BITS
