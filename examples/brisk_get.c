@@ -119,7 +119,7 @@ int main(int argc, char **argv)
     rc = brisk_connect(&cfg, host, port, &c);
     if (rc != BRISK_OK) {
         free(ticket);
-        fprintf(stderr, "brisk: connect failed: %s\n", err_name(rc));
+        fprintf(stderr, "brisk: connect failed: %s\n", brisk_strerror(rc));
         return 2;
     }
     if (brisk_alpn(c, &alpn_name, &alpn_len) != BRISK_OK) {
@@ -147,7 +147,7 @@ int main(int argc, char **argv)
         free(key);
     }
     if (rc != BRISK_OK) {
-        fprintf(stderr, "brisk: %s\n", err_name(rc));
+        fprintf(stderr, "brisk: %s\n", brisk_strerror(rc));
         return 2;
     }
     return 0;

@@ -32,33 +32,4 @@ static uint8_t *read_file(const char *path, size_t *len)
     return buf;
 }
 
-static const char *err_name(int rc)
-{
-    switch (rc) {
-    case BRISK_OK:
-        return "ok";
-    case BRISK_E_ARG:
-        return "E_ARG (bad argument or config)";
-    case BRISK_E_RNG:
-        return "E_RNG (no kernel randomness)";
-    case BRISK_E_AUTH:
-        return "E_AUTH (server certificate/signature not acceptable)";
-    case BRISK_E_PROTO:
-        return "E_PROTO (server broke the protocol)";
-    case BRISK_E_PEER_ALERT:
-        return "E_PEER_ALERT (server sent a fatal alert)";
-    case BRISK_E_IO:
-        return "E_IO (network error)";
-    case BRISK_E_TIMEOUT:
-        return "E_TIMEOUT";
-    case BRISK_E_INSECURE:
-        return "E_INSECURE (server only offers TLS below the security floor: TLS 1.2 without "
-               "extended master secret / renegotiation_info, or TLS <= 1.1)";
-    case BRISK_E_RETRY:
-        return "E_RETRY (HTTP/2, HTTP/3: not processed, retry on a new connection)";
-    default:
-        return "unknown error";
-    }
-}
-
 #endif /* EXAMPLE_UTIL_H */

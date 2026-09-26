@@ -103,6 +103,11 @@ void brisk__secure_zero(void *p, size_t n)
 #else
 #    define BRISK__OFF_CUSTOM_IO " -custom_io"
 #endif
+#if BRISK_ENABLE_KEYLOG
+#    define BRISK__KEYLOG_NAME " KEYLOG" /* every traffic secret can leave through cfg.keylog */
+#else
+#    define BRISK__KEYLOG_NAME ""
+#endif
 #define BRISK__OFF_NAMES                                                                           \
     BRISK__OFF_AESGCM BRISK__OFF_AES256 BRISK__OFF_CHACHA BRISK__OFF_X25519 BRISK__OFF_P256_KX     \
         BRISK__OFF_RSA BRISK__OFF_TICKETS BRISK__OFF_PEM BRISK__OFF_SYSTEM_CA BRISK__OFF_CUSTOM_IO
@@ -120,16 +125,18 @@ void brisk__secure_zero(void *p, size_t n)
 #    define BRISK__RETAIN
 #    if defined(__ELF__)
 __asm__(".pushsection .comment\n\t.asciz \"@(#)BRISKCFG " BRISK_SSL_VERSION_STRING
-        " profile=" BRISK__PROFILE_NAME BRISK__TIME_NAME BRISK__OFF_NAMES "\"\n\t.popsection");
+        " profile=" BRISK__PROFILE_NAME BRISK__TIME_NAME BRISK__OFF_NAMES BRISK__KEYLOG_NAME
+        "\"\n\t.popsection");
 #    endif
 #endif
 
 BRISK__RETAIN static const char brisk__build_info[] =
     "@(#)BRISKCFG " BRISK_SSL_VERSION_STRING
-    " profile=" BRISK__PROFILE_NAME BRISK__TIME_NAME BRISK__OFF_NAMES;
+    " profile=" BRISK__PROFILE_NAME BRISK__TIME_NAME BRISK__OFF_NAMES BRISK__KEYLOG_NAME;
 #undef BRISK__RETAIN
 #undef BRISK__TIME_NAME
 #undef BRISK__OFF_NAMES
+#undef BRISK__KEYLOG_NAME
 #undef BRISK__OFF_AESGCM
 #undef BRISK__OFF_AES256
 #undef BRISK__OFF_CHACHA
@@ -140,6 +147,36 @@ BRISK__RETAIN static const char brisk__build_info[] =
 #undef BRISK__OFF_PEM
 #undef BRISK__OFF_SYSTEM_CA
 #undef BRISK__OFF_CUSTOM_IO
+
+/* brisk_strerror: the name always, the sentence with BRISK_ENABLE_ERROR_STRINGS. Indexed by
+ * -err (BRISK_E_ARG = -1 .. BRISK_E_INSECURE = -10). */
+#if BRISK_ENABLE_ERROR_STRINGS
+#    define BRISK__ERR(name, text) name " (" text ")"
+#else
+#    define BRISK__ERR(name, text) name
+#endif
+static const char *const brisk__err_str[] = {
+    "ok",
+    BRISK__ERR("E_ARG", "bad argument or config"),
+    BRISK__ERR("E_RNG", "no kernel randomness"),
+    BRISK__ERR("E_AUTH", "server certificate/signature not acceptable"),
+    BRISK__ERR("E_PROTO", "server broke the protocol"),
+    BRISK__ERR("E_PEER_ALERT", "server sent a fatal alert"),
+    BRISK__ERR("E_IO", "network error"),
+    BRISK__ERR("E_TIMEOUT", "no progress within the timeout"),
+    BRISK__ERR("E_WANT", "sans-I/O: feed more bytes first"),
+    BRISK__ERR("E_RETRY", "HTTP/2, HTTP/3: not processed, retry on a new connection"),
+    BRISK__ERR("E_INSECURE", "server only offers TLS below the security floor: TLS 1.2 without "
+                             "extended master secret / renegotiation_info, or TLS <= 1.1")};
+#undef BRISK__ERR
+
+const char *brisk_strerror(int err)
+{
+    if (err > 0 || err < -(int)(sizeof brisk__err_str / sizeof brisk__err_str[0] - 1)) {
+        return "unknown error";
+    }
+    return brisk__err_str[-err];
+}
 
 const char *brisk_version(void)
 {

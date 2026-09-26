@@ -288,6 +288,20 @@
 #    error "BRISK_ENABLE_X25519 and BRISK_ENABLE_P256_KX are both 0: no key exchange left"
 #endif
 
+/* brisk_strerror (src/util.c) with a sentence per code: "E_AUTH (server certificate/signature
+ * not acceptable)". Off in TINY, where it gives only the name ("E_AUTH"), about 500 bytes less. */
+#ifndef BRISK_ENABLE_ERROR_STRINGS
+#    define BRISK_ENABLE_ERROR_STRINGS (BRISK_PROFILE >= BRISK_PROFILE_DEFAULT)
+#endif
+
+/* NSS key log lines (cfg.keylog, SSLKEYLOGFILE format) for decrypting a capture in Wireshark.
+ * OFF in every profile: a debugging aid that hands out every traffic secret. With it off a
+ * non-NULL cfg.keylog is BRISK_E_ARG at setup, so nobody believes a capture is decryptable when
+ * it is not; with it on brisk_build_info says " KEYLOG", so a shipped image cannot hide it. */
+#ifndef BRISK_ENABLE_KEYLOG
+#    define BRISK_ENABLE_KEYLOG 0
+#endif
+
 /* clang-format off */
 /* Features every profile has; an explicit 0 drops one for flash. None of them weakens a
  * connection: what is gone is refused at setup (BRISK_E_ARG) or simply never offered.

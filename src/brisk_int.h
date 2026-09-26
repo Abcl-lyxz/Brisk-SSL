@@ -1872,6 +1872,8 @@ typedef struct {
     void *tp_ctx;
     brisk__tls13_ticket_fn on_ticket; /* may be NULL: tickets are silently ignored */
     void *ticket_ctx;
+    brisk_keylog_fn keylog; /* BRISK_ENABLE_KEYLOG only; NULL = off (brisk.h brisk_cfg.keylog) */
+    void *keylog_ctx;
     /* mTLS (RFC 9846 4.5.1, 4.5.2). Same layout in every profile; a chain with
      * BRISK_ENABLE_MTLS == 0 is BRISK_E_ARG at init. hs_init checks, as configuration bugs
      * (BRISK_E_ARG): exactly one of client_key / sign; sign_rand with client_key; every
@@ -1968,6 +1970,8 @@ typedef struct {
      * srand are the hello randoms, kx_pub our ECDHE share for the ClientKeyExchange. */
     uint8_t priv_p256[32], main[48], crand[32], srand[32], kx_pub[65];
     uint8_t kx_pub_len, cr_send; /* cr_send: the CertificateRequest also lists ecdsa_sign(64) */
+#elif BRISK_ENABLE_KEYLOG
+    uint8_t crand[32]; /* the client random, for the key log lines */
 #endif
     int err; /* the sticky return code once FAILED */
     /* scratch carve-up: [message reassembly | certificate array | output queue] */
@@ -2058,6 +2062,11 @@ int brisk__tls12_suite(uint16_t suite, brisk_hash_alg *prf, size_t *key_len, siz
 /* handshake.c helpers shared with tls12.c (formerly static; see handshake.c for each) */
 brisk_hash_alg brisk__hs_alg(uint16_t suite);
 int brisk__hs_fail(brisk__tls13_hs *hs, uint8_t alert);
+#    if BRISK_ENABLE_KEYLOG
+/* cfg.keylog(ctx, "<label> <client random hex> <secret hex>") when set (handshake.c). */
+void brisk__hs_keylog(const brisk__tls13_hs *hs, const char *label, const uint8_t *secret,
+                      size_t len);
+#    endif
 void brisk__hs_th_add(brisk__tls13_hs *hs, const uint8_t *m, size_t n);
 void brisk__hs_th_snap(const brisk__tls13_hs *hs, uint8_t *out);
 uint8_t *brisk__hs_reserve(brisk__tls13_hs *hs, unsigned epoch, size_t n);

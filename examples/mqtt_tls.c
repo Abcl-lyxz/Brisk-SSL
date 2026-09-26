@@ -107,7 +107,7 @@ int main(int argc, char **argv)
     }
     free(chain);
     if (rc != BRISK_OK) {
-        fprintf(stderr, "failed: %s\n", err_name(rc));
+        fprintf(stderr, "failed: %s\n", brisk_strerror(rc));
         return 2;
     }
     puts("published");

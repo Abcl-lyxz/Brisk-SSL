@@ -395,11 +395,14 @@ def cmd_fuzz(target, seconds):
 AMALG_WARN = ["-std=c99", "-Wall", "-Wextra", "-Wpedantic", "-Wshadow", "-Wcast-align",
               "-Wstrict-prototypes", "-Wundef", "-Wvla", "-Werror"]
 AMALG_VARIANTS = [("TINY", ""), ("DEFAULT", ""), ("FULL", ""),
-                  ("FULL", "-DBRISK_AES_IMPL=BRISK_AES_IMPL_CT32 -DBRISK__GHASH64=0 -DBRISK__FIAT_64=0")]
+                  ("FULL", "-DBRISK_AES_IMPL=BRISK_AES_IMPL_CT32 -DBRISK__GHASH64=0 -DBRISK__FIAT_64=0"),
+                  ("DEFAULT", "-DBRISK_ENABLE_KEYLOG=1")]  # the whole suite, RFC 8448 key log lines
 KNOBS_OFF = ["-DBRISK_ENABLE_AESGCM=0", "-DBRISK_ENABLE_AES256=0", "-DBRISK_ENABLE_CHACHA=0",
              "-DBRISK_ENABLE_X25519=0", "-DBRISK_ENABLE_P256_KX=0", "-DBRISK_ENABLE_RSA=0",
              "-DBRISK_ENABLE_RSA=0 -DBRISK_ENABLE_P384=0", "-DBRISK_ENABLE_TICKETS=0",
              "-DBRISK_ENABLE_PEM=0", "-DBRISK_ENABLE_SYSTEM_CA=0", "-DBRISK_ENABLE_CUSTOM_IO=0",
+             "-DBRISK_ENABLE_ERROR_STRINGS=0",
+             "-DBRISK_ENABLE_KEYLOG=1 -DBRISK_ENABLE_TLS12=0",  # hs.crand without TLS 1.2
              # the smallest crypto set, at -O0 too: nothing may rely on dead-code elimination
              "-DBRISK_ENABLE_CHACHA=0 -DBRISK_ENABLE_AES256=0 -DBRISK_ENABLE_X25519=0 "
              "-DBRISK_ENABLE_RSA=0 -DBRISK_ENABLE_P384=0 -DBRISK_ENABLE_TICKETS=0 "
@@ -417,7 +420,7 @@ def amalg_inside():
     bad = []
     for profile, extra in AMALG_VARIANTS:
         defs = [f"-DBRISK_PROFILE=BRISK_PROFILE_{profile}", *extra.split()]
-        name = f"{profile}{' 32-bit variants' if extra else ''}"
+        name = f"{profile}{(' KEYLOG' if 'KEYLOG' in extra else ' 32-bit variants') if extra else ''}"
         for cc in ("gcc", "clang"):
             r = subprocess.run([cc, *AMALG_WARN, "-Os", *defs, "-c", "dist/brisk.c", "-o",
                                 f"build/amalg-{cc}.o"], cwd=ROOT, capture_output=True, text=True)

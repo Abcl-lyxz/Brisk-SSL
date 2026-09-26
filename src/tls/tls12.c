@@ -394,6 +394,11 @@ static int t12_on_shd(brisk__tls13_hs *hs, const uint8_t *m, size_t n)
                           NULL, 0, ms, sizeof ms);
     memcpy(hs->main, ms, sizeof ms);
     brisk__secure_zero(ms, sizeof ms);
+#    if BRISK_ENABLE_KEYLOG
+    if (rc == BRISK_OK) {
+        brisk__hs_keylog(hs, "CLIENT_RANDOM", hs->main, sizeof hs->main);
+    }
+#    endif
 #    if BRISK_ENABLE_MTLS
     if (rc == BRISK_OK && send) {
         /* 7.4.8: ecdsa_secp256r1_sha256 over handshake_messages CH..CKE - SHA-256 whatever the

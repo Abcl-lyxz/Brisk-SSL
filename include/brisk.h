@@ -92,6 +92,11 @@ enum {
                               * help: the server needs an update (common on old IoT brokers). */
 };
 
+/* The code's name and what it means, for a log line: "E_AUTH (server certificate/signature not
+ * acceptable)"; "ok" for BRISK_OK, "unknown error" for anything else. Static storage, never
+ * NULL. With BRISK_ENABLE_ERROR_STRINGS=0 (TINY) just the name: "E_AUTH". */
+BRISK_API const char *brisk_strerror(int err);
+
 /* Library version, e.g. "0.1.0". */
 BRISK_API const char *brisk_version(void);
 
@@ -311,6 +316,14 @@ typedef int (*brisk_sign_fn)(void *ctx, uint16_t scheme, const uint8_t *tbs, siz
  */
 #define BRISK_TICKET_MAX 2048
 
+/* Called with one NSS key log line (the SSLKEYLOGFILE format Wireshark reads), no newline:
+ * "CLIENT_HANDSHAKE_TRAFFIC_SECRET <client random hex> <secret hex>", the SERVER_ one, then
+ * CLIENT_TRAFFIC_SECRET_0 / SERVER_TRAFFIC_SECRET_0 / EXPORTER_SECRET (TLS 1.3), or
+ * "CLIENT_RANDOM <client random hex> <main secret hex>" (TLS 1.2). DEBUGGING ONLY: whoever sees
+ * these lines can decrypt the whole connection. Only a build with -DBRISK_ENABLE_KEYLOG=1 calls
+ * it (brisk_build_info then says KEYLOG); elsewhere a non-NULL cfg.keylog is BRISK_E_ARG. */
+typedef void (*brisk_keylog_fn)(void *ctx, const char *line);
+
 /* Called with each exported ticket blob (len <= BRISK_TICKET_MAX), synchronously, from inside
  * the brisk_feed / brisk_read that received the NewSessionTicket. The blob lives on the stack
  * and is wiped when this returns: copy it. Store it for at most 7 days and hand it back as
@@ -400,6 +413,10 @@ typedef struct {
     /* No runtime certificate-time floor yet: the clock policy is compile-time
      * (BRISK_X509_TIME_POLICY / BRISK_X509_TIME_FLOOR in brisk_config.h). A device that stores a
      * last-known-good time must NOT pass it off as the clock - see docs/ROADMAP.md. */
+    /* Key log for Wireshark (brisk_keylog_fn above; BRISK_ENABLE_KEYLOG builds only). NULL =
+     * off. Called synchronously from the handshake; copy the line, it dies on return. */
+    brisk_keylog_fn keylog;
+    void *keylog_ctx;
 } brisk_cfg;
 
 #define BRISK_DEFAULTS {0}

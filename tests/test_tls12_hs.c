@@ -74,9 +74,56 @@ static void load(const struct tls12_flow_kat *k)
     t_unhex(k->siv, R.si, sizeof R.si);
 }
 
+#    if BRISK_ENABLE_KEYLOG
+/* cfg.keylog (the KEYLOG amalg variant): the one TLS 1.2 line, "CLIENT_RANDOM <cr> <main>" */
+static char g_kl[256];
+static int g_nkl;
+
+static void keylog_fn(void *ctx, const char *line)
+{
+    (void)ctx;
+    if (strlen(line) < sizeof g_kl) {
+        strcpy(g_kl, line);
+    }
+    g_nkl++;
+}
+
+/* The logged main secret is THE main secret: its key block (RFC 5246 6.3, AEAD: no MAC keys)
+ * starts with the row's client_write_key. The random must be the ClientHello's. */
+static void kl_check(const struct tls12_flow_kat *k, long idx)
+{
+    static const char P[] = "CLIENT_RANDOM ";
+    uint8_t cr[32], ms[48], kb[32];
+    brisk_hash_alg prf = BRISK_HASH_SHA256;
+    size_t i;
+    CHECKI(g_nkl == 1 && strlen(g_kl) == sizeof P - 1 + 64 + 1 + 96, idx);
+    if (g_nkl != 1 || strlen(g_kl) != sizeof P - 1 + 64 + 1 + 96 ||
+        g_kl[sizeof P - 1 + 64] != ' ' || strncmp(g_kl, P, sizeof P - 1) != 0) {
+        CHECKI(0, idx);
+        return;
+    }
+    g_kl[sizeof P - 1 + 64] = 0;
+    t_unhex(g_kl + sizeof P - 1, cr, sizeof cr);
+    t_unhex(g_kl + sizeof P - 1 + 65, ms, sizeof ms);
+    CHECKI(memcmp(cr, R.ch + 4 + 2, 32) == 0, idx);
+    CHECKI(brisk__tls12_suite((uint16_t)k->suite, &prf, NULL, NULL, NULL), idx);
+    for (i = 0; i < 32; i++) {
+        kb[i] = 0;
+    }
+    CHECKI(brisk__tls12_prf(prf, ms, sizeof ms, "key expansion", R.s1 + 4 + 2, 32, cr, 32, kb,
+                            R.kl) == BRISK_OK &&
+               memcmp(kb, R.ck, R.kl) == 0,
+           idx);
+}
+#    endif
+
 static int setup(const struct tls12_flow_kat *k, size_t off, brisk_sign_fn sign)
 {
     brisk_cfg cfg = BRISK_DEFAULTS;
+#    if BRISK_ENABLE_KEYLOG
+    cfg.keylog = keylog_fn;
+    g_nkl = 0;
+#    endif
     cfg.ca_mem = root;
     cfg.ca_mem_len = root_len;
     cfg.alpn = *k->alpn ? k->alpn : NULL;
@@ -297,6 +344,9 @@ static void rows(void)
         if (k->alert == 0) {
             for (mode = 0; mode < 3; mode++) {
                 CHECKI(happy(k, (i + (size_t)mode) & 7, mode) == 0, i * 10 + (size_t)mode);
+#    if BRISK_ENABLE_KEYLOG
+                kl_check(k, (long)(i * 10 + (size_t)mode));
+#    endif
             }
 #    if BRISK_ENABLE_MTLS
             if (k->mtls) { /* M9: the same Certificate message out of a PEM client_chain */

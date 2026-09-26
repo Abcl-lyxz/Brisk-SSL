@@ -232,9 +232,14 @@ default still holds: certificate verification can never be switched off.
       Every KAT row of each primitive also runs through its wrapper; RNG faults (none, stuck
       0xFF) fail closed with outputs zeroed; ct suite covers them. Signing now compiles for
       MTLS || CRYPTO_API (BRISK__P256_SIGN). Signatures are raw r || s (no DER helper yet)
-- [ ] Compile-time knobs: AESGCM, CHACHA, AES256, X25519, P256_KX, RSA, TICKETS, SYSTEM_CA, PEM,
+- [x] Compile-time knobs: AESGCM, CHACHA, AES256, X25519, P256_KX, RSA, TICKETS, SYSTEM_CA, PEM,
       CUSTOM_IO, ERROR_STRINGS (+ `brisk_strerror`), KEYLOG (default off everywhere),
-      AES_IMPL; deps auto-resolved with #error on conflict; CI knob-matrix job (each knob off)
+      AES_IMPL; deps auto-resolved with #error on conflict; CI knob-matrix job (each knob off).
+      Algorithm/feature knobs are on in every profile, only an explicit 0 drops one (user,
+      2026-09-26: MTI ones too, documented non-conformant); off = empty TU + fail-closed
+      static inline stubs in brisk_int.h. tests/test_knobs.c + the `dev.py amalg` matrix (each
+      knob off, a minimal -O0 set, KEYLOG on) run in CI. brisk_build_info lists knobs off and
+      KEYLOG. cfg.keylog (NSS lines) appended to brisk_cfg - another 0.2 ABI note
 - [ ] Runtime cfg: min/max version, suites/groups preference strings, sni override, SPKI pins
       (on top of chain verification), time_floor, max_fragment / record_size_limit (RFC 8449);
       rfc-auditor clean

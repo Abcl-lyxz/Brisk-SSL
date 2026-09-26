@@ -97,25 +97,25 @@ int main(int argc, char **argv)
 
     rc = brisk_quic_connect(&cfg, host, port, &q);
     if (rc != BRISK_OK) {
-        fprintf(stderr, "brisk: connect failed: %s\n", err_name(rc));
+        fprintf(stderr, "brisk: connect failed: %s\n", brisk_strerror(rc));
         return 2;
     }
     mem = malloc(brisk_h3_size());
     rc = mem == NULL ? BRISK_E_ARG : brisk_h3_open(q, mem, brisk_h3_size(), &h);
     if (rc != BRISK_OK) {
-        fprintf(stderr, "brisk: h3_open: %s\n", err_name(rc));
+        fprintf(stderr, "brisk: h3_open: %s\n", brisk_strerror(rc));
     }
     for (; rc == BRISK_OK && opened < n; opened++) {
         rc = brisk_h3_request(h, "GET", path, NULL, 0, NULL, 0, &s[opened]);
         if (rc != BRISK_OK) {
-            fprintf(stderr, "brisk: request %d: %s\n", opened + 1, err_name(rc));
+            fprintf(stderr, "brisk: request %d: %s\n", opened + 1, brisk_strerror(rc));
             opened--; /* the failed request holds no stream */
         }
     }
     for (k = 0; k < opened; k++) {
         int r = rc == BRISK_OK ? fetch(s[k], quiet) : BRISK_OK;
         if (r != BRISK_OK) {
-            fprintf(stderr, "brisk: response %d: %s (QUIC error 0x%llx)\n", k + 1, err_name(r),
+            fprintf(stderr, "brisk: response %d: %s (QUIC error 0x%llx)\n", k + 1, brisk_strerror(r),
                     (unsigned long long)brisk_quic_error(q));
             rc = r;
         }
@@ -132,7 +132,6 @@ int main(int argc, char **argv)
 int main(void)
 {
     (void)read_file;
-    (void)err_name;
     fprintf(stderr,
             "h3_get: this build has no HTTP/3 (BRISK_ENABLE_H3 is 0; use the FULL profile)\n");
     return 1;

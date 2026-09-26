@@ -345,7 +345,8 @@ CONN_SHARED int brisk__conn_core(brisk_conn *c, const brisk_cfg *cfg, const char
     if ((!BRISK_ENABLE_PEM &&
          (cfg->ca_file != NULL ||
           (cfg->ca_mem_len != 0 && cfg->ca_mem != NULL && cfg->ca_mem[0] != 0x30))) ||
-        (!BRISK_ENABLE_SYSTEM_CA && cfg->ca_file == NULL && cfg->ca_mem == NULL)) {
+        (!BRISK_ENABLE_SYSTEM_CA && cfg->ca_file == NULL && cfg->ca_mem == NULL) ||
+        (!BRISK_ENABLE_KEYLOG && cfg->keylog != NULL)) {
         return BRISK_E_ARG;
     }
     if (!conn_host_ok(host, &host_len) || (cfg->ca_mem == NULL) != (cfg->ca_mem_len == 0) ||
@@ -381,6 +382,8 @@ CONN_SHARED int brisk__conn_core(brisk_conn *c, const brisk_cfg *cfg, const char
     hc.auth_ctx = &c->auth;
     hc.on_ticket = c->cfg.on_ticket != NULL ? conn_on_ticket : NULL; /* NULL: 4.7.1 ignore */
     hc.ticket_ctx = c;
+    hc.keylog = c->cfg.keylog;
+    hc.keylog_ctx = c->cfg.keylog_ctx;
     hc.client_chain = cfg->client_chain;
     hc.client_chain_len = cfg->client_chain_len;
     hc.client_key = cfg->client_key; /* without mTLS, hs_init refuses any key */

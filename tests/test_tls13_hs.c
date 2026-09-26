@@ -8,6 +8,7 @@
  * The RFC 8448 server key is RSA-1024 and chains to nothing, so those flows run with a stub
  * authenticator that checks the CertificateVerify content it is handed and says yes; the
  * synthetic flows run with brisk__tls13_auth_x509, which is what production uses. */
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -226,6 +227,55 @@ static int anchor_fn(void *ctx, const uint8_t *dn, size_t dn_len, size_t index,
     return index == 0 ? brisk__x509_parse(out, a->der, a->len) : BRISK_E_ARG;
 }
 
+#if BRISK_ENABLE_KEYLOG
+/* cfg.keylog (a -DBRISK_ENABLE_KEYLOG=1 build: dev.py amalg): the NSS lines of one handshake */
+#    define KL_LINE (32 + 1 + 64 + 1 + 2 * BRISK_HASH_MAX_LEN + 1)
+static char g_kl[8][KL_LINE];
+static int g_nkl;
+
+static void keylog_fn(void *ctx, const char *line)
+{
+    (void)ctx;
+    if (g_nkl < 8 && strlen(line) < KL_LINE) {
+        strcpy(g_kl[g_nkl], line);
+    }
+    g_nkl++;
+}
+
+static void kl_hex(char *o, const uint8_t *p, size_t n)
+{
+    size_t i;
+    for (i = 0; i < n; i++) {
+        sprintf(o + 2 * i, "%02x", p[i]);
+    }
+    o[2 * n] = 0;
+}
+
+/* RFC 8448 secrets as Wireshark wants them, in the engine's order: the handshake pair, then the
+ * exporter and application secrets once the server Finished checks out. */
+static void check_keylog(const uint8_t *ch1, const uint8_t *const sec[6], size_t hl, long idx)
+{
+    static const struct {
+        const char *label;
+        int sec;
+    } W[] = {{"SERVER_HANDSHAKE_TRAFFIC_SECRET", 0},
+             {"CLIENT_HANDSHAKE_TRAFFIC_SECRET", 1},
+             {"EXPORTER_SECRET", 4},
+             {"SERVER_TRAFFIC_SECRET_0", 2},
+             {"CLIENT_TRAFFIC_SECRET_0", 3}};
+    char cr[65], want[KL_LINE], hex[2 * BRISK_HASH_MAX_LEN + 1];
+    size_t i;
+    kl_hex(cr, ch1 + 4 + 2, 32);
+    CHECKI(g_nkl == 5, idx);
+    for (i = 0; i < 5 && (int)i < g_nkl; i++) {
+        kl_hex(hex, sec[W[i].sec], hl);
+        sprintf(want, "%s %s %s", W[i].label, cr, hex);
+        CHECKI(strcmp(g_kl[i], want) == 0, idx);
+    }
+}
+#    undef KL_LINE
+#endif
+
 /* ---------------------------------------------------------------- the runner --------------- */
 enum { FEED_MSG, FEED_BYTES, FEED_FLIGHT, FEED_CUT };
 
@@ -320,6 +370,10 @@ static int run_flow(run *r, const flow *f, int ov_idx, const uint8_t *ov, size_t
     memset(&cfg, 0, sizeof cfg);
     cfg.on_secret = on_secret;
     cfg.secret_ctx = &r->cap;
+#if BRISK_ENABLE_KEYLOG
+    cfg.keylog = keylog_fn;
+    g_nkl = 0;
+#endif
     if (f->root_len != 0) {
         r->an.der = f->root;
         r->an.len = f->root_len;
@@ -428,6 +482,9 @@ static void check_connected(const run *r, const flow *f, int rc, long idx)
         CHECKI(r->cap.len[i] == f->hl && memcmp(r->cap.sec[i], f->sec[i], f->hl) == 0, idx);
     }
     CHECKI(memcmp(r->hs.exp_ms, f->sec[4], f->hl) == 0, idx);
+#if BRISK_ENABLE_KEYLOG
+    check_keylog(f->ch1, f->sec, f->hl, idx);
+#endif
     CHECKI(memcmp(r->hs.res_ms, f->sec[5], f->hl) == 0, idx);
     CHECKI(r->hsk_len == f->cf_len && memcmp(r->hsk, f->cf, f->cf_len) == 0, idx);
     CHECKI(r->init_len == f->ch1_len + f->ch2_len && memcmp(r->init, f->ch1, f->ch1_len) == 0 &&

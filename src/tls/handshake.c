@@ -172,7 +172,8 @@ static const uint16_t DEF_SIGS[] = {0x0403,
                                     0x0503,
 #endif
 #if BRISK_ENABLE_RSA
-                                    0x0804, 0x0805, 0x0806, 0x0401, 0x0501, 0x0601
+                                    0x0804, 0x0805, 0x0806, 0x0401,
+                                    0x0501, 0x0601
 #endif
 };
 
@@ -221,7 +222,7 @@ static int hs_known_suite(uint16_t s)
 static size_t hs_share_len(uint16_t group)
 {
     /* 4.3.8.2, RFC 7748; 0 = not a group of this build */
-    return BRISK_ENABLE_X25519 && group == GROUP_X25519    ? 32u
+    return BRISK_ENABLE_X25519 && group == GROUP_X25519  ? 32u
            : BRISK_ENABLE_P256_KX && group == GROUP_P256 ? 65u
                                                          : 0u;
 }
@@ -420,8 +421,47 @@ HS_SHARED int brisk__hs_queue(brisk__tls13_hs *hs, unsigned epoch, const uint8_t
     return 1;
 }
 
+#if BRISK_ENABLE_KEYLOG
+/* Lowercase hex without a table lookup: the digits are secrets. */
+static char hs_hex(unsigned v)
+{
+    return (char)(v + 48u + (((9u - v) >> 8) & 39u));
+}
+
+void brisk__hs_keylog(const brisk__tls13_hs *hs, const char *label, const uint8_t *secret,
+                      size_t len)
+{
+    char line[32 + 1 + 64 + 1 + 2 * BRISK_HASH_MAX_LEN + 1];
+    size_t n = strlen(label), i;
+    if (hs->cfg.keylog == NULL || n > 32 || len > BRISK_HASH_MAX_LEN) {
+        return;
+    }
+    memcpy(line, label, n);
+    line[n++] = ' ';
+    for (i = 0; i < 32; i++) {
+        line[n++] = hs_hex(hs->crand[i] >> 4u);
+        line[n++] = hs_hex(hs->crand[i] & 15u);
+    }
+    line[n++] = ' ';
+    for (i = 0; i < len; i++) {
+        line[n++] = hs_hex(secret[i] >> 4u);
+        line[n++] = hs_hex(secret[i] & 15u);
+    }
+    line[n] = 0;
+    hs->cfg.keylog(hs->cfg.keylog_ctx, line);
+    brisk__secure_zero(line, sizeof line);
+}
+#endif
+
 static int hs_export(brisk__tls13_hs *hs, unsigned epoch, int is_send, const uint8_t *secret)
 {
+#if BRISK_ENABLE_KEYLOG
+    static const char *const LABEL[4] = {"SERVER_HANDSHAKE_TRAFFIC_SECRET",
+                                         "CLIENT_HANDSHAKE_TRAFFIC_SECRET",
+                                         "SERVER_TRAFFIC_SECRET_0", "CLIENT_TRAFFIC_SECRET_0"};
+    brisk__hs_keylog(hs, LABEL[(epoch == BRISK__EPOCH_APP) * 2 + (is_send != 0)], secret,
+                     brisk_hash_len(brisk__hs_alg(hs->suite)));
+#endif
     if (hs->cfg.on_secret == NULL) {
         return 1;
     }
@@ -1016,6 +1056,11 @@ static int hs_on_fin(brisk__tls13_hs *hs, const uint8_t *m, size_t n)
     brisk__hs_th_add(hs, m, n);
     brisk__hs_th_snap(hs, th); /* TH(CH..server Finished): the application secrets (7.1) */
     rc = brisk__tls_ks_derive_application(&hs->ks, th, c_ap, s_ap, hs->exp_ms);
+#if BRISK_ENABLE_KEYLOG
+    if (rc == BRISK_OK) {
+        brisk__hs_keylog(hs, "EXPORTER_SECRET", hs->exp_ms, hl);
+    }
+#endif
 
     /* Client flight (4.5, A.1): Certificate [+ CertificateVerify] iff one was requested, then
      * Finished over TH(CH..SF[..Certificate[..CertificateVerify]]) (4.5.3). */
@@ -1536,7 +1581,7 @@ int brisk__tls13_hs_client_hello(brisk__tls13_hs *hs, const uint8_t *ch, size_t 
             return BRISK_E_ARG; /* 4.3.2: never a cookie in an initial ClientHello */
         }
         hs->session_id_len = ch[4 + 34];
-#if BRISK_ENABLE_TLS12
+#if BRISK_ENABLE_TLS12 || BRISK_ENABLE_KEYLOG
         memcpy(hs->crand, ch + 4 + 2, 32); /* the client_random of RFC 5246 7.4.3 / 6.3 */
 #endif
         memcpy(hs->session_id, ch + 4 + 35, hs->session_id_len);

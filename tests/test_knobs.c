@@ -184,6 +184,11 @@ static int dummy_anchor(void *ctx, const uint8_t *dn, size_t dn_len, size_t inde
     return BRISK_E_ARG;
 }
 
+static void keylog_sink(void *ctx, const char *line)
+{
+    (void)ctx, (void)line;
+}
+
 static void trust_setup(void)
 {
     static const uint8_t der[] = {0x30, 0x00}, pem[] = "-----BEGIN CERTIFICATE-----";
@@ -211,6 +216,9 @@ static void trust_setup(void)
     cfg.ca_mem = der;
     cfg.ca_mem_len = sizeof der;
     CHECK(brisk__conn_setup(mem, size, &cfg, "a.example", 0, rnd, dummy_anchor, &c) == BRISK_OK);
+    cfg.keylog = keylog_sink; /* KEYLOG: off = refused, so nobody trusts a silent no-op */
+    CHECK((brisk__conn_setup(mem, size, &cfg, "a.example", 0, rnd, dummy_anchor, &c) == BRISK_OK) ==
+          BRISK_ENABLE_KEYLOG);
     free(mem);
 }
 
@@ -229,10 +237,41 @@ static void build_info(void)
     for (i = 0; i < N(K); i++) {
         CHECKI((strstr(brisk_build_info(), K[i].tag) != NULL) == !K[i].on, i);
     }
+    CHECK((strstr(brisk_build_info(), " KEYLOG") != NULL) == BRISK_ENABLE_KEYLOG);
+}
+
+/* brisk_strerror: the name always, the sentence only with BRISK_ENABLE_ERROR_STRINGS */
+static void strerror_names(void)
+{
+    static const struct {
+        int err;
+        const char *name;
+    } E[] = {{BRISK_E_ARG, "E_ARG"},
+             {BRISK_E_RNG, "E_RNG"},
+             {BRISK_E_AUTH, "E_AUTH"},
+             {BRISK_E_PROTO, "E_PROTO"},
+             {BRISK_E_PEER_ALERT, "E_PEER_ALERT"},
+             {BRISK_E_IO, "E_IO"},
+             {BRISK_E_TIMEOUT, "E_TIMEOUT"},
+             {BRISK_E_WANT, "E_WANT"},
+             {BRISK_E_RETRY, "E_RETRY"},
+             {BRISK_E_INSECURE, "E_INSECURE"}};
+    size_t i, n;
+    for (i = 0; i < N(E); i++) {
+        const char *t = brisk_strerror(E[i].err);
+        n = strlen(E[i].name);
+        CHECKI(strncmp(t, E[i].name, n) == 0, i);
+        CHECKI(BRISK_ENABLE_ERROR_STRINGS ? strncmp(t + n, " (", 2) == 0 : t[n] == 0, i);
+    }
+    CHECK(strcmp(brisk_strerror(BRISK_OK), "ok") == 0);
+    CHECK(strcmp(brisk_strerror(1), "unknown error") == 0);
+    CHECK(strcmp(brisk_strerror(BRISK_E_INSECURE - 1), "unknown error") == 0);
+    CHECK(strcmp(brisk_strerror(-2147483647 - 1), "unknown error") == 0);
 }
 
 void test_knobs(void)
 {
+    strerror_names();
     build_info();
     trust_setup();
     offer();

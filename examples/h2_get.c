@@ -124,13 +124,13 @@ int main(int argc, char **argv)
     rc = brisk_connect(&cfg, host, port, &c);
     if (rc != BRISK_OK) {
         free(body);
-        fprintf(stderr, "brisk: connect failed: %s\n", err_name(rc));
+        fprintf(stderr, "brisk: connect failed: %s\n", brisk_strerror(rc));
         return 2;
     }
     mem = malloc(brisk_h2_size());
     rc = mem == NULL ? BRISK_E_ARG : brisk_h2_open(c, mem, brisk_h2_size(), &h);
     if (rc != BRISK_OK) {
-        fprintf(stderr, "brisk: h2_open: %s\n", err_name(rc));
+        fprintf(stderr, "brisk: h2_open: %s\n", brisk_strerror(rc));
     }
     for (j = 0; rc == BRISK_OK && j < rounds; j++) {
         int opened = 0;
@@ -139,12 +139,12 @@ int main(int argc, char **argv)
         }
         if (rc != BRISK_OK) {
             opened--; /* the failed request holds no stream */
-            fprintf(stderr, "brisk: request %d: %s\n", j * n + opened + 1, err_name(rc));
+            fprintf(stderr, "brisk: request %d: %s\n", j * n + opened + 1, brisk_strerror(rc));
         }
         for (k = 0; k < (size_t)opened; k++) {
             int r = rc == BRISK_OK ? fetch(s[k], quiet) : BRISK_OK;
             if (r != BRISK_OK) {
-                fprintf(stderr, "brisk: response %d: %s\n", j * n + (int)k + 1, err_name(r));
+                fprintf(stderr, "brisk: response %d: %s\n", j * n + (int)k + 1, brisk_strerror(r));
                 rc = r;
             }
             brisk_h2_stream_close(s[k]);
