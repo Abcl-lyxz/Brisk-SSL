@@ -21,6 +21,9 @@
 #if BRISK_ENABLE_QUIC
 
 #    include "kat/quic_api.inc"
+#    if BRISK_ENABLE_MTLS
+#        include "kat/mtls_key.inc"
+#    endif
 
 #    ifdef __linux__
 #        include <errno.h>
@@ -196,6 +199,26 @@ static void test_init(void)
         bad = brisk__quic_setup(g_mem, g_size, &c, h, 0, g_rnd, NULL, NULL, 0, &q) == BRISK_E_ARG;
         CHECKI(bad && q == NULL && (i == 0 || i == 3 || g_mem[g_size / 2] == 0), i);
     }
+#    if BRISK_ENABLE_MTLS
+    /* M9: the device key and chain as PEM through the QUIC setup (brisk__conn_core parses the
+     * key there too); a key that is not the leaf's is refused and the whole arena wiped */
+    for (i = 0; i < 2; i++) {
+        static uint8_t key[1024], chain[4096];
+        size_t j;
+        c = cfg_ok();
+        c.client_chain = chain;
+        c.client_chain_len = t_unhex(KEY_MTLS_CHAIN[1].chain, chain, sizeof chain);
+        c.client_key = key;
+        c.client_key_len = t_unhex(KEY_MTLS[i == 0 ? 4 : 6].key, key, sizeof key);
+        memset(g_mem, 0x5a, g_size);
+        q = (brisk_quic *)1;
+        bad = brisk__quic_setup(g_mem, g_size, &c, HOST, 0, g_rnd, NULL, NULL, 0, &q) != BRISK_OK;
+        CHECKI(bad == (i == 1) && (q == NULL) == bad, i);
+        for (j = 0; bad && j < g_size && g_mem[j] == 0; j++) {
+        }
+        CHECKI(!bad || j == g_size, i);
+    }
+#    endif
     /* any alignment */
     c = cfg_ok();
     for (i = 1; i < 8; i += 2) {
@@ -1308,6 +1331,10 @@ static void test_h3_loop(void)
 
 void test_quic_api(void)
 {
+#    if BRISK_ENABLE_MTLS
+    (void)KEY_MTLS_BIG_OK;
+    (void)KEY_MTLS_BIG_OVER;
+#    endif
     g_root_len = t_unhex(QUIC_API_ROOT, g_root, sizeof g_root);
     t_unhex(QUIC_API_RND, g_rnd, sizeof g_rnd);
     g_size = brisk_quic_size();

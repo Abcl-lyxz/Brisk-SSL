@@ -88,6 +88,7 @@ struct tls13_hsmsg_kat {
 #include "kat/tls13_psk.inc"
 #include "kat/tls13_record.inc"
 #include "kat/tls13_trace.inc"
+#include "kat/mtls_key.inc"
 
 #if BRISK_ENABLE_TLS12
 #    define FX_KAT   TLS13_CONNFX_KAT
@@ -219,11 +220,21 @@ static brisk_cfg cfg_of(const struct tls13_flow_kat *k)
     return cfg;
 }
 
+/* LIFETIMES seam: when set, setup() overwrites the caller's client_key buffer right after a
+ * successful brisk__conn_setup - the handshake must not notice (the key was parsed and copied). */
+static uint8_t *g_scribble;
+static size_t g_scribble_len;
+
 static int setup(const struct tls13_flow_kat *k, size_t off, const brisk_cfg *cfg, int64_t now_ms)
 {
+    int rc;
     memset(g_mem, 0, g_size + 8);
     app_len = 0;
-    return brisk__conn_setup(g_mem + off, g_size, cfg, k->host, now_ms, RND, NULL, &C);
+    rc = brisk__conn_setup(g_mem + off, g_size, cfg, k->host, now_ms, RND, NULL, &C);
+    if (rc == BRISK_OK && g_scribble != NULL) {
+        memset(g_scribble, 0xaa, g_scribble_len);
+    }
+    return rc;
 }
 
 static int64_t now_of(const struct tls13_flow_kat *k)
@@ -1004,6 +1015,98 @@ static int dev_sign(void *ctx, uint16_t scheme, const uint8_t *tbs, size_t tbs_l
 }
 #    endif
 
+#    if BRISK_ENABLE_MTLS
+static int mem_has(const uint8_t *hay, size_t n, const uint8_t *needle, size_t k)
+{
+    size_t i;
+    for (i = 0; i + k <= n; i++) {
+        if (memcmp(hay + i, needle, k) == 0) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+/* M9: cfg.client_key as raw d (len 0 and 32), SEC1 / PKCS#8 DER and both PEM labels, and
+ * cfg.client_chain as PEM. The CertificateVerify is deterministic (hedged RFC 6979 with the
+ * fixed sign_rand), so every form must reproduce the row's client flight byte for byte - while
+ * the caller's key buffer is overwritten right after setup (g_scribble), which proves the
+ * handshake signs with the parsed copy. */
+static void conn_mtls_forms(const struct tls13_flow_kat *r)
+{
+    static uint8_t kbuf[1024], copy[1024];
+    const size_t nk = sizeof KEY_MTLS / sizeof KEY_MTLS[0];
+    const uint8_t *key, *d;
+    brisk_cfg cfg;
+    size_t i, n, dn;
+
+    for (i = 0; i <= nk; i++) {
+        const struct key_mtls_kat *m = &KEY_MTLS[i < nk ? i : 0];
+        if (!m->ok) {
+            continue;
+        }
+        arena_used = 0;
+        cfg = cfg_of(r);
+        if (i & 1) { /* half the runs with a PEM chain, both PEM chain shapes */
+            cfg.client_chain = dec(KEY_MTLS_CHAIN[(i >> 1) & 1].chain, &cfg.client_chain_len);
+        } else {
+            cfg.client_chain = dec(r->cchain, &cfg.client_chain_len);
+        }
+        key = dec(m->key, &n);
+        memcpy(kbuf, key, n);
+        cfg.client_key = kbuf;
+        cfg.client_key_len = i == 0 ? 0 : n; /* 0: the v0.1 raw d; i == nk: raw with 32 */
+        g_scribble = kbuf;
+        g_scribble_len = n;
+        CHECKI(happy(r, i & 1, 1 << 20, &cfg) == 0, i);
+        g_scribble = NULL;
+    }
+    /* the parsed d sits in the connection until brisk_conn_wipe, and the caller's buffer is
+     * read, never written (brisk.h LIFETIMES) */
+    arena_used = 0;
+    cfg = cfg_of(r);
+    cfg.client_chain = dec(KEY_MTLS_CHAIN[1].chain, &cfg.client_chain_len);
+    key = dec(KEY_MTLS[4].key, &n);
+    memcpy(copy, key, n);
+    cfg.client_key = key;
+    cfg.client_key_len = n;
+    d = dec(r->ckey, &dn);
+    CHECK(setup(r, 0, &cfg, now_of(r)) == BRISK_OK && mem_has(g_mem, g_size + 8, d, dn));
+    CHECK(memcmp(key, copy, n) == 0);
+    brisk_conn_wipe(C);
+    CHECK(!mem_has(g_mem, g_size + 8, d, dn) && all_zero(g_mem, g_size + 8));
+    /* refusals at setup, each leaving the whole arena zero: a key that is not the leaf's, an
+     * encrypted key, the SEC1 DER cut to 32 bytes (the raw path: a valid scalar, not the leaf's
+     * key), a key with a sign callback too, and the malformed PEM chains */
+    for (i = 0; i < nk + 2; i++) {
+        arena_used = 0;
+        cfg = cfg_of(r);
+        cfg.client_chain = dec(r->cchain, &cfg.client_chain_len);
+        cfg.client_key = dec(KEY_MTLS[i < nk ? i : 1].key, &n);
+        cfg.client_key_len = i == nk ? 32 : n;
+        if (i == nk + 1) {
+            cfg.sign = dev_sign;
+        } else if (i < nk && KEY_MTLS[i].ok) {
+            continue;
+        }
+        CHECKI(setup(r, 0, &cfg, now_of(r)) == BRISK_E_ARG && C == NULL &&
+                   all_zero(g_mem, g_size + 8),
+               i);
+    }
+    for (i = 0; i < sizeof KEY_MTLS_CHAIN / sizeof KEY_MTLS_CHAIN[0]; i++) {
+        arena_used = 0;
+        cfg = cfg_of(r);
+        cfg.client_chain = dec(KEY_MTLS_CHAIN[i].chain, &cfg.client_chain_len);
+        cfg.client_key = dec(r->ckey, &n);
+        CHECKI(setup(r, 0, &cfg, now_of(r)) == (KEY_MTLS_CHAIN[i].ok ? BRISK_OK : BRISK_E_ARG), i);
+        if (KEY_MTLS_CHAIN[i].ok) {
+            brisk_conn_wipe(C);
+        }
+        CHECKI(all_zero(g_mem, g_size + 8), i);
+    }
+}
+#    endif
+
 static void conn_mtls(void)
 {
 #    if BRISK_ENABLE_MTLS
@@ -1025,6 +1128,7 @@ static void conn_mtls(void)
          * happy() checks the whole memory is zero after brisk_conn_wipe */
         CHECKI(happy(r, (size_t)i, 1 << 20, &cfg) == 0 && sign_calls == i, i);
     }
+    conn_mtls_forms(r);
 #    else
     (void)dec;
 #    endif
@@ -1085,6 +1189,9 @@ static void conn_args(void)
     CHECK(brisk__conn_setup(g_mem, g_size, &cfg, HOST, 0, RND, NULL, &C) == BRISK_E_ARG);
     cfg = z;
     cfg.client_key = KEY;
+    CHECK(brisk__conn_setup(g_mem, g_size, &cfg, HOST, 0, RND, NULL, &C) == BRISK_E_ARG);
+    cfg = z;
+    cfg.client_key_len = 5; /* a length without a key */
     CHECK(brisk__conn_setup(g_mem, g_size, &cfg, HOST, 0, RND, NULL, &C) == BRISK_E_ARG);
     cfg = z;
     cfg.client_chain = dec(CONN_KAT[4].cchain, &cfg.client_chain_len);
@@ -1162,6 +1269,10 @@ void test_conn(void)
     (void)TLS13_REC_KAT;
     (void)TLS13_NONCE_KAT;
     (void)TLS13_CONN_NOW_MS;
+    (void)KEY_MTLS;
+    (void)KEY_MTLS_CHAIN;
+    (void)KEY_MTLS_BIG_OK;
+    (void)KEY_MTLS_BIG_OVER;
     t_unhex(TLS13_CONN_RND, RND, sizeof RND);
     g_size = brisk_conn_size();
     g_mem = (uint8_t *)malloc(g_size + 8);

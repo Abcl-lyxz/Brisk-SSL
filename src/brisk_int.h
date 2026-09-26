@@ -1210,6 +1210,52 @@ void brisk__x509_pem_init(brisk__x509_pem *p);
  * There is no error return: a malformed block is skipped, not reported (see above). */
 int brisk__x509_pem_feed(brisk__x509_pem *p, const uint8_t **in, size_t *len);
 
+#if BRISK_ENABLE_MTLS
+/* ---- x509/bundle.c: ONE PEM block out of a buffer, STRICT --------------------------------
+ *
+ * The other PEM reader, for the device's OWN configuration (cfg.client_chain as PEM, the PEM
+ * forms of cfg.client_key), and deliberately NOT the lenient streaming one above. That one skips
+ * bad blocks because one unreadable root in a 140-root third-party bundle must not cost the other
+ * 139; here a bad block is the integrator's own file and must fail the connection setup loudly
+ * rather than send a different chain or no key. Do not "unify" the two.
+ *
+ * Next block labelled `label` (no dashes: "CERTIFICATE", "EC PRIVATE KEY") in in[*off..len).
+ * RFC 7468 2-3: the BEGIN line starts at a line start (the anchor the streaming reader and
+ * OpenSSL use) and matches "-----BEGIN " label "-----" WHOLE; blocks with other labels and text
+ * outside blocks are skipped. The block ends with "-----END " + the SAME label + "-----" at a
+ * line start. RFC 4648 3.3 / 3.5 for the body: base64 plus SP / HTAB / CR / LF only, '=' only at
+ * the end and at most two, a whole number of 4-character quanta (pads included), zero pad bits.
+ * out == NULL: validate and count only (pass 1 of a size-then-write pair; cap is ignored).
+ * Otherwise at most cap bytes are written, and on failure what was written is wiped.
+ *   BRISK_OK, *out_len > 0   one block; *off is just past its END line.
+ *   BRISK_OK, *out_len == 0  no more blocks; *off = len.
+ *   BRISK_E_ARG              a malformed block (any rule above, a missing END, an empty body,
+ *                            more than cap bytes).
+ * Constant time in the body's characters (the device key's base64 is the secret): only the
+ * byte class (data / pad / layout / newline / dash) and the final verdict are declassified. */
+int brisk__x509_pem_block(const uint8_t *in, size_t len, size_t *off, const char *label,
+                          uint8_t *out, size_t cap, size_t *out_len);
+
+/* ---- x509/key.c: the device's P-256 private key (cfg.client_key) --------------------------
+ *
+ * d (SECRET) out of:
+ *   len 32            the raw big-endian scalar (RFC 5915 3: I2OSP(d, 32)).
+ *   first byte 0x30   DER: SEC1 ECPrivateKey (RFC 5915 3; version 1, a 32-octet privateKey,
+ *                     [0] namedCurve prime256v1 REQUIRED, optional [1] publicKey) or PKCS#8
+ *                     PrivateKeyInfo / OneAsymmetricKey (RFC 5958 2; version 0 or 1, algorithm
+ *                     id-ecPublicKey + prime256v1, the privateKey an ECPrivateKey whose [0] may
+ *                     be omitted, attributes skipped, [1] publicKey only in version 1).
+ *   anything else     PEM text with exactly ONE "EC PRIVATE KEY" (SEC1) or "PRIVATE KEY"
+ *                     (PKCS#8) block, RFC 7468 10, decoded with brisk__x509_pem_block.
+ * prime256v1 only (RFC 5480 2.1.1: namedCurve, never implicit or specified), 1 <= d <= n-1, and
+ * every embedded public key must be 0x04 || X || Y equal to keygen(d). DER only, never BER -
+ * although RFC 5958 2 asks receivers to take BER: fail closed, one strict reader, and every
+ * encoder in use emits DER. Encrypted keys (RFC 5958 3, legacy Proc-Type PEM) are refused, with
+ * no decryption code: their outer structure or label never matches. BRISK_OK, or BRISK_E_ARG
+ * with d wiped; every stack copy is wiped on every path. */
+int brisk__x509_p256_key(uint8_t d[32], const uint8_t *in, size_t len);
+#endif
+
 /* ---- x509/name.c: service identity, i.e. does this certificate speak for this name --------
  *
  * RFC 9525 (which obsoletes RFC 6125), from the point of view of a client that has ONE
@@ -1694,15 +1740,17 @@ typedef struct {
     void *ticket_ctx;
     /* mTLS (RFC 9846 4.5.1, 4.5.2). Same layout in every profile; a chain with
      * BRISK_ENABLE_MTLS == 0 is BRISK_E_ARG at init. hs_init checks, as configuration bugs
-     * (BRISK_E_ARG): exactly one of client_key / sign; sign_rand with client_key; every DER
-     * certificate parses; the leaf is P-256 with digitalSignature when keyUsage is present
-     * (4.5.1.2); keygen(client_key) is the leaf's point; client_chain_len is at most
+     * (BRISK_E_ARG): exactly one of client_key / sign; sign_rand with client_key; every
+     * certificate parses (DER, or one PEM CERTIFICATE block each - exactly one TLV per block);
+     * the leaf is P-256 with digitalSignature when keyUsage is present (4.5.1.2);
+     * keygen(client_key) is the leaf's point; the DER certificates total at most
      * BRISK_TLS_MAX_CLIENT_CHAIN, so the Certificate + CertificateVerify + Finished fit an
      * empty output queue (BRISK__TLS13_OUT_MAX) - it is empty in practice,
      * because the ClientHello is pulled before the server can answer it; if it is not, the
      * flight fails with internal_error, never truncated. Buffers are not copied: they must
      * outlive the handshake. */
-    const uint8_t *client_chain; /* concatenated DER certificates, leaf first; NULL = none */
+    const uint8_t *client_chain; /* DER certificates, or PEM text (first byte != 0x30), leaf
+                                    first; NULL = none. Decoded again at handshake time. */
     size_t client_chain_len;
     const uint8_t *client_key; /* 32-byte P-256 d (SECRET), or NULL when `sign` is used */
     const uint8_t *sign_rand;  /* 32 fresh bytes of brisk__os_random per handshake: the hedged
@@ -1885,7 +1933,9 @@ int brisk__hs_ext_next(const uint8_t **p, const uint8_t *end, uint16_t *type, co
 int brisk__hs_in_list(const uint16_t *list, size_t n, uint16_t v);
 uint8_t brisk__hs_alpn_check(brisk__tls13_hs *hs, const uint8_t *d, size_t dl);
 #    if BRISK_ENABLE_MTLS
-size_t brisk__hs_chain_entries(const uint8_t *chain, size_t len, uint8_t *out, int ext);
+/* The CertificateEntry list of the device chain (DER or PEM): its length when out is NULL,
+ * else written to out[cap]; 0 = refused (malformed, no certificate, or more than cap). */
+size_t brisk__hs_chain_entries(const uint8_t *chain, size_t len, uint8_t *out, size_t cap, int ext);
 #    endif
 #endif
 
@@ -2123,6 +2173,8 @@ struct brisk_conn {
     brisk_cfg cfg;
     brisk__x509_anchor_fn sys_anchor; /* the file / system store; NULL = memory anchors only */
     uint8_t rnd[BRISK__CONN_RAND];    /* SECRET, layout above */
+    uint8_t key[32]; /* SECRET: cfg.client_key parsed once (RFC 5915 d); hs.cfg.client_key points
+                        here; wiped with the rest of *c by brisk_conn_wipe and on setup failure */
     uint8_t alpn[BRISK__TLS13_ALPN_MAX];
     uint16_t alpn_len;
     char host[256]; /* NUL-terminated copy of the caller's host */

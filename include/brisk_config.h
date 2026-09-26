@@ -359,16 +359,22 @@
 #    error "BRISK_TLS_MAX_HS_MSG must be 4096..65536"
 #endif
 
-/* Largest mTLS device chain (cfg client_chain: concatenated DER, leaf first) the TLS 1.3 engine
- * sends, in bytes. The client Certificate is built whole in the engine's output queue, so this
- * is RAM: the scratch buffer grows by exactly this much, and only with BRISK_ENABLE_MTLS. RFC
- * 9846 4.4.2 allows 2^24-1; 4 KB holds a P-256 leaf plus an RSA-4096 issuing CA, or a leaf plus
- * two RSA-2048 CAs. A longer chain is BRISK_E_ARG at setup (a local limit, never truncated). */
+/* Largest mTLS device chain (cfg client_chain, leaf first, DER or PEM - see brisk_cfg) the TLS
+ * 1.3 engine sends, in bytes of DER certificates: the limit counts the decoded certificates, not
+ * client_chain_len, so PEM text may be about 1.37x longer. The client Certificate is built whole
+ * in the engine's output queue, so this is RAM: the scratch buffer grows by exactly this much,
+ * and only with BRISK_ENABLE_MTLS. RFC 9846 4.4.2 allows 2^24-1; 4 KB holds a P-256 leaf plus an
+ * RSA-4096 issuing CA, or a leaf plus two RSA-2048 CAs. More DER than this is BRISK_E_ARG at
+ * setup (a local limit, never truncated). At most BRISK_TLS_MAX_HS_MSG: a PEM certificate is
+ * decoded through the handshake input buffer, so DER and PEM chains share one limit. */
 #ifndef BRISK_TLS_MAX_CLIENT_CHAIN
 #    define BRISK_TLS_MAX_CLIENT_CHAIN 4096
 #endif
 #if BRISK_TLS_MAX_CLIENT_CHAIN < 1024 || BRISK_TLS_MAX_CLIENT_CHAIN > 65536
 #    error "BRISK_TLS_MAX_CLIENT_CHAIN must be 1024..65536"
+#endif
+#if BRISK_TLS_MAX_CLIENT_CHAIN > BRISK_TLS_MAX_HS_MSG
+#    error "BRISK_TLS_MAX_CLIENT_CHAIN must not exceed BRISK_TLS_MAX_HS_MSG"
 #endif
 
 #endif /* BRISK_CONFIG_H */

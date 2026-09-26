@@ -2,12 +2,12 @@
  * one QoS 0 message, DISCONNECT. No MQTT library: the point is that the TLS connection is just a
  * byte pipe, and a 60-line client is enough for telemetry.
  *
- *   mqtt_tls HOST PORT CLIENT_ID TOPIC MESSAGE [chain.der key.d]
+ *   mqtt_tls HOST PORT CLIENT_ID TOPIC MESSAGE [chain.pem key.pem]
  *
  * PORT 8883 is MQTT over TLS as usual. PORT 443 offers ALPN "x-amzn-mqtt-ca", which is how AWS
- * IoT Core accepts MQTT on 443; other brokers ignore it. chain.der / key.d add a device
- * certificate (see aws_iot_https.c for the openssl conversions). A real client also needs
- * PINGREQ every keep-alive interval, QoS 1 retries and SUBSCRIBE - not shown.
+ * IoT Core accepts MQTT on 443; other brokers ignore it. chain.pem / key.pem add a device
+ * certificate (P-256 key: PEM, DER or the raw 32-byte d; for AWS see aws_iot_https.c). A real
+ * client also needs PINGREQ every keep-alive interval, QoS 1 retries and SUBSCRIBE - not shown.
  *
  * SPDX-License-Identifier: Apache-2.0
  */
@@ -51,7 +51,7 @@ int main(int argc, char **argv)
     uint16_t port;
 
     if ((argc != 6 && argc != 8) || strlen(argv[3]) + strlen(argv[4]) + strlen(argv[5]) > 900) {
-        fprintf(stderr, "usage: mqtt_tls HOST PORT CLIENT_ID TOPIC MESSAGE [chain.der key.d]\n");
+        fprintf(stderr, "usage: mqtt_tls HOST PORT CLIENT_ID TOPIC MESSAGE [chain.pem key.pem]\n");
         return 1;
     }
     port = (uint16_t)atoi(argv[2]);
@@ -61,11 +61,12 @@ int main(int argc, char **argv)
     if (argc == 8) {
         chain = read_file(argv[6], &cfg.client_chain_len);
         key = read_file(argv[7], &key_len);
-        if (chain == NULL || key == NULL || key_len != 32) {
+        if (chain == NULL || key == NULL || key_len == 0) { /* 0 would mean raw d */
             return 1;
         }
         cfg.client_chain = chain;
         cfg.client_key = key;
+        cfg.client_key_len = key_len; /* raw d, DER or PEM */
     }
 
     rc = brisk_connect(&cfg, argv[1], port, &c);

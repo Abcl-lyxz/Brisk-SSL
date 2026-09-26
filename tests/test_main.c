@@ -69,6 +69,7 @@ static const struct {
     {"rsa", test_rsa},
     {"der", test_der},
     {"x509", test_x509},
+    {"key", test_key},
     {"ct", test_ct},
     {"tls13_ks", test_tls13_ks},
     {"tls13_hs", test_tls13_hs},

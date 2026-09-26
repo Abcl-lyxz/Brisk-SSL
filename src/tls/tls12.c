@@ -348,7 +348,7 @@ static int t12_on_shd(brisk__tls13_hs *hs, const uint8_t *m, size_t n)
         }
         if (send) {
             size_t cl =
-                brisk__hs_chain_entries(hs->cfg.client_chain, hs->cfg.client_chain_len, NULL, 0);
+                brisk__hs_chain_entries(hs->cfg.client_chain, hs->cfg.client_chain_len, NULL, 0, 0);
             q = cl != 0 ? brisk__hs_reserve(hs, BRISK__EPOCH_INITIAL, 7 + cl) : NULL;
             if (q == NULL) {
                 return brisk__hs_fail(hs, BRISK__ALERT_INTERNAL_ERROR);
@@ -356,7 +356,10 @@ static int t12_on_shd(brisk__tls13_hs *hs, const uint8_t *m, size_t n)
             q[0] = T12_CERTIFICATE;
             brisk__store_be24(q + 1, (uint32_t)(3 + cl));
             brisk__store_be24(q + 4, (uint32_t)cl);
-            brisk__hs_chain_entries(hs->cfg.client_chain, hs->cfg.client_chain_len, q + 7, 0);
+            if (brisk__hs_chain_entries(hs->cfg.client_chain, hs->cfg.client_chain_len, q + 7, cl,
+                                        0) != cl) {
+                return brisk__hs_fail(hs, BRISK__ALERT_INTERNAL_ERROR); /* changed (LIFETIMES) */
+            }
             brisk__hs_th_add(hs, q, 7 + cl);
         }
 #    endif

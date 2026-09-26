@@ -37,6 +37,7 @@ struct tls12_flow_kat {
     int mtls;
 };
 #include "kat/tls12_conn.inc"
+#include "kat/mtls_key.inc"
 
 #define NROW   (sizeof TLS12_FLOW_KAT / sizeof TLS12_FLOW_KAT[0])
 #define HOST   "device.example.com"
@@ -297,6 +298,13 @@ static void rows(void)
             for (mode = 0; mode < 3; mode++) {
                 CHECKI(happy(k, (i + (size_t)mode) & 7, mode) == 0, i * 10 + (size_t)mode);
             }
+#    if BRISK_ENABLE_MTLS
+            if (k->mtls) { /* M9: the same Certificate message out of a PEM client_chain */
+                chain_len = t_unhex(KEY_MTLS_CHAIN[1].chain, chain, sizeof chain);
+                CHECKI(happy(k, i & 7, 0) == 0, i);
+                chain_len = t_unhex(TLS12_CONN_CCHAIN, chain, sizeof chain);
+            }
+#    endif
             continue;
         }
         want = err_of(k->alert);
@@ -557,8 +565,10 @@ static void ct_flow(const struct tls12_flow_kat *k)
     load(k);
     t_unhex(TLS12_CONN_RND, RND, sizeof RND);
     BRISK__CT_SECRET(RND + 64, 96); /* x25519 d | P-256 d | sign_rand */
+    /* before setup: the key is parsed and keygen'd there (M9), and only the resulting point is
+     * declassified, so the copy the CertificateVerify signs with is secret all the way */
+    BRISK__CT_SECRET(dkey, sizeof dkey);
     CHECK(setup(k, 0, NULL) == BRISK_OK);
-    BRISK__CT_SECRET(dkey, sizeof dkey); /* after hs_init's public keygen(d) == leaf check */
     n = brisk_pull(C, wire, sizeof wire);
     BRISK__CT_PUBLIC(wire, n);
     CHECK(n == 5 + R.ch_len);
@@ -643,6 +653,10 @@ void tls12_ct_run(void)
 
 void test_tls12_hs(void)
 {
+    (void)KEY_MTLS;
+    (void)KEY_MTLS_CHAIN;
+    (void)KEY_MTLS_BIG_OK;
+    (void)KEY_MTLS_BIG_OVER;
     t_unhex(TLS12_CONN_RND, RND, sizeof RND);
     root_len = t_unhex(TLS12_CONN_ROOT, root, sizeof root);
     chain_len = t_unhex(TLS12_CONN_CCHAIN, chain, sizeof chain);

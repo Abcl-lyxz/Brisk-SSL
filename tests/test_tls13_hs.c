@@ -77,6 +77,7 @@ struct tls13_cv_kat {
 #include "kat/tls13_mut.inc"
 #include "kat/tls13_cv.inc"
 #include "kat/tls13_psk.inc"
+#include "kat/mtls_key.inc"
 
 #define NFLOW  (sizeof TLS13_FLOW_KAT / sizeof TLS13_FLOW_KAT[0])
 #define F_TIME 1 /* the verdict depends on BRISK_X509_TIME_POLICY */
@@ -2088,6 +2089,30 @@ static void hs_mtls(void)
                    (i == 0 || i == 5 ? BRISK_OK : BRISK_E_ARG),
                i);
     }
+    /* M9: client_chain as PEM (first byte != 0x30), checked the same way through hs_client_cfg_ok,
+     * each block decoded into the scratch: the good shapes, then a key-only file, a block holding
+     * a TLV plus a byte, a block without END, bad base64. BRISK_TLS_MAX_CLIENT_CHAIN bounds the
+     * DER: the leaf repeated up to the limit is accepted although its text is longer than the
+     * limit, one more copy is refused. */
+    for (i = 0; i < sizeof KEY_MTLS_CHAIN / sizeof KEY_MTLS_CHAIN[0] + 2; i++) {
+        static uint8_t pem[3 * BRISK_TLS_MAX_CLIENT_CHAIN];
+        const size_t nc = sizeof KEY_MTLS_CHAIN / sizeof KEY_MTLS_CHAIN[0];
+        const char *h = i < nc    ? KEY_MTLS_CHAIN[i].chain
+                        : i == nc ? KEY_MTLS_BIG_OK
+                                  : KEY_MTLS_BIG_OVER;
+        int ok = i < nc ? KEY_MTLS_CHAIN[i].ok : i == nc;
+        memset(&cfg, 0, sizeof cfg);
+        cfg.auth = stub_auth;
+        cfg.client_chain = pem;
+        cfg.client_chain_len = t_unhex(h, pem, sizeof pem);
+        cfg.client_key = f.ckey;
+        cfg.sign_rand = f.srand;
+        CHECKI(brisk__tls13_hs_init(&R.hs, &cfg, g_scratch, g_scratch_len) ==
+                   (ok ? BRISK_OK : BRISK_E_ARG),
+               i);
+        CHECKI(i != nc || cfg.client_chain_len > BRISK_TLS_MAX_CLIENT_CHAIN, i);
+    }
+    (void)KEY_MTLS;
 #else
     /* no BRISK_ENABLE_MTLS: any client certificate is a configuration error */
     brisk__tls13_hs_cfg cfg;
@@ -2101,6 +2126,10 @@ static void hs_mtls(void)
     cfg.sign_rand = f.srand;
     CHECK(brisk__tls13_hs_init(&R.hs, &cfg, g_scratch, g_scratch_len) == BRISK_E_ARG);
     (void)TLS13_MTLS_KAT;
+    (void)KEY_MTLS;
+    (void)KEY_MTLS_CHAIN;
+    (void)KEY_MTLS_BIG_OK;
+    (void)KEY_MTLS_BIG_OVER;
 #endif
 }
 

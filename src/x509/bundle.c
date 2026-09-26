@@ -24,27 +24,45 @@ static const char BEGIN_LINE[] = "-----BEGIN CERTIFICATE-----";
  * PEM_SCAN is a name all three would want. */
 enum { PEM_SCAN = 0, PEM_BODY = 1 };
 
-/* The RFC 4648 4 alphabet, as a value or -1. A table would be 256 bytes of flash to save a
- * handful of comparisons on data that is not secret and not hot: this runs ~200 KB per
- * handshake at most, against public bytes, so the branches are free and the flash is not. */
+/* The RFC 4648 4 alphabet in mask arithmetic, no branch and no table. The streaming reader only
+ * ever sees public certificates, but brisk__x509_pem_block also decodes the device's PRIVATE KEY,
+ * whose base64 characters ARE the secret - so the one function both use must not branch or index
+ * on the character (base64 decoders are a known key-loading side channel). A 256-byte table would
+ * also cost more flash than these few instructions. b64_in is all-ones when lo <= c <= hi: for
+ * c < 256 either subtraction wraps (sets bit 31) exactly when c is outside. */
+static uint32_t b64_in(uint32_t c, uint32_t lo, uint32_t hi)
+{
+    return (((c - lo) | (hi - c)) >> 31) - 1u;
+}
+
+/* The 6-bit value of c; *ok is all-ones when c is in the alphabet, else 0 (and the value 0). */
+static uint32_t b64_ct(uint32_t c, uint32_t *ok)
+{
+    uint32_t m, v = 0, k = 0;
+    m = b64_in(c, 'A', 'Z');
+    v |= m & (c - 'A');
+    k |= m;
+    m = b64_in(c, 'a', 'z');
+    v |= m & (c - ('a' - 26));
+    k |= m;
+    m = b64_in(c, '0', '9');
+    v |= m & (c + (52 - '0'));
+    k |= m;
+    m = b64_in(c, '+', '+');
+    v |= m & 62u;
+    k |= m;
+    m = b64_in(c, '/', '/');
+    v |= m & 63u;
+    k |= m;
+    *ok = k;
+    return v;
+}
+
+/* The value, or -1 outside the alphabet (the streaming reader's public branch). */
 static int b64_val(uint8_t c)
 {
-    if (c >= 'A' && c <= 'Z') {
-        return c - 'A';
-    }
-    if (c >= 'a' && c <= 'z') {
-        return c - 'a' + 26;
-    }
-    if (c >= '0' && c <= '9') {
-        return c - '0' + 52;
-    }
-    if (c == '+') {
-        return 62;
-    }
-    if (c == '/') {
-        return 63;
-    }
-    return -1;
+    uint32_t ok, v = b64_ct(c, &ok);
+    return (int)(v & ok) - (int)(~ok & 1u);
 }
 
 void brisk__x509_pem_init(brisk__x509_pem *p)
@@ -159,3 +177,132 @@ int brisk__x509_pem_feed(brisk__x509_pem *p, const uint8_t **in, size_t *len)
 }
 
 #undef BEGIN_LEN
+
+#if BRISK_ENABLE_MTLS
+/* ---- one-shot and STRICT: the device's own chain and key (see brisk_int.h for
+ * why) -------- */
+
+/* Body byte classes. The loop branches on the class, which is declassified: it
+ * says where the layout is and that a character is in the alphabet, never which
+ * character it is. */
+enum { PEM_K_BAD = 0, PEM_K_DATA = 1, PEM_K_PAD = 2, PEM_K_WS = 4, PEM_K_LF = 8, PEM_K_DASH = 16 };
+
+static uint32_t pem_eq(uint32_t c, uint32_t x)
+{
+    return b64_in(c, x, x);
+}
+
+/* The length of "-----" kw label "-----" when in[i..len) starts with it, else
+ * 0. Only ever called on a '-' at a line start, which no valid body contains:
+ * public text. */
+static size_t pem_line(const uint8_t *in, size_t len, size_t i, const char *kw, const char *label)
+{
+    size_t k = strlen(kw), l = strlen(label);
+    if (len - i < 10 + k + l || memcmp(in + i, "-----", 5) != 0 || memcmp(in + i + 5, kw, k) != 0 ||
+        memcmp(in + i + 5 + k, label, l) != 0 || memcmp(in + i + 5 + k + l, "-----", 5) != 0) {
+        return 0;
+    }
+    return 10 + k + l;
+}
+
+int brisk__x509_pem_block(const uint8_t *in, size_t len, size_t *off, const char *label,
+                          uint8_t *out, size_t cap, size_t *out_len)
+{
+    size_t i, k = 0, n = 0, chars = 0, pads = 0;
+    uint32_t acc = 0, bits = 0, bad = 0, bol = 0, hdr = 1, cls, ok, v, c;
+
+    if (out_len != NULL) {
+        *out_len = 0;
+    }
+    if (in == NULL || off == NULL || label == NULL || out_len == NULL || *off > len) {
+        return BRISK_E_ARG;
+    }
+    /* RFC 7468 2: BEGIN at a line start (the streaming reader's anchor, and
+     * OpenSSL's) and the label matched WHOLE, so "-----BEGIN EC PRIVATE KEY-----"
+     * is no "PRIVATE KEY" block and "ENCRYPTED PRIVATE KEY" never matches at all.
+     * "A '-' at a line start" is computed without a branch on the byte: this scan
+     * also crosses the bodies of blocks with other labels, and one of those may
+     * be a private key. */
+    for (i = *off; i < len; i++) {
+        uint32_t at = pem_eq(in[i], '-') & (i == 0 ? ~0u : pem_eq(in[i - 1], '\n'));
+        BRISK__CT_PUBLIC(&at, sizeof at);
+        if (at != 0 && (k = pem_line(in, len, i, "BEGIN ", label)) != 0) {
+            break;
+        }
+    }
+    if (i >= len) {
+        *off = len;
+        return BRISK_OK; /* no more blocks */
+    }
+    /* RFC 4648 3.3: "MUST reject ... characters outside the base alphabet" - SP /
+     * HTAB / CR / LF are RFC 7468's layout (its lax W without VT / FF), anything
+     * else fails the block. A bad character is accumulated, not returned on the
+     * spot: the characters are the secret. */
+    for (i += k;; i++) {
+        if (i >= len) {
+            goto fail; /* no END line */
+        }
+        c = in[i];
+        v = b64_ct(c, &ok);
+        cls = (ok & PEM_K_DATA) | (pem_eq(c, '=') & PEM_K_PAD) |
+              ((pem_eq(c, ' ') | pem_eq(c, '\t') | pem_eq(c, '\r')) & PEM_K_WS) |
+              (pem_eq(c, '\n') & PEM_K_LF) | (pem_eq(c, '-') & PEM_K_DASH);
+        BRISK__CT_PUBLIC(&cls, sizeof cls);
+        if (cls == PEM_K_DASH) {
+            break;
+        }
+        if (cls == PEM_K_LF) {
+            hdr = 0;
+        } else if ((cls & (PEM_K_DATA | PEM_K_PAD)) != 0) {
+            bad |= hdr; /* RFC 7468 2: the BEGIN line is a line of its own */
+        }
+        if (cls == PEM_K_DATA) {
+            bad |= (uint32_t)(pads != 0); /* '=' only at the end */
+            chars++;
+            acc = (acc << 6) | v;
+            bits += 6;
+            if (bits >= 8) {
+                bits -= 8;
+                if (out != NULL) {
+                    if (n >= cap) {
+                        goto fail;
+                    }
+                    out[n] = (uint8_t)(acc >> bits);
+                }
+                n++;
+            }
+        } else if (cls == PEM_K_PAD) {
+            pads++;
+            chars++;
+        } else if (cls == PEM_K_BAD) {
+            bad = 1;
+        }
+        bol = (uint32_t)(cls == PEM_K_LF);
+    }
+    /* RFC 7468 2: the END line is its own line and carries the SAME label. The
+     * count includes the pads and is a whole number of quanta, at most two '='
+     * (RFC 4648 4). */
+    if (!bol || (k = pem_line(in, len, i, "END ", label)) == 0 || chars == 0 || (chars & 3u) != 0 ||
+        pads > 2) {
+        goto fail;
+    }
+    /* RFC 4648 3.5: the pad bits of the last quantum are zero ("decoders MAY
+     * choose to reject" and this one does: one canonical encoding per key). They
+     * are secret-derived, so they are folded into one 0/1 verdict and only that
+     * is declassified. */
+    bad |= acc & ((1u << bits) - 1u);
+    bad = (bad | (0u - bad)) >> 31;
+    BRISK__CT_PUBLIC(&bad, sizeof bad);
+    if (bad != 0) {
+        goto fail;
+    }
+    *off = i + k;
+    *out_len = n;
+    return BRISK_OK;
+fail:
+    if (out != NULL) {
+        brisk__secure_zero(out, n); /* n <= cap: only written bytes are counted */
+    }
+    return BRISK_E_ARG;
+}
+#endif /* BRISK_ENABLE_MTLS */

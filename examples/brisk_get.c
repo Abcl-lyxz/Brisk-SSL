@@ -4,9 +4,8 @@
  *   brisk_get [options] host [port]          port defaults to 443
  *     -a ALPN     comma-separated ALPN list, e.g. "h2,http/1.1"
  *     -c FILE     trust only this PEM bundle (default: the system bundle)
- *     -C FILE     mTLS: client chain, concatenated DER, leaf first
- *     -K FILE     mTLS: the 32-byte raw P-256 private scalar. From a PEM key:
- *                   openssl ec -in dev.key -outform DER | tail -c +8 | head -c 32 > dev.d
+ *     -C FILE     mTLS: client chain, PEM or concatenated DER, leaf first
+ *     -K FILE     mTLS: P-256 private key, PEM, SEC1 / PKCS#8 DER or the raw 32-byte d
  *     -T FILE     resumption: offer the ticket in FILE if present, save the newest one there
  *     -r TEXT     request to send; "\n" in TEXT becomes CRLF, "" = handshake only.
  *                 Default: GET / HTTP/1.1 with Host and Connection: close
@@ -84,6 +83,7 @@ int main(int argc, char **argv)
         case 'K':
             key = read_file(v, &key_len);
             cfg.client_key = key;
+            cfg.client_key_len = key_len; /* raw d, SEC1 / PKCS#8 DER or PEM */
             break;
         case 'T':
             sink.path = v;
@@ -100,9 +100,10 @@ int main(int argc, char **argv)
             break;
         }
     }
-    if (i >= argc || (key != NULL && key_len != 32)) {
-        fprintf(stderr, "usage: brisk_get [-a alpn] [-c ca.pem] [-C chain.der -K key.d] "
-                        "[-T ticket] [-r request] host [port]\n");
+    if (i >= argc || (key != NULL && key_len == 0)) { /* 0 would mean raw d */
+        fprintf(stderr,
+                "usage: brisk_get [-a alpn] [-c ca.pem] [-C chain.pem|der -K key.pem|der|d] "
+                "[-T ticket] [-r request] host [port]\n");
         return 1;
     }
     host = argv[i];
@@ -142,7 +143,7 @@ int main(int argc, char **argv)
     free(req);
     free(chain);
     if (key != NULL) {
-        memset(key, 0, key_len); /* the library never wipes cfg.client_key: that is ours */
+        memset(key, 0, key_len); /* our buffer: the library wipes only its parsed copy */
         free(key);
     }
     if (rc != BRISK_OK) {

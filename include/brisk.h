@@ -227,10 +227,13 @@ typedef void (*brisk_ticket_fn)(void *ctx, const uint8_t *blob, size_t len);
  * certificate, 10 s timeouts. Certificate verification cannot be switched off. There is no
  * 0-RTT, renegotiation, compression or non-AEAD suite in this library.
  *
- * LIFETIMES: nothing in the config is copied. ca_file, ca_mem, alpn, client_chain, client_key
- * and ticket must stay valid and unchanged until the connection is closed (the ticket is re-read
- * if the server sends a HelloRetryRequest, the anchors whenever a chain is verified).
- * client_key is never copied and never wiped by the library: protecting and wiping it is yours.
+ * LIFETIMES: ca_file, ca_mem, alpn, client_chain and ticket are not copied: they must stay valid
+ * and unchanged until the connection is closed (the ticket is re-read if the server sends a
+ * HelloRetryRequest, the anchors whenever a chain is verified, client_chain when the server asks
+ * for it). client_key is parsed once, by the call that sets the connection up (brisk_connect,
+ * brisk_conn_init, the brisk_quic setup), into the connection, then wiped when it is closed or
+ * wiped and on every setup failure. Your client_key buffer is only read during that call and is
+ * still yours to protect and wipe.
  */
 typedef struct {
     /* Trust anchors (RFC 5280 6.1). Which store is used:
@@ -252,13 +255,26 @@ typedef struct {
      * is brisk_alpn(); whether "none" is acceptable is your decision. */
     const char *alpn;
     /* mTLS, ECDSA P-256 only (BRISK_ENABLE_MTLS; a build without it refuses these with
-     * BRISK_E_ARG). client_chain: concatenated DER certificates, leaf first, whose leaf key is
-     * P-256. Then EXACTLY ONE of client_key (the 32-byte big-endian private scalar d) or sign
-     * (a callback, e.g. into a secure element; sign_ctx is passed through). The chain is sent
-     * only when the server asks for a certificate and accepts ecdsa_secp256r1_sha256. */
+     * BRISK_E_ARG). client_chain: leaf first, whose leaf key is P-256 - concatenated DER
+     * certificates (first byte 0x30), or PEM text with one or more BEGIN CERTIFICATE blocks
+     * (other blocks and text between them are skipped; a malformed block is BRISK_E_ARG). The
+     * DER certificates may total BRISK_TLS_MAX_CLIENT_CHAIN (4096 by default) bytes, however long the text.
+     * Then EXACTLY ONE of client_key or sign (a callback, e.g. into a secure element; sign_ctx is
+     * passed through). client_key / client_key_len, auto-detected:
+     *   len 0 or 32   the 32-byte big-endian private scalar d (0 keeps v0.1 code working, so
+     *                 the buffer MUST then hold 32 bytes: when passing a file's size, refuse
+     *                 an empty file yourself - 0 never means "no key")
+     *   DER           SEC1 ECPrivateKey (RFC 5915) or PKCS#8 PrivateKeyInfo (RFC 5958)
+     *   PEM text      exactly one "EC PRIVATE KEY" or "PRIVATE KEY" block, e.g. the file
+     *                 `openssl ecparam -genkey -name prime256v1` or `openssl pkey` writes
+     * prime256v1 only; an encrypted key, another curve, a public key inside that does not match
+     * d, BER or trailing bytes are BRISK_E_ARG (re-export with `openssl pkey -in k.pem -out
+     * k2.pem`). client_key_len without client_key is BRISK_E_ARG. The chain is sent only when
+     * the server asks for a certificate and accepts ecdsa_secp256r1_sha256. */
     const uint8_t *client_chain;
     size_t client_chain_len;
     const uint8_t *client_key;
+    size_t client_key_len;
     brisk_sign_fn sign;
     void *sign_ctx;
     /* Resumption (RFC 9846 2.2): ticket = a blob from a previous on_ticket for this host, or

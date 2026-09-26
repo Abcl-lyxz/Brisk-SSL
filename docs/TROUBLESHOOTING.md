@@ -89,10 +89,18 @@ A host that does not answer at all (seen: mqtt.eclipseprojects.io:8883) ends her
 
 A caller mistake or a local limit, never the peer: a NULL or too-short buffer, an invalid host
 string (1..255 bytes, A-labels for IDNs), an ALPN entry that is empty or longer than 255, a
-`client_key` that is not 32 bytes, a device chain over `BRISK_TLS_MAX_CLIENT_CHAIN`, a stream
+`client_key` that does not parse or does not match the chain's leaf, a device chain over
+`BRISK_TLS_MAX_CLIENT_CHAIN` (DER bytes) or with a malformed PEM block, a stream
 call on a stream that is already closed. Also a `sign` callback that refused (internal_error),
 and mTLS with a `sign` callback against a TLS 1.2 server that asks for a certificate: in v0.1.0
 the callback works over TLS 1.3 only - use `client_key` there, or enable TLS 1.3 on the server.
+
+A `client_key` is refused (setup returns `BRISK_E_ARG`, your key buffer untouched) when it is
+encrypted (`ENCRYPTED PRIVATE KEY`, or `Proc-Type: 4,ENCRYPTED` inside `EC PRIVATE KEY`), on a
+curve other than P-256 (prime256v1), not the key of the leaf certificate in `client_chain`, BER
+rather than DER, or followed by trailing bytes; also a PEM file with zero or two key blocks, and
+a SEC1 key whose private scalar is 31 octets (a sloppy encoder stripped a leading zero). Fix any
+of these with `openssl pkey -in key.pem -out key2.pem` (add `-passin` for an encrypted key).
 
 ## `BRISK_E_RNG` (-2): no kernel randomness
 

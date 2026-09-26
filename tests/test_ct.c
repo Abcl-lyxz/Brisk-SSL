@@ -16,6 +16,46 @@
 #include "brisk_int.h"
 #include "test.h"
 
+#if BRISK_ENABLE_MTLS
+#    include "kat/mtls_key.inc"
+
+/* M9: brisk__x509_p256_key on the device key as raw d, SEC1 DER and PEM. Marked secret: the
+ * whole raw d; in the DER, the 32 privateKey octets (the framing - tags, lengths, OIDs - is public
+ * structure); in the PEM, the whole body between the BEGIN and END lines, newlines included, so
+ * the base64 decode itself is under test (b64_ct, the class / verdict declassification). */
+static void ct_key(void)
+{
+    static uint8_t in[1024];
+    uint8_t d[32];
+    size_t i, n, a, b;
+    for (i = 0; i < 3; i++) {
+        n = t_unhex(KEY_MTLS[i == 0 ? 0 : i == 1 ? 1 : 4].key, in, sizeof in);
+        a = 0;
+        b = n;
+        if (i == 1) {
+            a = 7; /* 30 77 | 02 01 01 | 04 20 | d */
+            b = 39;
+        } else if (i == 2) {
+            while (a < n && in[a] != '\n') {
+                a++;
+            }
+            b = n - 1; /* the END line: the last line of the file */
+            while (b > a && in[b - 1] != '\n') {
+                b--;
+            }
+        }
+        BRISK__CT_SECRET(in + a, b - a);
+        CHECKI(brisk__x509_p256_key(d, in, n) == BRISK_OK, i);
+        BRISK__CT_PUBLIC(in, n);
+        BRISK__CT_PUBLIC(d, sizeof d);
+        brisk__secure_zero(d, sizeof d);
+    }
+    (void)KEY_MTLS_CHAIN;
+    (void)KEY_MTLS_BIG_OK;
+    (void)KEY_MTLS_BIG_OVER;
+}
+#endif
+
 /* Keys and plaintexts are secret; the nonce, AAD and lengths are not. Values are arbitrary: what
  * matters is only that the bytes are marked, not what they are. */
 static uint8_t secret32[32], secret16[16], plain[96];
@@ -305,6 +345,9 @@ void test_ct(void)
 #endif
     ct_bn_rsa();
     ct_memeq();
+#if BRISK_ENABLE_MTLS
+    ct_key();
+#endif
     tls13_hs_ct_run();  /* the handshake engine over RFC 8448 sect 3, ECDHE key secret */
     tls13_rec_ct_run(); /* record seal/open, dir_init/update with secret keys */
     tls12_ct_run();     /* TLS 1.2: PRF, EMS, key block, CV, Finished, 1.2 records */

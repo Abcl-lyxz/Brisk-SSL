@@ -306,6 +306,10 @@ FUZZ = {"der": ("fuzz/fuzz_der.c src/x509/der.c", "tests/kat/der.inc"),
         # The streaming PEM reader; seeds are the bundle rows' PEM text (not hex, see fuzz_corpus).
         "pem": ("fuzz/fuzz_pem.c src/x509/bundle.c src/x509/der.c src/util.c",
                 "tests/kat/x509_bundle.inc"),
+        # The device key decoder (M9): raw d / SEC1 / PKCS#8 / PEM, and the strict one-shot PEM
+        # block decoder under it. Seeds are key.inc rows (hex; the PEM rows too).
+        "key": ("fuzz/fuzz_key.c src/x509/key.c src/x509/bundle.c src/x509/der.c "
+                "src/crypto/p256.c src/crypto/sha2.c src/crypto/hkdf.c src/util.c", "tests/kat/key.inc"),
         "ticket": ("fuzz/fuzz_ticket.c src/tls/ticket.c src/util.c",
                    "tests/kat/tls13_ticket_fuzz.inc"),
         # HPACK (RFC 7541): block sequences through one decoder + Huffman + encoder round trip.

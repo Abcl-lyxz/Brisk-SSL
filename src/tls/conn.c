@@ -338,7 +338,8 @@ CONN_SHARED int brisk__conn_core(brisk_conn *c, const brisk_cfg *cfg, const char
     int rc;
 
     if (!conn_host_ok(host, &host_len) || (cfg->ca_mem == NULL) != (cfg->ca_mem_len == 0) ||
-        (cfg->client_chain == NULL && cfg->client_chain_len != 0)) {
+        (cfg->client_chain == NULL && cfg->client_chain_len != 0) ||
+        (cfg->client_key == NULL && cfg->client_key_len != 0)) {
         return BRISK_E_ARG;
     }
     memset(c, 0, sizeof *c);
@@ -366,7 +367,16 @@ CONN_SHARED int brisk__conn_core(brisk_conn *c, const brisk_cfg *cfg, const char
     hc.ticket_ctx = c;
     hc.client_chain = cfg->client_chain;
     hc.client_chain_len = cfg->client_chain_len;
-    hc.client_key = cfg->client_key;
+    hc.client_key = cfg->client_key; /* without mTLS, hs_init refuses any key */
+#if BRISK_ENABLE_MTLS
+    /* Parsed ONCE, here, into the connection: the handshake signs with c->key, never with the
+     * caller's buffer, and brisk_conn_wipe wipes it with the rest of *c. 0 = the v0.1 raw d. */
+    if (rc == BRISK_OK && cfg->client_key != NULL) {
+        rc = brisk__x509_p256_key(c->key, cfg->client_key,
+                                  cfg->client_key_len != 0 ? cfg->client_key_len : 32);
+        hc.client_key = c->key;
+    }
+#endif
     hc.sign_rand = c->rnd + CONN_RND_S;
     hc.sign = cfg->sign;
     hc.sign_ctx = cfg->sign_ctx;
@@ -377,7 +387,11 @@ CONN_SHARED int brisk__conn_core(brisk_conn *c, const brisk_cfg *cfg, const char
     if (rc == BRISK_OK) {
         rc = brisk__tls13_hs_init(&c->hs, &hc, hs_scratch, brisk__tls13_hs_scratch_size());
     }
-    return rc == BRISK_OK ? BRISK_OK : BRISK_E_ARG;
+    if (rc != BRISK_OK) {
+        brisk__secure_zero(c->key, sizeof c->key); /* the callers wipe the whole arena too */
+        return BRISK_E_ARG;
+    }
+    return BRISK_OK;
 }
 
 int brisk__conn_setup(void *mem, size_t mem_len, const brisk_cfg *cfg, const char *host,

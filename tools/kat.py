@@ -42,6 +42,7 @@ SRC = {
     "rfc9002": "https://www.rfc-editor.org/rfc/rfc9002.txt",
     "rfc8439": "https://www.rfc-editor.org/rfc/rfc8439.txt",
     "rfc7748": "https://www.rfc-editor.org/rfc/rfc7748.txt",
+    "rfc7468": "https://www.rfc-editor.org/rfc/rfc7468.txt",
     "wp_x25519": f"{WP}x25519_test.json",
     **{f"cavp_aes_{k}": "https://csrc.nist.gov/CSRC/media/Projects/Cryptographic-Algorithm-Validation-Program/"
        f"documents/aes/{f}" for k, f in (("kat", "KAT_AES.zip"), ("mmt", "aesmmt.zip"), ("mct", "aesmct.zip"))},
@@ -12545,6 +12546,515 @@ def quic_api_vectors():
     return out, now_ms
 
 
+# ------------------------------------------------ M9: the device's P-256 private key (key.inc)
+# brisk__x509_p256_key (src/x509/key.c) and the strict one-shot PEM decoder it shares with a PEM
+# cfg.client_chain (brisk__x509_pem_block, src/x509/bundle.c).
+#   OFFICIAL   NIST CAVP 186-3 KeyPair.rsp [P-256]: the ten (d, Q) pairs, wrapped in every
+#              encoding, so the embedded-public-key check runs against NIST's Q and not against
+#              our own keygen. RFC 7468 sec 10 Figure 12, the RFC's own "PRIVATE KEY" example,
+#              is on secp256k1: an official NEGATIVE row.
+#   OPENSSL    an independent encoder. The first CAVP key's SEC1 DER must come out of
+#              `openssl pkcs8 -topk8` as our PKCS#8 and out of `openssl ec` / `openssl pkey` as our two
+#              PEM forms, byte for byte; the PBES2 key must decrypt with `openssl pkcs8`; the
+#              P-384 key must pass `openssl ec -check`. Deterministic inputs only (CAVP d, fixed
+#              salt and IV), so key.inc does not churn.
+#   GENERATED  one row per rule of RFC 5915 3, RFC 5958 2, RFC 5480 2.1.1 / 2.2, RFC 7468 2-3
+#              and RFC 4648 3.3 / 3.5. Every verdict is re-derived by py_p256_key, written from
+#              those RFCs, and must agree with what the row was built to test.
+# Wycheproof has no private-key-encoding suite (tests/kat/SOURCES.md says so).
+KEY_OID_EC, KEY_OID_P256 = "1.2.840.10045.2.1", "1.2.840.10045.3.1.7"
+KEY_OID_P384, KEY_OID_K256 = "1.3.132.0.34", "1.3.132.0.10"
+KEY_PEM_CAP = 256  # key.c: the stack buffer a PEM key is decoded into
+B64_ALPHABET = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
+OPENSSL_VERSION = None
+
+
+def py_pem_blocks(text, label, cap=None):
+    """(blocks, ok): RFC 7468 2-3 + RFC 4648 3.3 / 3.5, strict - the model of
+    brisk__x509_pem_block. `blocks` are the DER bodies labelled `label` up to the first bad one;
+    ok = 0 when a block is malformed (a byte outside the alphabet and SP/HTAB/CR/LF, '=' before
+    the end or more than two of them, a length that is not a multiple of 4, non-zero pad bits,
+    an empty body, END missing / for another label / not at a line start) or longer than cap.
+    BEGIN counts only at a line start and only as a whole-label match; blocks with other labels
+    and text between blocks are skipped."""
+    begin, end, out, i = f"-----BEGIN {label}-----", f"-----END {label}-----", [], 0
+    while True:
+        while i < len(text) and not ((i == 0 or text[i - 1] == "\n") and text.startswith(begin, i)):
+            i += 1
+        if i >= len(text):
+            return out, 1
+        j = text.find("-", i + len(begin))
+        if j < 0 or text[j - 1] != "\n" or not text.startswith(end, j):
+            return out, 0
+        if text[i + len(begin):j].split("\n", 1)[0].strip(" \t\r"):
+            return out, 0  # RFC 7468 2: nothing but layout after BEGIN on its line
+        b64 = "".join(c for c in text[i + len(begin):j] if c not in " \t\r\n")
+        data = b64.rstrip("=")
+        if (not b64 or len(b64) % 4 or len(b64) - len(data) > 2
+                or any(c not in B64_ALPHABET for c in data)):
+            return out, 0
+        der = base64.b64decode(b64)
+        if base64.b64encode(der).decode() != b64 or (cap is not None and len(der) > cap):
+            return out, 0  # RFC 4648 3.5: the pad bits are zero, one canonical encoding
+        out.append(der)
+        i = j + len(end)
+
+
+class KeyDer:
+    """A strict DER cursor for py_key_der: py_der_hdr for every header, py_der_leaf_ok for every
+    primitive, ValueError for anything else."""
+
+    def __init__(self, b, i=0, end=None):
+        self.b, self.i, self.end = b, i, len(b) if end is None else end
+
+    def peek(self):
+        return self.b[self.i] if self.i < self.end else None
+
+    def take(self, tag):
+        h = py_der_hdr(self.b, self.i, self.end)
+        if h is None or h[0] != tag:
+            raise ValueError
+        self.i = h[2]
+        if tag & 0x20:
+            return KeyDer(self.b, h[1], h[2])
+        if not py_der_leaf_ok(tag, self.b[h[1]:h[2]]):
+            raise ValueError
+        return self.b[h[1]:h[2]]
+
+    def done(self):
+        if self.i != self.end:
+            raise ValueError
+
+    def uint(self):
+        v = self.take(0x02)
+        if v[0] & 0x80:
+            raise ValueError
+        return int.from_bytes(v, "big")
+
+
+def py_key_ec(s, standalone):
+    """ECPrivateKey (RFC 5915 3) from privateKey on (the caller read version 1): (d, Q)."""
+    d = s.take(0x04)
+    if len(d) != 32:  # I2OSP(d, ceiling(log2(n)/8)): exactly 32 octets, leading zeros kept
+        raise ValueError
+    pub, ok = py_p256_keygen(int.from_bytes(d, "big"))
+    if not ok:
+        raise ValueError
+    if s.peek() == 0xA0:
+        p = s.take(0xA0)
+        if p.take(0x06) != py_oid(KEY_OID_P256):  # RFC 5480 2.1.1: namedCurve only
+            raise ValueError
+        p.done()
+    elif standalone:
+        raise ValueError  # RFC 5915 3: "MUST always include the parameters field"
+    if s.peek() == 0xA1:
+        p = s.take(0xA1)
+        if p.take(0x03) != b"\x00" + pub:  # RFC 5480 2.2: 0x04 || X || Y, and it is OUR point
+            raise ValueError
+        p.done()
+    s.done()
+    return d, pub
+
+
+def py_key_der(b, form=0):
+    """d from DER: form 0 = SEC1 or PKCS#8 (told apart by what follows the version), 1 = SEC1
+    ("EC PRIVATE KEY"), 2 = PKCS#8 ("PRIVATE KEY")."""
+    if not py_der_walk(b):  # key.c walks before its cursor reads, skipped fields included
+        raise ValueError
+    top = KeyDer(b)
+    s = top.take(0x30)
+    top.done()
+    ver = s.uint()
+    if s.peek() == 0x04 and form != 2:
+        if ver != 1:  # ecPrivkeyVer1
+            raise ValueError
+        return py_key_ec(s, True)[0]
+    if form == 1 or ver not in (0, 1):  # RFC 5958 2: v1(0) / v2(1)
+        raise ValueError
+    alg = s.take(0x30)
+    if alg.take(0x06) != py_oid(KEY_OID_EC) or alg.take(0x06) != py_oid(KEY_OID_P256):
+        raise ValueError
+    alg.done()
+    ib = s.take(0x04)
+    if not py_der_walk(ib):
+        raise ValueError
+    inner = KeyDer(ib)
+    e = inner.take(0x30)
+    inner.done()
+    if e.uint() != 1:
+        raise ValueError
+    d, pub = py_key_ec(e, False)
+    if s.peek() == 0xA0:
+        s.take(0xA0)  # attributes: skipped
+    if s.peek() == 0x81:  # "If publicKey is present, then version is set to v2"
+        if ver != 1 or s.take(0x81) != b"\x00" + pub:
+            raise ValueError
+    s.done()
+    return d
+
+
+def py_p256_key(b):
+    """d (32 bytes) or None - brisk__x509_p256_key: 32 bytes = raw d, first byte 0x30 = DER,
+    anything else = PEM with exactly one EC PRIVATE KEY / PRIVATE KEY block."""
+    try:
+        if len(b) == 32:
+            return b if 1 <= int.from_bytes(b, "big") < P256["n"] else None
+        if b[:1] == b"\x30":
+            return py_key_der(b)
+        text, found = b.decode("latin-1"), []
+        for form, label in ((1, "EC PRIVATE KEY"), (2, "PRIVATE KEY")):
+            blocks, ok = py_pem_blocks(text, label)
+            if not ok:
+                return None
+            found += [(form, der) for der in blocks]
+        if len(found) != 1 or len(found[0][1]) > KEY_PEM_CAP:
+            return None
+        return py_key_der(found[0][1], found[0][0])
+    except ValueError:
+        return None
+
+
+def k_ec(d, params="p256", point=None, bits=None, ver=1, tail=b""):
+    """ECPrivateKey. d: int (32 bytes) or the raw OCTET STRING contents; params: "p256", a TLV,
+    or None; point: the 65-byte key as a BIT STRING, or bits: a whole [1] contents TLV."""
+    parts = [x_int(ver), der_tlv(0x04, d if isinstance(d, bytes) else d.to_bytes(32, "big"))]
+    if params is not None:
+        parts.append(x_ctx(0, x_oid(KEY_OID_P256) if params == "p256" else params))
+    if point is not None or bits is not None:
+        parts.append(x_ctx(1, bits if bits is not None else x_bits(point)))
+    return x_seq(*parts, tail)
+
+
+def k_p8(inner, ver=0, alg=None, attrs=None, point=None, tail=b""):
+    """PrivateKeyInfo / OneAsymmetricKey (RFC 5958 2) around an ECPrivateKey."""
+    alg = alg if alg is not None else x_seq(x_oid(KEY_OID_EC), x_oid(KEY_OID_P256))
+    parts = [x_int(ver), alg, der_tlv(0x04, inner)]
+    if attrs is not None:
+        parts.append(der_tlv(0xA0, attrs))
+    if point is not None:
+        parts.append(der_tlv(0x81, b"\x00" + point))
+    return x_seq(*parts, tail)
+
+
+def k_pbes2(p8, salt, iv, password=b"brisk", iters=2048):
+    """EncryptedPrivateKeyInfo (RFC 5958 3) with PBES2 (RFC 8018 6.2): PBKDF2-HMAC-SHA256 and
+    AES-128-CBC, PKCS#7 padding. A REAL encrypted key (openssl decrypts it) that must be refused
+    without any decryption code on our side."""
+    key = hashlib.pbkdf2_hmac("sha256", password, salt, iters, 16)
+    pad = 16 - len(p8) % 16
+    pt, rk, prev, ct = p8 + bytes([pad]) * pad, py_aes_expand(key), iv, b""
+    for i in range(0, len(pt), 16):
+        prev = py_aes_encrypt(key, bytes(a ^ b for a, b in zip(pt[i:i + 16], prev)), rk)
+        ct += prev
+    kdf = x_seq(x_oid("1.2.840.113549.1.5.12"),
+                x_seq(der_tlv(0x04, salt), x_int(iters),
+                      x_seq(x_oid("1.2.840.113549.2.9"), b"\x05\x00")))
+    enc = x_seq(x_oid("2.16.840.1.101.3.4.1.2"), der_tlv(0x04, iv))
+    return x_seq(x_seq(x_oid("1.2.840.113549.1.5.13"), x_seq(kdf, enc)), der_tlv(0x04, ct))
+
+
+def ossl(args, data):
+    """openssl <args> -in <data>: through a file, because stdin is not binary-safe on every
+    host. A missing openssl is fatal: silently dropping the cross-check would weaken key.inc."""
+    global OPENSSL_VERSION
+    CACHE.mkdir(parents=True, exist_ok=True)
+    f = CACHE / "openssl_in.bin"
+    f.write_bytes(data)
+    try:
+        if OPENSSL_VERSION is None:
+            OPENSSL_VERSION = subprocess.run(["openssl", "version"], capture_output=True,
+                                             check=True).stdout.decode().split(" (")[0].strip()
+        r = subprocess.run(["openssl", *args, "-in", str(f)], capture_output=True)
+    except (FileNotFoundError, subprocess.CalledProcessError):
+        die("openssl (3.x) is required: key.inc cross-checks every key encoding against it")
+    finally:
+        f.unlink(missing_ok=True)
+    if r.returncode:
+        die(f"openssl {' '.join(args)}: {r.stderr.decode(errors='replace').strip()}")
+    return r.stdout
+
+
+def rfc7468_fig12():
+    """RFC 7468 sec 10 Figure 12, the one 'PRIVATE KEY' example in the RFC, as text."""
+    lines = rfc_lines(fetch("rfc7468"))
+    i = next(k for k, ln in enumerate(lines) if ln.strip() == "-----BEGIN PRIVATE KEY-----")
+    j = next(k for k in range(i, len(lines)) if lines[k].strip() == "-----END PRIVATE KEY-----")
+    return "".join(ln.strip() + "\n" for ln in lines[i:j + 1])
+
+
+def key_vectors():
+    """key.inc: KEY_KAT (in, ok, d, min_ok, note) for brisk__x509_p256_key and KEY_PEM_KAT (text,
+    cap, ok, blobs, note) for brisk__x509_pem_block; mtls_key.inc: the mTLS fixture's device key
+    and chain in every accepted form for the connection / handshake tests."""
+    n = P256["n"]
+    z = zipfile.ZipFile(io.BytesIO(fetch("cavp_ecdsa")))
+    body = rsp_sections(z.read("KeyPair.rsp").decode("latin-1"))["[P-256]"]
+    cavp = [(int(d, 16), p256_enc((int(qx, 16), int(qy, 16))))
+            for d, qx, qy in re.findall(r"d = ([0-9a-f]+)\nQx = ([0-9a-f]+)\nQy = ([0-9a-f]+)", body)]
+    if len(cavp) != 10 or any(py_p256_keygen(d)[0] != q for d, q in cavp):
+        die("key: CAVP KeyPair P-256 did not parse to 10 matching (d, Q) pairs")
+    rows = []
+
+    def row(b, ok, note):
+        if isinstance(b, str):
+            b = b.encode("latin-1")
+        got = py_p256_key(b)
+        if (got is not None) != bool(ok):
+            die(f"key: '{note}' was built to be {'valid' if ok else 'invalid'}, py_p256_key disagrees")
+        min_ok = 0
+        if got is not None:
+            # the shortest prefix that still parses (the END line of a PEM key; len for DER),
+            # and every longer prefix must parse to the same d: the C sweep relies on both.
+            # A 32-byte prefix is skipped by both sides: 32 bytes are a raw d by definition.
+            pre = [k for k in range(len(b) + 1) if k != 32 or len(b) == 32]
+            min_ok = next(k for k in pre if py_p256_key(b[:k]) is not None)
+            if any(py_p256_key(b[:k]) != got for k in pre if k >= min_ok):
+                die(f"key: '{note}' has a prefix that parses to another key")
+            if b[:1] == b"\x30" and len(b) != 32 and (min_ok != len(b) or py_p256_key(b + b"\x00")):
+                die(f"key: '{note}': DER must need every byte and refuse a trailing one")
+            if b[:1] != b"\x30" and len(b) != 32 and py_p256_key(b + b"\n") != got:
+                die(f"key: '{note}': text after the END line must be allowed")
+        rows.append((b.hex(), int(ok), got.hex() if got else "", min_ok, note))
+
+    def pem(der, label="EC PRIVATE KEY", **kw):
+        return pem_block(der, label=label, **kw)
+
+    # -- official: NIST CAVP KeyPair, every encoding
+    for i, (d, q) in enumerate(cavp):
+        sec1 = k_ec(d, point=q)
+        p8 = k_p8(k_ec(d, params=None, point=q))
+        row(d.to_bytes(32, "big"), 1, f"CAVP KeyPair P-256 #{i}: raw d")
+        row(sec1, 1, f"CAVP KeyPair P-256 #{i}: SEC1 ECPrivateKey (RFC 5915 3) with Q")
+        row(p8, 1, f"CAVP KeyPair P-256 #{i}: PKCS#8 v1 (RFC 5958 2), Q in the inner key")
+        row(k_p8(k_ec(d, params=None, point=q), ver=1, point=q), 1,
+            f"CAVP KeyPair P-256 #{i}: OneAsymmetricKey v2 with publicKey [1]")
+        row(pem(sec1), 1, f"CAVP KeyPair P-256 #{i}: EC PRIVATE KEY PEM")
+        row(pem(p8, "PRIVATE KEY"), 1, f"CAVP KeyPair P-256 #{i}: PRIVATE KEY PEM (RFC 7468 10)")
+    (d0, q0), (d1, q1) = cavp[0], cavp[1]
+    sec1, inner = k_ec(d0, point=q0), k_ec(d0, params=None, point=q0)
+    p8 = k_p8(inner)
+
+    # -- OpenSSL as a second encoder, byte for byte
+    if ossl(["pkcs8", "-topk8", "-nocrypt", "-inform", "DER", "-outform", "DER"], sec1) != p8:
+        die("key: openssl pkcs8 -topk8 SEC1 -> PKCS#8 differs from k_p8")
+    if ossl(["ec", "-inform", "DER", "-outform", "PEM"], sec1).replace(b"\r\n", b"\n") != pem(sec1).encode():
+        die("key: openssl ec -outform PEM differs from pem_block(EC PRIVATE KEY)")
+    if ossl(["pkey", "-inform", "DER", "-outform", "PEM"], sec1).replace(b"\r\n", b"\n") != \
+            pem(p8, "PRIVATE KEY").encode():
+        die("key: openssl pkey -outform PEM differs from pem_block(PRIVATE KEY)")
+
+    # -- official negative: RFC 7468 Figure 12 is a secp256k1 key
+    fig12 = rfc7468_fig12()
+    der12 = py_pem_blocks(fig12, "PRIVATE KEY")[0]
+    s = KeyDer(der12[0]).take(0x30)
+    s.uint()
+    alg = s.take(0x30)
+    if len(der12) != 1 or alg.take(0x06) != py_oid(KEY_OID_EC) or alg.take(0x06) != py_oid(KEY_OID_K256):
+        die("key: RFC 7468 Figure 12 is no longer the secp256k1 PKCS#8 key")
+    row(fig12, 0, "RFC 7468 10 Figure 12: well-formed PKCS#8, but secp256k1 (RFC 5480 2.1.1)")
+
+    # -- raw d (RFC 5915 3: 1 <= d <= n-1)
+    for v, ok, what in ((0, 0, "d = 0"), (n, 0, "d = n"), (n + 1, 0, "d = n + 1"),
+                        ((1 << 256) - 1, 0, "d = 2^256 - 1"), (1, 1, "d = 1"), (n - 1, 1, "d = n - 1"),
+                        ((0x30 << 248) | (d0 & ((1 << 248) - 1)), 1,
+                         "32 bytes starting 0x30 are a raw d, never DER")):
+        row(v.to_bytes(32, "big"), ok, f"raw {what}")
+    # -- SEC1 ECPrivateKey (RFC 5915 3)
+    for v, what in ((0, "d = 0"), (n, "d = n"), (n + 1, "d = n + 1"), ((1 << 256) - 1, "d = 2^256 - 1")):
+        row(k_ec(v), 0, f"SEC1 {what}")
+    row(k_ec(1, point=py_p256_keygen(1)[0]), 1, "SEC1 d = 1, Q = G")
+    row(k_ec(n - 1, point=py_p256_keygen(n - 1)[0]), 1, "SEC1 d = n - 1")
+    row(k_ec(d0), 1, "SEC1 without the optional publicKey")
+    row(k_ec((d0 >> 8).to_bytes(31, "big")), 0, "SEC1 privateKey of 31 octets (a leading zero stripped)")
+    row(k_ec(d0.to_bytes(32, "big")[1:]), 0, "SEC1 privateKey of 31 octets")
+    row(k_ec(b"\x00" + d0.to_bytes(32, "big")), 0, "SEC1 privateKey of 33 octets")
+    row(k_ec(d0, point=q0, ver=0), 0, "SEC1 version 0 (must be ecPrivkeyVer1)")
+    row(k_ec(d0, point=q0, ver=2), 0, "SEC1 version 2")
+    row(k_ec(d0, params=None, point=q0), 0, "SEC1 alone without [0] parameters (RFC 5915 3 MUST)")
+    row(k_ec(d0, params=x_oid(KEY_OID_P384)), 0, "SEC1 [0] secp384r1")
+    row(k_ec(d0, params=x_oid(KEY_OID_K256)), 0, "SEC1 [0] secp256k1")
+    row(k_ec(d0, params=b"\x05\x00"), 0, "SEC1 [0] implicitCurve NULL (RFC 5480 2.1.1)")
+    row(k_ec(d0, params=x_seq(x_int(1), x_seq(x_oid("1.2.840.10045.1.1"), x_int(P256["p"])))), 0,
+        "SEC1 [0] specifiedCurve (RFC 5480 2.1.1)")
+    row(x_seq(x_int(1), der_tlv(0x04, d0.to_bytes(32, "big")), x_ctx(1, x_bits(q0)),
+              x_ctx(0, x_oid(KEY_OID_P256))), 0, "SEC1 [1] before [0]")
+    row(k_ec(d0, point=q0, tail=x_ctx(2, x_int(0))), 0, "SEC1 with an unknown [2]")
+    row(k_ec(d0, point=q1), 0, "SEC1 publicKey of another CAVP key")
+    row(k_ec(d0, point=bytes([2 + (q0[-1] & 1)]) + q0[1:33]), 0, "SEC1 compressed publicKey")
+    row(k_ec(d0, bits=der_tlv(0x03, b"\x01" + q0[:-1] + bytes([q0[-1] & 0xFE]))), 0,
+        "SEC1 publicKey BIT STRING with 1 unused bit")
+    row(k_ec(d0, bits=der_tlv(0x03, b"\x00" + q0[1:])), 0, "SEC1 publicKey without the 0x04")
+    row(sec1 + b"\x00", 0, "SEC1 with a trailing 0x00")
+    row(der_tlv(0x30, sec1[2:], lenbytes=1), 0, "SEC1 with a long-form length (BER, not DER)")
+    # -- PKCS#8 / OneAsymmetricKey (RFC 5958 2)
+    row(k_p8(inner, ver=1), 1, "PKCS#8 v2 without publicKey")
+    row(k_p8(k_ec(d0), ver=0), 1, "PKCS#8 whose inner key repeats [0] prime256v1")
+    row(k_p8(k_ec(d0, params=None)), 1, "PKCS#8 inner key without Q")
+    row(k_p8(inner, attrs=x_seq(x_oid("1.2.840.113549.1.9.20"), der_tlv(0x31, der_tlv(0x1e, b"\x00k")))),
+        1, "PKCS#8 with attributes [0] (skipped)")
+    row(k_p8(inner, attrs=x_seq(x_oid("1.2.840.113549.1.9.20"),
+                                der_tlv(0x31, der_tlv(0x24, der_tlv(0x04, b"k"))))),
+        0, "PKCS#8 attributes [0] holding a constructed OCTET STRING (BER, not DER)")
+    row(k_p8(inner, attrs=x_seq(x_oid("1.2.840.113549.1.9.20"), der_tlv(0x31, b"\x02\x02\x00\x01"))),
+        0, "PKCS#8 attributes [0] holding a non-minimal INTEGER (BER, not DER)")
+    row(k_p8(inner, point=q0), 0, "PKCS#8 v1 carrying publicKey [1] (needs v2)")
+    row(k_p8(inner, ver=2), 0, "PKCS#8 version 2")
+    row(k_p8(inner, ver=1, point=q1), 0, "PKCS#8 v2 publicKey of another CAVP key")
+    row(k_p8(k_ec(d0, params=None, point=q1)), 0, "PKCS#8 inner publicKey of another CAVP key")
+    row(k_p8(k_ec(d0, params=x_oid(KEY_OID_P384), point=q0)), 0, "PKCS#8 inner [0] secp384r1")
+    row(k_p8(k_ec(d0, params=None, point=q0, ver=0)), 0, "PKCS#8 inner version 0")
+    row(k_p8(inner, alg=x_seq(x_oid("1.2.840.113549.1.1.1"), b"\x05\x00")), 0,
+        "PKCS#8 rsaEncryption")
+    row(k_p8(inner, alg=x_seq(x_oid("1.3.101.112"))), 0, "PKCS#8 id-Ed25519")
+    row(k_p8(inner, alg=x_seq(x_oid(KEY_OID_EC), x_oid(KEY_OID_K256))), 0, "PKCS#8 secp256k1")
+    row(k_p8(inner, alg=x_seq(x_oid(KEY_OID_EC), x_oid(KEY_OID_P384))), 0, "PKCS#8 secp384r1")
+    row(k_p8(inner, alg=x_seq(x_oid(KEY_OID_EC), b"\x05\x00")), 0, "PKCS#8 implicitCurve")
+    row(p8 + b"\x00", 0, "PKCS#8 with a trailing 0x00")
+    row(k_p8(inner + b"\x00"), 0, "PKCS#8 with a 0x00 after the inner ECPrivateKey")
+    # -- other curves, encrypted keys
+    d384 = int.from_bytes(hashlib.sha512(b"brisk p384 key").digest(), "big") % P384["n"]
+    x, y = py_ec_mul(P384, d384, (P384["gx"], P384["gy"]))
+    q384 = b"\x04" + x.to_bytes(48, "big") + y.to_bytes(48, "big")
+    s384 = x_seq(x_int(1), der_tlv(0x04, d384.to_bytes(48, "big")), x_ctx(0, x_oid(KEY_OID_P384)),
+                 x_ctx(1, x_bits(q384)))
+    ossl(["ec", "-inform", "DER", "-noout", "-check"], s384)
+    row(s384, 0, "a P-384 key (openssl ec -check accepts it)")
+    row(pem(s384), 0, "a P-384 key, EC PRIVATE KEY PEM")
+    enc = k_pbes2(p8, hashlib.sha256(b"brisk salt").digest()[:16],
+                  hashlib.sha256(b"brisk iv").digest()[:16])
+    # openssl pkcs8 (no -topk8) decrypts and writes the key back in SEC1 form
+    if ossl(["pkcs8", "-inform", "DER", "-passin", "pass:brisk", "-outform", "DER"], enc) != sec1:
+        die("key: openssl pkcs8 does not decrypt the PBES2 key back to ours")
+    row(enc, 0, "EncryptedPrivateKeyInfo PBES2 (RFC 5958 3): refused, never decrypted")
+    row(pem(enc, "ENCRYPTED PRIVATE KEY"), 0, "ENCRYPTED PRIVATE KEY PEM (RFC 7468 11)")
+    legacy = ("-----BEGIN EC PRIVATE KEY-----\nProc-Type: 4,ENCRYPTED\nDEK-Info: AES-128-CBC,"
+              + hashlib.sha256(b"brisk iv").hexdigest()[:32].upper() + "\n\n"
+              + pem(enc[-128:])[len("-----BEGIN EC PRIVATE KEY-----\n"):])
+    row(legacy, 0, "legacy OpenSSL encrypted EC PRIVATE KEY (Proc-Type / DEK-Info headers)")
+    # -- PEM (RFC 7468) around the good key
+    ec_pem, p8_pem = pem(sec1), pem(p8, "PRIVATE KEY")
+    b64 = base64.b64encode(sec1).decode()
+    row(pem(sec1, eol="\r\n"), 1, "EC PRIVATE KEY, CRLF")
+    row(pem(sec1, cols=76), 1, "EC PRIVATE KEY, 76 columns")
+    row(ec_pem[:-1], 1, "EC PRIVATE KEY, no newline after END")
+    row("device key\nissued 2026\n" + ec_pem + "trailing notes\n", 1, "text before and after the block")
+    row(pem(x_oid(KEY_OID_P256), "EC PARAMETERS") + ec_pem, 1,
+        "EC PARAMETERS then EC PRIVATE KEY (openssl ecparam -genkey)")
+    row(pem(MT["chain"][0], "CERTIFICATE") + p8_pem, 1, "a certificate and the key in one file")
+    row(ec_pem + p8_pem, 0, "two key blocks, EC PRIVATE KEY and PRIVATE KEY")
+    row(ec_pem + ec_pem, 0, "the same key block twice")
+    row(pem(sec1, label="PRIVATE KEY"), 0, "PRIVATE KEY label around SEC1")
+    row(pem(p8), 0, "EC PRIVATE KEY label around PKCS#8")
+    row(pem(None, body=b64[:10] + "!" + b64[11:]), 0, "a '!' in the body (RFC 4648 3.3)")
+    row(pem(None, body=b64[:10] + "\x0b" + b64[11:]), 0, "a VT in the body")
+    row(pem(None, body=b64[:8] + "=" + b64[9:]), 0, "'=' in the middle of the body")
+    row(pem(None, body=b64 + "="), 0, "'===' at the end")
+    last = len(b64.rstrip("=")) - 1
+    if last == len(b64) - 1:
+        die("key: the SEC1 test key needs padding for the pad-bit row")
+    row(pem(None, body=b64[:last] + B64_ALPHABET[B64_ALPHABET.index(b64[last]) ^ 1] + b64[last + 1:]),
+        0, "non-zero pad bits (RFC 4648 3.5)")
+    row(ec_pem.replace("-----END EC PRIVATE KEY-----", "-----END PRIVATE KEY-----"), 0,
+        "END label differs from BEGIN (RFC 7468 2)")
+    row(ec_pem.replace("-----END EC PRIVATE KEY-----\n", ""), 0, "no END line")
+    row(ec_pem.replace("\n-----END", " -----END"), 0, "END not at a line start")
+    row("  " + ec_pem, 0, "an indented BEGIN line opens no block")
+    row(ec_pem.replace("-----BEGIN EC PRIVATE KEY-----\n", "-----BEGIN EC PRIVATE KEY-----" + b64[:4] + "\n",
+                       1), 0, "base64 after BEGIN on its line (RFC 7468 2)")
+    row(ec_pem.replace("-----BEGIN EC PRIVATE KEY-----\n", "-----BEGIN EC PRIVATE KEY----- \r\n", 1), 1,
+        "SP / CR after BEGIN on its line")
+    row(pem(None, body=""), 0, "an empty body")
+    row(pem(k_p8(inner, attrs=x_seq(x_oid("1.2.840.113549.1.9.20"),
+                                    der_tlv(0x31, der_tlv(0x04, bytes(160))))), "PRIVATE KEY"), 0,
+        f"a valid PKCS#8 whose DER is over key.c's {KEY_PEM_CAP}-byte buffer")
+    row(b"", 0, "empty input")
+    row("no PEM here\n", 0, "text without a block")
+
+    # -- brisk__x509_pem_block on its own: (text, cap, ok, blobs, note), label CERTIFICATE
+    prow = []
+
+    def pr(text, note, cap=4096):
+        blobs, ok = py_pem_blocks(text, "CERTIFICATE", cap)
+        prow.append((text.encode("latin-1").hex(), cap, ok,
+                     "".join(len(b).to_bytes(2, "big").hex() + b.hex() for b in blobs), note))
+
+    rfc4648 = [("f", "Zg=="), ("fo", "Zm8="), ("foo", "Zm9v"), ("foob", "Zm9vYg=="),
+               ("fooba", "Zm9vYmE="), ("foobar", "Zm9vYmFy")]
+    for plain, b in rfc4648:
+        if base64.b64encode(plain.encode()).decode() != b:
+            die("key: RFC 4648 10 table typo")
+        pr(pem_block(None, body=b), f"RFC 4648 10: {plain} = {b}")
+    pr(pem_block(None, body=""), "RFC 4648 10: '' is an empty body, refused here")
+    pr("".join(pem_block(None, body=b) for _, b in rfc4648), "all six back to back")
+    pr(pem_block(None, body="Zh=="), "non-zero pad bits, Zh== (RFC 4648 3.5)")
+    pr(pem_block(None, body="Zm9="), "non-zero pad bits, Zm9=")
+    pr(pem_block(None, body="Zg==Zg=="), "data after '='")
+    pr(pem_block(None, body="Zm=9"), "'=' mid-quantum")
+    pr(pem_block(None, body="Zg=A"), "data after '=' that every other rule would pass")
+    pr(pem_block(None, body="Zg==="), "three '='")
+    pr(pem_block(None, body="Zg="), "3 characters")
+    pr(pem_block(None, body="Zm9vY"), "5 characters")
+    pr(pem_block(None, body="Zm9v!"), "'!' in the body")
+    pr(pem_block(None, body=" Zm9v\tYmFy \r"), "SP / HTAB / CR inside the body")
+    pr("-----BEGIN CERTIFICATE-----\nZm9v\n-----END X509 CRL-----\n", "END label mismatch")
+    pr("-----BEGIN CERTIFICATE-----\nZm9v\n", "missing END")
+    pr("-----BEGIN CERTIFICATE-----\nZm9v -----END CERTIFICATE-----\n", "END not at a line start")
+    pr(pem_block(None, body="!!!!", label="X509 CRL") + pem_block(None, body="Zm9v"),
+       "another label is skipped, not judged")
+    pr(pem_block(None, body="Zm9v", label="CERTIFICATE REQUEST") + pem_block(None, body="YmFy"),
+       "BEGIN is matched whole: CERTIFICATE REQUEST is another label")
+    pr("hdr\n" + pem_block(None, body="Zm9v", eol="\r\n") + "mid\n" + pem_block(None, body="YmFy"),
+       "text around blocks, CRLF")
+    pr("  " + pem_block(None, body="Zm9v"), "an indented BEGIN is no block")
+    pr("-----BEGIN CERTIFICATE-----Zm9v\n-----END CERTIFICATE-----\n", "body on the BEGIN line")
+    pr("-----BEGIN CERTIFICATE-----Zm9v\nYmFy\n-----END CERTIFICATE-----\n",
+       "text after BEGIN, then a valid body")
+    pr("-----BEGIN CERTIFICATE-----==\nZm9v\n-----END CERTIFICATE-----\n", "'=' on the BEGIN line")
+    pr("-----BEGIN CERTIFICATE-----\t \r\nZm9v\n-----END CERTIFICATE-----\n",
+       "HTAB / SP / CR after BEGIN")
+    pr(pem_block(None, body="Zm9v") + pem_block(None, body="Zm9"), "a good block, then a bad one")
+    pr(pem_block(None, body="Zm9vYmFy"), "6 bytes at cap 6", cap=6)
+    pr(pem_block(None, body="Zm9vYmFy"), "6 bytes over cap 5", cap=5)
+    pr("", "empty text")
+
+    # -- mtls_key.inc: the mTLS fixture's device identity in every accepted form
+    dev_d, chain = MT["dev_d"], MT["chain"]
+    dq = py_p256_keygen(dev_d)[0]
+    dsec1, dinner = k_ec(dev_d, point=dq), k_ec(dev_d, params=None, point=dq)
+    mkeys = [(dev_d.to_bytes(32, "big"), 1, "raw d"), (dsec1, 1, "SEC1 DER"),
+             (k_p8(dinner), 1, "PKCS#8 v1 DER"), (k_p8(dinner, ver=1, point=dq), 1, "PKCS#8 v2 DER"),
+             (pem(dsec1).encode(), 1, "EC PRIVATE KEY PEM"),
+             (pem(k_p8(dinner), "PRIVATE KEY").encode(), 1, "PRIVATE KEY PEM"),
+             (pem(k_ec(dev_d + 1)).encode(), 0, "a valid key that is not the leaf's"),
+             (k_pbes2(k_p8(dinner), bytes(16), bytes(16)), 0, "the device key, encrypted")]
+    for b, ok, note in mkeys:
+        if (py_p256_key(b) == dev_d.to_bytes(32, "big")) != bool(ok):
+            die(f"key: mTLS key '{note}' does not parse as intended")
+    leaf = chain[0]
+    cpem = "".join(pem_block(c) for c in chain)
+    mchains = [(cpem, 1, "PEM chain"),
+               ("device chain\n" + pem_block(chain[0], eol="\r\n") + "issuing CA\n"
+                + pem(dsec1) + pem_block(chain[1], eol="\r\n"), 1,
+                "PEM chain, text between blocks, a key block mixed in, CRLF"),
+               (pem(dsec1), 0, "no CERTIFICATE block"),
+               (pem_block(leaf + b"\x00") + pem_block(chain[1]), 0, "a block holding a TLV and a byte"),
+               (cpem.replace("-----END CERTIFICATE-----\n", "", 1), 0, "a block without END"),
+               (pem_block(None, body="MII!") + pem_block(chain[1]), 0, "bad base64")]
+    for text, ok, note in mchains:
+        blocks, good = py_pem_blocks(text, "CERTIFICATE")
+        if ok and (not good or blocks != chain):
+            die(f"key: mTLS chain '{note}' does not decode to the fixture chain")
+    maxc = int(re.search(r"#\s*define\s+BRISK_TLS_MAX_CLIENT_CHAIN\s+(\d+)",
+                         (ROOT / "include" / "brisk_config.h").read_text()).group(1))
+    k = maxc // len(leaf)
+    big_ok, big_over = pem_block(leaf) * k, pem_block(leaf) * (k + 1)
+    if len(big_ok) <= maxc:
+        die("key: the at-the-limit PEM chain must be longer than the limit as text")
+    print(f"  key: {len(rows)} key rows, {len(prow)} PEM decoder rows, {len(mkeys)} mTLS keys, "
+          f"{len(mchains)} mTLS chains; {OPENSSL_VERSION}")
+    return rows, prow, mkeys, mchains, big_ok, big_over
+
+
 def main():
     OUT.mkdir(parents=True, exist_ok=True)
     print("fetching + verifying official vectors ...")
@@ -12671,6 +13181,7 @@ def main():
     rec_rows, rec_nonces, rec_hsmsg, rec_seeds, rec_fuzz_key = tls13_records()
     conn_rows, conn_fx, conn_rnd, conn_pem, conn_blob, conn_now, conn_nst, conn_streams =         tls13_conn(True)
     conn13_rows = tls13_conn(False)[0]
+    key_rows, key_pem, key_mtls, key_mchains, key_big_ok, key_big_over = key_vectors()
     tls12_rfc_checks()
     tls12_prf = tls12_prf_vectors()
     tls12_rec = tls12_record_vectors()
@@ -12817,6 +13328,20 @@ def main():
                  f"static const char TLS13_CONN_BLOB[] = {cstr(conn_blob.hex())};\n"
                  f"static const long long TLS13_CONN_NOW_MS = {conn_now}LL;\n"
                  f"static const char TLS13_CONN_NST_LONG[] = {cstr(conn_nst.hex())};\n")
+    # tests/test_key.c + fuzz/fuzz_key.c (M9): the device key decoder and the one-shot PEM decoder
+    emit("key.inc", "struct key_kat KEY_KAT", key_rows,
+         lambda r: f'{cstr(r[0])}, {r[1]}, {cstr(r[2])}, {r[3]}, "{cesc(r[4])}"')
+    emit("key.inc", "struct key_pem_kat KEY_PEM_KAT", key_pem,
+         lambda r: f'{cstr(r[0])}, {r[1]}, {r[2]}, {cstr(r[3])}, "{cesc(r[4])}"', append=True)
+    # tests/test_conn.c, test_tls13_hs.c, test_tls12_hs.c, test_quic_api.c, test_ct.c: the mTLS
+    # fixture's device key and chain in every accepted form (M9)
+    emit("mtls_key.inc", "struct key_mtls_kat KEY_MTLS", key_mtls,
+         lambda r: f'{cstr(r[0].hex())}, {r[1]}, "{cesc(r[2])}"')
+    emit("mtls_key.inc", "struct key_chain_kat KEY_MTLS_CHAIN", key_mchains,
+         lambda r: f'{cstr(r[0].encode().hex())}, {r[1]}, "{cesc(r[2])}"', append=True)
+    with open(OUT / "mtls_key.inc", "a", newline="\n") as fh:
+        fh.write(f"static const char KEY_MTLS_BIG_OK[] = {cstr(key_big_ok.encode().hex())};\n"
+                 f"static const char KEY_MTLS_BIG_OVER[] = {cstr(key_big_over.encode().hex())};\n")
     # Seeds for fuzz/fuzz_conn.c (tools/dev.py fuzz conn): chunk-size byte 0 (all at once) and
     # the server's record stream of every public-API flow.
     emit("tls13_conn_fuzz.inc", "struct tls13_fuzz_seed TLS13_CONN_FUZZ_SEED",
@@ -13254,6 +13779,22 @@ def main():
         "  log), written from the RFC text with the section of each MUST in its note. aioquic's\n"
         "  H3Connection was planned as the second implementation; it is not used (it needs a stub\n"
         "  QUIC connection and is not installed here) - interop is the oracle.\n\n"
+        "- **Device private key (M9, `key.inc`, `mtls_key.inc`).** OFFICIAL: NIST CAVP 186-3\n"
+        "  `KeyPair.rsp` [P-256] - all ten (d, Q) pairs as raw d, SEC1 (RFC 5915), PKCS#8 v1 and v2\n"
+        "  (RFC 5958) and both PEM labels, so the embedded-public-key check is held to NIST's Q -\n"
+        "  and RFC 7468 sec 10 Figure 12, a well-formed PKCS#8 key on secp256k1, which is a\n"
+        "  NEGATIVE row (pinned above as `rfc7468`). INDEPENDENT ENCODER: "
+        + (OPENSSL_VERSION or "OpenSSL") + ". The\n"
+        "  Python-built PKCS#8 and both PEM forms of the first CAVP key are byte-identical to\n"
+        "  `openssl pkcs8 -topk8` / `pkey` / `ec` output, the PBES2 EncryptedPrivateKeyInfo decrypts with\n"
+        "  `openssl pkcs8`, the P-384 negative passes `openssl ec -check`. GENERATED: one row per\n"
+        "  RFC 5915 / 5958 / 5480 / 7468 / 4648 rule (range of d, octet count, versions, curve\n"
+        "  choices, public-key match, trailing bytes, BER lengths, labels, base64 strictness,\n"
+        "  pad bits), each verdict re-derived by `py_p256_key`. **Wycheproof has no private-key\n"
+        "  encoding suite** (its EC files cover ECDH / ECDSA public inputs only), so there is no\n"
+        "  Wycheproof source for this item; the scalar and point arithmetic behind keygen(d) is\n"
+        "  covered by the existing Wycheproof ECDH / ECDSA rows. BER is refused on purpose,\n"
+        "  although RFC 5958 2 asks receivers to accept it (fail closed; every encoder emits DER).\n\n"
         "## x509-limbo skip tally\n\n"
         f"limbo.json carries {len(x509_limbo) + sum(x509_limbo_skipped.values())} testcases and this "
         f"library exercises {len(x509_limbo)} of them.\n"

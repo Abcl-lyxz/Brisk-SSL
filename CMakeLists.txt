@@ -33,7 +33,8 @@ add_library(brisk STATIC
     src/x509/cert.c       # one certificate: fields, extensions, validity dates
     src/x509/chain.c      # path building to a trust anchor + the signature checks
     src/x509/name.c       # RFC 9525 service identity: host name / IP against the SAN
-    src/x509/bundle.c     # PEM certificates out of a byte stream, sans-I/O
+    src/x509/bundle.c     # PEM certificates out of a byte stream, sans-I/O; strict one-shot PEM
+    src/x509/key.c        # the device P-256 key: raw d, SEC1 / PKCS#8 DER, PEM (BRISK_ENABLE_MTLS)
     src/tls/keyschedule.c # TLS 1.3 key schedule (RFC 9846 sect 7.1) + Finished + exporter
     src/tls/handshake.c   # TLS 1.3 client handshake engine (RFC 9846 sect 4), sans-I/O
     src/tls/tls12.c       # TLS 1.2 client half of the engine (empty TU without BRISK_ENABLE_TLS12)
@@ -94,7 +95,7 @@ if(BRISK_BUILD_TESTS)
     enable_testing()
     add_executable(brisk_tests tests/test_main.c tests/test_hash.c tests/test_aead.c tests/test_aes.c
                                tests/test_x25519.c tests/test_p256.c tests/test_p384.c
-                               tests/test_rsa.c tests/test_der.c tests/test_x509.c
+                               tests/test_rsa.c tests/test_der.c tests/test_x509.c tests/test_key.c
                                tests/test_ct.c tests/test_tls13_ks.c
                                tests/test_tls13_hs.c tests/test_tls13_rec.c tests/test_conn.c
                                tests/test_tls12_prf.c tests/test_tls12_rec.c tests/test_tls12_hs.c
@@ -129,6 +130,8 @@ if(BRISK_BUILD_TESTS)
     set_tests_properties(der PROPERTIES TIMEOUT 900)
     add_test(NAME x509 COMMAND brisk_tests x509)
     set_tests_properties(x509 PROPERTIES TIMEOUT 900)
+    add_test(NAME key COMMAND brisk_tests key)
+    set_tests_properties(key PROPERTIES TIMEOUT 900)
     add_test(NAME ct COMMAND brisk_tests ct) # under valgrind in `dev.py ct`; here just a smoke run
     set_tests_properties(ct PROPERTIES TIMEOUT 900)
     add_test(NAME tls13_ks COMMAND brisk_tests tls13_ks)

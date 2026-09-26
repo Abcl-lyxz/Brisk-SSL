@@ -827,31 +827,68 @@ static int hs_on_cv(brisk__tls13_hs *hs, const uint8_t *m, size_t n)
 }
 
 #if BRISK_ENABLE_MTLS
-/* The CertificateEntry list of the device chain (4.4.2): per certificate cert_data<1..2^24-1>
- * and empty extensions (4.5.1: client entry extensions only answer CR extensions, and we answer
- * none). Returns its length, written to out when non-NULL; 0 if the chain is not a sequence of
- * DER TLVs (refused at hs_init, so never at handshake time). */
-HS_SHARED size_t brisk__hs_chain_entries(const uint8_t *chain, size_t len, uint8_t *out, int ext)
+/* The next certificate of the device chain at *off. DER (first byte 0x30): *der points into the
+ * chain. PEM (anything else): the next CERTIFICATE block (other labels, text between blocks
+ * skipped) decoded by the strict brisk__x509_pem_block into buf[cap] - buf NULL = only its
+ * length. 1 = a certificate, 0 = the end, -1 = malformed. */
+static int hs_chain_next(const uint8_t *chain, size_t len, size_t *off, uint8_t *buf, size_t cap,
+                         const uint8_t **der, size_t *dl)
 {
     brisk__der c;
-    const uint8_t *tlv;
-    size_t tl, n = 0;
-    brisk__der_init(&c, chain, len);
-    while (brisk__der_peek(&c) != -1) {
-        if (brisk__der_tlv(&c, &tlv, &tl) != BRISK_OK) {
-            return 0;
+    if (*off >= len) {
+        return 0;
+    }
+    if (chain[0] != BRISK__DER_SEQUENCE) {
+        *der = buf;
+        if (brisk__x509_pem_block(chain, len, off, "CERTIFICATE", buf, cap, dl) != BRISK_OK) {
+            return -1;
+        }
+        return *dl != 0;
+    }
+    brisk__der_init(&c, chain + *off, len - *off);
+    if (brisk__der_tlv(&c, der, dl) != BRISK_OK) {
+        return -1;
+    }
+    *off += *dl;
+    return 1;
+}
+
+/* The CertificateEntry list of the device chain (4.4.2): per certificate cert_data<1..2^24-1>
+ * and empty extensions (4.5.1: client entry extensions only answer CR extensions, and we answer
+ * none). Returns its length, written to out[cap] when out is non-NULL; 0 if the chain is not a
+ * sequence of DER TLVs or of PEM certificate blocks (refused at hs_init, so never at handshake
+ * time) or would not fit cap. PEM is decoded twice, never buffered: the size pass, then straight
+ * into each entry of the reserved flight. Both read the caller's bytes, which must not change
+ * (the brisk_cfg LIFETIMES rule); if they did, cap turns an overflow into a refusal. */
+HS_SHARED size_t brisk__hs_chain_entries(const uint8_t *chain, size_t len, uint8_t *out, size_t cap,
+                                         int ext)
+{
+    const uint8_t *der;
+    size_t off = 0, dl, n = 0;
+    size_t e = ext ? 2u : 0u; /* TLS 1.2 entries carry no extensions (RFC 5246 7.4.2) */
+    int r;
+    for (;;) {
+        size_t room = out != NULL && cap >= n + 3 + e ? cap - n - 3 - e : 0;
+        r = hs_chain_next(chain, len, &off, out != NULL ? out + n + 3 : NULL, room, &der, &dl);
+        if (r != 1) {
+            break;
         }
         if (out != NULL) {
-            brisk__store_be24(out + n, (uint32_t)tl);
-            memcpy(out + n + 3, tlv, tl);
+            if (dl > room) {
+                return 0;
+            }
+            brisk__store_be24(out + n, (uint32_t)dl);
+            if (der != out + n + 3) {
+                memcpy(out + n + 3, der, dl); /* DER; a PEM block was decoded in place */
+            }
             if (ext) {
-                out[n + 3 + tl] = 0;
-                out[n + 4 + tl] = 0;
+                out[n + 3 + dl] = 0;
+                out[n + 4 + dl] = 0;
             }
         }
-        n += 3 + tl + (ext ? 2u : 0u); /* TLS 1.2 entries carry no extensions (RFC 5246 7.4.2) */
+        n += 3 + dl + e;
     }
-    return brisk__der_err(&c) == BRISK_OK ? n : 0;
+    return r == 0 ? n : 0;
 }
 #endif
 
@@ -868,7 +905,7 @@ static int hs_client_auth(brisk__tls13_hs *hs)
     int rc;
 
     if (hs->cfg.client_chain != NULL && hs->cr_sig_ok) {
-        n = brisk__hs_chain_entries(hs->cfg.client_chain, hs->cfg.client_chain_len, NULL, 1);
+        n = brisk__hs_chain_entries(hs->cfg.client_chain, hs->cfg.client_chain_len, NULL, 0, 1);
         q = n != 0 ? brisk__hs_reserve(hs, BRISK__EPOCH_HANDSHAKE, 8 + n) : NULL;
         if (q == NULL) {
             return BRISK_E_ARG; /* the ClientHello was never pulled: see hs_cfg.client_chain */
@@ -877,7 +914,10 @@ static int hs_client_auth(brisk__tls13_hs *hs)
         brisk__store_be24(q + 1, (uint32_t)(4 + n));
         q[4] = 0;
         brisk__store_be24(q + 5, (uint32_t)n);
-        brisk__hs_chain_entries(hs->cfg.client_chain, hs->cfg.client_chain_len, q + 8, 1);
+        if (brisk__hs_chain_entries(hs->cfg.client_chain, hs->cfg.client_chain_len, q + 8, n, 1) !=
+            n) {
+            return BRISK_E_ARG; /* the chain changed since the size pass (LIFETIMES) */
+        }
         brisk__hs_th_add(hs, q, 8 + n);
         /* 4.5.2: ecdsa_secp256r1_sha256 over the client context string || TH(CH..Certificate) */
         brisk__hs_th_snap(hs, th);
@@ -1131,27 +1171,30 @@ size_t brisk__tls13_hs_scratch_size(void)
 #if BRISK_ENABLE_MTLS
 /* The device chain, checked once as configuration (RFC 9846 4.5.1.2): every certificate parses,
  * the leaf is P-256 and may sign (digitalSignature when keyUsage is present), the key is the
- * leaf's, and the chain is within BRISK_TLS_MAX_CLIENT_CHAIN (the 2048-byte base of the output
- * queue covers the 5 bytes per entry, CertificateVerify and Finished). */
-static int hs_client_cfg_ok(const brisk__tls13_hs_cfg *cfg)
+ * leaf's, and the DER certificates total at most BRISK_TLS_MAX_CLIENT_CHAIN - whatever the chain
+ * is as text: a PEM chain is ~1.37x its DER (the 2048-byte base of the output queue covers the 5
+ * bytes per entry, CertificateVerify and Finished). A PEM block is decoded into `scratch`, the hs
+ * scratch that hs_init has not started using yet. */
+static int hs_client_cfg_ok(const brisk__tls13_hs_cfg *cfg, uint8_t *scratch, size_t cap)
 {
     brisk__x509_cert x;
-    brisk__der c;
-    const uint8_t *tlv;
+    const uint8_t *der;
     uint8_t pub[65];
-    size_t tl, n = brisk__hs_chain_entries(cfg->client_chain, cfg->client_chain_len, NULL, 1);
-    int first = 1;
+    size_t off = 0, dl, total = 0;
+    size_t n = brisk__hs_chain_entries(cfg->client_chain, cfg->client_chain_len, NULL, 0, 1);
+    int first = 1, r;
 
     if ((cfg->client_key != NULL) == (cfg->sign != NULL) ||
         (cfg->client_key != NULL && cfg->sign_rand == NULL) || n == 0 ||
-        cfg->client_chain_len > BRISK_TLS_MAX_CLIENT_CHAIN ||
         n > BRISK__TLS13_OUT_MAX - (8 + 8 + 72 + 4 + BRISK_HASH_MAX_LEN)) {
         return 0;
     }
-    brisk__der_init(&c, cfg->client_chain, cfg->client_chain_len);
-    while (brisk__der_peek(&c) != -1) {
-        if (brisk__der_tlv(&c, &tlv, &tl) != BRISK_OK ||
-            brisk__x509_parse(&x, tlv, tl) != BRISK_OK) {
+    while ((r = hs_chain_next(cfg->client_chain, cfg->client_chain_len, &off, scratch, cap, &der,
+                              &dl)) == 1) {
+        total += dl;
+        /* brisk__x509_parse walks the whole buffer first: exactly ONE DER value, so a PEM block
+         * holding a certificate and a stray byte is refused there */
+        if (total > BRISK_TLS_MAX_CLIENT_CHAIN || brisk__x509_parse(&x, der, dl) != BRISK_OK) {
             return 0;
         }
         if (first) {
@@ -1160,13 +1203,18 @@ static int hs_client_cfg_ok(const brisk__tls13_hs_cfg *cfg)
                 (x.key_usage != 0 && !(x.key_usage & BRISK__X509_KU_DIGITAL_SIGNATURE))) {
                 return 0;
             }
-            if (cfg->client_key != NULL && (brisk__p256_keygen(pub, cfg->client_key) != BRISK_OK ||
-                                            memcmp(pub, x.key, sizeof pub) != 0)) {
-                return 0; /* the point is public; only keygen touches d, in constant time */
+            if (cfg->client_key != NULL) {
+                if (brisk__p256_keygen(pub, cfg->client_key) != BRISK_OK) {
+                    return 0;
+                }
+                BRISK__CT_PUBLIC(pub, sizeof pub); /* the point is public; only keygen touches d */
+                if (memcmp(pub, x.key, sizeof pub) != 0) {
+                    return 0;
+                }
             }
         }
     }
-    return 1;
+    return r == 0;
 }
 #endif
 
@@ -1180,7 +1228,7 @@ int brisk__tls13_hs_init(brisk__tls13_hs *hs, const brisk__tls13_hs_cfg *cfg, ui
     }
     if (cfg->client_chain != NULL || cfg->client_key != NULL || cfg->sign != NULL) {
 #if BRISK_ENABLE_MTLS
-        if (cfg->client_chain == NULL || !hs_client_cfg_ok(cfg)) {
+        if (cfg->client_chain == NULL || !hs_client_cfg_ok(cfg, scratch, HS_IN_CAP)) {
             return BRISK_E_ARG;
         }
 #else
