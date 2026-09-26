@@ -1,41 +1,32 @@
-# Handoff - 2026-09-25 (session 23)
+# Handoff - 2026-09-26 (session 24)
 
-## Done - live testing, M8 complete, v0.1.0 released
-- 1249a9a **tls:** first found by live testing. Tickets never arrived from real servers because
-  CH1 carried psk_key_exchange_modes only alongside a PSK. It now sends them whenever
-  cfg.on_ticket is set. cloudflare/google resume; github/facebook don't resume with OpenSSL either.
-- 9badc3e **tls:** new public `BRISK_E_INSECURE` (-10) for TLS 1.2 without EMS/RI and for
-  TLS <= 1.1 (the alert is unchanged). CH2 keeps psk modes when the HRR drops the PSK.
-  rfc-auditor: clean.
-- e54a699 **build:** fuzz_pem, tools/amalg.py plus `dev.py amalg` (every profile, gcc+clang
-  -Werror, suite against dist/), size budgets (`size/budget.json`, `dev.py size --profiles`),
-  CMake install(), openwrt/brisk-ssl.
-- ce03993 / 7ad5731 **docs:** API.md is generated (tools/apidoc.py). Added TROUBLESHOOTING.md.
-  README, SECURITY, ARCHITECTURE, CONFIG and CLAUDE.md now match the code. Version is "0.1.0".
-- **v0.1.0 tagged at 7ad5731**, and the GitHub release has dist/brisk.{c,h} attached. CI was
-  green (all archs, amalg, size budgets) and interop was 14/14 on the same commit.
-- e2fdc8f **build:** the OpenWrt Makefile is pinned to the commit and PKG_MIRROR_HASH. The SDK
-  (openwrt/sdk:x86-64-24.10.2) downloads, verifies and builds from the tag.
+## Done - M9 box 1: key/chain formats
+- 34a575f **tls:** new `cfg.client_key_len` field. Accepted key forms:
+  - 0 or 32 = raw d (v0.1 compat);
+  - SEC1 or PKCS#8, as DER or PEM, auto-detected; prime256v1 only.
+  - The key is parsed once into `brisk_conn.key`, which is wiped on close and on setup failure.
+  - `client_chain` may also be PEM. It is decoded straight into the hs output in two passes, with no per-conn buffer.
+  - The strict constant-time base64 `brisk__x509_pem_block` in src/x509/bundle.c is shared with the streaming reader.
+  - New files: src/x509/key.c, tests/test_key.c, fuzz/fuzz_key.c, tests/kat/{key,mtls_key}.inc (openssl via kat.py).
+  - Examples now read PEM keys directly. Host tests and all 10 archs are green.
+- Size: DEFAULT/FULL grew 3-4 KB flash, TINY 0.1-0.3 KB. **mips DEFAULT is at 138.1 of 144 KB budget**.
 
 ## In progress
-- Nothing. The tree is clean and every ROADMAP milestone (M1-M8) is ticked.
+- Nothing. The tree is clean.
 
-## Next up - ROADMAP M9 "Open API (0.2)" (agreed with the user 2026-09-25, session 24)
-1. First M9 box: key/chain formats (`cfg.client_key_len`, SEC1/PKCS#8/PEM, PEM client_chain).
-   Then the custom transport, public crypto API, compile-time knobs and runtime cfg, in order.
-2. Full plan with rationale: ROADMAP M9 section. wolfSSL was the reference for the knob list.
-   The runtime time floor and SPKI pins are now M9 items. The TLS 1.2 sign callback, PSK and
-   the .so build are in ROADMAP `## Backlog`.
+## Next up - ROADMAP M9 box 2: custom transport
+- `brisk_connect_fd`: the caller opens the socket/fd, and brisk_close does not close it.
+- `brisk_connect_io`: send/recv callbacks, for UART, tunnels and tests.
+- net_flush/net_fill go through an io vtable (src/os/linux_net.c, src/tls/conn.c).
+- read/write must work for non-socket fds.
+- Watch the mips DEFAULT flash headroom (6 KB left). The M9 compile-time knobs box is the way to buy some back.
 
 ## Decisions / gotchas
-- EMS stays required (user, 2026-09-25): an old server gets a clear E_INSECURE, not an opt-in knob.
-- Live-run findings are in docs/TROUBLESHOOTING.md.
-  - E_INSECURE: badssl.com and broker.hivemq.com.
-  - Unreachable: mqtt.eclipseprojects.io:8883.
-  - Private CA: test.mosquitto.org, so E_AUTH unless you pass ca_file.
-- OpenWrt-built binaries need libgcc_s: a weak __register_frame_info from the toolchain's
-  crtbegin. It's in default images, so this isn't a Brisk bug.
-- The Bash tool heredoc eats backslashes ("\\n" becomes a real newline). Write Python snippets
-  with the Write tool, or use chr(92).
-- Low memory on this PC reaps background watchers. Poll CI with a foreground loop instead
-  (`gh run view ID --json status,conclusion`, sleep 60, 9 min per call).
+- The client_key_len==0 => raw 32 bytes rule is kept for v0.1 code, so the docs tell callers to refuse an empty key file themselves.
+- The PEM chain limit counts decoded DER (BRISK_TLS_MAX_CLIENT_CHAIN). brisk_config.h now errors if that is greater than BRISK_TLS_MAX_HS_MSG.
+- The all-arch run gets killed by low memory when it runs in the background. What works: run it in the foreground in two groups (4 archs, then 6) with `-j 2`, and poll the log with a foreground loop.
+- EMS stays required (user, 2026-09-25): an old server gets a clear E_INSECURE.
+- Live-run findings are in docs/TROUBLESHOOTING.md (badssl/hivemq E_INSECURE, mosquitto private CA).
+- OpenWrt-built binaries need libgcc_s (weak __register_frame_info). It is not a Brisk bug.
+- The Bash heredoc eats backslashes. Write code with the Write tool or use chr(92).
+- Poll CI in the foreground (`gh run view ID --json status,conclusion`, sleep 60).
