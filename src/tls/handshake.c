@@ -124,18 +124,57 @@ static const uint16_t CH_ALLOWED[] = {EXT_SERVER_NAME,
 
 /* The library's default offer (brisk_int.h, brisk__tls13_ch_params). ChaCha20 first: AES here
  * is bitsliced software on every target (docs/ARCHITECTURE.md). */
-static const uint16_t DEF_SUITES[] = {0x1303, 0x1301, 0x1302};
-static const uint16_t DEF_GROUPS[] = {GROUP_X25519, GROUP_P256};
+static const uint16_t DEF_SUITES[] = {
+#if BRISK_ENABLE_CHACHA
+    0x1303,
+#endif
+#if BRISK_ENABLE_AESGCM
+    0x1301,
+#endif
+#if BRISK_ENABLE_AES256
+    0x1302,
+#endif
+};
+static const uint16_t DEF_GROUPS[] = {
+#if BRISK_ENABLE_X25519
+    GROUP_X25519,
+#endif
+#if BRISK_ENABLE_P256_KX
+    GROUP_P256,
+#endif
+};
 #if BRISK_ENABLE_TLS12
 /* Appended when ch_params.tls12 is set: ECDHE + AEAD only (RFC 9325 4.2, RFC 9846 E.5), ChaCha20
  * first as above - RFC 7905 2, RFC 5289 3.2. Never CBC, static RSA, DHE, RC4 or the SCSV. */
-static const uint16_t DEF12_SUITES[] = {0xCCA9, 0xCCA8, 0xC02B, 0xC02F, 0xC02C, 0xC030};
+static const uint16_t DEF12_SUITES[] = {
+#    if BRISK_ENABLE_CHACHA
+    0xCCA9,
+#        if BRISK_ENABLE_RSA
+    0xCCA8,
+#        endif
+#    endif
+#    if BRISK_ENABLE_AESGCM
+    0xC02B,
+#        if BRISK_ENABLE_RSA
+    0xC02F,
+#        endif
+#    endif
+#    if BRISK_ENABLE_AES256
+    0xC02C,
+#        if BRISK_ENABLE_RSA
+    0xC030,
+#        endif
+#    endif
+};
 #endif
 static const uint16_t DEF_SIGS[] = {0x0403,
 #if BRISK_ENABLE_P384
                                     0x0503,
 #endif
-                                    0x0804, 0x0805, 0x0806, 0x0401, 0x0501, 0x0601};
+#if BRISK_ENABLE_RSA
+                                    0x0804, 0x0805, 0x0806, 0x0401, 0x0501, 0x0601
+#endif
+};
 
 /* A CertificateVerify is at most scheme(2) + len(2) + the widest signature this build checks:
  * RSA at BRISK_RSA_MAX_BITS. A DER ECDSA-Sig-Value at P-384 is ~104 bytes, far below. */
@@ -175,12 +214,16 @@ HS_SHARED brisk_hash_alg brisk__hs_alg(uint16_t suite)
 
 static int hs_known_suite(uint16_t s)
 {
-    return s == 0x1301 || s == 0x1302 || s == 0x1303;
+    return (BRISK_ENABLE_AESGCM && s == 0x1301) || (BRISK_ENABLE_AES256 && s == 0x1302) ||
+           (BRISK_ENABLE_CHACHA && s == 0x1303);
 }
 
 static size_t hs_share_len(uint16_t group)
 {
-    return group == GROUP_X25519 ? 32u : group == GROUP_P256 ? 65u : 0u; /* 4.3.8.2, RFC 7748 */
+    /* 4.3.8.2, RFC 7748; 0 = not a group of this build */
+    return BRISK_ENABLE_X25519 && group == GROUP_X25519    ? 32u
+           : BRISK_ENABLE_P256_KX && group == GROUP_P256 ? 65u
+                                                         : 0u;
 }
 
 HS_SHARED int brisk__hs_in_list(const uint16_t *list, size_t n, uint16_t v)
@@ -2035,6 +2078,7 @@ static unsigned cv_scheme(uint16_t scheme, brisk_hash_alg *alg, uint8_t *family)
         *family = BRISK__X509_SIG_ECDSA;
         return BRISK__X509_KEY_P384;
 #endif
+#if BRISK_ENABLE_RSA
     case 0x0804:
         *alg = BRISK_HASH_SHA256;
         return BRISK__X509_KEY_RSA;
@@ -2044,6 +2088,7 @@ static unsigned cv_scheme(uint16_t scheme, brisk_hash_alg *alg, uint8_t *family)
     case 0x0806:
         *alg = BRISK_HASH_SHA512;
         return BRISK__X509_KEY_RSA;
+#endif
     default:
         return 0;
     }
@@ -2059,7 +2104,7 @@ static unsigned sig12_scheme(uint16_t scheme, unsigned leaf_key, brisk_hash_alg 
                              uint8_t *family)
 {
     unsigned h = scheme >> 8;
-    if ((scheme & 0xff) == 0x01 && h >= 4 && h <= 6) { /* rsa_pkcs1_sha256 / 384 / 512 */
+    if (BRISK_ENABLE_RSA && (scheme & 0xff) == 0x01 && h >= 4 && h <= 6) { /* rsa_pkcs1_sha* */
         *alg = h == 4 ? BRISK_HASH_SHA256 : h == 5 ? BRISK_HASH_SHA384 : BRISK_HASH_SHA512;
         *family = BRISK__X509_SIG_RSA_PKCS1;
         return BRISK__X509_KEY_RSA;

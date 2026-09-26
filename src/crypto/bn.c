@@ -65,6 +65,8 @@
  */
 #include "brisk_int.h"
 
+#if BRISK_ENABLE_RSA || BRISK_ENABLE_P384
+
 #define BN_MASK 0x7FFFFFFFu
 
 /* Number of 31-bit limbs implied by an announced bit length. The header word is not counted. */
@@ -379,3 +381,5 @@ int brisk__bn_modpow_pub(uint32_t *x, const uint8_t *e, size_t e_len, const uint
 }
 
 #undef BN_MASK
+
+#endif /* BRISK_ENABLE_RSA || BRISK_ENABLE_P384 */

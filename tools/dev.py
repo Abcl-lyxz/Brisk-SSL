@@ -88,8 +88,8 @@ def cmd_test(archs, jobs):
 # is the same C either way, and what differs per arch (multiplier timing, cache) is beyond valgrind.
 # ct32m: the multiply-free GHASH of armv5 / MIPS32 (BRISK_GHASH_MULFREE) under the same AEAD calls.
 # FULL profile, so the QUIC packet protection (tests/test_quic.c quic_ct_run) is in the run too.
-CT_VARIANTS = [("ct64", ""), ("ct32", " -DBRISK__AES_CT64=0 -DBRISK__FIAT_64=0"),
-               ("ct32m", " -DBRISK__AES_CT64=0 -DBRISK__FIAT_64=0 -DBRISK_GHASH_MULFREE=1")]
+CT32 = " -DBRISK_AES_IMPL=BRISK_AES_IMPL_CT32 -DBRISK__GHASH64=0 -DBRISK__FIAT_64=0"
+CT_VARIANTS = [("ct64", ""), ("ct32", CT32), ("ct32m", CT32 + " -DBRISK_GHASH_MULFREE=1")]
 
 
 def cmd_ct():
@@ -395,7 +395,13 @@ def cmd_fuzz(target, seconds):
 AMALG_WARN = ["-std=c99", "-Wall", "-Wextra", "-Wpedantic", "-Wshadow", "-Wcast-align",
               "-Wstrict-prototypes", "-Wundef", "-Wvla", "-Werror"]
 AMALG_VARIANTS = [("TINY", ""), ("DEFAULT", ""), ("FULL", ""),
-                  ("FULL", "-DBRISK__AES_CT64=0 -DBRISK__FIAT_64=0")]
+                  ("FULL", "-DBRISK_AES_IMPL=BRISK_AES_IMPL_CT32 -DBRISK__GHASH64=0 -DBRISK__FIAT_64=0")]
+KNOBS_OFF = ["-DBRISK_ENABLE_AESGCM=0", "-DBRISK_ENABLE_AES256=0", "-DBRISK_ENABLE_CHACHA=0",
+             "-DBRISK_ENABLE_X25519=0", "-DBRISK_ENABLE_P256_KX=0", "-DBRISK_ENABLE_RSA=0",
+             "-DBRISK_ENABLE_RSA=0 -DBRISK_ENABLE_P384=0",
+             # the smallest crypto set, at -O0 too: nothing may rely on dead-code elimination
+             "-DBRISK_ENABLE_CHACHA=0 -DBRISK_ENABLE_AES256=0 -DBRISK_ENABLE_X25519=0 "
+             "-DBRISK_ENABLE_RSA=0 -DBRISK_ENABLE_P384=0 -O0"]
 
 
 def amalg_inside():
@@ -429,6 +435,24 @@ def amalg_inside():
         if r.returncode:
             bad.append(f"{name} tests")
             print("\n".join((r.stdout + r.stderr).splitlines()[-30:]))
+    # knob matrix: each algorithm knob off on its own, FULL (DEFAULT for AESGCM: QUIC needs it). The
+    # replayed-transcript suites need the all-on ClientHello, so these builds run test_knobs.c
+    # alone: the offer holds exactly what is left, and every entry point refuses what is not.
+    for knob in KNOBS_OFF:
+        profile = "DEFAULT" if "AESGCM=0" in knob else "FULL"  # QUIC needs AES-GCM
+        defs = [f"-DBRISK_PROFILE=BRISK_PROFILE_{profile}", *knob.split()]
+        r = None
+        for cc in ("gcc", "clang"):
+            r = subprocess.run([cc, *AMALG_WARN, "-Os", *defs, "-DT_KNOBS_MAIN", "-Idist", "-Isrc",
+                                "-Itests", "tests/test_knobs.c", "dist/brisk.c", "-o",
+                                f"build/knobs-{cc}"], cwd=ROOT, capture_output=True, text=True)
+            if r.returncode == 0:
+                r = subprocess.run([f"./build/knobs-{cc}"], cwd=ROOT, capture_output=True,
+                                   text=True)
+            print(f"{knob:<24} {cc:<6} {'ok' if r.returncode == 0 else 'FAILED'}", flush=True)
+            if r.returncode:
+                bad.append(f"{knob} {cc}")
+                print("\n".join((r.stdout + r.stderr).splitlines()[:40]))
     print("amalg:", "ALL PASSED" if not bad else "FAILED: " + ", ".join(bad))
     return 1 if bad else 0
 

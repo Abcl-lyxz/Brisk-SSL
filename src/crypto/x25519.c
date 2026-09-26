@@ -22,6 +22,8 @@
  */
 #include "brisk_int.h"
 
+#if BRISK_ENABLE_X25519
+
 #if defined(__GNUC__) || defined(__clang__)
 #    pragma GCC diagnostic push
 #    pragma GCC diagnostic ignored "-Wunused-function"
@@ -244,3 +246,5 @@ void brisk__x25519_base(uint8_t out[32], const uint8_t scalar[32])
 }
 
 #undef FE_LIMBS
+
+#endif /* BRISK_ENABLE_X25519 */

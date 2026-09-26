@@ -71,6 +71,7 @@ static const struct {
     {"x509", test_x509},
     {"key", test_key},
     {"ct", test_ct},
+    {"knobs", test_knobs},
     {"tls13_ks", test_tls13_ks},
     {"tls13_hs", test_tls13_hs},
     {"tls13_rec", test_tls13_rec},

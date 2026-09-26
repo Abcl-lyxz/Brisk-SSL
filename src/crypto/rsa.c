@@ -54,6 +54,8 @@
  */
 #include "brisk_int.h"
 
+#if BRISK_ENABLE_RSA
+
 /* DER DigestInfo prefixes, RFC 8017 9.2 note 1, with the explicit NULL parameters. 19 octets
  * each for these three digests. No value here was typed from memory: tools/kat.py parses the
  * table out of the RFC text itself and checks these constants against it - but that runs on
@@ -323,3 +325,5 @@ out:
 }
 
 #undef RSA_DI_LEN
+
+#endif /* BRISK_ENABLE_RSA */

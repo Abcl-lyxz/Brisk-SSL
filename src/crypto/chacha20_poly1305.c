@@ -9,6 +9,8 @@
  */
 #include "brisk_int.h"
 
+#if BRISK_ENABLE_CHACHA
+
 /* ---- ChaCha20 (RFC 8439 2.1-2.4) ---- */
 #define BRISK__ROTL32(x, n) (((x) << (n)) | ((x) >> (32 - (n))))
 #define BRISK__QR(x, a, b, c, d)                                                                   \
@@ -318,3 +320,5 @@ int brisk__chacha20_poly1305_open(const uint8_t key[32], const uint8_t nonce[12]
 #undef BRISK__ROTL32
 #undef BRISK__QR
 #undef BRISK__CHACHA_P_MAX
+
+#endif /* BRISK_ENABLE_CHACHA */

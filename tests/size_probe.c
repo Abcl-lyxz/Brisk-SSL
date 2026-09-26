@@ -29,7 +29,9 @@ int main(int argc, char **argv)
     brisk_hmac(alg, out, 32, out, 32, out);
     brisk__hkdf_extract(alg, out, 32, out, 32, out);
     brisk__hkdf_expand_label(alg, out, 32, "derived", out, 32, out, 32);
+#if BRISK_ENABLE_CHACHA
     brisk__chacha20(out, 1, out + 32, out, out, 5);
+#endif
     brisk__chacha20_poly1305_seal(out, out + 32, out, 5, out, 16, out, out + 48);
     brisk__chacha20_poly1305_open(out, out + 32, out, 5, out, 16, out, out + 48);
     {
@@ -68,8 +70,10 @@ int main(int argc, char **argv)
         brisk_aead_open((brisk_aead_alg)argc, out, 32, out, out, 5, out, 16, out, out + 48);
         brisk_hkdf_extract(alg, out, 32, out, 32, out);
         brisk_hkdf_expand(alg, out, 32, out, 5, out, 32);
+#if BRISK_ENABLE_X25519
         brisk_x25519_keygen(out, out + 32);
         brisk_x25519(out, out + 32, out);
+#endif
         brisk_p256_keygen(out, pt);
         brisk_p256_ecdh(out, out + 32, pt);
         brisk_p256_sign(sig, out, out + 32, 32);

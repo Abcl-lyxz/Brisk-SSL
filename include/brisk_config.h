@@ -92,7 +92,7 @@
  * compression / resumption. Off in TINY: that ClientHello stays TLS 1.3 only, byte for byte, and
  * a TLS 1.2 ServerHello is protocol_version. A device that must be 1.3-only in a bigger profile
  * builds with -DBRISK_ENABLE_TLS12=0 - there is no runtime version knob. Needs nothing forced:
- * SHA-2, HMAC, AES-GCM, ChaCha20-Poly1305, X25519, P-256, RSA and X.509 are always linked. */
+ * SHA-2, HMAC and X.509 are always linked; its suites follow the algorithm knobs below. */
 #ifndef BRISK_ENABLE_TLS12
 #    define BRISK_ENABLE_TLS12 (BRISK_PROFILE >= BRISK_PROFILE_DEFAULT)
 #endif
@@ -107,8 +107,8 @@
 
 /* QUIC v1 client transport (RFC 9000 + RFC 9001; src/quic/). Packets and header protection,
  * CRYPTO frames on the one TLS 1.3 engine, transport parameters. On in FULL only; with it off
- * both src/quic files compile to empty translation units. Needs nothing forced: AES-128/256-GCM,
- * ChaCha20-Poly1305, HKDF and the TLS 1.3 engine are always built. */
+ * both src/quic files compile to empty translation units. Needs BRISK_ENABLE_AESGCM (Initial
+ * packets, RFC 9001 5.2), which is on unless explicitly 0; HKDF and the engine are always built. */
 #ifndef BRISK_ENABLE_QUIC
 #    define BRISK_ENABLE_QUIC (BRISK_PROFILE >= BRISK_PROFILE_FULL)
 #endif
@@ -234,6 +234,70 @@
 #    define BRISK_ENABLE_CRYPTO_API (BRISK_PROFILE >= BRISK_PROFILE_DEFAULT)
 #endif
 
+/* Cipher suites, key-exchange groups and RSA. On in EVERY profile; only an explicit 0 turns one
+ * off, and a knob that is off is gone from the ClientHello, the engine and the public crypto API
+ * alike (its source file compiles to an empty translation unit).
+ *
+ * NOT CONFORMANT when off: RFC 9846 9.1 makes TLS_AES_128_GCM_SHA256, secp256r1 ECDHE and the
+ * RSA signature schemes mandatory to implement. Switching AESGCM, P256_KX or RSA off is for a
+ * device that only ever talks to servers you control (a private ECDSA PKI, a fixed suite), where
+ * the flash matters more than talking to the rest of the Internet. A server that needs what was
+ * cut fails the handshake (handshake_failure / unsupported_certificate) - never a weaker path.
+ *
+ *   BRISK_ENABLE_AESGCM   TLS_AES_128_GCM_SHA256 (+ TLS 1.2 *_AES_128_GCM_*), src/crypto/aes_ct*.c
+ *                         and gcm.c. QUIC needs it: Initial packets are always AES-128-GCM
+ *                         (RFC 9001 5.2).
+ *   BRISK_ENABLE_AES256   TLS_AES_256_GCM_SHA384 (+ TLS 1.2 *_AES_256_GCM_*). Needs AESGCM.
+ *   BRISK_ENABLE_CHACHA   TLS_CHACHA20_POLY1305_SHA256 (+ TLS 1.2), chacha20_poly1305.c.
+ *   BRISK_ENABLE_X25519   the x25519 group (RFC 7748), x25519.c.
+ *   BRISK_ENABLE_P256_KX  the secp256r1 group. p256.c stays: ECDSA P-256 verify is always built.
+ *                         TLS 1.2 ECDHE_ECDSA with a P-256 certificate then fails against a
+ *                         conforming server (RFC 8422 5.3); 1.3 is unaffected.
+ *   BRISK_ENABLE_RSA      RSA PKCS#1 v1.5 / PSS verify: certificates, CertificateVerify and TLS
+ *                         1.2 ECDHE_RSA suites, rsa.c. bn.c goes too unless P-384 is on.
+ *
+ * At least one AEAD and one group must be left. */
+#ifndef BRISK_ENABLE_AESGCM
+#    define BRISK_ENABLE_AESGCM 1
+#endif
+#ifndef BRISK_ENABLE_AES256
+#    define BRISK_ENABLE_AES256 BRISK_ENABLE_AESGCM
+#endif
+#ifndef BRISK_ENABLE_CHACHA
+#    define BRISK_ENABLE_CHACHA 1
+#endif
+#ifndef BRISK_ENABLE_X25519
+#    define BRISK_ENABLE_X25519 1
+#endif
+#ifndef BRISK_ENABLE_P256_KX
+#    define BRISK_ENABLE_P256_KX 1
+#endif
+#ifndef BRISK_ENABLE_RSA
+#    define BRISK_ENABLE_RSA 1
+#endif
+#if BRISK_ENABLE_QUIC && !BRISK_ENABLE_AESGCM
+#    error "BRISK_ENABLE_QUIC needs BRISK_ENABLE_AESGCM (RFC 9001 5.2 Initial packets)"
+#endif
+#if BRISK_ENABLE_AES256 && !BRISK_ENABLE_AESGCM
+#    error "BRISK_ENABLE_AES256 needs BRISK_ENABLE_AESGCM: drop -DBRISK_ENABLE_AESGCM=0"
+#endif
+#if !BRISK_ENABLE_AESGCM && !BRISK_ENABLE_CHACHA
+#    error "BRISK_ENABLE_AESGCM and BRISK_ENABLE_CHACHA are both 0: no cipher suite left"
+#endif
+#if !BRISK_ENABLE_X25519 && !BRISK_ENABLE_P256_KX
+#    error "BRISK_ENABLE_X25519 and BRISK_ENABLE_P256_KX are both 0: no key exchange left"
+#endif
+
+/* Which constant-time AES: BRISK_AES_IMPL_CT32 (aes_ct.c, 2 blocks per pass, ~0.6 KB stack) or
+ * BRISK_AES_IMPL_CT64 (aes_ct64.c, 4 blocks, ~1.1 KB, faster on 64-bit CPUs). Both are
+ * bitsliced and table-free. Undefined = CT64 on 64-bit pointers, CT32 elsewhere. */
+#define BRISK_AES_IMPL_CT32 1
+#define BRISK_AES_IMPL_CT64 2
+#if defined(BRISK_AES_IMPL) && BRISK_AES_IMPL != BRISK_AES_IMPL_CT32 &&                            \
+    BRISK_AES_IMPL != BRISK_AES_IMPL_CT64
+#    error "BRISK_AES_IMPL must be BRISK_AES_IMPL_CT32 or BRISK_AES_IMPL_CT64"
+#endif
+
 /* GHASH without multiply instructions (src/crypto/gcm.c). The default GHASH is constant time
  * only if the CPU's integer multiply is: ARM7/ARM9 (armv5) and some MIPS32 cores (4K family)
  * finish early on small operands, which would leak the GCM hash key H through timing. 1 = use
@@ -262,9 +326,8 @@
  * src/crypto/rsa.c header.
  *
  * 4096 by default because real trust anchors are 4096-bit (ISRG Root X1). Drop it to 2048 only
- * for a private PKI whose largest certificate you control. There is no knob to switch RSA off:
- * RFC 9846 9.1 makes rsa_pkcs1_sha256 (certificates) and rsa_pss_rsae_sha256 (CertificateVerify
- * and certificates) mandatory to implement, exactly as it does P-256 ECDHE.
+ * for a private PKI whose largest certificate you control. RSA itself is mandatory to implement
+ * (RFC 9846 9.1) and on in every profile; only -DBRISK_ENABLE_RSA=0 drops it (see above).
  *
  * No public struct size depends on this, so the ABI rule at the top of this file still holds. */
 #ifndef BRISK_RSA_MAX_BITS

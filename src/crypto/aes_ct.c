@@ -32,7 +32,7 @@
  */
 #include "brisk_int.h"
 
-#if !BRISK__AES_CT64
+#if BRISK_ENABLE_AESGCM && !BRISK__AES_CT64
 
 /* Layout: word i of block A sits in q[2i], of block B in q[2i+1]; ortho() transposes that into
  * 8 bit planes. No table is indexed by secret data anywhere: the S-box is a boolean circuit. */

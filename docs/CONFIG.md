@@ -33,12 +33,29 @@ that says how to fix it. Knobs are added as their milestone lands.
 Let's Encrypt's Generation Y intermediates are P-384, so a chain from them cannot be verified
 without it. With it off, `src/crypto/p384.c` compiles to an empty object and costs nothing.
 
-RSA verification has **no knob**: RFC 9846 9.1 makes `rsa_pkcs1_sha256` (certificates) and
-`rsa_pss_rsae_sha256` (CertificateVerify and certificates) mandatory to implement, so
-`src/crypto/bn.c` and `src/crypto/rsa.c` are in every profile including TINY - exactly as
-`src/crypto/p256.c` is, for ECDHE. Together they cost 2613 (armv7hf) to 4956 (mips64) bytes of
-flash, and that is simply owed: there is no honest knob to hide a mandatory-to-implement
-algorithm behind.
+### Algorithm knobs (on in every profile; only an explicit 0 turns one off)
+
+| Knob | Removes | Notes |
+|---|---|---|
+| `BRISK_ENABLE_AESGCM` | TLS_AES_128_GCM_SHA256 and the TLS 1.2 AES-GCM suites; `aes_ct*.c`, `gcm.c` | `#error` with QUIC (Initial packets are AES-128-GCM, RFC 9001 5.2). Forces AES256 off unless set. |
+| `BRISK_ENABLE_AES256` | TLS_AES_256_GCM_SHA384, ECDHE_*_AES_256_GCM | needs AESGCM |
+| `BRISK_ENABLE_CHACHA` | TLS_CHACHA20_POLY1305_SHA256 and the TLS 1.2 ChaCha suites; `chacha20_poly1305.c` | |
+| `BRISK_ENABLE_X25519` | the x25519 group; `x25519.c` | CH1's key share becomes secp256r1 |
+| `BRISK_ENABLE_P256_KX` | the secp256r1 group | `p256.c` stays (ECDSA verify is always built). TLS 1.2: a conforming server may not pick ECDHE_ECDSA with a P-256 certificate when the client does not list secp256r1 (RFC 8422 5.3), so 1.2 then needs RSA or another curve |
+| `BRISK_ENABLE_RSA` | RSA PKCS#1 / PSS verify (certificates, CertificateVerify, TLS 1.2 ECDHE_RSA); `rsa.c`, and `bn.c` too when P384 is off | an RSA certificate anywhere in the chain is refused as unsupported |
+| `BRISK_AES_IMPL` | - | `BRISK_AES_IMPL_CT32` (`aes_ct.c`, less stack) or `BRISK_AES_IMPL_CT64` (`aes_ct64.c`, faster on 64-bit); default by pointer width. AES only: GHASH stays by pointer width |
+
+At least one AEAD and one group must stay (`#error` otherwise). **Off is not conformant**:
+RFC 9846 9.1 makes TLS_AES_128_GCM_SHA256, secp256r1 and the RSA schemes mandatory to
+implement. These knobs are for a device that only talks to servers you control (a private ECDSA
+PKI, a fixed suite) and needs the flash; a server that needs what was cut fails the handshake,
+never a weaker path. The public crypto API loses the matching calls (`brisk_x25519*`,
+`brisk_rsa_*` no longer link; `brisk_aead_*` returns `BRISK_E_ARG` for a missing algorithm).
+Flash they free on mips (size/baseline.json): x25519 8.9 KB, AES + GCM 5.2 KB, ChaCha20-Poly1305
+3.4 KB, RSA 2.1 KB (+ bn 2.9 KB with P384 off). `python tools/dev.py amalg` builds each one off
+with gcc and clang and runs `tests/test_knobs.c` against it. The CMake test suite
+(`BRISK_BUILD_TESTS`) needs every algorithm knob on: its replayed handshakes are byte-exact
+ClientHellos.
 
 ### Value knobs
 | Knob | Default | Range | What it changes |
@@ -99,8 +116,8 @@ profile exceeds its budget in `size/budget.json`; per-module numbers: `python to
 | profile | budget | x86_64 | i686 | aarch64 | armv7hf | armv5 | mips | mipsel | mips64 | riscv64 | ppc |
 |---|---|---|---|---|---|---|---|---|---|---|---|
 | TINY | 104 | 69.8 | 85.6 | 65.9 | 52.4 | 77.4 | 97.9 | 98.2 | 89.5 | 56.3 | 81.4 |
-| DEFAULT | 144 | 101.1 | 119.0 | 97.8 | 74.5 | 111.1 | 140.3 | 140.7 | 130.6 | 81.6 | 116.4 |
-| FULL | 216 | 145.3 | 171.9 | 142.7 | 110.8 | 163.7 | 207.6 | 208.0 | 187.3 | 118.1 | 172.7 |
+| DEFAULT | 144 | 101.1 | 119.0 | 97.8 | 74.4 | 111.1 | 140.3 | 140.7 | 130.6 | 81.6 | 116.5 |
+| FULL | 216 | 145.3 | 171.9 | 142.7 | 110.8 | 163.7 | 207.6 | 208.1 | 187.3 | 118.2 | 172.7 |
 
 KB of flash (text + rodata + data, -Os, static link map, libc excluded); budget = the most any arch may take (size/budget.json). Static RAM is at most 132 B on any arch and profile - every context is caller-owned.
 <!-- size-table:end -->

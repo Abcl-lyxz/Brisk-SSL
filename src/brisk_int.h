@@ -150,6 +150,7 @@ int brisk__tls12_prf(brisk_hash_alg alg, const uint8_t *secret, size_t secret_le
  * partial overlap. The caller guarantees counter + ceil(len/64) <= 2^32: the 32-bit block counter
  * is NOT checked for wrap, and a wrap would reuse keystream. Also QUIC header protection
  * (RFC 9001 5.4.4): brisk__chacha20(hp, brisk__load_le32(sample), sample + 4, zero5, mask, 5). */
+#if BRISK_ENABLE_CHACHA
 void brisk__chacha20(const uint8_t key[32], uint32_t counter, const uint8_t nonce[12],
                      const uint8_t *in, uint8_t *out, size_t len);
 
@@ -169,6 +170,35 @@ int brisk__chacha20_poly1305_seal(const uint8_t key[32], const uint8_t nonce[12]
 int brisk__chacha20_poly1305_open(const uint8_t key[32], const uint8_t nonce[12],
                                   const uint8_t *aad, size_t aad_len, const uint8_t *in, size_t len,
                                   uint8_t *out, const uint8_t tag[16]);
+#else
+/* Off in this build: fail-closed stubs keep one code path in the callers. The gates that
+ * pick a suite / group / scheme never select what is off, so these are unreachable. */
+#    if BRISK_ENABLE_QUIC /* header protection is its only user outside the TU */
+static inline void brisk__chacha20(const uint8_t key[32], uint32_t counter,
+                                   const uint8_t nonce[12], const uint8_t *in, uint8_t *out,
+                                   size_t len)
+{
+    (void)key, (void)counter, (void)nonce, (void)in;
+    memset(out, 0, len);
+}
+#    endif
+static inline int brisk__chacha20_poly1305_seal(const uint8_t key[32], const uint8_t nonce[12],
+                                                const uint8_t *aad, size_t aad_len,
+                                                const uint8_t *in, size_t len, uint8_t *out,
+                                                uint8_t tag[16])
+{
+    (void)key, (void)nonce, (void)aad, (void)aad_len, (void)in, (void)len, (void)out, (void)tag;
+    return BRISK_E_ARG;
+}
+static inline int brisk__chacha20_poly1305_open(const uint8_t key[32], const uint8_t nonce[12],
+                                                const uint8_t *aad, size_t aad_len,
+                                                const uint8_t *in, size_t len, uint8_t *out,
+                                                const uint8_t tag[16])
+{
+    (void)key, (void)nonce, (void)aad, (void)aad_len, (void)in, (void)len, (void)out, (void)tag;
+    return BRISK_E_ARG;
+}
+#endif /* BRISK_ENABLE_CHACHA */
 
 /* ---- crypto/aes_ct.c | aes_ct64.c: AES-128/256 forward cipher (FIPS 197), bitsliced, constant
  * time Only the forward cipher: GCM (SP 800-38D) and QUIC header protection (RFC 9001 5.4.3) never
@@ -177,10 +207,21 @@ int brisk__chacha20_poly1305_open(const uint8_t key[32], const uint8_t nonce[12]
  * 64-bit, ct (2 blocks per pass in uint32_t q[8]) elsewhere, including ILP32 ABIs (x32, n32).
  * Stack: about 0.6 KB (ct) / 1.1 KB (ct64) per call for the expanded schedule and state. */
 #ifndef BRISK__AES_CT64 /* -DBRISK__AES_CT64=0 builds the 32-bit variant anywhere (dev.py ct) */
-#    if UINTPTR_MAX > 0xFFFFFFFFu
+#    if defined(BRISK_AES_IMPL)
+#        define BRISK__AES_CT64 (BRISK_AES_IMPL == BRISK_AES_IMPL_CT64)
+#    elif UINTPTR_MAX > 0xFFFFFFFFu
 #        define BRISK__AES_CT64 1
 #    else
 #        define BRISK__AES_CT64 0
+#    endif
+#endif
+/* GHASH word size (gcm.c) is its own axis, never BRISK_AES_IMPL: ctmul64 on a 32-bit core would
+ * pull in a libgcc multiply helper. -DBRISK__GHASH64=0 builds the 32-bit one anywhere (dev.py ct). */
+#ifndef BRISK__GHASH64
+#    if UINTPTR_MAX > 0xFFFFFFFFu
+#        define BRISK__GHASH64 1
+#    else
+#        define BRISK__GHASH64 0
 #    endif
 #endif
 
@@ -231,6 +272,7 @@ typedef struct {
 } brisk__gcm_key;       /* 264 B; the caller wipes it with brisk__secure_zero(k, sizeof *k) */
 
 /* key_len 16 or 32; otherwise BRISK_E_ARG and nothing is written. */
+#if BRISK_ENABLE_AESGCM
 int brisk__gcm_init(brisk__gcm_key *k, const uint8_t *key, size_t key_len);
 
 /* Same shape as brisk__chacha20_poly1305_seal/open. in == out allowed (no partial overlap); NULL
@@ -244,6 +286,29 @@ int brisk__gcm_seal(const brisk__gcm_key *k, const uint8_t iv[12], const uint8_t
 int brisk__gcm_open(const brisk__gcm_key *k, const uint8_t iv[12], const uint8_t *aad,
                     size_t aad_len, const uint8_t *in, size_t len, uint8_t *out,
                     const uint8_t tag[16]);
+#else
+/* Off in this build: fail-closed stubs keep one code path in the callers. The gates that
+ * pick a suite / group / scheme never select what is off, so these are unreachable. */
+static inline int brisk__gcm_init(brisk__gcm_key *k, const uint8_t *key, size_t key_len)
+{
+    (void)k, (void)key, (void)key_len;
+    return BRISK_E_ARG;
+}
+static inline int brisk__gcm_seal(const brisk__gcm_key *k, const uint8_t iv[12], const uint8_t *aad,
+                                  size_t aad_len, const uint8_t *in, size_t len, uint8_t *out,
+                                  uint8_t tag[16])
+{
+    (void)k, (void)iv, (void)aad, (void)aad_len, (void)in, (void)len, (void)out, (void)tag;
+    return BRISK_E_ARG;
+}
+static inline int brisk__gcm_open(const brisk__gcm_key *k, const uint8_t iv[12], const uint8_t *aad,
+                                  size_t aad_len, const uint8_t *in, size_t len, uint8_t *out,
+                                  const uint8_t tag[16])
+{
+    (void)k, (void)iv, (void)aad, (void)aad_len, (void)in, (void)len, (void)out, (void)tag;
+    return BRISK_E_ARG;
+}
+#endif /* BRISK_ENABLE_AESGCM */
 
 /* ---- crypto/x25519.c: X25519 (RFC 7748) on vendored fiat-crypto field arithmetic ----
  * One TU: vendor/fiat/curve25519_{64,32}.c is #included (every fiat function is static).
@@ -270,6 +335,7 @@ int brisk__gcm_open(const brisk__gcm_key *k, const uint8_t iv[12], const uint8_t
  * BRISK_OK, or BRISK_E_ARG with out wiped when the result is the all-zero value: the peer sent a
  * small-order point (RFC 7748 6.1, 7; RFC 9846 7.4.2 says MUST abort). The TLS layer maps that to
  * an illegal_parameter alert. */
+#if BRISK_ENABLE_X25519
 int brisk__x25519(uint8_t out[32], const uint8_t scalar[32], const uint8_t u[32]);
 
 /* Public key for a private key: X25519(scalar, 9), the KeyShareEntry.key_exchange bytes
@@ -277,6 +343,21 @@ int brisk__x25519(uint8_t out[32], const uint8_t scalar[32], const uint8_t u[32]
  * the all-zero case cannot occur on the base point. The caller supplies the private key from
  * brisk__os_random - L1 crypto never calls the OS itself. */
 void brisk__x25519_base(uint8_t out[32], const uint8_t scalar[32]);
+#else
+/* Off in this build: fail-closed stubs keep one code path in the callers. The gates that
+ * pick a suite / group / scheme never select what is off, so these are unreachable. */
+static inline int brisk__x25519(uint8_t out[32], const uint8_t scalar[32], const uint8_t u[32])
+{
+    (void)scalar, (void)u;
+    memset(out, 0, 32);
+    return BRISK_E_ARG;
+}
+static inline void brisk__x25519_base(uint8_t out[32], const uint8_t scalar[32])
+{
+    (void)scalar;
+    memset(out, 0, 32);
+}
+#endif /* BRISK_ENABLE_X25519 */
 
 /* ECDSA P-256 signing is compiled for mTLS and for the public crypto API (brisk_p256_sign). */
 #define BRISK__P256_SIGN (BRISK_ENABLE_MTLS || BRISK_ENABLE_CRYPTO_API)
@@ -285,7 +366,8 @@ void brisk__x25519_base(uint8_t out[32], const uint8_t scalar[32]);
  * RFC 9846 4.3.8.2 (key_share encoding + the MUST to validate the peer point), 7.4.2 (the ECDHE
  * shared secret), 4.3.3 (ecdsa_secp256r1_sha256); FIPS 186-5 6.4.2 (verify); parameters from
  * RFC 5903 3.1 = SP 800-186 3.2.1.3. Both halves are mandatory-to-implement for a TLS 1.3 client
- * (RFC 9846 9.1), so neither sits behind a config knob.
+ * (RFC 9846 9.1). Verify is always built; -DBRISK_ENABLE_P256_KX=0 only takes secp256r1 out of
+ * the offer (brisk_config.h), the ECDH code stays for the public API and costs little.
  *
  * One TU: vendor/fiat/p256_{64,32}.c is #included (every fiat function is static), selected by
  * BRISK__FIAT_64 exactly as for x25519. Stateless, no key context; the caller owns all memory.
@@ -547,8 +629,9 @@ int brisk__bn_modpow_pub(uint32_t *x, const uint8_t *e, size_t e_len, const uint
  * Verify only (locked decision): no signing, no RSAES, no OAEP, no CRT, no key generation, no
  * primality testing, and this module consumes no randomness. Both halves are mandatory to
  * implement for a TLS 1.3 client (RFC 9846 9.1: rsa_pkcs1_sha256 for certificates,
- * rsa_pss_rsae_sha256 for CertificateVerify and certificates), so neither sits behind a config
- * knob - the same reasoning that keeps p256.c unconditional for ECDHE.
+ * rsa_pss_rsae_sha256 for CertificateVerify and certificates), so both are on in every profile;
+ * only an explicit -DBRISK_ENABLE_RSA=0 (a private ECDSA PKI) drops them, and then the stubs
+ * below refuse every RSA signature as unsupported.
  *
  * `n` and `e` are the big-endian modulus and public exponent as the M2 SPKI parser hands them
  * over; leading zero octets are allowed. `hash` is the already-computed digest, as in
@@ -573,6 +656,7 @@ int brisk__bn_modpow_pub(uint32_t *x, const uint8_t *e, size_t e_len, const uint
  * Per RFC 9846 4.3.3 the rsa_pkcs1_* schemes "refer solely to signatures which appear in
  * certificates" and "are not defined for use in signed TLS handshake messages": this is an X.509
  * (M2) entry point only and a CertificateVerify caller must never reach it. */
+#if BRISK_ENABLE_RSA
 int brisk__rsa_pkcs1_verify(const uint8_t *n, size_t n_len, const uint8_t *e, size_t e_len,
                             brisk_hash_alg alg, const uint8_t *hash, size_t hash_len,
                             const uint8_t *sig, size_t sig_len);
@@ -592,6 +676,27 @@ int brisk__rsa_pkcs1_verify(const uint8_t *n, size_t n_len, const uint8_t *e, si
 int brisk__rsa_pss_verify(const uint8_t *n, size_t n_len, const uint8_t *e, size_t e_len,
                           brisk_hash_alg alg, size_t salt_len, const uint8_t *hash, size_t hash_len,
                           const uint8_t *sig, size_t sig_len);
+#else
+/* Off in this build: fail-closed stubs keep one code path in the callers. The gates that
+ * pick a suite / group / scheme never select what is off, so these are unreachable. */
+static inline int brisk__rsa_pkcs1_verify(const uint8_t *n, size_t n_len, const uint8_t *e,
+                                          size_t e_len, brisk_hash_alg alg, const uint8_t *hash,
+                                          size_t hash_len, const uint8_t *sig, size_t sig_len)
+{
+    (void)n, (void)n_len, (void)e, (void)e_len, (void)alg, (void)hash, (void)hash_len, (void)sig;
+    (void)sig_len;
+    return BRISK_E_ARG;
+}
+static inline int brisk__rsa_pss_verify(const uint8_t *n, size_t n_len, const uint8_t *e,
+                                        size_t e_len, brisk_hash_alg alg, size_t salt_len,
+                                        const uint8_t *hash, size_t hash_len, const uint8_t *sig,
+                                        size_t sig_len)
+{
+    (void)n, (void)n_len, (void)e, (void)e_len, (void)alg, (void)salt_len, (void)hash;
+    (void)hash_len, (void)sig, (void)sig_len;
+    return BRISK_E_ARG;
+}
+#endif /* BRISK_ENABLE_RSA */
 
 /* ---- x509/der.c: strict DER reader (ITU-T X.690) --------------------------------------------
  *
@@ -1658,7 +1763,8 @@ size_t brisk__tls13_cv_content(int is_server, const uint8_t *th, size_t hl, uint
 /* ClientHello parameters (RFC 9846 4.2.2). NULL lists take the library's offer, which is the
  * security-relevant default: suites 0x1303, 0x1301, 0x1302 (ChaCha20 first: this library has no
  * AES instructions); groups x25519, secp256r1; signature schemes 0x0403, 0x0503 (with
- * BRISK_ENABLE_P384), 0x0804-0x0806, then 0x0401/0x0501/0x0601 for certificates only. Never
+ * BRISK_ENABLE_P384), 0x0804-0x0806, then 0x0401/0x0501/0x0601 for certificates only - minus
+ * whatever the brisk_config.h algorithm knobs left out (tests/test_knobs.c). Never
  * SHA-1, never rsa_pss_pss (no RSASSA-PSS key type in x509), never a group without ECDHE. */
 typedef struct {
     const uint8_t *random; /* 32 bytes from brisk__os_random */

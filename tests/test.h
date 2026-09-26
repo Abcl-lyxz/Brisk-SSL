@@ -39,6 +39,7 @@ void test_aead(void);
 void test_aes(void);
 void test_x25519(void);
 void test_p256(void);
+void test_knobs(void); /* test_knobs.c: the offer matches the brisk_config.h algorithm knobs */
 void test_p384(void); /* the suite is a no-op stub when BRISK_ENABLE_P384 is 0 */
 void test_rsa(void);
 void test_der(void);

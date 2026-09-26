@@ -194,7 +194,10 @@ static int conn_hello(brisk_conn *c, uint8_t *buf)
     brisk__tls13_psk psk;
     uint8_t pub[65];
     int ch2 = hs->state == BRISK__HS_WAIT_CH2, use_psk = 0, rc, quic = 0;
-    uint16_t g = ch2 && hs->hrr_group != 0 ? hs->hrr_group : CONN_X25519;
+    /* CH1's share: x25519 unless brisk_config.h left it out (the engine refuses a group that is
+     * not in this build, so an HRR can only name one that is) */
+    uint16_t g = ch2 && hs->hrr_group != 0 ? hs->hrr_group
+                                           : (BRISK_ENABLE_X25519 ? CONN_X25519 : CONN_P256);
     const uint8_t *priv = c->rnd + (g == CONN_P256 ? CONN_RND_P : CONN_RND_X);
     size_t n = 0;
 

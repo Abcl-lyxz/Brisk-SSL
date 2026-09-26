@@ -186,7 +186,8 @@ BRISK_API int brisk_random(void *out, size_t len);
  * a counter; random 12-byte nonces are safe for about 2^32 messages per key. in == out is
  * allowed (no partial overlap); aad, in and out may be NULL when their length is 0. BRISK_E_ARG
  * also for len beyond the algorithm's limit (GCM 2^36 - 32 bytes, ChaCha20-Poly1305 2^38 - 64)
- * or aad_len >= 2^61 (GCM, 64-bit only). */
+ * or aad_len >= 2^61 (GCM, 64-bit only), and for an algorithm brisk_config.h left out
+ * (BRISK_ENABLE_AESGCM / _AES256 / _CHACHA = 0). */
 typedef enum {
     BRISK_AEAD_AES128_GCM = 1,
     BRISK_AEAD_AES256_GCM = 2,
@@ -218,7 +219,8 @@ BRISK_API int brisk_hkdf_expand(brisk_hash_alg alg, const uint8_t *prk, size_t p
 /* X25519 key agreement (RFC 7748). keygen: a fresh private key from brisk_random and its public
  * key; BRISK_OK, or BRISK_E_RNG with priv and pub zeroed. brisk_x25519: shared = X25519(priv,
  * peer); BRISK_E_ARG with shared zeroed when the peer sent a small-order key (RFC 7748 6.1) - abort
- * the exchange. Feed the shared secret through HKDF; never use it as a key directly. */
+ * the exchange. Feed the shared secret through HKDF; never use it as a key directly. Not linked
+ * with BRISK_ENABLE_X25519=0. */
 #define BRISK_X25519_LEN 32
 BRISK_API int brisk_x25519_keygen(uint8_t priv[BRISK_X25519_LEN], uint8_t pub[BRISK_X25519_LEN]);
 BRISK_API int brisk_x25519(uint8_t shared[BRISK_X25519_LEN], const uint8_t priv[BRISK_X25519_LEN],
@@ -262,7 +264,7 @@ BRISK_API int brisk_p384_verify(const uint8_t pub[BRISK_P384_PUB_LEN], const uin
  * (8.1.2). n and e are the big-endian modulus and exponent (leading zeros allowed); the modulus
  * is 2048 .. BRISK_RSA_MAX_BITS bits. hash_len must equal brisk_hash_len(alg). For PSS pass the
  * signer's salt length - usually hash_len. BRISK_OK, BRISK_E_AUTH (bad signature) or
- * BRISK_E_ARG (bad key or arguments). */
+ * BRISK_E_ARG (bad key or arguments). Not linked with BRISK_ENABLE_RSA=0. */
 BRISK_API int brisk_rsa_pkcs1_verify(const uint8_t *n, size_t n_len, const uint8_t *e, size_t e_len,
                                      brisk_hash_alg alg, const uint8_t *hash, size_t hash_len,
                                      const uint8_t *sig, size_t sig_len);

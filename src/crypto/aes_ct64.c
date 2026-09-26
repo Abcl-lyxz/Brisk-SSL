@@ -32,7 +32,7 @@
  */
 #include "brisk_int.h"
 
-#if BRISK__AES_CT64
+#if BRISK_ENABLE_AESGCM && BRISK__AES_CT64
 
 /* Layout: after interleave_in, the 16-bit lane u of q[i] / q[i+4] holds block u; ortho() then
  * transposes into 8 bit planes. No table is indexed by secret data anywhere: the S-box is a

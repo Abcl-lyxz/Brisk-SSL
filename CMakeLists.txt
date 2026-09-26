@@ -97,7 +97,7 @@ if(BRISK_BUILD_TESTS)
     add_executable(brisk_tests tests/test_main.c tests/test_hash.c tests/test_aead.c tests/test_aes.c
                                tests/test_x25519.c tests/test_p256.c tests/test_p384.c
                                tests/test_rsa.c tests/test_der.c tests/test_x509.c tests/test_key.c
-                               tests/test_ct.c tests/test_tls13_ks.c
+                               tests/test_ct.c tests/test_knobs.c tests/test_tls13_ks.c
                                tests/test_tls13_hs.c tests/test_tls13_rec.c tests/test_conn.c
                                tests/test_tls12_prf.c tests/test_tls12_rec.c tests/test_tls12_hs.c
                                tests/test_hpack.c tests/test_h2.c tests/test_quic.c
@@ -135,6 +135,7 @@ if(BRISK_BUILD_TESTS)
     set_tests_properties(key PROPERTIES TIMEOUT 900)
     add_test(NAME ct COMMAND brisk_tests ct) # under valgrind in `dev.py ct`; here just a smoke run
     set_tests_properties(ct PROPERTIES TIMEOUT 900)
+    add_test(NAME knobs COMMAND brisk_tests knobs)
     add_test(NAME tls13_ks COMMAND brisk_tests tls13_ks)
     set_tests_properties(tls13_ks PROPERTIES TIMEOUT 900)
     add_test(NAME tls13_hs COMMAND brisk_tests tls13_hs)

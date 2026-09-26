@@ -46,8 +46,14 @@ int brisk__tls12_suite(uint16_t suite, brisk_hash_alg *prf, size_t *key_len, siz
     brisk_hash_alg h = suite == 0xC02C || suite == 0xC030 ? BRISK_HASH_SHA384 : BRISK_HASH_SHA256;
     size_t kl = suite == 0xC02B || suite == 0xC02F ? 16u : 32u;
     size_t il = suite == 0xCCA8 || suite == 0xCCA9 ? 12u : 4u;
+    int is_ecdsa = suite == 0xC02B || suite == 0xC02C || suite == 0xCCA9;
     if (suite != 0xC02B && suite != 0xC02C && suite != 0xC02F && suite != 0xC030 &&
         suite != 0xCCA8 && suite != 0xCCA9) {
+        return 0;
+    }
+    /* what brisk_config.h left out of this build is not a suite at all */
+    if ((!BRISK_ENABLE_RSA && !is_ecdsa) || (!BRISK_ENABLE_CHACHA && il == 12) ||
+        (!BRISK_ENABLE_AESGCM && il == 4) || (!BRISK_ENABLE_AES256 && il == 4 && kl == 32)) {
         return 0;
     }
     if (prf != NULL) {
@@ -60,7 +66,7 @@ int brisk__tls12_suite(uint16_t suite, brisk_hash_alg *prf, size_t *key_len, siz
         *iv_len = il;
     }
     if (ecdsa != NULL) {
-        *ecdsa = (uint8_t)(suite == 0xC02B || suite == 0xC02C || suite == 0xCCA9);
+        *ecdsa = (uint8_t)is_ecdsa;
     }
     return 1;
 }
@@ -222,7 +228,9 @@ static int t12_on_ske(brisk__tls13_hs *hs, const uint8_t *m, size_t n)
     }
     group = (uint16_t)brisk__load_be16(b + 1);
     pl = b[3];
-    want = group == 0x001d ? 32u : group == 0x0017 ? 65u : 0u;
+    want = BRISK_ENABLE_X25519 && group == 0x001d    ? 32u
+           : BRISK_ENABLE_P256_KX && group == 0x0017 ? 65u
+                                                     : 0u;
     /* 5.4: named_curve(3) only, a group we offered (RFC 8422 5.1) */
     if (b[0] != 3 || want == 0 || !brisk__hs_in_list(hs->offered_groups, hs->n_groups, group)) {
         return brisk__hs_fail(hs, BRISK__ALERT_ILLEGAL_PARAMETER);

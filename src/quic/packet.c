@@ -146,7 +146,9 @@ int brisk__quic_keys_init(brisk__quic_keys *k, uint16_t suite, const uint8_t *se
     size_t kl = suite == 0x1301 ? 16 : 32;
     uint8_t key[32], hp[32];
     int rc;
+    /* a suite brisk_config.h left out fails here, before any key or HP stub could run */
     if (k == NULL || secret == NULL || (suite != 0x1301 && suite != 0x1302 && suite != 0x1303) ||
+        (!BRISK_ENABLE_AES256 && suite == 0x1302) || (!BRISK_ENABLE_CHACHA && suite == 0x1303) ||
         len != brisk_hash_len(alg)) {
         return BRISK_E_ARG;
     }

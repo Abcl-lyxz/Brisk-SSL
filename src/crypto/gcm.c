@@ -42,6 +42,8 @@
  */
 #include "brisk_int.h"
 
+#if BRISK_ENABLE_AESGCM
+
 /* One 16-byte GHASH input block: the next 16 bytes, or the zero-padded tail (SP 800-38D 7.1
  * step 5, the 0^v / 0^u padding). */
 static const uint8_t *next_block(const uint8_t **data, size_t *len, uint8_t tmp[16])
@@ -104,7 +106,7 @@ void brisk__ghash(uint8_t y[16], const uint8_t h[16], const uint8_t *data, size_
     brisk__ghash_mulfree(y, h, data, len);
 }
 
-#elif BRISK__AES_CT64
+#elif BRISK__GHASH64
 
 /* Carry-less 64x64 multiply, low 64 bits: 4-bit holes keep every carry out of the kept bits. */
 static uint64_t bmul64(uint64_t x, uint64_t y)
@@ -198,7 +200,7 @@ void brisk__ghash(uint8_t y[16], const uint8_t h[16], const uint8_t *data, size_
     brisk__secure_zero(tmp, sizeof tmp);
 }
 
-#else /* !BRISK__AES_CT64 */
+#else /* !BRISK__GHASH64 */
 
 /* Carry-less 32x32 multiply, low 32 bits only: no widening multiply is ever needed. */
 static uint32_t bmul32(uint32_t x, uint32_t y)
@@ -318,7 +320,7 @@ void brisk__ghash(uint8_t y[16], const uint8_t h[16], const uint8_t *data, size_
     brisk__secure_zero(&s, sizeof s);
 }
 
-#endif /* BRISK_GHASH_MULFREE / BRISK__AES_CT64 */
+#endif /* BRISK_GHASH_MULFREE / BRISK__GHASH64 */
 
 /* ---- AES-GCM (SP 800-38D 7.1 / 7.2) ---- */
 /* SP 800-38D 5.2.1.1: len(P) <= 2^39 - 256 bits = 2^36 - 32 bytes (2^32 - 2 counter blocks; one
@@ -415,3 +417,5 @@ int brisk__gcm_open(const brisk__gcm_key *k, const uint8_t iv[12], const uint8_t
 
 #undef BRISK__GCM_P_MAX
 #undef BRISK__GCM_A_MAX
+
+#endif /* BRISK_ENABLE_AESGCM */

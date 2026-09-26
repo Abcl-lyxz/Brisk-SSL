@@ -190,6 +190,7 @@ int brisk_random(void *out, size_t len)
     return rc;
 }
 
+#    if BRISK_ENABLE_X25519
 int brisk_x25519_keygen(uint8_t priv[BRISK_X25519_LEN], uint8_t pub[BRISK_X25519_LEN])
 {
     int rc = brisk_random(priv, BRISK_X25519_LEN);
@@ -200,6 +201,7 @@ int brisk_x25519_keygen(uint8_t priv[BRISK_X25519_LEN], uint8_t pub[BRISK_X25519
     }
     return rc;
 }
+#    endif
 
 int brisk_p256_keygen(uint8_t priv[BRISK_P256_PRIV_LEN], uint8_t pub[BRISK_P256_PUB_LEN])
 {

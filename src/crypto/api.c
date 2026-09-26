@@ -17,8 +17,11 @@ static int aead(int seal, brisk_aead_alg alg, const uint8_t *key, size_t key_len
 {
     const uint8_t *a = (const uint8_t *)aad, *i = (const uint8_t *)in;
     uint8_t *o = (uint8_t *)out;
+#    if BRISK_ENABLE_AESGCM
     brisk__gcm_key k;
     int rc;
+#    endif
+#    if BRISK_ENABLE_CHACHA
     if (alg == BRISK_AEAD_CHACHA20_POLY1305) {
         if (key_len != BRISK__CHACHA20_KEY_LEN) {
             return BRISK_E_ARG;
@@ -26,8 +29,10 @@ static int aead(int seal, brisk_aead_alg alg, const uint8_t *key, size_t key_len
         return seal ? brisk__chacha20_poly1305_seal(key, nonce, a, aad_len, i, len, o, stag)
                     : brisk__chacha20_poly1305_open(key, nonce, a, aad_len, i, len, o, otag);
     }
+#    endif
+#    if BRISK_ENABLE_AESGCM
     if (!((alg == BRISK_AEAD_AES128_GCM && key_len == 16) ||
-          (alg == BRISK_AEAD_AES256_GCM && key_len == 32))) {
+          (BRISK_ENABLE_AES256 && alg == BRISK_AEAD_AES256_GCM && key_len == 32))) {
         return BRISK_E_ARG;
     }
     rc = brisk__gcm_init(&k, key, key_len);
@@ -37,6 +42,11 @@ static int aead(int seal, brisk_aead_alg alg, const uint8_t *key, size_t key_len
     }
     brisk__secure_zero(&k, sizeof k);
     return rc;
+#    else
+    (void)seal, (void)key, (void)key_len, (void)nonce, (void)a, (void)aad_len, (void)i, (void)len;
+    (void)o, (void)stag, (void)otag;
+    return BRISK_E_ARG; /* the algorithm is not in this build */
+#    endif
 }
 
 int brisk_aead_seal(brisk_aead_alg alg, const uint8_t *key, size_t key_len,
@@ -69,11 +79,13 @@ int brisk_hkdf_expand(brisk_hash_alg alg, const uint8_t *prk, size_t prk_len, co
     return brisk__hkdf_expand(alg, prk, prk_len, (const uint8_t *)info, info_len, out, out_len);
 }
 
+#    if BRISK_ENABLE_X25519
 int brisk_x25519(uint8_t shared[BRISK_X25519_LEN], const uint8_t priv[BRISK_X25519_LEN],
                  const uint8_t peer[BRISK_X25519_LEN])
 {
     return brisk__x25519(shared, priv, peer);
 }
+#    endif
 
 int brisk_p256_ecdh(uint8_t shared[BRISK_P256_SHARED_LEN], const uint8_t priv[BRISK_P256_PRIV_LEN],
                     const uint8_t peer[BRISK_P256_PUB_LEN])
@@ -95,6 +107,7 @@ int brisk_p384_verify(const uint8_t pub[BRISK_P384_PUB_LEN], const uint8_t *hash
 }
 #    endif
 
+#    if BRISK_ENABLE_RSA
 int brisk_rsa_pkcs1_verify(const uint8_t *n, size_t n_len, const uint8_t *e, size_t e_len,
                            brisk_hash_alg alg, const uint8_t *hash, size_t hash_len,
                            const uint8_t *sig, size_t sig_len)
@@ -108,5 +121,6 @@ int brisk_rsa_pss_verify(const uint8_t *n, size_t n_len, const uint8_t *e, size_
 {
     return brisk__rsa_pss_verify(n, n_len, e, e_len, alg, salt_len, hash, hash_len, sig, sig_len);
 }
+#    endif
 
 #endif /* BRISK_ENABLE_CRYPTO_API */

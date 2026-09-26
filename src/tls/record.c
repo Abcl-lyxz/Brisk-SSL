@@ -24,10 +24,13 @@ static brisk_hash_alg rec_alg(uint16_t suite)
     return suite == 0x1302 ? BRISK_HASH_SHA384 : BRISK_HASH_SHA256;
 }
 
-/* 7.3 key length for the three TLS 1.3 AEAD suites this library speaks, 0 for anything else. */
+/* 7.3 key length for the TLS 1.3 AEAD suites this build speaks, 0 for anything else. */
 static size_t rec_key_len(uint16_t suite)
 {
-    return suite == 0x1301 ? 16 : (suite == 0x1302 || suite == 0x1303) ? 32 : 0;
+    return BRISK_ENABLE_AESGCM && suite == 0x1301   ? 16
+           : BRISK_ENABLE_AES256 && suite == 0x1302 ? 32
+           : BRISK_ENABLE_CHACHA && suite == 0x1303 ? 32
+                                                    : 0;
 }
 
 #if BRISK_ENABLE_TLS12
