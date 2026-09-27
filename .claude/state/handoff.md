@@ -1,32 +1,38 @@
-# Handoff - 2026-09-26 (session 24)
+# Handoff - 2026-09-27 (session 25)
 
-## Done - M9 box 1: key/chain formats
-- 34a575f **tls:** new `cfg.client_key_len` field. Accepted key forms:
-  - 0 or 32 = raw d (v0.1 compat);
-  - SEC1 or PKCS#8, as DER or PEM, auto-detected; prime256v1 only.
-  - The key is parsed once into `brisk_conn.key`, which is wiped on close and on setup failure.
-  - `client_chain` may also be PEM. It is decoded straight into the hs output in two passes, with no per-conn buffer.
-  - The strict constant-time base64 `brisk__x509_pem_block` in src/x509/bundle.c is shared with the streaming reader.
-  - New files: src/x509/key.c, tests/test_key.c, fuzz/fuzz_key.c, tests/kat/{key,mtls_key}.inc (openssl via kat.py).
-  - Examples now read PEM keys directly. Host tests and all 10 archs are green.
-- Size: DEFAULT/FULL grew 3-4 KB flash, TINY 0.1-0.3 KB. **mips DEFAULT is at 138.1 of 144 KB budget**.
+## Done - M9 boxes 2-4 (all 10 archs green, host + amalg + ct)
+- 944af08 **tls:** brisk_connect_fd / brisk_connect_io (custom transport).
+- 35a2aeb **crypto:** public crypto API (BRISK_ENABLE_CRYPTO_API), src/crypto/api.c + linux_rand.c.
+- f32b2de **crypto:** algorithm knobs AESGCM/AES256/CHACHA/X25519/P256_KX/RSA + BRISK_AES_IMPL.
+- bc4ac35 **tls:** feature knobs TICKETS/PEM/SYSTEM_CA/CUSTOM_IO; brisk_build_info appends " -rsa ...".
+- 5ad670c **tls:** brisk_strerror (ERROR_STRINGS, off in TINY = name only) + cfg.keylog (KEYLOG, off everywhere).
+- Size: mips DEFAULT 140.4 of 144 KB (knobs off free up to 8.9 KB x25519 / 5.2 AES+GCM / 3.4 ChaCha).
 
 ## In progress
-- Nothing. The tree is clean.
+- Nothing. Tree clean.
 
-## Next up - ROADMAP M9 box 2: custom transport
-- `brisk_connect_fd`: the caller opens the socket/fd, and brisk_close does not close it.
-- `brisk_connect_io`: send/recv callbacks, for UART, tunnels and tests.
-- net_flush/net_fill go through an io vtable (src/os/linux_net.c, src/tls/conn.c).
-- read/write must work for non-socket fds.
-- Watch the mips DEFAULT flash headroom (6 KB left). The M9 compile-time knobs box is the way to buy some back.
+## Next up - ROADMAP M9 box "Runtime cfg"
+- min/max version, suites/groups preference strings, SNI override, SPKI pins (on top of chain
+  verification), time_floor, record_size_limit (RFC 8449 - the engine already honours the
+  server's). rfc-auditor clean.
+- Open design questions to ASK the user first (not decided yet):
+  1. suites/groups format: comma short names like ALPN ("chacha,aes128" / "x25519,p256") vs
+     IANA names vs uint16 arrays - recommend comma short names.
+  2. SNI override: cfg.sni NULL = host, "" = omit, else send it while still verifying `host`?
+  3. SPKI pin scope: SHA-256 of SPKI matching any cert of the verified chain vs leaf only.
+- New fields go at the END of brisk_cfg (0/NULL = default); note the ABI change for 0.2.
 
 ## Decisions / gotchas
-- The client_key_len==0 => raw 32 bytes rule is kept for v0.1 code, so the docs tell callers to refuse an empty key file themselves.
-- The PEM chain limit counts decoded DER (BRISK_TLS_MAX_CLIENT_CHAIN). brisk_config.h now errors if that is greater than BRISK_TLS_MAX_HS_MSG.
-- The all-arch run gets killed by low memory when it runs in the background. What works: run it in the foreground in two groups (4 archs, then 6) with `-j 2`, and poll the log with a foreground loop.
-- EMS stays required (user, 2026-09-25): an old server gets a clear E_INSECURE.
-- Live-run findings are in docs/TROUBLESHOOTING.md (badssl/hivemq E_INSECURE, mosquitto private CA).
-- OpenWrt-built binaries need libgcc_s (weak __register_frame_info). It is not a Brisk bug.
-- The Bash heredoc eats backslashes. Write code with the Write tool or use chr(92).
-- Poll CI in the foreground (`gh run view ID --json status,conclusion`, sleep 60).
+- Knobs (user, 2026-09-26): on in every profile, only explicit 0 drops one - MTI ones too,
+  documented non-conformant. Off = empty TU + fail-closed static inline stubs in brisk_int.h
+  (callers keep one code path; clang warns on an UNUSED static inline in the amalgamation -
+  gate a stub whose only caller is optional, like brisk__chacha20 under QUIC).
+- The CMake test suite needs every algorithm knob on (byte-exact ClientHello replays); knob-off
+  builds are covered by tests/test_knobs.c in the `dev.py amalg` matrix (KNOBS_OFF).
+- P256_KX=0 + TLS 1.2: a conforming server will not do ECDHE_ECDSA with a P-256 cert (RFC 8422 5.3).
+- GHASH width is BRISK__GHASH64, independent of BRISK_AES_IMPL (dev.py ct passes both =0 for ct32).
+- Python edits on Windows: write bytes (read_bytes/write_bytes) or CRLF sneaks in; run
+  clang-format -i on files edited outside the Edit tool.
+- Don't edit src/ while a Docker arch run is going: the containers compile the live tree.
+- All-arch: two groups (4 then 6) with -j 2; a chained background command works.
+- EMS stays required (user, 2026-09-25). Bash heredoc eats backslashes: use the Write tool.
