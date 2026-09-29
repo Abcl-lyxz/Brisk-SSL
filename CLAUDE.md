@@ -39,7 +39,7 @@ tools/dev.py           test size ct fuzz amalg interop      tools/mcp/rfc_server
 tools/amalg.py         -> dist/brisk.{c,h} (gitignored)     tools/apidoc.py         -> docs/API.md (CI --check)
 docker/Dockerfile      cross gcc + qemu image               size/baseline.json      per-module size baseline
 size/budget.json       max flash per profile (CI gate)      openwrt/brisk-ssl/      OpenWrt package Makefile
-examples/              brisk_get h2_get h3_get mqtt_tls aws_iot_https (built by every Docker preset)
+examples/              brisk_get h2_get h3_get mqtt_tls aws_iot_https tcp_tls_embedded (every Docker preset)
 docs/ ROADMAP ARCHITECTURE CONFIG API(generated) TROUBLESHOOTING
 ```
 

@@ -41,6 +41,25 @@ Also available:
 - **Sans-I/O**: the same connection in your own event loop and memory, with `brisk_conn_init`,
   `brisk_feed`, `brisk_pull`, `brisk_app_read` and `brisk_app_write`
 
+## Certificates without files
+Firmware can carry its CA, device certificate and key as C arrays (`xxd -i ca.der`): no
+filesystem, no system CA store. `ca_mem` alone trusts ONLY those anchors.
+```c
+static const uint8_t my_ca_der[] = { 0x30, 0x82, /* ... xxd -i my_ca.der ... */ };
+
+brisk_cfg cfg = BRISK_DEFAULTS;
+cfg.ca_mem = my_ca_der;             cfg.ca_mem_len = sizeof my_ca_der;      /* DER or PEM text */
+cfg.client_chain = my_cert_der;     cfg.client_chain_len = sizeof my_cert_der;  /* optional mTLS */
+cfg.client_key = my_key_der;        cfg.client_key_len = sizeof my_key_der;     /* SEC1/PKCS#8 */
+cfg.pins = my_root_spki_sha256;     cfg.n_pins = 1;     /* optional, on top of chain checks */
+brisk_connect_fd(&cfg, "device.example.com", fd, &c);   /* a socket you opened, or ... */
+brisk_connect_io(&cfg, "device.example.com", &io, &c);  /* ... send/recv callbacks (UART, tunnel) */
+```
+Runtime policy, all optional and only ever narrowing: `cfg.suites` ("chacha,aes128,aes256"),
+`cfg.groups` ("x25519,p256"), `cfg.min_version` (0x0304 = TLS 1.3 only), `cfg.sni`,
+`cfg.time_floor` (a persisted last-known-good time). Complete program:
+[`examples/tcp_tls_embedded.c`](examples/tcp_tls_embedded.c).
+
 ## HTTP/2 and HTTP/3 (optional modules, called explicitly)
 ```c
 cfg.alpn = "h2";                                         /* HTTP/2 over the TLS stream */
@@ -55,7 +74,7 @@ brisk_quic_connect(&cfg, host, 443, &q);
 brisk_h3_open(q, mem, brisk_h3_size(), &h3);             /* then the same request/response calls */
 ```
 Complete programs: [`examples/`](examples) (`brisk_get`, `h2_get`, `h3_get`, `mqtt_tls`,
-`aws_iot_https`). Every public call is listed in [docs/API.md](docs/API.md), and
+`aws_iot_https`, `tcp_tls_embedded`). Every public call is listed in [docs/API.md](docs/API.md), and
 [`include/brisk.h`](include/brisk.h) has the full contracts.
 
 ## Tested against real servers (2026-09-25)

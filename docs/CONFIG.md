@@ -121,11 +121,11 @@ profile exceeds its budget in `size/budget.json`; per-module numbers: `python to
 <!-- size-table:begin (tools/dev.py size --profiles --doc) -->
 | profile | budget | x86_64 | i686 | aarch64 | armv7hf | armv5 | mips | mipsel | mips64 | riscv64 | ppc |
 |---|---|---|---|---|---|---|---|---|---|---|---|
-| TINY | 104 | 69.8 | 85.6 | 66.0 | 52.4 | 77.5 | 97.9 | 98.2 | 89.5 | 56.3 | 81.6 |
-| DEFAULT | 144 | 101.1 | 119.1 | 97.8 | 74.4 | 111.1 | 140.4 | 140.7 | 130.7 | 81.7 | 117.0 |
-| FULL | 216 | 145.3 | 172.0 | 142.7 | 110.8 | 163.8 | 207.7 | 208.1 | 187.3 | 118.2 | 173.3 |
+| TINY | 104 | 70.7 | 86.5 | 66.8 | 53.0 | 78.3 | 98.9 | 99.2 | 90.4 | 57.0 | 82.3 |
+| DEFAULT | 144 | 102.1 | 120.1 | 98.7 | 75.1 | 112.1 | 141.4 | 141.8 | 131.6 | 82.4 | 117.9 |
+| FULL | 216 | 146.3 | 172.9 | 143.6 | 111.5 | 164.7 | 208.7 | 209.1 | 188.3 | 118.9 | 174.2 |
 
-KB of flash (text + rodata + data, -Os, static link map, libc excluded); budget = the most any arch may take (size/budget.json). Static RAM is at most 132 B on any arch and profile - every context is caller-owned.
+KB of flash (text + rodata + data, -Os, static link map, libc excluded); budget = the most any arch may take (size/budget.json). Static RAM is at most 212 B on any arch and profile - every context is caller-owned.
 <!-- size-table:end -->
 
 ## What did my firmware get compiled with?

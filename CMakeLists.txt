@@ -184,7 +184,7 @@ if(BRISK_SIZE_PROBE)
 endif()
 
 if(BRISK_BUILD_EXAMPLES AND CMAKE_SYSTEM_NAME STREQUAL "Linux") # the blocking API is Linux-only
-    foreach(ex brisk_get h2_get h3_get aws_iot_https mqtt_tls)
+    foreach(ex brisk_get h2_get h3_get aws_iot_https mqtt_tls tcp_tls_embedded)
         add_executable(${ex} examples/${ex}.c)
         set_target_properties(${ex} PROPERTIES C_STANDARD 99 C_EXTENSIONS OFF)
         target_link_libraries(${ex} PRIVATE brisk)
