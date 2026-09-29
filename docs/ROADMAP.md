@@ -251,7 +251,7 @@ default still holds: certificate verification can never be switched off.
       record_size_limit / max_fragment_length (the receive buffer is always full size, so a
       smaller limit saves nothing; the server's RFC 8449 limit is honoured). Another 0.2 ABI
       note: brisk_cfg grew again. tests/test_conn.c conn_policy, mutation-checked
-- [ ] Docs + release: `examples/tcp_tls_embedded.c` (CA/cert/key as `xxd -i` arrays, no files),
+- [x] Docs + release: `examples/tcp_tls_embedded.c` (CA/cert/key as `xxd -i` arrays, no files),
       README "Certificates without files", CONFIG.md knob -> KB table, apidoc, v0.2.0 tag
 
 ## Backlog (pick the next milestone from here when every box above is ticked)
