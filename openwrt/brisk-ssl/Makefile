@@ -12,15 +12,15 @@
 include $(TOPDIR)/rules.mk
 
 PKG_NAME:=brisk-ssl
-PKG_VERSION:=0.1.0
+PKG_VERSION:=0.2.0
 PKG_RELEASE:=1
 
 PKG_SOURCE_PROTO:=git
 PKG_SOURCE_URL:=https://github.com/Abcl-lyxz/Brisk-SSL.git
-# Pinned to the v0.1.0 tag's commit (a moved tag cannot change what builds) and the hash of
+# Pinned to the v0.2.0 tag's commit (a moved tag cannot change what builds) and the hash of
 # the source tarball OpenWrt makes from it (`make package/brisk-ssl/check FIXUP=1`).
-PKG_SOURCE_VERSION:=7ad57319102fec0489844ee58d7f66567689b8ce
-PKG_MIRROR_HASH:=8647fa38806933b3edcfe180ede5f07307e89d3218f4d57ddc6d57307b3b2ccd
+PKG_SOURCE_VERSION:=98360103ac37c03a75a93455dbbf6d06e8370377
+PKG_MIRROR_HASH:=29da243b64e5f7ccbaa936298ea7eef17b5f5bd8dadd29705075d33776d768bd
 
 PKG_LICENSE:=Apache-2.0
 PKG_LICENSE_FILES:=LICENSE NOTICE
