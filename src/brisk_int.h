@@ -1201,6 +1201,10 @@ typedef struct {
     void *anchor_ctx;
     const uint8_t (*pins)[BRISK_SHA256_LEN]; /* n_pins sha256 digests; NULL = no pinning */
     size_t n_pins;
+    /* A runtime clock floor (seconds, e.g. a persisted last-known-good time). Only a value above
+     * BRISK_X509_TIME_FLOOR counts; chain_verify then judges `now` below it as the time policy
+     * judges a clock below the build floor. It can only refuse more, never accept more. */
+    int64_t time_floor;
 } brisk__x509_trust;
 
 /* Is `now` inside this certificate's validity window, under the policy the build was configured
@@ -1821,7 +1825,7 @@ typedef struct {
      * that hs_client_hello fills (4.3.11). The extension is written LAST, as 4.3.11 demands. */
     const brisk__tls13_psk *psk;
     /* 1 = also offer TLS 1.2 (M5): 0x0303 after 0x0304 in supported_versions (RFC 9846 4.3.1),
-     * the six TLS 1.2 suites after `suites`, and ec_point_formats [uncompressed] (RFC 8422 5.1),
+     * the TLS 1.2 ECDHE suites of the same AEADs after `suites` (handshake.c SUITES12), and ec_point_formats [uncompressed] (RFC 8422 5.1),
      * extended_main_secret (RFC 7627 5.1) and renegotiation_info {0x00} (RFC 5746 3.4) right
      * after supported_versions. BRISK_E_ARG with BRISK_ENABLE_TLS12 == 0 or over QUIC. */
     uint8_t tls12;
@@ -2339,6 +2343,14 @@ struct brisk_conn {
     uint16_t alpn_len;
     char host[256]; /* NUL-terminated copy of the caller's host */
     size_t host_len;
+    const char *sni; /* what the ClientHello names: host, cfg.sni, or NULL (none) */
+    size_t sni_len;
+    /* cfg.suites / cfg.groups parsed; suites NULL / n_groups 0 = the engine's default list.
+     * QUIC's test seam (src/quic/api.c) may point suites elsewhere. */
+    const uint16_t *suites;
+    size_t n_suites, n_groups;
+    uint16_t suite_pref[3], group_pref[2];
+    uint8_t tls12; /* offer TLS 1.2 too: BRISK_ENABLE_TLS12 and cfg.min_version below 0x0304 */
     uint16_t port;  /* brisk_connect's port (0 = unknown: sans-I/O / test fd) - the h2 :authority */
     int64_t now_ms; /* wall clock: ticket age / stamp; auth.now holds the same in seconds */
     int64_t ch1_ms; /* now_ms when CH1 was built: CH2 re-imports its PSK at that time (4.2.2) */
@@ -2354,11 +2366,9 @@ struct brisk_conn {
 #if BRISK_ENABLE_QUIC
     /* QUIC mode (src/quic/api.c): no record layer (tc unused), the ClientHello is built with
      * no session id (RFC 9001 8.4), no TLS 1.2 offer (4.2) and these transport parameters
-     * (8.2); suites NULL = the engine's default list */
+     * (8.2) */
     const uint8_t *quic_tp;
     size_t quic_tp_len;
-    const uint16_t *suites;
-    size_t n_suites;
     uint8_t quic;
 #endif
 };

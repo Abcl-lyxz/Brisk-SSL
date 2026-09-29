@@ -157,6 +157,7 @@ int main(int argc, char **argv)
         /* 1, not argc: `pins` aims at a 64-byte buffer, so anything above 2 would make
          * pinned() read past it if this probe were ever RUN under a sanitizer. */
         trust.n_pins = 1;
+        trust.time_floor = 0;
         brisk__x509_chain_verify(&xc, 1, when, &trust);
         brisk__x509_time_ok(&xc, when);
         brisk__x509_signed_by(&xc, &xc);

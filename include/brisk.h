@@ -410,13 +410,44 @@ typedef struct {
      * (DNS resolution comes before and is NOT bounded by it: getaddrinfo has no timeout).
      * brisk_read / brisk_write: the longest wait without any progress. */
     uint32_t timeout_ms;
-    /* No runtime certificate-time floor yet: the clock policy is compile-time
-     * (BRISK_X509_TIME_POLICY / BRISK_X509_TIME_FLOOR in brisk_config.h). A device that stores a
-     * last-known-good time must NOT pass it off as the clock - see docs/ROADMAP.md. */
     /* Key log for Wireshark (brisk_keylog_fn above; BRISK_ENABLE_KEYLOG builds only). NULL =
      * off. Called synchronously from the handshake; copy the line, it dies on return. */
     brisk_keylog_fn keylog;
     void *keylog_ctx;
+    /* ---- Runtime policy (0.2). Every field 0 / NULL = the default; each one can only narrow
+     * what is offered or accepted, never switch a check off. Strings are not copied (same
+     * lifetime as alpn). Anything unknown, empty, duplicated or left out of this build by
+     * brisk_config.h is BRISK_E_ARG at setup - never silently ignored. */
+    /* AEAD preference, comma-separated: "chacha", "aes128", "aes256". NULL = "chacha,aes128,aes256"
+     * (ChaCha20 first: AES is software here). Applies to TLS 1.3 and QUIC, and to TLS 1.2, where
+     * each name brings its ECDHE_ECDSA then (BRISK_ENABLE_RSA) ECDHE_RSA suite. */
+    const char *suites;
+    /* Key-exchange groups, comma-separated: "x25519", "p256". NULL = "x25519,p256". The first
+     * one gets the key share; a server that wants another costs a HelloRetryRequest. */
+    const char *groups;
+    /* server_name (RFC 6066) to SEND: NULL = `host`; "" = send none; else this name (printable
+     * ASCII, at most 255 bytes, e.g. when `host` is an IP literal or a proxy). The certificate is
+     * ALWAYS checked against `host`, never against sni. Tickets are bound to `host`: when sni
+     * differs from it, ticket and on_ticket are ignored (RFC 9846 4.7.1). */
+    const char *sni;
+    /* SPKI pins (RFC 7469 style, without the base64): n_pins SHA-256 digests of a
+     * SubjectPublicKeyInfo, 32 bytes each, back to back - `openssl x509 -pubkey -noout |
+     * openssl pkey -pubin -outform DER | openssl dgst -sha256`. With n_pins > 0 the verified
+     * chain (leaf, intermediates, or the anchor it ended at) must ALSO hold one of them; a copy
+     * the server merely appended counts for nothing. Pin your root or your own CA: a leaf or
+     * intermediate pin breaks at the next rotation. Resumption (ticket) does not re-check pins
+     * (RFC 9846 2.2) - use tickets only from connections made with the same pins. */
+    const uint8_t *pins;
+    size_t n_pins;
+    /* Certificate-time floor in Unix seconds, e.g. a last-known-good time the device persisted.
+     * Counts only above the build's BRISK_X509_TIME_FLOOR; a clock below it is treated as
+     * unset under BRISK_X509_TIME_POLICY (STRICT refuses, FLOOR only needs notAfter >= floor).
+     * Never pass such a value off as the clock itself. 0 = the build floor only; non-zero is
+     * BRISK_E_ARG in a BRISK_X509_TIME_POLICY_INSECURE_NO_TIME build. */
+    int64_t time_floor;
+    /* Lowest version: 0 = TLS 1.2 where built (BRISK_ENABLE_TLS12), else 1.3; 0x0303 the same
+     * but refused by a build without TLS 1.2; 0x0304 = TLS 1.3 only. TLS 1.3 is always offered. */
+    uint16_t min_version;
 } brisk_cfg;
 
 #define BRISK_DEFAULTS {0}

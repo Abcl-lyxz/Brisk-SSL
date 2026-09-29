@@ -196,8 +196,10 @@ static int conn_hello(brisk_conn *c, uint8_t *buf)
     int ch2 = hs->state == BRISK__HS_WAIT_CH2, use_psk = 0, rc, quic = 0;
     /* CH1's share: x25519 unless brisk_config.h left it out (the engine refuses a group that is
      * not in this build, so an HRR can only name one that is) */
-    uint16_t g =
-        ch2 && hs->hrr_group != 0 ? hs->hrr_group : (BRISK_ENABLE_X25519 ? CONN_X25519 : CONN_P256);
+    uint16_t g = ch2 && hs->hrr_group != 0 ? hs->hrr_group
+                 : c->n_groups != 0        ? c->group_pref[0]
+                 : BRISK_ENABLE_X25519     ? CONN_X25519
+                                           : CONN_P256;
     const uint8_t *priv = c->rnd + (g == CONN_P256 ? CONN_RND_P : CONN_RND_X);
     size_t n = 0;
 
@@ -216,11 +218,15 @@ static int conn_hello(brisk_conn *c, uint8_t *buf)
     p.session_id_len = 32;
     p.share_group = g;
     p.share_pub = pub;
-    p.sni = c->host;
-    p.sni_len = c->host_len;
+    p.sni = c->sni;
+    p.sni_len = c->sni_len;
     p.alpn = c->alpn_len != 0 ? c->alpn : NULL;
     p.alpn_len = c->alpn_len;
-    p.tls12 = BRISK_ENABLE_TLS12; /* one ClientHello for TLS 1.3 and 1.2 (RFC 9846 4.3.1) */
+    p.suites = c->suites;
+    p.n_suites = c->n_suites;
+    p.groups = c->n_groups != 0 ? c->group_pref : NULL;
+    p.n_groups = c->n_groups;
+    p.tls12 = c->tls12; /* one ClientHello for TLS 1.3 and 1.2 (RFC 9846 4.3.1) */
 #if BRISK_ENABLE_QUIC
     quic = c->quic;
     if (quic) {
@@ -228,8 +234,6 @@ static int conn_hello(brisk_conn *c, uint8_t *buf)
         p.tls12 = 0;            /* RFC 9001 4.2 (MUST NOT): TLS 1.3 only */
         p.quic_tp = c->quic_tp; /* 8.2 (MUST) */
         p.quic_tp_len = c->quic_tp_len;
-        p.suites = c->suites;
-        p.n_suites = c->n_suites;
     }
 #endif
     if (ch2 && hs->cookie_len != 0) {
@@ -313,6 +317,43 @@ int brisk__conn_next_hello(brisk_conn *c, uint8_t *buf)
 
 /* ------------------------------------------------------------------ setup ------------------- */
 
+/* cfg.suites / cfg.groups names; what brisk_config.h left out is not a name in this build */
+typedef struct {
+    const char *name;
+    uint16_t code;
+    uint8_t on;
+} conn_name;
+static const conn_name CONN_SUITES[3] = {{"chacha", 0x1303, BRISK_ENABLE_CHACHA},
+                                         {"aes128", 0x1301, BRISK_ENABLE_AESGCM},
+                                         {"aes256", 0x1302, BRISK_ENABLE_AES256}};
+static const conn_name CONN_GROUPS[2] = {{"x25519", CONN_X25519, BRISK_ENABLE_X25519},
+                                         {"p256", CONN_P256, BRISK_ENABLE_P256_KX}};
+
+/* "a,b" -> codes in that order (out has room for nt). 0 = an empty, unknown, disabled or
+ * repeated name; NULL list = 1 with *n 0 (the default). */
+static int conn_names(const char *list, const conn_name *t, size_t nt, uint16_t *out, size_t *n)
+{
+    size_t i, len;
+    unsigned used = 0;
+    *n = 0;
+    while (list != NULL) {
+        for (len = 0; list[len] != '\0' && list[len] != ','; len++) {
+        }
+        for (i = 0; i < nt; i++) {
+            if (t[i].on && strlen(t[i].name) == len && memcmp(t[i].name, list, len) == 0) {
+                break;
+            }
+        }
+        if (i == nt || (used & (1u << i))) {
+            return 0;
+        }
+        used |= 1u << i;
+        out[(*n)++] = t[i].code;
+        list = list[len] == ',' ? list + len + 1 : NULL;
+    }
+    return 1;
+}
+
 /* The ONE host string must be acceptable to every consumer (ch_write comment): the SNI writer
  * refuses what is not printable ASCII, and brisk__x509_match_host says BRISK_E_ARG for anything
  * that is not a usable reference identity - checked here with no certificate, so a bad host is
@@ -351,10 +392,23 @@ CONN_SHARED int brisk__conn_core(brisk_conn *c, const brisk_cfg *cfg, const char
     }
     if (!conn_host_ok(host, &host_len) || (cfg->ca_mem == NULL) != (cfg->ca_mem_len == 0) ||
         (cfg->client_chain == NULL && cfg->client_chain_len != 0) ||
-        (cfg->client_key == NULL && cfg->client_key_len != 0)) {
+        (cfg->client_key == NULL && cfg->client_key_len != 0) ||
+        (cfg->pins == NULL) != (cfg->n_pins == 0) ||
+        (cfg->min_version != 0 && cfg->min_version != 0x0304 &&
+         (cfg->min_version != 0x0303 || !BRISK_ENABLE_TLS12)) ||
+        /* a build that never reads the clock cannot honour a floor: refused, not ignored */
+        (BRISK_X509_TIME_POLICY == BRISK_X509_TIME_POLICY_INSECURE_NO_TIME &&
+         cfg->time_floor != 0)) {
         return BRISK_E_ARG;
     }
     memset(c, 0, sizeof *c);
+    if (!conn_names(cfg->suites, CONN_SUITES, 3, c->suite_pref, &n) ||
+        !conn_names(cfg->groups, CONN_GROUPS, 2, c->group_pref, &c->n_groups)) {
+        return BRISK_E_ARG;
+    }
+    c->suites = n != 0 ? c->suite_pref : NULL;
+    c->n_suites = n;
+    c->tls12 = (uint8_t)(BRISK_ENABLE_TLS12 && cfg->min_version != 0x0304);
     c->fd = -1;
     c->cfg = *cfg;
 #if !BRISK_ENABLE_TICKETS
@@ -364,6 +418,22 @@ CONN_SHARED int brisk__conn_core(brisk_conn *c, const brisk_cfg *cfg, const char
 #endif
     memcpy(c->host, host, host_len);
     c->host_len = host_len;
+    /* cfg.sni: NULL = host, "" = none; its characters are ch_write's to check (every setup path
+     * builds CH1 before it returns) */
+    c->sni = cfg->sni == NULL ? c->host : cfg->sni;
+    while (c->sni_len < 256 && c->sni[c->sni_len] != '\0') {
+        c->sni_len++;
+    }
+    if (c->sni_len > 255) {
+        return BRISK_E_ARG;
+    }
+    /* RFC 9846 4.7.1: resume only under the SNI of the original session. Tickets are bound to
+     * host, so a connection that sends another name (or none) neither offers nor keeps one. */
+    if (c->sni_len != host_len || memcmp(c->sni, host, host_len) != 0) {
+        c->cfg.ticket = NULL;
+        c->cfg.ticket_len = 0;
+        c->cfg.on_ticket = NULL;
+    }
     memcpy(c->rnd, rnd, BRISK__CONN_RAND);
     rc = brisk__alpn_encode(cfg->alpn, c->alpn, sizeof c->alpn, &n);
     c->alpn_len = (uint16_t)n;
@@ -372,6 +442,9 @@ CONN_SHARED int brisk__conn_core(brisk_conn *c, const brisk_cfg *cfg, const char
     c->bundle.path = cfg->ca_file; /* NULL: brisk__os_ca_anchor autodetects on first use */
     c->trust.find_anchor = brisk__conn_anchor;
     c->trust.anchor_ctx = c;
+    c->trust.pins = (const uint8_t (*)[BRISK_SHA256_LEN])(const void *)cfg->pins;
+    c->trust.n_pins = cfg->n_pins;
+    c->trust.time_floor = cfg->time_floor;
     c->auth.host = c->host;
     c->auth.host_len = host_len;
     c->auth.trust = &c->trust;

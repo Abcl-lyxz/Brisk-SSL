@@ -64,9 +64,7 @@ Tick a box only when the work is green on **every** arch (`python tools/dev.py t
     list, ticket in/out with the no-PSK retry) and `src/os/linux_net.c` (clocks, getaddrinfo +
     non-blocking TCP with poll deadlines, `brisk_conn_init`, the blocking API). One malloc per
     blocking connection; `brisk_conn_size()` per arch is in the commit message.
-  - Open: a RUNTIME certificate-time floor (a persisted last-known-good time) is not in
-    `brisk_cfg` yet. It must be threaded through `brisk__x509_chain_verify` /
-    `brisk__x509_time_ok` next to `BRISK_X509_TIME_FLOOR` - never done by raising `now`.
+  - Done in M9: `cfg.time_floor`, the runtime certificate-time floor (brisk__x509_trust).
   - Open: sans-I/O connections stamp tickets with the init time (no clock in the core); add a
     public `brisk_conn_set_time` if a long-lived sans-I/O user needs fresher stamps.
 - [x] RFC 8448 trace test; Docker interop (nginx, Caddy, openssl s_server); badssl.com
@@ -240,9 +238,19 @@ default still holds: certificate verification can never be switched off.
       static inline stubs in brisk_int.h. tests/test_knobs.c + the `dev.py amalg` matrix (each
       knob off, a minimal -O0 set, KEYLOG on) run in CI. brisk_build_info lists knobs off and
       KEYLOG. cfg.keylog (NSS lines) appended to brisk_cfg - another 0.2 ABI note
-- [ ] Runtime cfg: min/max version, suites/groups preference strings, sni override, SPKI pins
-      (on top of chain verification), time_floor, max_fragment / record_size_limit (RFC 8449);
-      rfc-auditor clean
+- [x] Runtime cfg (appended to brisk_cfg, 0/NULL = default, each can only narrow): `suites`
+      "chacha,aes128,aes256" and `groups` "x25519,p256" (comma names like alpn, caller's order;
+      the TLS 1.2 ECDHE suites follow the TLS 1.3 list; first group gets the key share), `sni`
+      (NULL = host, "" = none; the certificate is still checked against host; a connection
+      whose SNI is not host neither offers nor keeps tickets - RFC 9846 4.7.1, rfc-auditor), `pins`/`n_pins`
+      (SHA-256 SPKI, any certificate on the verified path incl. the anchor - chain.c's existing
+      pins), `time_floor` (runtime clock floor in chain.c, max with the build floor, never by
+      raising now; BRISK_E_ARG under INSECURE_NO_TIME), `min_version` (0x0304 = TLS 1.3 only). Decided (user, 2026-09-29): comma
+      names, sni tri-state, pin scope = whole verified path. Not done, on purpose: max_version
+      (TLS 1.3 is always offered - lowering it only weakens) and sending our own
+      record_size_limit / max_fragment_length (the receive buffer is always full size, so a
+      smaller limit saves nothing; the server's RFC 8449 limit is honoured). Another 0.2 ABI
+      note: brisk_cfg grew again. tests/test_conn.c conn_policy, mutation-checked
 - [ ] Docs + release: `examples/tcp_tls_embedded.c` (CA/cert/key as `xxd -i` arrays, no files),
       README "Certificates without files", CONFIG.md knob -> KB table, apidoc, v0.2.0 tag
 

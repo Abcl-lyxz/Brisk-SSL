@@ -144,28 +144,12 @@ static const uint16_t DEF_GROUPS[] = {
 #endif
 };
 #if BRISK_ENABLE_TLS12
-/* Appended when ch_params.tls12 is set: ECDHE + AEAD only (RFC 9325 4.2, RFC 9846 E.5), ChaCha20
- * first as above - RFC 7905 2, RFC 5289 3.2. Never CBC, static RSA, DHE, RC4 or the SCSV. */
-static const uint16_t DEF12_SUITES[] = {
-#    if BRISK_ENABLE_CHACHA
-    0xCCA9,
-#        if BRISK_ENABLE_RSA
-    0xCCA8,
-#        endif
-#    endif
-#    if BRISK_ENABLE_AESGCM
-    0xC02B,
-#        if BRISK_ENABLE_RSA
-    0xC02F,
-#        endif
-#    endif
-#    if BRISK_ENABLE_AES256
-    0xC02C,
-#        if BRISK_ENABLE_RSA
-    0xC030,
-#        endif
-#    endif
-};
+/* Appended when ch_params.tls12 is set, one pair per TLS 1.3 suite offered and in its order
+ * (ECDHE_ECDSA, then ECDHE_RSA with BRISK_ENABLE_RSA): ECDHE + AEAD only (RFC 9325 4.2, RFC 9846
+ * E.5), RFC 7905 2, RFC 5289 3.2 - the default offer gives CCA9 CCA8 C02B C02F C02C C030. Never
+ * CBC, static RSA, DHE, RC4 or the SCSV. */
+static const uint16_t SUITES12[3][3] = {
+    {0x1303, 0xCCA9, 0xCCA8}, {0x1301, 0xC02B, 0xC02F}, {0x1302, 0xC02C, 0xC030}};
 #endif
 static const uint16_t DEF_SIGS[] = {0x0403,
 #if BRISK_ENABLE_P384
@@ -1983,8 +1967,15 @@ int brisk__tls13_ch_write(const brisk__tls13_ch_params *p, uint8_t *out, size_t 
         w_u16(&w, suites[i]);
     }
 #if BRISK_ENABLE_TLS12
-    for (i = 0; p->tls12 && i < sizeof DEF12_SUITES / sizeof DEF12_SUITES[0]; i++) {
-        w_u16(&w, DEF12_SUITES[i]);
+    for (i = 0; p->tls12 && i < n_suites; i++) {
+        for (b = 0; b < 3; b++) {
+            if (SUITES12[b][0] == suites[i] && hs_known_suite(suites[i])) {
+                w_u16(&w, SUITES12[b][1]);
+                if (BRISK_ENABLE_RSA) {
+                    w_u16(&w, SUITES12[b][2]);
+                }
+            }
+        }
     }
 #endif
     w_close(&w, a, 2);

@@ -518,6 +518,241 @@ static void conn_suites(void)
     }
 }
 
+/* ---------------------------------------------------------------- runtime policy (M9) ------ */
+
+/* In the ClientHello record at wire[0..n): extension `type`'s data (or, for 0xffff, the
+ * cipher_suites list) and its length; NULL when absent. */
+static const uint8_t *ch_part(size_t n, unsigned type, size_t *len)
+{
+    const uint8_t *p = wire + 5 + 4 + 2 + 32, *end = wire + n;
+    size_t l;
+    p += 1 + p[0]; /* legacy_session_id */
+    if (type == 0xffff) {
+        *len = brisk__load_be16(p);
+        return p + 2;
+    }
+    p += 2 + brisk__load_be16(p); /* cipher_suites */
+    p += 1 + p[0];                /* legacy_compression_methods */
+    for (p += 2; end - p >= 4; p += 4 + l) {
+        l = brisk__load_be16(p + 2);
+        if (brisk__load_be16(p) == type) {
+            *len = l;
+            return p + 4;
+        }
+    }
+    *len = 0;
+    return NULL;
+}
+
+static int u16s_are(const uint8_t *p, size_t len, const uint16_t *want, size_t n)
+{
+    size_t i;
+    if (p == NULL || len != 2 * n) {
+        return 0;
+    }
+    for (i = 0; i < n; i++) {
+        if (brisk__load_be16(p + 2 * i) != want[i]) {
+            return 0;
+        }
+    }
+    return 1;
+}
+
+/* CH1 of `cfg` into wire[]; its record length, 0 when setup refused the config */
+static size_t policy_ch(const brisk_cfg *cfg)
+{
+    const struct tls13_flow_kat *k = row("fixture: P-256 leaf");
+    if (setup(k, 1, cfg, now_of(k)) != BRISK_OK) {
+        return 0;
+    }
+    return brisk_pull(C, wire, sizeof wire);
+}
+
+/* The row's server flight against `cfg` (whose CH1 must be the row's): brisk_feed's answer */
+static int policy_rc(const struct tls13_flow_kat *k, const brisk_cfg *cfg)
+{
+    size_t n, used;
+    int rc;
+    if (setup(k, 2, cfg, now_of(k)) != BRISK_OK || !pull_hello(k->ch1, 0x0301)) {
+        return 99;
+    }
+    n = flight(k, srv);
+    rc = brisk_feed(C, srv, n, &used);
+    brisk_conn_wipe(C);
+    return rc;
+}
+
+static void policy_ticket(void *ctx, const uint8_t *blob, size_t len)
+{
+    (void)ctx;
+    (void)blob;
+    (void)len;
+}
+
+static void conn_policy(void)
+{
+    static const char *const BAD[] = {
+        "",    ",",       "chacha,",       ",chacha",           "a,,b", "chacha,chacha", "CHACHA",
+        "aes", "aes1280", "chacha aes128", "x25519,p256,x25519"};
+    static const uint16_t DEF13[] = {0x1303, 0x1301, 0x1302}, V13[] = {0x0304}, P256[] = {0x0017},
+                          P256X[] = {0x0017, 0x001d};
+    static const uint16_t SUITES_A[] = {
+        0x1302, 0x1303,
+#    if BRISK_ENABLE_TLS12
+        0xC02C,
+#        if BRISK_ENABLE_RSA
+        0xC030,
+#        endif
+        0xCCA9,
+#        if BRISK_ENABLE_RSA
+        0xCCA8,
+#        endif
+#    endif
+    };
+    static const uint16_t MINV[] = {0x0300, 0x0301, 0x0302, 0x0305, 0x0403};
+    static brisk__x509_cert root, leaf;
+    const struct tls13_flow_kat *k = row("fixture: P-256 leaf");
+    uint8_t pins[2][BRISK_SHA256_LEN];
+    char longname[257];
+    brisk_cfg cfg;
+    size_t i, n, len;
+    const uint8_t *p;
+    int64_t now_s = (int64_t)k->now;
+
+    /* every malformed, unknown or repeated name, bad version or half-set pin is BRISK_E_ARG */
+    for (i = 0; i < sizeof BAD / sizeof BAD[0]; i++) {
+        arena_used = 0;
+        cfg = cfg_of(k);
+        cfg.suites = BAD[i];
+        CHECKI(setup(k, 0, &cfg, now_of(k)) == BRISK_E_ARG, i);
+        cfg.suites = NULL;
+        cfg.groups = BAD[i];
+        CHECKI(setup(k, 0, &cfg, now_of(k)) == BRISK_E_ARG, 100 + i);
+    }
+    arena_used = 0;
+    cfg = cfg_of(k);
+    cfg.suites = "x25519";
+    CHECK(setup(k, 0, &cfg, now_of(k)) == BRISK_E_ARG);
+    cfg = cfg_of(k);
+    cfg.groups = "chacha";
+    CHECK(setup(k, 0, &cfg, now_of(k)) == BRISK_E_ARG);
+    for (i = 0; i < sizeof MINV / sizeof MINV[0]; i++) {
+        cfg = cfg_of(k);
+        cfg.min_version = MINV[i];
+        CHECKI(setup(k, 0, &cfg, now_of(k)) == BRISK_E_ARG, 200 + i);
+    }
+    cfg = cfg_of(k);
+    cfg.min_version = 0x0303;
+    CHECK(setup(k, 0, &cfg, now_of(k)) == (BRISK_ENABLE_TLS12 ? BRISK_OK : BRISK_E_ARG));
+    cfg = cfg_of(k);
+    cfg.n_pins = 1;
+    CHECK(setup(k, 0, &cfg, now_of(k)) == BRISK_E_ARG);
+    cfg.pins = pins[0];
+    cfg.n_pins = 0;
+    CHECK(setup(k, 0, &cfg, now_of(k)) == BRISK_E_ARG);
+    memset(longname, 'a', 256);
+    longname[256] = '\0';
+    cfg = cfg_of(k);
+    cfg.sni = longname;
+    CHECK(setup(k, 0, &cfg, now_of(k)) == BRISK_E_ARG);
+    cfg.sni = "gw example"; /* RFC 6066 3: printable ASCII, no space */
+    CHECK(setup(k, 0, &cfg, now_of(k)) == BRISK_E_ARG);
+    CHECK(all_zero(g_mem, g_size + 8));
+
+    /* suites: the TLS 1.3 list in the caller's order, the TLS 1.2 pairs following it */
+    cfg = cfg_of(k);
+    cfg.suites = "aes256,chacha";
+    n = policy_ch(&cfg);
+    p = ch_part(n, 0xffff, &len);
+    CHECK(u16s_are(p, len, SUITES_A, sizeof SUITES_A / sizeof SUITES_A[0]));
+    brisk_conn_wipe(C);
+    /* groups: the list as given, the key share for its first */
+    cfg = cfg_of(k);
+    cfg.groups = "p256";
+    n = policy_ch(&cfg);
+    p = ch_part(n, 10, &len);
+    CHECK(p != NULL && u16s_are(p + 2, len - 2, P256, 1));
+    p = ch_part(n, 51, &len);
+    CHECK(p != NULL && len == 2 + 4 + 65 && brisk__load_be16(p + 2) == 0x0017);
+    brisk_conn_wipe(C);
+    cfg.groups = "p256,x25519";
+    n = policy_ch(&cfg);
+    p = ch_part(n, 10, &len);
+    CHECK(p != NULL && u16s_are(p + 2, len - 2, P256X, 2));
+    brisk_conn_wipe(C);
+    /* min_version 1.3: no 0x0303, no TLS 1.2 suite, no extended_main_secret */
+    cfg = cfg_of(k);
+    cfg.min_version = 0x0304;
+    n = policy_ch(&cfg);
+    p = ch_part(n, 43, &len);
+    CHECK(p != NULL && p[0] == len - 1 && u16s_are(p + 1, len - 1, V13, 1));
+    p = ch_part(n, 0xffff, &len);
+    CHECK(u16s_are(p, len, DEF13, 3));
+    CHECK(ch_part(n, 23, &len) == NULL);
+    brisk_conn_wipe(C);
+    /* sni: "" sends none; a name is sent as is, while the certificate is still held to host */
+    cfg = cfg_of(k);
+    cfg.sni = "";
+    n = policy_ch(&cfg);
+    CHECK(n != 0 && ch_part(n, 0, &len) == NULL);
+    brisk_conn_wipe(C);
+    cfg.sni = "gw.example.net";
+    n = policy_ch(&cfg);
+    p = ch_part(n, 0, &len);
+    CHECK(p != NULL && len == 5 + 14 && brisk__load_be16(p + 3) == 14 &&
+          memcmp(p + 5, "gw.example.net", 14) == 0);
+    CHECK(C->auth.host_len == strlen(HOST) && memcmp(C->auth.host, HOST, strlen(HOST)) == 0);
+    brisk_conn_wipe(C);
+    /* RFC 9846 4.7.1: tickets are bound to host, so another SNI (or none) neither offers one
+     * nor keeps new ones; the same name spelled out keeps them */
+    cfg.ticket = pins[0];
+    cfg.ticket_len = sizeof pins[0];
+    cfg.on_ticket = policy_ticket;
+    for (i = 0; i < 3; i++) {
+        cfg.sni = i == 0 ? "gw.example.net" : i == 1 ? "" : HOST;
+        CHECKI(policy_ch(&cfg) != 0, i);
+        CHECKI((C->cfg.ticket != NULL && C->cfg.on_ticket != NULL) == (i == 2), i);
+        brisk_conn_wipe(C);
+    }
+
+    /* pins leave CH1 alone, so the row's own flight replays: the anchor's SPKI pinned passes,
+     * a set without it is refused */
+    arena_used = 0;
+    cfg = cfg_of(k);
+    CHECK(brisk__x509_parse(&root, cfg.ca_mem, cfg.ca_mem_len) == BRISK_OK);
+    brisk_sha256(root.spki, root.spki_len, pins[1]);
+    memcpy(pins[0], pins[1], sizeof pins[0]);
+    pins[0][7] ^= 1;
+    cfg.pins = pins[0];
+    cfg.n_pins = 1;
+    CHECK(policy_rc(k, &cfg) == BRISK_E_AUTH);
+    cfg.n_pins = 2;
+    CHECK(policy_rc(k, &cfg) == BRISK_OK);
+    cfg.pins = pins[1];
+    cfg.n_pins = 1;
+    CHECK(policy_rc(k, &cfg) == BRISK_OK);
+
+    /* time_floor: below the build floor it is ignored; above the clock, the clock is judged
+     * as unset (FLOOR: notAfter >= the floor; STRICT: refused) */
+    p = dec(k->cert, &len); /* Certificate: header, empty context, list length, leaf */
+    n = (size_t)p[8] << 16 | (size_t)p[9] << 8 | p[10];
+    CHECK(p[4] == 0 && brisk__x509_parse(&leaf, p + 11, n) == BRISK_OK);
+    cfg = cfg_of(k);
+    cfg.time_floor = 1;
+#    if BRISK_X509_TIME_POLICY == BRISK_X509_TIME_POLICY_INSECURE_NO_TIME
+    CHECK(setup(k, 0, &cfg, now_of(k)) == BRISK_E_ARG); /* no clock: a floor is refused */
+    (void)leaf;
+    (void)now_s;
+#    else
+    CHECK(policy_rc(k, &cfg) == BRISK_OK);
+    cfg.time_floor = now_s + 1;
+    CHECK(policy_rc(k, &cfg) ==
+          (BRISK_X509_TIME_POLICY == BRISK_X509_TIME_POLICY_STRICT ? BRISK_E_AUTH : BRISK_OK));
+    cfg.time_floor = leaf.not_after + 1;
+    CHECK(policy_rc(k, &cfg) == BRISK_E_AUTH);
+#    endif
+}
+
 static void conn_negative_rows(void)
 {
     const struct tls13_flow_kat *k;
@@ -1292,6 +1527,7 @@ void test_conn(void)
     conn_full();
     conn_trust();
     conn_suites();
+    conn_policy();
     conn_negative_rows();
     conn_pull_cap();
     conn_closure_early();

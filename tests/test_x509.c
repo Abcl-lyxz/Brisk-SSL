@@ -362,6 +362,7 @@ static const brisk__x509_trust *row_trust(void)
     t.anchor_ctx = &g_row;
     t.pins = NULL;
     t.n_pins = 0;
+    t.time_floor = 0;
     return &t;
 }
 
@@ -522,7 +523,7 @@ static void t_chain_args(void)
     size_t row = plain_row();
     const struct chain_kat *k = &X509_CHAIN_KAT[row];
 
-    brisk__x509_trust storeless = {NULL, NULL, NULL, 0};
+    brisk__x509_trust storeless = {NULL, NULL, NULL, 0, 0};
 
     CHECK(brisk__x509_chain_verify(NULL, 0, k->now, NULL) == BRISK_E_ARG);
     if (chain_load(k, row)) {
@@ -745,6 +746,7 @@ static void t_pin(void)
         trust.anchor_ctx = &g_row;
         trust.pins = n_pins != 0 ? (const uint8_t (*)[BRISK_SHA256_LEN])pins : NULL;
         trust.n_pins = n_pins;
+        trust.time_floor = 0;
         CHECKI(brisk__x509_chain_verify(g_row.certs, g_row.n_certs, k->now, &trust) ==
                    (k->want != 0 ? BRISK_E_AUTH : BRISK_OK),
                i);
@@ -765,6 +767,7 @@ static void t_pin(void)
         trust.anchor_ctx = &g_row;
         trust.pins = NULL;
         trust.n_pins = 0;
+        trust.time_floor = 0;
         CHECKI(brisk__x509_chain_verify(g_row.certs, g_row.n_certs, k->now, &trust) == BRISK_OK, i);
         trust.n_pins = 3; /* ... and the same call with a count but no array fails closed */
         CHECKI(brisk__x509_chain_verify(g_row.certs, g_row.n_certs, k->now, &trust) == BRISK_E_AUTH,
@@ -821,6 +824,7 @@ static void t_store(void)
         trust.anchor_ctx = &bundle;
         trust.pins = NULL;
         trust.n_pins = 0;
+        trust.time_floor = 0;
         CHECKI(brisk__x509_chain_verify(g_row.certs, g_row.n_certs, k->now, &trust) ==
                    (k->want != 0 ? BRISK_E_AUTH : BRISK_OK),
                i);

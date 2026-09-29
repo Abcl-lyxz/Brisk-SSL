@@ -119,8 +119,10 @@ int brisk__quic_setup(void *mem, size_t mem_len, const brisk_cfg *cfg, const cha
     }
     q->c.quic_tp = q->tp;
     q->c.quic_tp_len = n;
-    q->c.suites = suites;
-    q->c.n_suites = n_suites;
+    if (suites != NULL) { /* the test seam wins over cfg.suites */
+        q->c.suites = suites;
+        q->c.n_suites = n_suites;
+    }
     /* RFC 9000 7.2 (MUST): the first DCID is 8 unpredictable bytes; our SCID 8 more */
     if (rc == BRISK_OK) {
         rc = brisk__quic_conn_init(

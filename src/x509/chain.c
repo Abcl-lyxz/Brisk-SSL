@@ -159,19 +159,23 @@ int brisk__x509_signed_by(const brisk__x509_cert *child, const brisk__x509_cert 
 
 /* ------------------------------------------------------------------ validity -------------- */
 
-int brisk__x509_time_ok(const brisk__x509_cert *c, int64_t now)
+/* brisk__x509_time_ok against `tfloor`: BRISK_X509_TIME_FLOOR, or the higher runtime one of
+ * brisk__x509_trust.time_floor. A clock below a runtime floor was rolled back (or never set):
+ * it is judged exactly like one below the build floor - never by raising `now`. */
+static int time_ok(const brisk__x509_cert *c, int64_t now, int64_t tfloor)
 {
     if (c == NULL) {
         return BRISK_E_ARG;
     }
 #if BRISK_X509_TIME_POLICY == BRISK_X509_TIME_POLICY_INSECURE_NO_TIME
     (void)now;
+    (void)tfloor;
     return BRISK_OK;
 #else
     /* A clock below the floor is an unset counter, not a time: the firmware cannot be running
      * before it was built. cert.c has already refused notBefore > notAfter, so the window is
      * never inverted here. */
-    if (now < (int64_t)(BRISK_X509_TIME_FLOOR)) {
+    if (now < tfloor) {
 #    if BRISK_X509_TIME_POLICY == BRISK_X509_TIME_POLICY_STRICT
         return BRISK_E_AUTH;
 #    else
@@ -179,11 +183,16 @@ int brisk__x509_time_ok(const brisk__x509_cert *c, int64_t now)
          * so a certificate issued after this build is legitimate and cannot be told apart from
          * one dated in the future. notAfter can still be judged, and that is the half that
          * stops a long-dead leaf. */
-        return (c->not_after >= (int64_t)(BRISK_X509_TIME_FLOOR)) ? BRISK_OK : BRISK_E_AUTH;
+        return (c->not_after >= tfloor) ? BRISK_OK : BRISK_E_AUTH;
 #    endif
     }
     return (c->not_before <= now && now <= c->not_after) ? BRISK_OK : BRISK_E_AUTH;
 #endif
+}
+
+int brisk__x509_time_ok(const brisk__x509_cert *c, int64_t now)
+{
+    return time_ok(c, now, (int64_t)(BRISK_X509_TIME_FLOOR));
 }
 
 /* ------------------------------------------------------------------ the walk -------------- */
@@ -266,7 +275,7 @@ static int pinned(const brisk__x509_trust *t, const brisk__x509_cert *c)
 int brisk__x509_chain_verify(const brisk__x509_cert *certs, size_t n_certs, int64_t now,
                              const brisk__x509_trust *trust)
 {
-    static const brisk__x509_trust empty = {NULL, NULL, NULL, 0};
+    static const brisk__x509_trust empty = {NULL, NULL, NULL, 0, 0};
     /* The path under construction. chosen[d] is the parent taken at depth d, and it is BOTH
      * halves of the search state: it is the path, and because it points into certs[] its index
      * plus one is where depth d's scan resumes when everything above it dead-ends. That is why
@@ -279,6 +288,7 @@ int brisk__x509_chain_verify(const brisk__x509_cert *certs, size_t n_certs, int6
      * anchor test asks in both worlds. A mask and not a flag because backtracking has to UNDO
      * what a parent it is abandoning contributed, and a bool cannot be un-set. */
     uint32_t pin_mask;
+    int64_t tfloor;
     size_t depth = 0, resume = 1, below = 0, work = 0, lookups = 0;
 
     if (certs == NULL || n_certs == 0) {
@@ -287,6 +297,8 @@ int brisk__x509_chain_verify(const brisk__x509_cert *certs, size_t n_certs, int6
     if (trust == NULL) {
         trust = &empty;
     }
+    tfloor = trust->time_floor > (int64_t)(BRISK_X509_TIME_FLOOR) ? trust->time_floor
+                                                                   : (int64_t)(BRISK_X509_TIME_FLOOR);
     cur = &certs[0];
     /* 6.1.3 (a)(2) for the end entity. Every other certificate of the path is checked below, as
      * a condition for being CHOSEN as the parent - never after the search has committed to it.
@@ -296,7 +308,7 @@ int brisk__x509_chain_verify(const brisk__x509_cert *certs, size_t n_certs, int6
      * this file already worries about) leaves BOTH on the wire, and the expired one is often
      * first. Checked as a filter, the search skips it and takes the live one. It also means an
      * expired candidate costs no public-key operation and no verify budget. */
-    if (brisk__x509_time_ok(cur, now) != BRISK_OK) {
+    if (time_ok(cur, now, tfloor) != BRISK_OK) {
         return BRISK_E_AUTH;
     }
     pin_mask = (trust->n_pins == 0 || pinned(trust, cur)) ? 0x80000000u : 0;
@@ -383,7 +395,7 @@ int brisk__x509_chain_verify(const brisk__x509_cert *certs, size_t n_certs, int6
                     !name_eq(cur->issuer, cur->issuer_len, p->subject, p->subject_len)) {
                     continue;
                 }
-                if (!usable_ca(p, below, 0) || brisk__x509_time_ok(p, now) != BRISK_OK) {
+                if (!usable_ca(p, below, 0) || time_ok(p, now, tfloor) != BRISK_OK) {
                     continue; /* (k)(l)(m)(n) and (a)(2), all of them selection predicates */
                 }
                 if (++work > BRISK__X509_MAX_VERIFY) {
