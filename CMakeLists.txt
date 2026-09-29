@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20...4.4)
-project(brisk_ssl VERSION 0.1.0 LANGUAGES C)
+project(brisk_ssl VERSION 0.2.0 LANGUAGES C)
 
 # Empty = let include/brisk_config.h decide (DEFAULT, or whatever a BRISK_USER_CONFIG header sets).
 set(BRISK_PROFILE "" CACHE STRING "Feature profile: TINY, DEFAULT or FULL; empty = header default")

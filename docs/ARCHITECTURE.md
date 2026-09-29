@@ -118,16 +118,15 @@ sized by `brisk_h2_size()`. No push, no priority.
 - No 0-RTT (telemetry POSTs are not replay-safe).
 - Clock policy FLOOR (default): if the wall clock is below `BRISK_X509_TIME_FLOOR` (the build
   date) the clock is "unsynced" - check notAfter against the floor, skip notBefore. STRICT
-  refuses instead; INSECURE_NO_TIME skips the window. The floor is compile-time only today: a
-  persisted last-known-good time cannot raise it, and must NOT be passed as `now` instead - that
+  refuses instead; INSECURE_NO_TIME skips the window. A persisted last-known-good time goes in
+  `cfg.time_floor` (0.2), which raises the floor - it must NOT be passed as `now` instead: that
   lifts the clock above the floor and re-enables the notBefore check against a stale value, so
-  every freshly issued certificate is refused. A runtime floor (from the device's storage) is not in
-  v0.1.0. The trust anchor is
+  every freshly issued certificate is refused. The trust anchor is
   exempt from the window (RFC 5280 6.1.1 (d); DST Root CA X3, 2021). Dates are int64, never
   `time_t` (Y2038, 9999 notAfter). Knob table in docs/CONFIG.md.
-- SPKI pinning is NOT in v0.1.0; a private PKI uses `ca_mem` with only its own root. If pins
-  come, they are additive (never replace chain validation) and pin roots, not
-  leaves/intermediates (Let's Encrypt rotates intermediates; lifetimes drop to 47 days by 2029).
+- SPKI pinning (`cfg.pins`, 0.2) is additive: it never replaces chain validation, and a pin
+  counts only on the verified path. A private PKI still starts with `ca_mem` holding only its own
+  root. Pin roots, not leaves/intermediates (Let's Encrypt rotates intermediates; lifetimes drop to 47 days by 2029).
 - RNG: getrandom (own per-arch syscall table, checked against the headers). Only on kernels
   < 4.8 without it (ENOSYS, or EPERM from seccomp): /dev/urandom once /dev/random has been
   readable, waited for once per process (on >= 4.8 readable no longer means seeded, so a filter

@@ -92,7 +92,7 @@ string (1..255 bytes, A-labels for IDNs), an ALPN entry that is empty or longer 
 `client_key` that does not parse or does not match the chain's leaf, a device chain over
 `BRISK_TLS_MAX_CLIENT_CHAIN` (DER bytes) or with a malformed PEM block, a stream
 call on a stream that is already closed. Also a `sign` callback that refused (internal_error),
-and mTLS with a `sign` callback against a TLS 1.2 server that asks for a certificate: in v0.1.0
+and mTLS with a `sign` callback against a TLS 1.2 server that asks for a certificate: so far
 the callback works over TLS 1.3 only - use `client_key` there, or enable TLS 1.3 on the server.
 
 A `client_key` is refused (setup returns `BRISK_E_ARG`, your key buffer untouched) when it is

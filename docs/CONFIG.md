@@ -129,7 +129,7 @@ KB of flash (text + rodata + data, -Os, static link map, libc excluded); budget 
 <!-- size-table:end -->
 
 ## What did my firmware get compiled with?
-`brisk_build_info()` returns e.g. `0.1.0 profile=DEFAULT`; the same text is embedded as
+`brisk_build_info()` returns e.g. `0.2.0 profile=DEFAULT`; the same text is embedded as
 `@(#)BRISKCFG ...`, so `strings firmware.bin | grep BRISKCFG` works on a shipped image.
 Every knob from the table above that was switched off is appended (`profile=DEFAULT -rsa
 -x25519`), as is a non-default time policy.

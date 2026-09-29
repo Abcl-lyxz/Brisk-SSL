@@ -15,9 +15,9 @@
 #include "brisk_config.h"
 
 #define BRISK_SSL_VERSION_MAJOR  0
-#define BRISK_SSL_VERSION_MINOR  1
+#define BRISK_SSL_VERSION_MINOR  2
 #define BRISK_SSL_VERSION_PATCH  0
-#define BRISK_SSL_VERSION_STRING "0.1.0"
+#define BRISK_SSL_VERSION_STRING "0.2.0"
 
 /* Symbol export: only a shared-library build (BRISK_SHARED_BUILD) exports the API. In a static
  * build it stays empty so a .so that embeds libbrisk.a keeps its own visibility policy.
@@ -97,10 +97,10 @@ enum {
  * NULL. With BRISK_ENABLE_ERROR_STRINGS=0 (TINY) just the name: "E_AUTH". */
 BRISK_API const char *brisk_strerror(int err);
 
-/* Library version, e.g. "0.1.0". */
+/* Library version, e.g. "0.2.0". */
 BRISK_API const char *brisk_version(void);
 
-/* What this binary was compiled with, e.g. "0.1.0 profile=DEFAULT". The same text is embedded
+/* What this binary was compiled with, e.g. "0.2.0 profile=DEFAULT". The same text is embedded
  * as "@(#)BRISKCFG ..." so `strings firmware.bin | grep BRISKCFG` works on a shipped image. */
 BRISK_API const char *brisk_build_info(void);
 

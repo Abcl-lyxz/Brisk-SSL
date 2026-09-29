@@ -12,7 +12,8 @@ routers, gateways and industrial boxes on x86, ARM, MIPS, RISC-V and PowerPC.
 - **Honest crypto**: official NIST / RFC / Wycheproof vectors, constant-time code checked
   under valgrind, formally verified field arithmetic (fiat-crypto) for X25519 and P-256
 
-> Status: **v0.1.0**, the first release. The API may still change before 1.0. Security
+> Status: **v0.2.0**. The API may still change before 1.0 (0.2 changed the `brisk_cfg` layout:
+> rebuild against the new header). Security
 > reports: [SECURITY.md](SECURITY.md).
 
 ## Quick start: a TLS stream
@@ -36,7 +37,7 @@ stream. Error codes and what to do about them: [docs/TROUBLESHOOTING.md](docs/TR
 Also available:
 - **mTLS**: an ECDSA P-256 device key (`cfg.client_chain` + `cfg.client_key`) or a secure
   element through the `cfg.sign` callback. With a TLS 1.2 server, only `client_key` works: the
-  `sign` callback is TLS 1.3 only in v0.1.0
+  `sign` callback is TLS 1.3 only so far
 - **Session resumption**: `cfg.on_ticket` hands you tickets, and `cfg.ticket` offers one next time
 - **Sans-I/O**: the same connection in your own event loop and memory, with `brisk_conn_init`,
   `brisk_feed`, `brisk_pull`, `brisk_app_read` and `brisk_app_write`

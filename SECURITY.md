@@ -3,10 +3,10 @@
 ## Supported versions
 | Version | Supported |
 |---|---|
-| 0.1.x | yes - fixes land on `main` and in the next 0.1.x release |
+| 0.2.x | yes - fixes land on `main` and in the next 0.2.x release |
 | older | no |
 
-v0.1.0 is the first release: well tested (official vectors, 10 architectures, fuzzing, a
+v0.2.0 is well tested (official vectors, 10 architectures, fuzzing, a
 constant-time check, interop against real servers), but not independently audited yet. Weigh
 that before protecting high-value traffic with it.
 
